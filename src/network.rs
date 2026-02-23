@@ -145,6 +145,12 @@ pub struct NodeConfig {
     /// Defaults to 60 seconds. Can be reduced for testing purposes.
     #[serde(default = "default_stale_peer_threshold")]
     pub stale_peer_threshold: Duration,
+
+    /// Optional override for the maximum application-layer message size.
+    ///
+    /// When `None`, the transport crate default is used (1 MiB).
+    #[serde(default)]
+    pub max_message_size: Option<usize>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -245,6 +251,7 @@ impl NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         })
     }
 
@@ -374,6 +381,7 @@ impl NodeConfigBuilder {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         })
     }
 }
@@ -405,6 +413,7 @@ impl Default for NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         }
     }
 }
@@ -462,6 +471,7 @@ impl NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         };
 
         // Add IPv6 listen address if enabled
@@ -845,6 +855,7 @@ impl P2PNode {
             max_connections: config.max_connections,
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            max_message_size: config.max_message_size,
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -2025,6 +2036,7 @@ mod tests {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         }
     }
 

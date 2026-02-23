@@ -34,6 +34,7 @@ async fn create_node_with_transport(
             max_connections: node_config.max_connections,
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            max_message_size: node_config.max_message_size,
         })
         .await?,
     );
