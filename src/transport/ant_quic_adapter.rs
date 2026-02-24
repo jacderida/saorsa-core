@@ -136,7 +136,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 ///
 /// This tunes both the QUIC stream receive window and the per-stream
 /// read buffer inside `ant-quic`.
-pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = P2pConfig::DEFAULT_MAX_MESSAGE_SIZE;
 
 impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with default P2pLinkTransport
@@ -147,20 +147,21 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with a specific connection limit and
     /// optional message-size override.
     ///
-    /// When `max_msg_size` is `None` the crate-level [`MAX_MESSAGE_SIZE`]
-    /// default is used.
+    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
     pub async fn new_with_max_connections(
         bind_addr: SocketAddr,
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        let effective_max_message_size = max_msg_size.unwrap_or(MAX_MESSAGE_SIZE);
-        let config = P2pConfig::builder()
+        let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
             .max_connections(max_connections)
             .conservative_timeouts()
-            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY)
-            .max_message_size(effective_max_message_size)
+            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
+        if let Some(max_msg_size) = max_msg_size {
+            builder = builder.max_message_size(max_msg_size);
+        }
+        let config = builder
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build P2P config: {}", e))?;
 
@@ -189,21 +190,21 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node from NetworkConfig with an optional
     /// message-size override.
     ///
-    /// When `max_msg_size` is `None` the crate-level [`MAX_MESSAGE_SIZE`]
-    /// default is used.
+    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
     pub async fn from_network_config(
         bind_addr: SocketAddr,
         net_config: &crate::transport::NetworkConfig,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        let effective_max_message_size = max_msg_size.unwrap_or(MAX_MESSAGE_SIZE);
         // Build P2pConfig based on NetworkConfig
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
             .max_connections(DEFAULT_MAX_CONNECTIONS)
             .conservative_timeouts()
-            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY)
-            .max_message_size(effective_max_message_size);
+            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
+        if let Some(max_msg_size) = max_msg_size {
+            builder = builder.max_message_size(max_msg_size);
+        }
 
         // Apply NAT traversal settings if present
         if let Some(ref nat_config) = net_config.to_ant_config() {

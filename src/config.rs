@@ -160,6 +160,10 @@ pub struct TransportConfig {
     pub buffer_size: usize,
     /// Server name for TLS (SNI)
     pub server_name: String,
+    /// Optional override for maximum application-layer message size in bytes.
+    ///
+    /// When `None`, transport-layer defaults are used.
+    pub max_message_size: Option<usize>,
 }
 
 /// Identity configuration
@@ -242,6 +246,7 @@ impl Default for TransportConfig {
             webrtc_enabled: false,
             buffer_size: 65536,
             server_name: "p2p.local".to_string(),
+            max_message_size: None,
         }
     }
 }
@@ -471,6 +476,15 @@ impl Config {
             })),
         }
 
+        if let Some(max_message_size) = self.transport.max_message_size
+            && max_message_size == 0
+        {
+            errors.push(P2PError::Config(ConfigError::InvalidValue {
+                field: "transport.max_message_size".to_string().into(),
+                reason: "max_message_size must be at least 1".to_string().into(),
+            }));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -668,6 +682,7 @@ mod tests {
         assert_eq!(config.network.listen_address, "0.0.0.0:9000");
         assert_eq!(config.security.rate_limit, 1000);
         assert!(config.security.encryption_enabled);
+        assert_eq!(config.transport.max_message_size, None);
     }
 
     #[test]
@@ -698,6 +713,13 @@ mod tests {
         // Valid multiaddr
         config.network.listen_address = "/ip4/127.0.0.1/tcp/9000".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_zero_transport_max_message_size() {
+        let mut config = Config::default();
+        config.transport.max_message_size = Some(0);
+        assert!(config.validate().is_err());
     }
 
     #[test]

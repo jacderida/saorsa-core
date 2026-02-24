@@ -90,8 +90,8 @@ pub struct TransportConfig {
     pub event_channel_capacity: usize,
     /// Optional override for the maximum application-layer message size.
     ///
-    /// When `None`, the transport crate default ([`MAX_MESSAGE_SIZE`]) is
-    /// used.  Set this to tune the QUIC stream receive window and the
+    /// When `None`, ant-quic's built-in default is used. Set this to tune
+    /// the QUIC stream receive window and the
     /// per-stream read buffer for larger or smaller payloads.
     pub max_message_size: Option<usize>,
 }
