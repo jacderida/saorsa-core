@@ -145,6 +145,12 @@ pub struct NodeConfig {
     /// Defaults to 60 seconds. Can be reduced for testing purposes.
     #[serde(default = "default_stale_peer_threshold")]
     pub stale_peer_threshold: Duration,
+
+    /// Optional override for the maximum application-layer message size.
+    ///
+    /// When `None`, the underlying ant-quic default is used.
+    #[serde(default)]
+    pub max_message_size: Option<usize>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -245,6 +251,7 @@ impl NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: config.transport.max_message_size,
         })
     }
 
@@ -271,6 +278,7 @@ pub struct NodeConfigBuilder {
     dht_config: Option<DHTConfig>,
     security_config: Option<SecurityConfig>,
     production_config: Option<ProductionConfig>,
+    max_message_size: Option<usize>,
 }
 
 impl NodeConfigBuilder {
@@ -334,6 +342,14 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set maximum application-layer message size in bytes.
+    ///
+    /// If this method is not called, ant-quic's built-in default is used.
+    pub fn max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = Some(max_message_size);
+        self
+    }
+
     /// Build the NodeConfig
     ///
     /// # Errors
@@ -374,6 +390,9 @@ impl NodeConfigBuilder {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: self
+                .max_message_size
+                .or(base_config.transport.max_message_size),
         })
     }
 }
@@ -405,6 +424,7 @@ impl Default for NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: config.transport.max_message_size,
         }
     }
 }
@@ -462,6 +482,7 @@ impl NodeConfig {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: config.transport.max_message_size,
         };
 
         // Add IPv6 listen address if enabled
@@ -845,6 +866,7 @@ impl P2PNode {
             max_connections: config.max_connections,
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            max_message_size: config.max_message_size,
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -1895,6 +1917,14 @@ impl NodeBuilder {
         self
     }
 
+    /// Set maximum application-layer message size in bytes.
+    ///
+    /// If this method is not called, ant-quic's built-in default is used.
+    pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
+        self.config.max_message_size = Some(max_message_size);
+        self
+    }
+
     /// Enable production mode with default configuration
     pub fn with_production_mode(mut self) -> Self {
         self.config.production_config = Some(ProductionConfig::default());
@@ -2025,6 +2055,7 @@ mod tests {
             bootstrap_cache_config: None,
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
+            max_message_size: None,
         }
     }
 
@@ -2458,7 +2489,8 @@ mod tests {
             .with_bootstrap_peer("/ip4/127.0.0.1/tcp/9000") // Use a valid port number
             .with_ipv6(true)
             .with_connection_timeout(Duration::from_secs(15))
-            .with_max_connections(200);
+            .with_max_connections(200)
+            .with_max_message_size(2 * 1024 * 1024);
 
         // Test the configuration that was built
         let config = builder.config;
@@ -2468,6 +2500,7 @@ mod tests {
         assert!(config.enable_ipv6);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.max_connections, 200);
+        assert_eq!(config.max_message_size, Some(2 * 1024 * 1024));
 
         Ok(())
     }

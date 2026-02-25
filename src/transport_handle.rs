@@ -88,6 +88,12 @@ pub struct TransportConfig {
     pub production_config: Option<ProductionConfig>,
     /// Broadcast channel capacity for P2P events.
     pub event_channel_capacity: usize,
+    /// Optional override for the maximum application-layer message size.
+    ///
+    /// When `None`, ant-quic's built-in default is used. Set this to tune
+    /// the QUIC stream receive window and the
+    /// per-stream read buffer for larger or smaller payloads.
+    pub max_message_size: Option<usize>,
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -163,13 +169,18 @@ impl TransportHandle {
         };
 
         let dual_node = Arc::new(
-            DualStackNetworkNode::new_with_max_connections(v6_opt, v4_opt, config.max_connections)
-                .await
-                .map_err(|e| {
-                    P2PError::Transport(crate::error::TransportError::SetupFailed(
-                        format!("Failed to create dual-stack network nodes: {}", e).into(),
-                    ))
-                })?,
+            DualStackNetworkNode::new_with_max_connections(
+                v6_opt,
+                v4_opt,
+                config.max_connections,
+                config.max_message_size,
+            )
+            .await
+            .map_err(|e| {
+                P2PError::Transport(crate::error::TransportError::SetupFailed(
+                    format!("Failed to create dual-stack network nodes: {}", e).into(),
+                ))
+            })?,
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
