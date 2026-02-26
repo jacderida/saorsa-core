@@ -24,7 +24,9 @@ use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
+use crate::identity::node_identity::{NodeId as IdentityNodeId, NodeIdentity};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
+use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature};
 use crate::{NetworkAddress, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +53,12 @@ pub(crate) struct WireMessage {
     pub(crate) from: String,
     /// Unix timestamp in seconds
     pub(crate) timestamp: u64,
+    /// Sender's ML-DSA-65 public key (1952 bytes). Empty if unsigned.
+    #[serde(default)]
+    pub(crate) public_key: Vec<u8>,
+    /// ML-DSA-65 signature over the signable bytes. Empty if unsigned.
+    #[serde(default)]
+    pub(crate) signature: Vec<u8>,
 }
 
 /// Payload bytes used for keepalive messages to prevent connection timeouts.
@@ -151,6 +159,13 @@ pub struct NodeConfig {
     /// When `None`, the underlying ant-quic default is used.
     #[serde(default)]
     pub max_message_size: Option<usize>,
+
+    /// Optional node identity for app-level message signing.
+    ///
+    /// When set, outgoing messages are signed with the node's ML-DSA-65 key
+    /// and incoming signed messages are verified at the transport layer.
+    #[serde(skip)]
+    pub node_identity: Option<Arc<NodeIdentity>>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -252,6 +267,7 @@ impl NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         })
     }
 
@@ -393,6 +409,7 @@ impl NodeConfigBuilder {
             max_message_size: self
                 .max_message_size
                 .or(base_config.transport.max_message_size),
+            node_identity: None,
         })
     }
 }
@@ -425,6 +442,7 @@ impl Default for NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         }
     }
 }
@@ -483,6 +501,7 @@ impl NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         };
 
         // Add IPv6 listen address if enabled
@@ -867,6 +886,7 @@ impl P2PNode {
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: config.max_message_size,
+            node_identity: config.node_identity.clone(),
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -1457,7 +1477,15 @@ pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent)
     }
 }
 
-pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<P2PEvent> {
+/// Result of parsing a protocol message, including optional authenticated identity.
+pub(crate) struct ParsedMessage {
+    /// The P2P event to broadcast.
+    pub(crate) event: P2PEvent,
+    /// If the message was signed and verified, the authenticated app-level NodeId hex.
+    pub(crate) authenticated_node_id: Option<String>,
+}
+
+pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
 
     // Validate timestamp to prevent replay attacks
@@ -1488,19 +1516,74 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<P2PEv
         return None;
     }
 
+    // Verify app-level signature if present
+    let (effective_source, authenticated_node_id) = if !message.signature.is_empty() {
+        match verify_message_signature(&message) {
+            Ok(node_id_hex) => {
+                debug!(
+                    "Message from {} authenticated as app-level NodeId {}",
+                    source, node_id_hex
+                );
+                (node_id_hex.clone(), Some(node_id_hex))
+            }
+            Err(e) => {
+                warn!(
+                    "Rejecting message from {}: signature verification failed: {}",
+                    source, e
+                );
+                return None;
+            }
+        }
+    } else {
+        // Unsigned message: use transport-level source
+        (source.to_string(), None)
+    };
+
     debug!(
-        "Parsed P2PEvent::Message - topic: {}, source: {} (logical: {}), payload_len: {}",
+        "Parsed P2PEvent::Message - topic: {}, source: {} (transport: {}, logical: {}), payload_len: {}",
         message.protocol,
+        effective_source,
         source,
         message.from,
         message.data.len()
     );
 
-    Some(P2PEvent::Message {
-        topic: message.protocol,
-        source: source.to_string(),
-        data: message.data,
+    Some(ParsedMessage {
+        event: P2PEvent::Message {
+            topic: message.protocol,
+            source: effective_source,
+            data: message.data,
+        },
+        authenticated_node_id,
     })
+}
+
+/// Verify the ML-DSA-65 signature on a WireMessage and return the authenticated NodeId hex.
+fn verify_message_signature(message: &WireMessage) -> std::result::Result<String, String> {
+    let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
+        .map_err(|e| format!("invalid public key: {e:?}"))?;
+
+    let node_id = IdentityNodeId::from_public_key(&pubkey);
+
+    let signable = postcard::to_stdvec(&(
+        &message.protocol,
+        &message.data as &[u8],
+        &message.from,
+        message.timestamp,
+    ))
+    .map_err(|e| format!("failed to serialize signable bytes: {e}"))?;
+
+    let sig = MlDsaSignature::from_bytes(&message.signature)
+        .map_err(|e| format!("invalid signature: {e:?}"))?;
+
+    let valid = crate::quantum_crypto::ml_dsa_verify(&pubkey, &signable, &sig)
+        .map_err(|e| format!("verification error: {e}"))?;
+
+    if valid {
+        Ok(node_id.to_hex())
+    } else {
+        Err("signature is invalid".to_string())
+    }
 }
 
 impl P2PNode {
@@ -2056,6 +2139,7 @@ mod tests {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
+            node_identity: None,
         }
     }
 
@@ -2936,23 +3020,27 @@ mod tests {
             data,
             from: from.to_string(),
             timestamp,
+            public_key: Vec::new(),
+            signature: Vec::new(),
         };
         postcard::to_stdvec(&msg).unwrap()
     }
 
     #[test]
     fn test_parse_protocol_message_uses_transport_peer_id_as_source() {
-        // Regression: P2PEvent::Message.source must be the transport peer ID,
-        // NOT the "from" field from the wire message.  This ensures consumers
-        // can pass source directly to send_message().
+        // Regression: For unsigned messages, P2PEvent::Message.source must be the
+        // transport peer ID, NOT the "from" field from the wire message.
         let transport_id = "abcdef0123456789";
         let logical_id = "spoofed-logical-id";
         let bytes = make_wire_bytes("test/v1", vec![1, 2, 3], logical_id, current_timestamp());
 
-        let event =
+        let parsed =
             parse_protocol_message(&bytes, transport_id).expect("valid message should parse");
 
-        match event {
+        // Unsigned message: no authenticated node ID
+        assert!(parsed.authenticated_node_id.is_none());
+
+        match parsed.event {
             P2PEvent::Message {
                 topic,
                 source,
@@ -2988,10 +3076,10 @@ mod tests {
     fn test_parse_protocol_message_empty_payload() {
         let bytes = make_wire_bytes("ping", vec![], "sender", current_timestamp());
 
-        let event = parse_protocol_message(&bytes, "transport-peer")
+        let parsed = parse_protocol_message(&bytes, "transport-peer")
             .expect("valid message with empty data should parse");
 
-        match event {
+        match parsed.event {
             P2PEvent::Message { data, .. } => assert!(data.is_empty()),
             other => panic!("expected P2PEvent::Message, got {:?}", other),
         }
@@ -3003,10 +3091,10 @@ mod tests {
         let payload: Vec<u8> = (0..=255).collect();
         let bytes = make_wire_bytes("binary/v1", payload.clone(), "sender", current_timestamp());
 
-        let event = parse_protocol_message(&bytes, "peer-id")
+        let parsed = parse_protocol_message(&bytes, "peer-id")
             .expect("valid message with full byte range should parse");
 
-        match event {
+        match parsed.event {
             P2PEvent::Message { data, topic, .. } => {
                 assert_eq!(topic, "binary/v1");
                 assert_eq!(
@@ -3016,5 +3104,76 @@ mod tests {
             }
             other => panic!("expected P2PEvent::Message, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_signed_message_verifies_and_uses_node_id() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/signed";
+        let data: Vec<u8> = vec![10, 20, 30];
+        let from = "some-peer";
+        let timestamp = current_timestamp();
+
+        // Compute signable bytes the same way create_protocol_message does
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), from, timestamp)).unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data: data.clone(),
+            from: from.to_string(),
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        let parsed =
+            parse_protocol_message(&bytes, "transport-xyz").expect("signed message should parse");
+
+        let expected_node_id = identity.node_id().to_hex();
+        assert_eq!(
+            parsed.authenticated_node_id.as_deref(),
+            Some(expected_node_id.as_str())
+        );
+
+        match parsed.event {
+            P2PEvent::Message { source, .. } => {
+                assert_eq!(
+                    source, expected_node_id,
+                    "source should be the verified NodeId hex"
+                );
+            }
+            other => panic!("expected P2PEvent::Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_message_with_bad_signature_is_rejected() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/bad-sig";
+        let data: Vec<u8> = vec![1, 2, 3];
+        let from = "some-peer";
+        let timestamp = current_timestamp();
+
+        // Sign correct signable bytes
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), from, timestamp)).unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        // Tamper with the data
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data: vec![99, 99, 99], // different data than what was signed
+            from: from.to_string(),
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        assert!(
+            parse_protocol_message(&bytes, "transport-xyz").is_none(),
+            "message with bad signature should be rejected"
+        );
     }
 }

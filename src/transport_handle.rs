@@ -19,11 +19,12 @@
 
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
+use crate::identity::node_identity::NodeIdentity;
 use crate::network::{
     ConnectionStatus, KEEPALIVE_PAYLOAD, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT,
-    MESSAGE_RECV_CHANNEL_CAPACITY, NetworkSender, P2PEvent, PeerInfo, PeerResponse, PendingRequest,
-    RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
-    parse_protocol_message, register_new_peer,
+    MESSAGE_RECV_CHANNEL_CAPACITY, NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse,
+    PendingRequest, RequestResponseEnvelope, WireMessage, broadcast_event,
+    normalize_wildcard_to_loopback, parse_protocol_message, register_new_peer,
 };
 use crate::production::{ProductionConfig, ResourceManager};
 use crate::security::GeoProvider;
@@ -94,6 +95,8 @@ pub struct TransportConfig {
     /// the QUIC stream receive window and the
     /// per-stream read buffer for larger or smaller payloads.
     pub max_message_size: Option<usize>,
+    /// Optional node identity for app-level message signing.
+    pub node_identity: Option<Arc<NodeIdentity>>,
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -123,6 +126,10 @@ pub struct TransportHandle {
     periodic_tasks_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     listener_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Optional node identity for signing outgoing messages.
+    node_identity: Option<Arc<NodeIdentity>>,
+    /// Maps app-level NodeId hex → transport peer ID for response routing.
+    app_to_transport: Arc<RwLock<HashMap<String, String>>>,
 }
 
 // ============================================================================
@@ -273,6 +280,8 @@ impl TransportHandle {
             periodic_tasks_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
+            node_identity: config.node_identity,
+            app_to_transport: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -329,6 +338,8 @@ impl TransportHandle {
             periodic_tasks_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
+            node_identity: None,
+            app_to_transport: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -581,21 +592,29 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Send a message to a peer (raw, no trust reporting).
+    ///
+    /// `peer_id` can be either a transport-level peer ID (from QUIC) or an
+    /// app-level NodeId hex string. When an app-level ID is given, the
+    /// internal `app_to_transport` mapping is used to resolve it.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
         protocol: &str,
         data: Vec<u8>,
     ) -> Result<()> {
+        // Resolve: if peer_id is an app-level NodeId, look up the transport ID.
+        let transport_id = self.resolve_transport_peer_id(peer_id).await;
+        let effective_id = transport_id.as_deref().unwrap_or(peer_id);
+
         debug!(
-            "Sending message to peer {} on protocol {}",
-            peer_id, protocol
+            "Sending message to peer {} (transport: {}) on protocol {}",
+            peer_id, effective_id, protocol
         );
 
         // Check rate limits if resource manager is enabled
         if let Some(ref resource_manager) = self.resource_manager
             && !resource_manager
-                .check_rate_limit(peer_id, "message")
+                .check_rate_limit(effective_id, "message")
                 .await?
         {
             return Err(P2PError::ResourceExhausted(
@@ -603,14 +622,14 @@ impl TransportHandle {
             ));
         }
 
-        if !self.peers.read().await.contains_key(peer_id) {
+        if !self.peers.read().await.contains_key(effective_id) {
             return Err(P2PError::Network(NetworkError::PeerNotFound(
                 peer_id.to_string().into(),
             )));
         }
 
-        if !self.is_connection_active(peer_id).await {
-            self.remove_peer(peer_id).await;
+        if !self.is_connection_active(effective_id).await {
+            self.remove_peer(&effective_id.to_string()).await;
             return Err(P2PError::Network(NetworkError::ConnectionClosed {
                 peer_id: peer_id.to_string().into(),
             }));
@@ -625,14 +644,14 @@ impl TransportHandle {
         info!(
             "Sending {} bytes to peer {} on protocol {} (raw data: {} bytes)",
             message_data.len(),
-            peer_id,
+            effective_id,
             protocol,
             raw_data_len
         );
 
         let send_fut = self
             .dual_node
-            .send_to_peer_string_optimized(peer_id, &message_data);
+            .send_to_peer_string_optimized(effective_id, &message_data);
         let result = tokio::time::timeout(self.connection_timeout, send_fut)
             .await
             .map_err(|_| {
@@ -650,13 +669,26 @@ impl TransportHandle {
             info!(
                 "Successfully sent {} bytes to peer {}",
                 message_data.len(),
-                peer_id
+                effective_id
             );
         } else {
             warn!("Failed to send message to peer {}", peer_id);
         }
 
         result
+    }
+
+    /// Resolve an app-level NodeId hex to the transport peer ID.
+    ///
+    /// Returns `None` if the given ID is already a transport peer ID (present
+    /// in the peers map) or if no mapping exists.
+    async fn resolve_transport_peer_id(&self, peer_id: &str) -> Option<String> {
+        // If it's directly in the peers map, it's already a transport ID.
+        if self.peers.read().await.contains_key(peer_id) {
+            return None;
+        }
+        // Otherwise, try the app→transport mapping.
+        self.app_to_transport.read().await.get(peer_id).cloned()
     }
 
     /// Send a request and wait for a response (no trust reporting).
@@ -781,6 +813,8 @@ impl TransportHandle {
     }
 
     /// Create a protocol message wrapper (WireMessage serialized with postcard).
+    ///
+    /// If `node_identity` is set, signs the message with the node's ML-DSA-65 key.
     fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u8>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -791,16 +825,49 @@ impl TransportHandle {
             })?
             .as_secs();
 
-        let message = WireMessage {
+        let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
             from: self.peer_id.clone(),
             timestamp,
+            public_key: Vec::new(),
+            signature: Vec::new(),
         };
+
+        // Sign the message if we have a node identity
+        if let Some(ref identity) = self.node_identity {
+            let signable = Self::compute_signable_bytes(
+                &message.protocol,
+                &message.data,
+                &message.from,
+                message.timestamp,
+            )?;
+            let sig = identity.sign(&signable).map_err(|e| {
+                P2PError::Network(NetworkError::ProtocolError(
+                    format!("Failed to sign message: {e}").into(),
+                ))
+            })?;
+            message.public_key = identity.public_key().as_bytes().to_vec();
+            message.signature = sig.as_bytes().to_vec();
+        }
 
         postcard::to_stdvec(&message).map_err(|e| {
             P2PError::Transport(crate::error::TransportError::StreamError(
                 format!("Failed to serialize message: {e}").into(),
+            ))
+        })
+    }
+
+    /// Compute the canonical bytes to sign/verify for a WireMessage.
+    fn compute_signable_bytes(
+        protocol: &str,
+        data: &[u8],
+        from: &str,
+        timestamp: u64,
+    ) -> Result<Vec<u8>> {
+        postcard::to_stdvec(&(protocol, data, from, timestamp)).map_err(|e| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to serialize signable bytes: {e}").into(),
             ))
         })
     }
@@ -952,6 +1019,7 @@ impl TransportHandle {
         let event_tx = self.event_tx.clone();
         let active_requests = Arc::clone(&self.active_requests);
         let peers_for_recv = Arc::clone(&self.peers);
+        let app_to_transport = Arc::clone(&self.app_to_transport);
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((peer_id, bytes)) = rx.recv().await {
@@ -973,7 +1041,18 @@ impl TransportHandle {
                 }
 
                 match parse_protocol_message(&bytes, &transport_peer_id) {
-                    Some(event) => {
+                    Some(ParsedMessage {
+                        event,
+                        authenticated_node_id,
+                    }) => {
+                        // If the message was signed, record the app→transport mapping
+                        if let Some(ref app_id) = authenticated_node_id {
+                            app_to_transport
+                                .write()
+                                .await
+                                .insert(app_id.clone(), transport_peer_id.clone());
+                        }
+
                         if let P2PEvent::Message {
                             ref topic,
                             ref data,
@@ -995,7 +1074,11 @@ impl TransportHandle {
                                     continue;
                                 }
                             };
-                            if expected_peer != transport_peer_id {
+                            // Accept response if it matches the expected peer by either
+                            // transport ID or authenticated app-level NodeId.
+                            if expected_peer != transport_peer_id
+                                && authenticated_node_id.as_deref() != Some(&expected_peer)
+                            {
                                 warn!(
                                     message_id = %envelope.message_id,
                                     expected = %expected_peer,

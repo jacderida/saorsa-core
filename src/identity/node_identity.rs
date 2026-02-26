@@ -80,6 +80,33 @@ impl NodeId {
         Ok(NodeId::from_public_key(&public_key))
     }
 
+    /// Create from a hex-encoded string (64 hex characters → 32 bytes).
+    pub fn from_hex(hex_str: &str) -> Result<Self> {
+        let bytes = hex::decode(hex_str).map_err(|e| {
+            P2PError::Identity(IdentityError::InvalidFormat(
+                format!("Invalid hex for NodeId: {e}").into(),
+            ))
+        })?;
+        if bytes.len() != 32 {
+            return Err(P2PError::Identity(IdentityError::InvalidFormat(
+                format!(
+                    "NodeId hex must be 64 characters (32 bytes), got {} characters ({} bytes)",
+                    hex_str.len(),
+                    bytes.len()
+                )
+                .into(),
+            )));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes);
+        Ok(Self(id))
+    }
+
+    /// Encode this NodeId as a lowercase hex string (64 characters).
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
     /// Helper for tests/backwards-compat: construct from raw bytes
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -116,6 +143,8 @@ impl PublicNodeIdentity {
 }
 
 /// Core node identity with cryptographic keys
+///
+/// `Debug` is manually implemented to redact secret key material.
 pub struct NodeIdentity {
     /// ML-DSA-65 secret key (private)
     secret_key: MlDsaSecretKey,
@@ -123,6 +152,15 @@ pub struct NodeIdentity {
     public_key: MlDsaPublicKey,
     /// Node ID derived from public key
     node_id: NodeId,
+}
+
+impl fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("node_id", &self.node_id)
+            .field("secret_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl NodeIdentity {
