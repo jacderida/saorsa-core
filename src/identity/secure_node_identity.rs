@@ -21,7 +21,7 @@
 //! This module provides enhanced security features for the NodeIdentity
 //! including secure key handling with automatic zeroization.
 
-use super::node_identity::{IdentityData, NodeId};
+use super::node_identity::{IdentityData, PeerId};
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use ant_quic::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
@@ -37,7 +37,7 @@ pub struct SecureNodeIdentity {
     public_key: MlDsaPublicKey,
 
     /// Node ID derived from public key
-    node_id: NodeId,
+    peer_id: PeerId,
 }
 
 impl SecureNodeIdentity {
@@ -53,13 +53,13 @@ impl SecureNodeIdentity {
                 ))
             })?;
 
-        // Derive node ID from public key
-        let node_id = NodeId::from_public_key(&public_key);
+        // Derive peer ID from public key
+        let peer_id = PeerId::from_public_key(&public_key);
 
         Ok(Self {
             secret_key,
             public_key,
-            node_id,
+            peer_id,
         })
     }
 
@@ -77,13 +77,13 @@ impl SecureNodeIdentity {
                 ))
             })?;
 
-        // Derive node ID from public key
-        let node_id = NodeId::from_public_key(&public_key);
+        // Derive peer ID from public key
+        let peer_id = PeerId::from_public_key(&public_key);
 
         Ok(Self {
             secret_key,
             public_key,
-            node_id,
+            peer_id,
         })
     }
 
@@ -125,8 +125,8 @@ impl SecureNodeIdentity {
     }
 
     /// Get node ID
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
     }
 
     // No four-word address embedded; see bootstrap/transport layers
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_secure_identity_generation() {
         let identity = SecureNodeIdentity::generate().unwrap();
-        assert!(!identity.node_id().to_string().is_empty());
+        assert!(!identity.peer_id().to_string().is_empty());
     }
 
     #[test]

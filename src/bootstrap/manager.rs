@@ -23,7 +23,7 @@
 use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use ant_quic::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
@@ -184,7 +184,7 @@ impl BootstrapManager {
     /// Enforces:
     /// 1. Rate limiting (per-subnet temporal limits)
     /// 2. IP diversity (geographic/ASN limits)
-    pub async fn add_peer(&self, peer_id: PeerId, addresses: Vec<SocketAddr>) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: String, addresses: Vec<SocketAddr>) -> Result<()> {
         if addresses.is_empty() {
             return Err(P2PError::Bootstrap(BootstrapError::InvalidData(
                 "No addresses provided".to_string().into(),
@@ -240,19 +240,19 @@ impl BootstrapManager {
     /// Add a trusted peer bypassing Sybil protection
     ///
     /// Use only for well-known bootstrap nodes or admin-approved peers.
-    pub async fn add_peer_trusted(&self, peer_id: PeerId, addresses: Vec<SocketAddr>) {
+    pub async fn add_peer_trusted(&self, peer_id: String, addresses: Vec<SocketAddr>) {
         let ant_peer_id = string_to_ant_peer_id(&peer_id);
         self.cache.add_seed(ant_peer_id, addresses).await;
     }
 
     /// Record a successful connection
-    pub async fn record_success(&self, peer_id: &PeerId, rtt_ms: u32) {
+    pub async fn record_success(&self, peer_id: &str, rtt_ms: u32) {
         let ant_peer_id = string_to_ant_peer_id(peer_id);
         self.cache.record_success(&ant_peer_id, rtt_ms).await;
     }
 
     /// Record a failed connection
-    pub async fn record_failure(&self, peer_id: &PeerId) {
+    pub async fn record_failure(&self, peer_id: &str) {
         let ant_peer_id = string_to_ant_peer_id(peer_id);
         self.cache.record_failure(&ant_peer_id).await;
     }
@@ -299,7 +299,7 @@ impl BootstrapManager {
     }
 
     /// Update peer capabilities
-    pub async fn update_capabilities(&self, peer_id: &PeerId, capabilities: PeerCapabilities) {
+    pub async fn update_capabilities(&self, peer_id: &str, capabilities: PeerCapabilities) {
         let ant_peer_id = string_to_ant_peer_id(peer_id);
         self.cache
             .update_capabilities(&ant_peer_id, capabilities)
@@ -307,13 +307,13 @@ impl BootstrapManager {
     }
 
     /// Check if a peer exists in the cache
-    pub async fn contains(&self, peer_id: &PeerId) -> bool {
+    pub async fn contains(&self, peer_id: &str) -> bool {
         let ant_peer_id = string_to_ant_peer_id(peer_id);
         self.cache.contains(&ant_peer_id).await
     }
 
     /// Get a specific peer from the cache
-    pub async fn get_peer(&self, peer_id: &PeerId) -> Option<CachedPeer> {
+    pub async fn get_peer(&self, peer_id: &str) -> Option<CachedPeer> {
         let ant_peer_id = string_to_ant_peer_id(peer_id);
         self.cache.get(&ant_peer_id).await
     }
@@ -341,7 +341,7 @@ impl BootstrapManager {
     /// Maps the old `QualityMetrics` to record_success/record_failure calls.
     pub async fn update_contact_metrics(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         metrics: super::QualityMetrics,
     ) -> Result<()> {
         // Convert QualityMetrics to success/failure recording

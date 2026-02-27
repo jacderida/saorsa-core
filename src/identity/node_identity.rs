@@ -16,7 +16,7 @@
 // Copyright 2024 P2P Foundation
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Node Identity (no embedded word address)
+//! Peer Identity
 //!
 //! Implements the core identity system for P2P nodes with:
 //! - ML-DSA-65 post-quantum cryptographic keys
@@ -27,39 +27,52 @@ use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::fmt;
+use std::str::FromStr;
 
 // Import PQC types from ant_quic via quantum_crypto module
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 
 // No four-word address tied to identity; addressing is handled elsewhere.
 
-/// Length of a NodeId in bytes (SHA-256 output).
-pub const NODE_ID_BYTE_LEN: usize = 32;
+/// Length of a PeerId in bytes (SHA-256 output).
+pub const PEER_ID_BYTE_LEN: usize = 32;
 
-/// Node ID derived from public key (256-bit)
+/// Backward-compat alias.
+#[deprecated(note = "use PEER_ID_BYTE_LEN")]
+pub const NODE_ID_BYTE_LEN: usize = PEER_ID_BYTE_LEN;
+
+/// Peer ID derived from public key (256-bit).
+///
+/// The canonical peer identity in the Saorsa network. Computed as the
+/// SHA-256 hash of the node's ML-DSA-65 public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; NODE_ID_BYTE_LEN]);
+pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
 
-impl NodeId {
+/// Backward-compat alias — use [`PeerId`] instead.
+#[deprecated(note = "use PeerId")]
+pub type NodeId = PeerId;
+
+impl PeerId {
     /// Create from ML-DSA public key
     pub fn from_public_key(public_key: &MlDsaPublicKey) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(public_key.as_bytes());
         let hash = hasher.finalize();
-        let mut id = [0u8; 32];
+        let mut id = [0u8; PEER_ID_BYTE_LEN];
         id.copy_from_slice(&hash);
         Self(id)
     }
 
     /// Convert to bytes
-    pub fn to_bytes(&self) -> &[u8; 32] {
+    pub fn to_bytes(&self) -> &[u8; PEER_ID_BYTE_LEN] {
         &self.0
     }
 
-    /// XOR distance to another node ID (for Kademlia)
-    pub fn xor_distance(&self, other: &NodeId) -> [u8; 32] {
-        let mut distance = [0u8; 32];
+    /// XOR distance to another peer ID (for Kademlia)
+    pub fn xor_distance(&self, other: &PeerId) -> [u8; PEER_ID_BYTE_LEN] {
+        let mut distance = [0u8; PEER_ID_BYTE_LEN];
         for (i, out) in distance.iter_mut().enumerate() {
             *out = self.0[i] ^ other.0[i];
         }
@@ -80,45 +93,65 @@ impl NodeId {
             IdentityError::InvalidFormat(format!("Invalid ML-DSA public key: {:?}", e).into())
         })?;
 
-        Ok(NodeId::from_public_key(&public_key))
+        Ok(PeerId::from_public_key(&public_key))
     }
 
     /// Create from a hex-encoded string (64 hex characters → 32 bytes).
     pub fn from_hex(hex_str: &str) -> Result<Self> {
         let bytes = hex::decode(hex_str).map_err(|e| {
             P2PError::Identity(IdentityError::InvalidFormat(
-                format!("Invalid hex for NodeId: {e}").into(),
+                format!("Invalid hex for PeerId: {e}").into(),
             ))
         })?;
-        if bytes.len() != NODE_ID_BYTE_LEN {
+        if bytes.len() != PEER_ID_BYTE_LEN {
             return Err(P2PError::Identity(IdentityError::InvalidFormat(
                 format!(
-                    "NodeId hex must be 64 characters ({NODE_ID_BYTE_LEN} bytes), got {} characters ({} bytes)",
+                    "PeerId hex must be 64 characters ({PEER_ID_BYTE_LEN} bytes), got {} characters ({} bytes)",
                     hex_str.len(),
                     bytes.len()
                 )
                 .into(),
             )));
         }
-        let mut id = [0u8; NODE_ID_BYTE_LEN];
+        let mut id = [0u8; PEER_ID_BYTE_LEN];
         id.copy_from_slice(&bytes);
         Ok(Self(id))
     }
 
-    /// Encode this NodeId as a lowercase hex string (64 characters).
+    /// Encode this PeerId as a lowercase hex string (64 characters).
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
     /// Helper for tests/backwards-compat: construct from raw bytes
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(bytes: [u8; PEER_ID_BYTE_LEN]) -> Self {
         Self(bytes)
     }
 }
 
-impl fmt::Display for NodeId {
+impl fmt::Display for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0[..8])) // First 8 bytes for brevity
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+impl Ord for PeerId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for PeerId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl FromStr for PeerId {
+    type Err = P2PError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::from_hex(s)
     }
 }
 
@@ -127,14 +160,20 @@ impl fmt::Display for NodeId {
 pub struct PublicNodeIdentity {
     /// ML-DSA public key
     public_key: MlDsaPublicKey,
-    /// Node ID derived from public key
-    node_id: NodeId,
+    /// Peer ID derived from public key
+    peer_id: PeerId,
 }
 
 impl PublicNodeIdentity {
-    /// Get node ID
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+    /// Get peer ID
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Get node ID (deprecated — use `peer_id()`)
+    #[deprecated(note = "use peer_id()")]
+    pub fn node_id(&self) -> &PeerId {
+        &self.peer_id
     }
 
     /// Get public key
@@ -153,14 +192,14 @@ pub struct NodeIdentity {
     secret_key: MlDsaSecretKey,
     /// ML-DSA-65 public key
     public_key: MlDsaPublicKey,
-    /// Node ID derived from public key
-    node_id: NodeId,
+    /// Peer ID derived from public key
+    peer_id: PeerId,
 }
 
 impl fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeIdentity")
-            .field("node_id", &self.node_id)
+            .field("peer_id", &self.peer_id)
             .field("secret_key", &"[REDACTED]")
             .finish()
     }
@@ -177,7 +216,7 @@ impl NodeIdentity {
                 ))
             })?;
 
-        let node_id = NodeId::from_public_key(&public_key);
+        let peer_id = PeerId::from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -187,13 +226,13 @@ impl NodeIdentity {
         Ok(Self {
             secret_key,
             public_key,
-            node_id,
+            peer_id,
         })
     }
 
-    /// Convert this identity's NodeId to a UserId for use in adaptive modules
+    /// Convert this identity's PeerId to a UserId for use in adaptive modules
     pub fn to_user_id(&self) -> crate::peer_record::UserId {
-        crate::peer_record::UserId::from_bytes(self.node_id.0)
+        crate::peer_record::UserId::from_bytes(self.peer_id.0)
     }
 
     /// Generate from seed (deterministic)
@@ -229,7 +268,7 @@ impl NodeIdentity {
                     ))
                 })?;
 
-        let node_id = NodeId::from_public_key(&public_key);
+        let peer_id = PeerId::from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -239,13 +278,19 @@ impl NodeIdentity {
         Ok(Self {
             secret_key,
             public_key,
-            node_id,
+            peer_id,
         })
     }
 
-    /// Get node ID
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+    /// Get peer ID
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Get node ID (deprecated — use `peer_id()`)
+    #[deprecated(note = "use peer_id()")]
+    pub fn node_id(&self) -> &PeerId {
+        &self.peer_id
     }
 
     /// Get public key
@@ -282,7 +327,7 @@ impl NodeIdentity {
     pub fn to_public(&self) -> PublicNodeIdentity {
         PublicNodeIdentity {
             public_key: self.public_key.clone(),
-            node_id: self.node_id.clone(),
+            peer_id: self.peer_id.clone(),
         }
     }
 }
@@ -381,7 +426,7 @@ impl NodeIdentity {
             ))
         })?;
 
-        let node_id = NodeId::from_public_key(&public_key);
+        let peer_id = PeerId::from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -391,7 +436,7 @@ impl NodeIdentity {
         Ok(Self {
             secret_key,
             public_key,
-            node_id,
+            peer_id,
         })
     }
 }
@@ -401,25 +446,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_node_id_generation() {
+    fn test_peer_id_generation() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
-        let node_id = NodeId::from_public_key(&public_key);
+        let peer_id = PeerId::from_public_key(&public_key);
 
         // Should be 32 bytes
-        assert_eq!(node_id.to_bytes().len(), 32);
+        assert_eq!(peer_id.to_bytes().len(), 32);
 
         // Should be deterministic
-        let node_id2 = NodeId::from_public_key(&public_key);
-        assert_eq!(node_id, node_id2);
+        let peer_id2 = PeerId::from_public_key(&public_key);
+        assert_eq!(peer_id, peer_id2);
     }
 
     #[test]
     fn test_xor_distance() {
-        let id1 = NodeId([0u8; 32]);
+        let id1 = PeerId([0u8; 32]);
         let mut id2_bytes = [0u8; 32];
         id2_bytes[0] = 0xFF;
-        let id2 = NodeId(id2_bytes);
+        let id2 = PeerId(id2_bytes);
 
         let distance = id1.xor_distance(&id2);
         assert_eq!(distance[0], 0xFF);
@@ -453,7 +498,7 @@ mod tests {
         let identity2 = NodeIdentity::from_seed(&seed).expect("Identity from seed should succeed");
 
         // Should generate same identity
-        assert_eq!(identity1.node_id, identity2.node_id);
+        assert_eq!(identity1.peer_id, identity2.peer_id);
         assert_eq!(
             identity1.public_key().as_bytes(),
             identity2.public_key().as_bytes()
@@ -471,7 +516,7 @@ mod tests {
         let imported = NodeIdentity::import(&data).expect("Import should succeed with valid data");
 
         // Should be the same
-        assert_eq!(identity.node_id, imported.node_id);
+        assert_eq!(identity.peer_id, imported.peer_id);
         assert_eq!(
             identity.public_key().as_bytes(),
             imported.public_key().as_bytes()
@@ -481,5 +526,27 @@ mod tests {
         let message = b"Test message";
         let signature = imported.sign(message);
         assert!(identity.verify(message, &signature.unwrap()).unwrap());
+    }
+
+    #[test]
+    fn test_peer_id_display_full_hex() {
+        let id = PeerId([0xAB; 32]);
+        let display = format!("{}", id);
+        assert_eq!(display.len(), 64);
+        assert_eq!(display, "ab".repeat(32));
+    }
+
+    #[test]
+    fn test_peer_id_ord() {
+        let a = PeerId([0x00; 32]);
+        let b = PeerId([0xFF; 32]);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_peer_id_from_str() {
+        let hex = "ab".repeat(32);
+        let id: PeerId = hex.parse().expect("should parse valid hex");
+        assert_eq!(id.0, [0xAB; 32]);
     }
 }

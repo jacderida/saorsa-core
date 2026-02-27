@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 
 use super::fitness::{FitnessMetrics, FitnessVerdict};
-use super::node_identity::NodeId;
+use super::node_identity::PeerId;
 use super::rejection::{RejectionHistory, RejectionInfo, RejectionReason, TargetRegion};
 
 /// Configuration for regeneration trigger.
@@ -282,10 +282,10 @@ pub struct RegenerationAttempt {
     pub timestamp: Instant,
 
     /// The old NodeId (before regeneration).
-    pub old_node_id: NodeId,
+    pub old_peer_id: PeerId,
 
     /// The new NodeId (after regeneration).
-    pub new_node_id: Option<NodeId>,
+    pub new_peer_id: Option<PeerId>,
 
     /// Whether the attempt succeeded (node accepted).
     pub succeeded: bool,
@@ -297,19 +297,19 @@ pub struct RegenerationAttempt {
 impl RegenerationAttempt {
     /// Create a new regeneration attempt record.
     #[must_use]
-    pub fn new(old_id: NodeId, reason: RegenerationReason) -> Self {
+    pub fn new(old_id: PeerId, reason: RegenerationReason) -> Self {
         Self {
             timestamp: Instant::now(),
-            old_node_id: old_id,
-            new_node_id: None,
+            old_peer_id: old_id,
+            new_peer_id: None,
             succeeded: false,
             reason,
         }
     }
 
     /// Mark the attempt as completed.
-    pub fn complete(&mut self, new_id: NodeId, succeeded: bool) {
-        self.new_node_id = Some(new_id);
+    pub fn complete(&mut self, new_id: PeerId, succeeded: bool) {
+        self.new_peer_id = Some(new_id);
         self.succeeded = succeeded;
     }
 }
@@ -567,7 +567,7 @@ impl RegenerationTrigger {
     }
 
     /// Record a regeneration attempt.
-    pub fn record_attempt(&self, old_id: NodeId, reason: RegenerationReason) {
+    pub fn record_attempt(&self, old_id: PeerId, reason: RegenerationReason) {
         let mut state = self.state.write();
 
         let attempt = RegenerationAttempt::new(old_id, reason);
@@ -581,7 +581,7 @@ impl RegenerationTrigger {
     }
 
     /// Record the result of a regeneration attempt.
-    pub fn record_result(&self, new_id: NodeId, succeeded: bool) {
+    pub fn record_result(&self, new_id: PeerId, succeeded: bool) {
         let mut state = self.state.write();
 
         // Update the last attempt
@@ -632,8 +632,8 @@ impl RegenerationTrigger {
     }
 
     /// Extract prefix bits from a NodeId.
-    fn extract_prefix(&self, node_id: &NodeId) -> Vec<u8> {
-        let bytes = node_id.to_bytes();
+    fn extract_prefix(&self, peer_id: &PeerId) -> Vec<u8> {
+        let bytes = peer_id.to_bytes();
         let full_bytes = self.config.rejection_prefix_bits as usize / 8;
         let remaining_bits = self.config.rejection_prefix_bits as usize % 8;
 
@@ -649,8 +649,8 @@ impl RegenerationTrigger {
 
     /// Check if a NodeId prefix is in the rejected set.
     #[must_use]
-    pub fn is_prefix_rejected(&self, node_id: &NodeId) -> bool {
-        let prefix = self.extract_prefix(node_id);
+    pub fn is_prefix_rejected(&self, peer_id: &PeerId) -> bool {
+        let prefix = self.extract_prefix(peer_id);
         self.state.read().rejected_prefixes.contains(&prefix)
     }
 
@@ -727,8 +727,8 @@ pub type SharedRegenerationTrigger = Arc<RegenerationTrigger>;
 mod tests {
     use super::*;
 
-    fn test_node_id() -> NodeId {
-        NodeId([0x42; 32])
+    fn test_peer_id() -> PeerId {
+        PeerId([0x42; 32])
     }
 
     fn test_rejection(reason: RejectionReason) -> RejectionInfo {
@@ -817,7 +817,7 @@ mod tests {
 
         // Record max attempts
         for _ in 0..3 {
-            trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
+            trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
         }
 
         let rejection = test_rejection(RejectionReason::KeyspaceSaturation);
@@ -836,10 +836,10 @@ mod tests {
         let trigger = RegenerationTrigger::new(config);
 
         // Record failures to trip circuit breaker
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x01; 32]), false);
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x02; 32]), false);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x01; 32]), false);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x02; 32]), false);
 
         assert!(trigger.is_circuit_open());
     }
@@ -850,16 +850,16 @@ mod tests {
         let trigger = RegenerationTrigger::new(config);
 
         // Record some failures
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x01; 32]), false);
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x02; 32]), false);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x01; 32]), false);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x02; 32]), false);
 
         assert_eq!(trigger.consecutive_failures(), 2);
 
         // Record success
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x03; 32]), true);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x03; 32]), true);
 
         assert_eq!(trigger.consecutive_failures(), 0);
         assert!(!trigger.is_circuit_open());
@@ -872,14 +872,14 @@ mod tests {
         config.rejection_prefix_bits = 8;
         let trigger = RegenerationTrigger::new(config);
 
-        let node_id = NodeId([0xAB; 32]);
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
+        let node_id = PeerId([0xAB; 32]);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
         trigger.record_result(node_id.clone(), false);
 
         assert!(trigger.is_prefix_rejected(&node_id));
 
         // Different prefix should not be rejected
-        let other_id = NodeId([0x12; 32]);
+        let other_id = PeerId([0x12; 32]);
         assert!(!trigger.is_prefix_rejected(&other_id));
     }
 
@@ -907,8 +907,8 @@ mod tests {
         let trigger = RegenerationTrigger::new(config);
 
         // Add some state
-        trigger.record_attempt(test_node_id(), RegenerationReason::Manual);
-        trigger.record_result(NodeId([0x01; 32]), false);
+        trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
+        trigger.record_result(PeerId([0x01; 32]), false);
         trigger.disable();
 
         assert!(!trigger.is_enabled());

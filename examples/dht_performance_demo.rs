@@ -6,7 +6,7 @@
 use saorsa_core::dht::{
     DHTConfig, Key, PeerId as DhtPeerId, Record, optimized_storage::OptimizedDHTStorage,
 };
-use saorsa_core::identity::node_identity::NodeId;
+use saorsa_core::identity::node_identity::PeerId;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         let key: Key = key_bytes;
         let value = format!("test_value_{}", i).into_bytes();
         let pub_bytes: [u8; 32] = blake3::hash(format!("publisher_{}", i % 100).as_bytes()).into();
-        let publisher: DhtPeerId = NodeId::from_bytes(pub_bytes);
+        let publisher: DhtPeerId = PeerId::from_bytes(pub_bytes);
         let record = Record::new(key, value, publisher);
         test_records.push(record);
     }
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     let mut legacy_results = 0;
     for publisher in &test_publishers {
         let pub_bytes: [u8; 32] = blake3::hash(publisher.as_bytes()).into();
-        let pub_id: DhtPeerId = NodeId::from_bytes(pub_bytes);
+        let pub_id: DhtPeerId = PeerId::from_bytes(pub_bytes);
         let records = legacy_storage.get_records_by_publisher(&pub_id).await;
         legacy_results += records.len();
     }
@@ -210,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
         let key: Key = blake3::hash(format!("bound_test_{}", i).as_bytes()).into();
         let value = vec![0u8; 512]; // 512 bytes per record
         let pub_bytes: [u8; 32] = blake3::hash(b"bound_tester").into();
-        let publisher: DhtPeerId = NodeId::from_bytes(pub_bytes);
+        let publisher: DhtPeerId = PeerId::from_bytes(pub_bytes);
         let record = Record::new(key, value, publisher);
         small_cache_storage.store(record).await?;
     }

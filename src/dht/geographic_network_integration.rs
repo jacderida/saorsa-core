@@ -3,6 +3,7 @@
 //! Integrates geographic-aware DHT routing with the existing network infrastructure.
 //! Provides region detection, latency-aware peer selection, and cross-region routing optimization.
 
+use crate::Multiaddr;
 use crate::dht::{
     geographic_routing::{GeographicRegion, PeerQualityMetrics},
     geographic_routing_table::{
@@ -11,7 +12,6 @@ use crate::dht::{
     latency_aware_selection::{LatencyAwarePeerSelection, LatencySelectionConfig, SelectedPeer},
 };
 use crate::error::P2pResult as Result;
-use crate::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -257,7 +257,7 @@ impl GeographicNetworkIntegration {
     pub async fn get_peers_by_region(
         &self,
         region: GeographicRegion,
-    ) -> Result<Vec<(PeerId, PeerQualityMetrics)>> {
+    ) -> Result<Vec<(String, PeerQualityMetrics)>> {
         let routing_table = self.routing_table.read().await;
         Ok(routing_table.get_regional_peers(region))
     }

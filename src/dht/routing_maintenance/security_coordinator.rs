@@ -21,9 +21,7 @@ use crate::dht::DhtNodeId;
 use crate::dht::collusion_detector::{CollusionDetector, CollusionDetectorConfig};
 use crate::dht::metrics::security_metrics::SecurityMetricsCollector;
 use crate::dht::sybil_detector::{SybilDetector, SybilDetectorConfig};
-// PeerId from trust_weighted_dht is the identity::NodeId
-use crate::dht::trust_weighted_dht::PeerId;
-use crate::identity::node_identity::NodeId as IdentityNodeId;
+use crate::identity::node_identity::PeerId;
 
 use super::close_group_validator::{
     AttackIndicators, CloseGroupFailure, CloseGroupResponse, CloseGroupValidationResult,
@@ -32,13 +30,13 @@ use super::close_group_validator::{
 use super::config::MaintenanceConfig;
 use super::eviction::{EvictionManager, EvictionReason};
 
-/// Convert DhtNodeId (core_engine::NodeId) to PeerId (identity::NodeId)
+/// Convert DhtNodeId (core_engine::NodeId) to PeerId (identity::PeerId)
 #[inline]
 fn dht_to_identity_id(dht_id: &DhtNodeId) -> PeerId {
-    IdentityNodeId::from_bytes(*dht_id.as_bytes())
+    PeerId::from_bytes(*dht_id.as_bytes())
 }
 
-/// Convert PeerId (identity::NodeId) to DhtNodeId (core_engine::NodeId)
+/// Convert PeerId (identity::PeerId) to DhtNodeId (core_engine::NodeId)
 #[inline]
 fn identity_to_dht_id(identity_id: &PeerId) -> DhtNodeId {
     DhtNodeId::from_bytes(*identity_id.to_bytes())

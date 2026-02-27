@@ -13,7 +13,7 @@
 
 //! Extensions to NodeIdentity for comprehensive test support (sans PoW)
 
-use super::node_identity::{NodeId, NodeIdentity};
+use super::node_identity::{PeerId, NodeIdentity};
 use crate::{P2PError, Result};
 use sha2::Digest;
 use std::path::{Path, PathBuf};

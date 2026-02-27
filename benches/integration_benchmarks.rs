@@ -19,7 +19,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use saorsa_core::adaptive::{TrustProvider, trust::MockTrustProvider};
 use saorsa_core::dht::{Key, PeerId, Record};
-use saorsa_core::identity::{NodeIdentity, node_identity::NodeId};
+use saorsa_core::identity::{NodeIdentity, node_identity::PeerId as IdentityPeerId};
 use saorsa_core::peer_record::UserId;
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,7 +145,7 @@ async fn benchmark_encryption_operations(
 
 /// Create a test PeerId from bytes
 fn create_test_peer_id(bytes: [u8; 32]) -> PeerId {
-    NodeId::from_bytes(bytes)
+    IdentityPeerId::from_bytes(bytes)
 }
 
 /// Calculate XOR distance between two keys

@@ -17,7 +17,6 @@
 //! success rates, and geographic proximity for optimal P2P network performance.
 
 use super::geographic_routing::{GeographicRegion, PeerQualityMetrics};
-use crate::PeerId;
 use crate::error::{P2PError, P2pResult as Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -53,7 +52,7 @@ impl Default for LatencySelectionConfig {
 /// Cache entry with LRU tracking
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    peer_id: PeerId,
+    peer_id: String,
     metrics: PeerQualityMetrics,
     last_accessed: Instant,
 }
@@ -62,13 +61,13 @@ struct CacheEntry {
 #[derive(Debug)]
 pub struct PeerMetricsCache {
     /// Cache entries by peer ID
-    entries: HashMap<PeerId, CacheEntry>,
+    entries: HashMap<String, CacheEntry>,
     /// Access order for LRU eviction
-    access_order: VecDeque<PeerId>,
+    access_order: VecDeque<String>,
     /// Maximum cache size
     max_size: usize,
     /// Regional organization of cached peers
-    regional_peers: HashMap<GeographicRegion, Vec<PeerId>>,
+    regional_peers: HashMap<GeographicRegion, Vec<String>>,
 }
 
 impl PeerMetricsCache {
@@ -83,7 +82,7 @@ impl PeerMetricsCache {
     }
 
     /// Add or update a peer in the cache
-    pub fn insert(&mut self, peer_id: PeerId, metrics: PeerQualityMetrics) {
+    pub fn insert(&mut self, peer_id: String, metrics: PeerQualityMetrics) {
         let now = Instant::now();
 
         // Remove from old position if exists
@@ -118,7 +117,7 @@ impl PeerMetricsCache {
     }
 
     /// Get a peer from the cache
-    pub fn get(&mut self, peer_id: &PeerId) -> Option<PeerQualityMetrics> {
+    pub fn get(&mut self, peer_id: &String) -> Option<PeerQualityMetrics> {
         if self.entries.contains_key(peer_id) {
             // Update access order first
             self.remove_from_access_order(peer_id);
@@ -140,7 +139,7 @@ impl PeerMetricsCache {
     pub fn get_regional_peers(
         &self,
         region: GeographicRegion,
-    ) -> Vec<(PeerId, PeerQualityMetrics)> {
+    ) -> Vec<(String, PeerQualityMetrics)> {
         self.regional_peers
             .get(&region)
             .map(|peer_ids| {
@@ -154,7 +153,7 @@ impl PeerMetricsCache {
     }
 
     /// Remove a peer from the cache
-    pub fn remove(&mut self, peer_id: &PeerId) -> bool {
+    pub fn remove(&mut self, peer_id: &String) -> bool {
         if let Some(_entry) = self.entries.remove(peer_id) {
             self.remove_from_access_order(peer_id);
             self.remove_from_regional_index(peer_id);
@@ -167,7 +166,7 @@ impl PeerMetricsCache {
     /// Clean up expired entries
     pub fn cleanup_expired(&mut self, max_age: Duration) {
         let now = Instant::now();
-        let expired_peers: Vec<PeerId> = self
+        let expired_peers: Vec<String> = self
             .entries
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.last_accessed) > max_age)
@@ -205,14 +204,14 @@ impl PeerMetricsCache {
     }
 
     /// Remove peer from access order tracking
-    fn remove_from_access_order(&mut self, peer_id: &PeerId) {
+    fn remove_from_access_order(&mut self, peer_id: &String) {
         if let Some(pos) = self.access_order.iter().position(|id| id == peer_id) {
             self.access_order.remove(pos);
         }
     }
 
     /// Remove peer from regional index
-    fn remove_from_regional_index(&mut self, peer_id: &PeerId) {
+    fn remove_from_regional_index(&mut self, peer_id: &String) {
         for peers in self.regional_peers.values_mut() {
             if let Some(pos) = peers.iter().position(|id| id == peer_id) {
                 peers.remove(pos);
@@ -269,7 +268,7 @@ impl LatencyAwarePeerSelection {
     /// Update metrics for a peer
     pub fn update_peer_metrics(
         &mut self,
-        peer_id: PeerId,
+        peer_id: String,
         metrics: PeerQualityMetrics,
     ) -> Result<()> {
         // Validate metrics quality
@@ -417,7 +416,7 @@ impl LatencyAwarePeerSelection {
     }
 
     /// Remove a peer from selection (e.g., if it becomes unavailable)
-    pub fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
+    pub fn remove_peer(&mut self, peer_id: &String) -> bool {
         self.cache.remove(peer_id)
     }
 
@@ -535,7 +534,7 @@ impl LatencyAwarePeerSelection {
 /// A selected peer with its selection metadata
 #[derive(Debug, Clone)]
 pub struct SelectedPeer {
-    pub peer_id: PeerId,
+    pub peer_id: String,
     pub metrics: PeerQualityMetrics,
     pub region: GeographicRegion,
     pub selection_score: f64,

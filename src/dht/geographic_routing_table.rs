@@ -20,7 +20,6 @@ use super::geographic_routing::{GeographicRegion, PeerQualityMetrics, RegionalBu
 use super::latency_aware_selection::{
     LatencyAwarePeerSelection, LatencySelectionConfig, SelectedPeer,
 };
-use crate::PeerId;
 use crate::dht::Key;
 use crate::error::{P2PError, P2pResult as Result};
 use serde::{Deserialize, Serialize};
@@ -126,7 +125,7 @@ impl GeographicRoutingTable {
     /// Add a peer to the routing table with geographic awareness
     pub fn add_peer(
         &mut self,
-        peer_id: PeerId,
+        peer_id: String,
         region: GeographicRegion,
         metrics: PeerQualityMetrics,
     ) -> Result<bool> {
@@ -147,7 +146,7 @@ impl GeographicRoutingTable {
     }
 
     /// Remove a peer from the routing table
-    pub fn remove_peer(&mut self, peer_id: &PeerId, region: GeographicRegion) -> bool {
+    pub fn remove_peer(&mut self, peer_id: &String, region: GeographicRegion) -> bool {
         // Remove from regional bucket
         let removed = if let Some(bucket) = self.regional_buckets.get_mut(&region) {
             bucket.remove_peer(peer_id)
@@ -222,7 +221,7 @@ impl GeographicRoutingTable {
     pub fn get_regional_peers(
         &self,
         region: GeographicRegion,
-    ) -> Vec<(PeerId, PeerQualityMetrics)> {
+    ) -> Vec<(String, PeerQualityMetrics)> {
         self.regional_buckets
             .get(&region)
             .map(|bucket| {
@@ -429,7 +428,7 @@ pub struct RoutingTableState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionalBucketState {
     pub region: GeographicRegion,
-    pub peers: Vec<(PeerId, PeerQualityMetrics)>,
+    pub peers: Vec<(String, PeerQualityMetrics)>,
     pub last_maintenance: SystemTime,
 }
 

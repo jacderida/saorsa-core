@@ -16,7 +16,6 @@
 //! This module extends the basic DHT functionality with advanced replication,
 //! peer selection, and repair mechanisms for multi-user P2P applications.
 
-use crate::PeerId;
 use crate::dht::Key;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
@@ -64,8 +63,8 @@ pub struct ReplicationResult {
     pub successful_replicas: usize,
     pub failed_replicas: usize,
     pub target_replicas: usize,
-    pub successful_peers: Vec<PeerId>,
-    pub failed_peers: Vec<(PeerId, String)>, // Simplified error representation
+    pub successful_peers: Vec<String>,
+    pub failed_peers: Vec<(String, String)>, // Simplified error representation
     pub is_sufficient: bool,
 }
 
@@ -127,7 +126,7 @@ pub enum ReplicationError {
 /// Geographic information for peer distribution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerGeographicInfo {
-    pub peer_id: PeerId,
+    pub peer_id: String,
     pub region: String,        // Geographic region (e.g., "us-east", "eu-west")
     pub country_code: String,  // ISO country code
     pub latitude: Option<f64>, // Approximate coordinates
@@ -171,7 +170,7 @@ pub enum RepairPriority {
 #[derive(Debug, Clone)]
 pub struct RepairTask {
     pub key: Key,
-    pub current_replicas: Vec<PeerId>,
+    pub current_replicas: Vec<String>,
     pub required_replicas: usize,
     pub priority: RepairPriority,
     pub scheduled_at: SystemTime,

@@ -637,7 +637,7 @@ impl NetworkCoordinator {
     pub async fn join_network(&self) -> Result<()> {
         info!(
             "Joining P2P network with identity: {:?}",
-            self.network.identity.node_id()
+            self.network.identity.peer_id()
         );
 
         // Connect to bootstrap nodes
@@ -759,7 +759,7 @@ impl NetworkCoordinator {
         let msg = GossipMessage {
             topic: topic.to_string(),
             data: message,
-            from: NodeId::from_bytes(self.network.identity.node_id().0),
+            from: NodeId::from_bytes(self.network.identity.peer_id().0),
             seqno: 0, // Will be set by gossip
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1155,7 +1155,7 @@ mod tests {
             Ok(Ok(coordinator)) => {
                 let message = NetworkMessage {
                     id: "test-123".to_string(),
-                    sender: NodeId::from_bytes(*coordinator.network.identity.node_id().to_bytes()),
+                    sender: NodeId::from_bytes(*coordinator.network.identity.peer_id().to_bytes()),
                     content: vec![1, 2, 3],
                     msg_type: ContentType::DHTLookup,
                     timestamp: 0,

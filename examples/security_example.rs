@@ -23,7 +23,7 @@ use std::time::Duration;
 async fn main() -> Result<()> {
     // Create a node identity
     let identity = NodeIdentity::generate()?;
-    println!("Generated node identity: {:?}", identity.node_id());
+    println!("Generated node identity: {:?}", identity.peer_id());
 
     // Configure security settings
     let mut security_config = SecurityConfig::default();

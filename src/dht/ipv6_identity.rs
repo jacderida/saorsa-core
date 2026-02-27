@@ -20,7 +20,7 @@
 use crate::dht::{DHTNode, Key};
 use crate::error::SecurityError;
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer, IPv6NodeID};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
@@ -71,13 +71,13 @@ pub struct IPv6DHTIdentityManager {
     /// IP diversity enforcer
     pub ip_enforcer: IPDiversityEnforcer,
     /// Verified IPv6 nodes
-    verified_nodes: HashMap<PeerId, IPv6DHTNode>,
+    verified_nodes: HashMap<String, IPv6DHTNode>,
     /// Node identity cache
-    identity_cache: HashMap<PeerId, (IPv6NodeID, SystemTime)>,
+    identity_cache: HashMap<String, (IPv6NodeID, SystemTime)>,
     /// IP analysis cache
     ip_analysis_cache: HashMap<Ipv6Addr, (crate::security::IPAnalysis, SystemTime)>,
     /// Banned nodes for security violations
-    banned_nodes: HashMap<PeerId, SystemTime>,
+    banned_nodes: HashMap<String, SystemTime>,
     /// Local IPv6 identity
     local_identity: Option<IPv6NodeID>,
 }
@@ -103,7 +103,7 @@ pub enum IPv6SecurityEvent {
     /// Node joined with valid IPv6 identity
     NodeJoined {
         /// ID of the peer that joined
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv6 address of the peer
         ipv6_addr: Ipv6Addr,
         /// Confidence level of identity verification (0.0-1.0)
@@ -112,7 +112,7 @@ pub enum IPv6SecurityEvent {
     /// Node failed IPv6 verification
     VerificationFailed {
         /// ID of the peer that failed verification
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv6 address that failed verification
         ipv6_addr: Ipv6Addr,
         /// Reason for verification failure
@@ -121,7 +121,7 @@ pub enum IPv6SecurityEvent {
     /// IP diversity violation detected
     DiversityViolation {
         /// ID of the peer causing violation
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv6 address involved in violation
         ipv6_addr: Ipv6Addr,
         /// Type of subnet causing the violation
@@ -130,7 +130,7 @@ pub enum IPv6SecurityEvent {
     /// Node banned for security violations
     NodeBanned {
         /// ID of the banned peer
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv6 address of the banned peer
         ipv6_addr: Ipv6Addr,
         /// Reason for banning
@@ -141,7 +141,7 @@ pub enum IPv6SecurityEvent {
     /// Suspicious activity detected
     SuspiciousActivity {
         /// ID of the suspicious peer
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv6 address of the suspicious peer
         ipv6_addr: Ipv6Addr,
         /// Type of suspicious activity detected
@@ -471,12 +471,12 @@ impl IPv6DHTIdentityManager {
     }
 
     /// Get verified IPv6 node by peer ID
-    pub fn get_verified_node(&self, peer_id: &PeerId) -> Option<&IPv6DHTNode> {
+    pub fn get_verified_node(&self, peer_id: &String) -> Option<&IPv6DHTNode> {
         self.verified_nodes.get(peer_id)
     }
 
     /// Remove node from IPv6 tracking
-    pub fn remove_node(&mut self, peer_id: &PeerId) {
+    pub fn remove_node(&mut self, peer_id: &String) {
         if let Some(ipv6_node) = self.verified_nodes.remove(peer_id) {
             // Remove from IP diversity tracking
             self.ip_enforcer.remove_node(&ipv6_node.ip_analysis);
@@ -485,7 +485,7 @@ impl IPv6DHTIdentityManager {
     }
 
     /// Check if node is banned
-    pub fn is_node_banned(&self, peer_id: &PeerId) -> bool {
+    pub fn is_node_banned(&self, peer_id: &String) -> bool {
         if let Some(ban_time) = self.banned_nodes.get(peer_id) {
             ban_time.elapsed().unwrap_or(Duration::MAX) < self.config.security_ban_duration
         } else {
@@ -494,7 +494,7 @@ impl IPv6DHTIdentityManager {
     }
 
     /// Ban a node for security violations
-    pub fn ban_node(&mut self, peer_id: &PeerId, reason: &str) {
+    pub fn ban_node(&mut self, peer_id: &String, reason: &str) {
         self.banned_nodes.insert(peer_id.clone(), SystemTime::now());
         warn!("Banned node {} for: {}", peer_id, reason);
     }
@@ -535,7 +535,7 @@ impl IPv6DHTIdentityManager {
     }
 
     /// Update node reputation based on IPv6 behavior
-    pub fn update_ipv6_reputation(&mut self, peer_id: &PeerId, positive_behavior: bool) {
+    pub fn update_ipv6_reputation(&mut self, peer_id: &String, positive_behavior: bool) {
         if let Some(ipv6_node) = self.verified_nodes.get_mut(peer_id) {
             // Update reputation score based on behavior
             if positive_behavior {

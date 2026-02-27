@@ -618,7 +618,7 @@ mod tests {
     fn random_peer_id() -> PeerId {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill(&mut bytes);
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     fn peer_with_prefix(prefix: [u8; 4]) -> PeerId {
@@ -628,7 +628,7 @@ mod tests {
         bytes[1] = prefix[1];
         bytes[2] = prefix[2];
         bytes[3] = prefix[3];
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 //! CLI commands for identity management
 
-use super::node_identity::{IdentityData, NodeId, NodeIdentity};
+use super::node_identity::{IdentityData, NodeIdentity, PeerId};
 use crate::Result;
 use sha2::Digest;
 use std::fs;
@@ -20,7 +20,7 @@ pub fn generate_identity() -> Result<()> {
     info!("⏱️  Generation time: {:?}", elapsed);
     info!("📋 Identity Details:");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("Node ID:      {}", identity.node_id());
+    info!("Node ID:      {}", identity.peer_id());
     info!(
         "Public Key:   {}",
         hex::encode(identity.public_key().as_bytes())
@@ -66,7 +66,7 @@ pub fn load_identity(path: &Path) -> Result<NodeIdentity> {
     let identity = NodeIdentity::import(&data)?;
 
     info!("✅ Identity loaded from: {}", path.display());
-    info!("Node ID: {}", identity.node_id());
+    info!("Node ID: {}", identity.peer_id());
 
     Ok(identity)
 }
@@ -75,7 +75,7 @@ pub fn load_identity(path: &Path) -> Result<NodeIdentity> {
 pub fn show_identity(identity: &NodeIdentity) -> Result<()> {
     info!("🆔 P2P Identity Information");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("Node ID:       {}", identity.node_id());
+    info!("Node ID:       {}", identity.peer_id());
     info!(
         "Public Key:    {}",
         hex::encode(identity.public_key().as_bytes())
@@ -200,11 +200,11 @@ impl IdentityCliHandler {
 
         identity.save_to_file(&output_path).await?;
 
-        let word_address = derive_word_address(identity.node_id());
+        let word_address = derive_word_address(identity.peer_id());
 
         Ok(format!(
             "Generated new identity\nNode ID: {}\nWord Address: {}\nSaved to: {}",
-            identity.node_id(),
+            identity.peer_id(),
             word_address,
             output_path.display()
         ))
@@ -219,11 +219,11 @@ impl IdentityCliHandler {
 
         let identity = NodeIdentity::load_from_file(&path).await?;
 
-        let word_address = derive_word_address(identity.node_id());
+        let word_address = derive_word_address(identity.peer_id());
 
         Ok(format!(
             "Identity Information\nNode ID: {}\nWord Address: {}\nPublic Key: {}\nPoW Difficulty: N/A",
-            identity.node_id(),
+            identity.peer_id(),
             word_address,
             hex::encode(identity.public_key().as_bytes())
         ))
@@ -238,7 +238,7 @@ impl IdentityCliHandler {
 
         let identity = NodeIdentity::load_from_file(&path).await?;
 
-        let _word_address = derive_word_address(identity.node_id());
+        let _word_address = derive_word_address(identity.peer_id());
 
         Ok("Identity is valid\n✓ Proof of Work: Valid\n✓ Cryptographic keys: Valid\n✓ Word address: Matches".to_string())
     }
@@ -316,8 +316,8 @@ impl IdentityCliHandler {
     }
 }
 
-fn derive_word_address(node_id: &NodeId) -> String {
-    let hex = hex::encode(node_id.to_bytes());
+fn derive_word_address(peer_id: &PeerId) -> String {
+    let hex = hex::encode(peer_id.to_bytes());
     if hex.len() >= 16 {
         format!(
             "{}-{}-{}-{}",
@@ -388,7 +388,7 @@ mod tests {
 
         // Generate identity
         let identity = NodeIdentity::generate().expect("Should generate identity in test");
-        let original_id = identity.node_id().clone();
+        let original_id = identity.peer_id().clone();
 
         // Save
         save_identity(&identity, &identity_path).expect("Should save identity in test");
@@ -397,6 +397,6 @@ mod tests {
         let loaded = load_identity(&identity_path).expect("Should load identity in test");
 
         // Verify
-        assert_eq!(loaded.node_id(), &original_id);
+        assert_eq!(loaded.peer_id(), &original_id);
     }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Four-word address integration: delegate to external crate API, keep our API facade
-use super::node_identity::NodeId;
+use super::node_identity::PeerId;
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
@@ -63,9 +63,9 @@ impl FourWordAddress {
     }
 
     /// Construct from a `NodeId` by encoding first 6 bytes as IPv4+port
-    pub fn from_node_id(node_id: &NodeId) -> Self {
+    pub fn from_peer_id(peer_id: &PeerId) -> Self {
         // Safe: always 32 bytes; take first 6 for IPv4+port derivation
-        let bytes = node_id.to_bytes();
+        let bytes = peer_id.to_bytes();
         match Self::from_bytes(&bytes[..6]) {
             Ok(addr) => addr,
             Err(e) => {

@@ -20,7 +20,7 @@
 //! 3. Refactor while keeping tests passing
 
 use proptest::prelude::*;
-use saorsa_core::identity::{FourWordAddress, NodeId, NodeIdentity};
+use saorsa_core::identity::{FourWordAddress, NodeIdentity, PeerId};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -37,9 +37,9 @@ mod identity_generation_tests {
         let identity = NodeIdentity::generate().unwrap();
 
         // Verify all components are present
-        assert!(identity.node_id().to_bytes().len() == 32);
+        assert!(identity.peer_id().to_bytes().len() == 32);
         // Word address is derived externally from node id
-        let addr = FourWordAddress::from_node_id(identity.node_id());
+        let addr = FourWordAddress::from_peer_id(identity.peer_id());
         assert!(!addr.to_string().is_empty());
     }
 
@@ -49,7 +49,7 @@ mod identity_generation_tests {
         let identity = NodeIdentity::from_seed(&seed).unwrap();
 
         // Verify identity was created
-        assert_eq!(identity.node_id().to_bytes().len(), 32);
+        assert_eq!(identity.peer_id().to_bytes().len(), 32);
         // PoW removed
     }
 
@@ -61,8 +61,8 @@ mod identity_generation_tests {
         let public_key = identity.public_key().clone();
 
         // Node ID should be deterministic from public key
-        let node_id = NodeId::from_public_key(&public_key);
-        assert_eq!(node_id, *identity.node_id());
+        let node_id = PeerId::from_public_key(&public_key);
+        assert_eq!(node_id, *identity.peer_id());
     }
 }
 
@@ -73,7 +73,7 @@ mod four_word_address_tests {
     #[test]
     fn test_four_word_address_format() {
         let identity = NodeIdentity::generate().unwrap();
-        let address = FourWordAddress::from_node_id(identity.node_id());
+        let address = FourWordAddress::from_peer_id(identity.peer_id());
 
         // Verify format: word-word-word-word
         let address_str = address.to_string();
@@ -91,11 +91,11 @@ mod four_word_address_tests {
     #[test]
     fn test_four_word_address_deterministic() {
         let identity = NodeIdentity::generate().unwrap();
-        let node_id = identity.node_id();
+        let node_id = identity.peer_id();
 
         // Creating address from same node_id should be deterministic
-        let addr1 = FourWordAddress::from_node_id(node_id);
-        let addr2 = FourWordAddress::from_node_id(node_id);
+        let addr1 = FourWordAddress::from_peer_id(node_id);
+        let addr2 = FourWordAddress::from_peer_id(node_id);
 
         assert_eq!(addr1.to_string(), addr2.to_string());
     }
@@ -147,8 +147,8 @@ mod four_word_address_tests {
         // #[test]
         fn prop_four_word_roundtrip(node_id_bytes: [u8; 32]) {
             // Test roundtrip: NodeId -> FourWords -> NodeId
-            let node_id = NodeId(node_id_bytes);
-            let address = FourWordAddress::from_node_id(&node_id);
+            let node_id = PeerId(node_id_bytes);
+            let address = FourWordAddress::from_peer_id(&node_id);
 
             // Verify address format
             let address_str = address.to_string();
@@ -171,7 +171,7 @@ mod proof_of_work_tests {
 
     //     // Get proof of work
     //     let pow = identity.proof_of_work();
-    //     assert!(pow.verify(identity.node_id(), TEST_DIFFICULTY));
+    //     assert!(pow.verify(identity.peer_id(), TEST_DIFFICULTY));
     // }
 
     // #[test]
@@ -239,7 +239,7 @@ mod persistence_tests {
         // let loaded = NodeIdentity::load_from_file(&path).await.unwrap();
 
         // For now, just test that identity generation works
-        assert!(!identity.node_id().to_string().is_empty());
+        assert!(!identity.peer_id().to_string().is_empty());
 
         // Test signing functionality
         let message = b"test message";
@@ -259,7 +259,7 @@ mod persistence_tests {
 
     //     // Deserialize from JSON
     //     let deserialized: NodeIdentity = serde_json::from_str(&json).unwrap();
-    //     assert_eq!(identity.node_id(), deserialized.node_id());
+    //     assert_eq!(identity.peer_id(), deserialized.peer_id());
     // }
     // #[tokio::test]
     // async fn test_default_identity_location() {
@@ -278,7 +278,7 @@ mod persistence_tests {
 
     //     // Import from bytes
     //     let imported = NodeIdentity::import(&exported).unwrap();
-    //     assert_eq!(identity.node_id(), imported.node_id());
+    //     assert_eq!(identity.peer_id(), imported.peer_id());
     // }
 }
 

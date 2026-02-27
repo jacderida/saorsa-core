@@ -17,7 +17,6 @@
 //! S/Kademlia provides enhanced security through disjoint path routing, sibling lists,
 //! and cryptographic verification mechanisms to resist various attacks on the DHT.
 
-use crate::PeerId;
 use crate::dht::{DHTNode, DhtKey, Key};
 use crate::error::{P2PError, P2pResult as Result};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature, ml_dsa_verify};
@@ -59,8 +58,8 @@ pub trait NetworkQuerier: Send + Sync {
     /// A distance measurement from the witness's perspective
     fn query_distance_measurement(
         &self,
-        witness: &PeerId,
-        target_node: &PeerId,
+        witness: &str,
+        target_node: &str,
         target_key: &Key,
     ) -> Pin<Box<dyn Future<Output = Result<DistanceMeasurement>> + Send + '_>>;
 
@@ -140,7 +139,7 @@ pub struct PathState {
     /// Nodes in this path
     pub nodes: Vec<DHTNode>,
     /// Nodes queried in this path
-    pub queried: HashSet<PeerId>,
+    pub queried: HashSet<String>,
     /// Nodes to query next
     pub to_query: VecDeque<DHTNode>,
     /// Path completion status
@@ -179,7 +178,7 @@ pub struct SecurityBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistanceChallenge {
     /// Challenger node ID
-    pub challenger: PeerId,
+    pub challenger: String,
     /// Target key for distance verification
     pub target_key: Key,
     /// Expected distance
@@ -196,7 +195,7 @@ pub struct DistanceProof {
     /// Original challenge
     pub challenge: DistanceChallenge,
     /// Proof nodes that can verify distance
-    pub proof_nodes: Vec<PeerId>,
+    pub proof_nodes: Vec<String>,
     /// Signatures from proof nodes
     pub signatures: Vec<Vec<u8>>,
     /// Response time (distance indicator)
@@ -207,7 +206,7 @@ pub struct DistanceProof {
 #[derive(Debug, Clone)]
 pub struct EnhancedDistanceChallenge {
     /// Peer being challenged
-    pub challenger: PeerId,
+    pub challenger: String,
     /// Target key for distance measurement
     pub target_key: Key,
     /// Expected distance based on claimed position
@@ -217,7 +216,7 @@ pub struct EnhancedDistanceChallenge {
     /// Challenge timestamp
     pub timestamp: SystemTime,
     /// Witness nodes for verification
-    pub witness_nodes: Vec<PeerId>,
+    pub witness_nodes: Vec<String>,
     /// Current challenge round
     pub challenge_round: u32,
     /// Maximum number of rounds
@@ -230,7 +229,7 @@ pub struct DistanceConsensus {
     /// Target key
     pub target_key: Key,
     /// Node being verified
-    pub target_node: PeerId,
+    pub target_node: String,
     /// Consensus distance
     pub consensus_distance: Key,
     /// Individual measurements from witness nodes
@@ -245,7 +244,7 @@ pub struct DistanceConsensus {
 #[derive(Debug, Clone)]
 pub struct DistanceMeasurement {
     /// Witness node that made the measurement
-    pub witness: PeerId,
+    pub witness: String,
     /// Measured distance
     pub distance: Key,
     /// Measurement confidence
@@ -262,7 +261,7 @@ pub struct ConsistencyReport {
     /// Number of inconsistencies found
     pub inconsistencies: usize,
     /// Suspicious nodes
-    pub suspicious_nodes: Vec<PeerId>,
+    pub suspicious_nodes: Vec<String>,
     /// Validation timestamp
     pub validated_at: Instant,
 }
@@ -281,9 +280,9 @@ pub struct SKademlia {
     /// Active disjoint lookups
     pub active_lookups: HashMap<Key, DisjointPathLookup>,
     /// Distance verification challenges
-    pub pending_challenges: HashMap<PeerId, DistanceChallenge>,
+    pub pending_challenges: HashMap<String, DistanceChallenge>,
     /// Registry of peer public keys for signature verification (ML-DSA-65)
-    pub peer_public_keys: HashMap<PeerId, Vec<u8>>,
+    pub peer_public_keys: HashMap<String, Vec<u8>>,
 }
 
 impl DisjointPathLookup {
@@ -398,7 +397,7 @@ impl DisjointPathLookup {
     }
 
     /// Check if adding a node to a path would violate disjointness constraints
-    fn would_violate_disjointness(&self, path_id: usize, peer_id: &PeerId) -> bool {
+    fn would_violate_disjointness(&self, path_id: usize, peer_id: &String) -> bool {
         for (i, path_state) in self.path_states.iter().enumerate() {
             if i == path_id {
                 continue;
@@ -546,7 +545,7 @@ impl DisjointPathLookup {
         let check_count = std::cmp::min(min_results, 5); // Check top 5 results
 
         for i in 0..check_count {
-            let mut node_counts: HashMap<PeerId, usize> = HashMap::new();
+            let mut node_counts: HashMap<String, usize> = HashMap::new();
 
             for path_result in &path_results {
                 if i < path_result.len() {
@@ -786,12 +785,12 @@ impl SKademlia {
     }
 
     /// Register a peer's public key for signature verification
-    pub fn register_peer_public_key(&mut self, peer_id: PeerId, public_key: Vec<u8>) {
+    pub fn register_peer_public_key(&mut self, peer_id: String, public_key: Vec<u8>) {
         self.peer_public_keys.insert(peer_id, public_key);
     }
 
     /// Get a peer's public key for signature verification
-    pub fn get_peer_public_key(&self, peer_id: &PeerId) -> Option<&Vec<u8>> {
+    pub fn get_peer_public_key(&self, peer_id: &String) -> Option<&Vec<u8>> {
         self.peer_public_keys.get(peer_id)
     }
 
@@ -980,7 +979,7 @@ impl SKademlia {
     }
 
     /// Create a distance verification challenge with multi-round protocol
-    pub fn create_distance_challenge(&mut self, target: &PeerId, key: &Key) -> DistanceChallenge {
+    pub fn create_distance_challenge(&mut self, target: &String, key: &Key) -> DistanceChallenge {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
@@ -1006,9 +1005,9 @@ impl SKademlia {
     /// Create an enhanced distance challenge with witness nodes
     pub fn create_enhanced_distance_challenge(
         &mut self,
-        target: &PeerId,
+        target: &String,
         key: &Key,
-        witness_nodes: Vec<PeerId>,
+        witness_nodes: Vec<String>,
     ) -> EnhancedDistanceChallenge {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
@@ -1243,9 +1242,9 @@ impl SKademlia {
     /// * `querier` - Network querier for making actual network calls
     pub async fn verify_distance_consensus<Q: NetworkQuerier>(
         &mut self,
-        target_node: &PeerId,
+        target_node: &str,
         target_key: &Key,
-        witness_nodes: Vec<PeerId>,
+        witness_nodes: Vec<String>,
         querier: &Q,
     ) -> Result<DistanceConsensus> {
         let mut measurements = Vec::new();
@@ -1325,7 +1324,7 @@ impl SKademlia {
 
         Ok(DistanceConsensus {
             target_key: *target_key,
-            target_node: target_node.clone(),
+            target_node: target_node.to_owned(),
             consensus_distance,
             measurements,
             confidence,
@@ -1426,7 +1425,7 @@ impl SKademlia {
     /// 3. Reputation filtering (must meet minimum threshold)
     pub fn create_adaptive_distance_challenge(
         &mut self,
-        target: &PeerId,
+        target: &String,
         key: &Key,
         suspected_attack: bool,
     ) -> EnhancedDistanceChallenge {
@@ -1502,7 +1501,7 @@ impl SKademlia {
         // 3. Sort by score (descending) and select top witnesses
         candidate_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let witness_nodes: Vec<PeerId> = candidate_nodes
+        let witness_nodes: Vec<String> = candidate_nodes
             .into_iter()
             .take(witness_count)
             .map(|(node, _)| hex::encode(node.id.as_bytes()))
@@ -1784,8 +1783,8 @@ mod tests {
 
         fn query_distance_measurement(
             &self,
-            _witness: &PeerId,
-            _target_node: &PeerId,
+            _witness: &str,
+            _target_node: &str,
             _target_key: &Key,
         ) -> Pin<Box<dyn Future<Output = Result<DistanceMeasurement>> + Send + '_>> {
             Box::pin(async {

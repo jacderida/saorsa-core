@@ -120,43 +120,14 @@ async fn create_test_manager(name: &str) -> Result<(Arc<DhtNetworkManager>, Arc<
 
 /// Perform bidirectional authentication between two managers.
 ///
-/// PeerConnected events (and thus DHT peer tracking) only fire when an
-/// authenticated (signed) message is received. This helper:
-/// 1. Connects A to B at the transport level
-/// 2. Sends a signed message A→B to authenticate A on B's side
-/// 3. Sends a signed message B→A to authenticate B on A's side
-/// 4. Waits for authentication to propagate through event handling
+/// Both sides send an automatic identity announce on connect, so we just
+/// need to connect and wait for the announces to propagate.
 ///
 /// Returns the channel ID from the initial connection.
-async fn authenticate_bidirectional(
-    manager_a: &DhtNetworkManager,
-    manager_b: &DhtNetworkManager,
-    identity_a: &NodeIdentity,
-    addr_b: &str,
-) -> Result<String> {
-    // Step 1: transport-level connection (returns channel ID)
+async fn authenticate_bidirectional(manager_a: &DhtNetworkManager, addr_b: &str) -> Result<String> {
     let channel_id_b = manager_a.connect_to_peer(addr_b).await?;
-
-    // Step 2: A sends signed message to B → B authenticates A
-    manager_a
-        .transport()
-        .send_message(&channel_id_b, "auth", b"hello".to_vec())
-        .await?;
-
-    // Wait for B to process the message, authenticate A, and emit PeerConnected
+    // Auto identity announce handles bidirectional authentication.
     sleep(AUTH_PROPAGATION_DELAY).await;
-
-    // Step 3: B now knows A's node_id via peer_to_channel.
-    // B sends signed message back to A → A authenticates B.
-    let a_node_id = identity_a.node_id().to_hex();
-    manager_b
-        .transport()
-        .send_message(&a_node_id, "auth", b"hello_back".to_vec())
-        .await?;
-
-    // Wait for A to process the message, authenticate B, and emit PeerConnected
-    sleep(AUTH_PROPAGATION_DELAY).await;
-
     Ok(channel_id_b)
 }
 
@@ -190,8 +161,8 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     let (manager_a, identity_a) = create_test_manager("address_test_a").await?;
     let (manager_b, identity_b) = create_test_manager("address_test_b").await?;
 
-    let a_node_id = identity_a.node_id().to_hex();
-    let b_node_id = identity_b.node_id().to_hex();
+    let a_node_id = identity_a.peer_id().to_hex();
+    let b_node_id = identity_b.peer_id().to_hex();
     info!(
         "Created nodes A (node_id={}) and B (node_id={})",
         a_node_id, b_node_id
@@ -204,7 +175,7 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
 
     // Connect and authenticate bidirectionally
     info!("Connecting and authenticating A ←→ B");
-    authenticate_bidirectional(&manager_a, &manager_b, &identity_a, &addr_b).await?;
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
     // Check Node A's view of Node B (look up by B's app-level node_id)
     info!("Checking Node A's view of connected peers...");
@@ -319,8 +290,8 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
     info!("=== TEST: Find Closest Nodes Returns Addresses ===");
 
     // Create three nodes (each with its own ML-DSA-65 identity)
-    let (manager_a, identity_a) = create_test_manager("find_nodes_a").await?;
-    let (manager_b, identity_b) = create_test_manager("find_nodes_b").await?;
+    let (manager_a, _identity_a) = create_test_manager("find_nodes_a").await?;
+    let (manager_b, _identity_b) = create_test_manager("find_nodes_b").await?;
     let (manager_c, _identity_c) = create_test_manager("find_nodes_c").await?;
 
     info!("Created nodes A, B, and C");
@@ -335,11 +306,11 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
 
     // Connect and authenticate A ←→ B
     info!("Connecting and authenticating A ←→ B");
-    authenticate_bidirectional(&manager_a, &manager_b, &identity_a, &addr_b).await?;
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
     // Connect and authenticate B ←→ C
     info!("Connecting and authenticating B ←→ C");
-    authenticate_bidirectional(&manager_b, &manager_c, &identity_b, &addr_c).await?;
+    authenticate_bidirectional(&manager_b, &addr_c).await?;
 
     // Node B calls find_closest_nodes for a test key
     let test_key = key_from_str("test_find_nodes_key");
@@ -439,10 +410,10 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     info!("=== TEST: Address Consistency Between P2P and DHT Layers ===");
 
     // Create two nodes (each with its own ML-DSA-65 identity)
-    let (manager_a, identity_a) = create_test_manager("consistency_a").await?;
+    let (manager_a, _identity_a) = create_test_manager("consistency_a").await?;
     let (manager_b, identity_b) = create_test_manager("consistency_b").await?;
 
-    let b_node_id = identity_b.node_id().to_hex();
+    let b_node_id = identity_b.peer_id().to_hex();
     info!("Created nodes A and B (B's node_id={})", b_node_id);
 
     // Connect and authenticate bidirectionally
@@ -451,7 +422,7 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Node B has no listen address"))?;
 
     info!("Connecting and authenticating A ←→ B");
-    authenticate_bidirectional(&manager_a, &manager_b, &identity_a, &addr_b).await?;
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
     // Query P2P layer for peer B's info (using B's app-level node ID)
     info!(

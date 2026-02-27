@@ -29,7 +29,7 @@ pub mod network_config;
 pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, RetryBehavior};
 
 use crate::validation::{Validate, ValidationContext, validate_message_size, validate_peer_id};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -114,7 +114,7 @@ pub struct ConnectionPoolStats {
 #[derive(Debug, Clone)]
 pub struct TransportMessage {
     /// Sender peer ID
-    pub sender: PeerId,
+    pub sender: String,
     /// Message data
     pub data: Vec<u8>,
     /// Protocol identifier

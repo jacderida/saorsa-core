@@ -53,7 +53,7 @@ proptest! {
         let id2 = NodeIdentity::generate().unwrap();
 
         // They should be different
-        prop_assert_ne!(id1.node_id(), id2.node_id());
+        prop_assert_ne!(id1.peer_id(), id2.peer_id());
     }
 
     #[test]
@@ -65,7 +65,7 @@ proptest! {
         let id1 = NodeIdentity::generate().unwrap();
         let id2 = NodeIdentity::generate().unwrap();
 
-        prop_assert_ne!(id1.node_id(), id2.node_id());
+        prop_assert_ne!(id1.peer_id(), id2.peer_id());
     }
 
     #[test]

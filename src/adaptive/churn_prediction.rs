@@ -245,7 +245,7 @@ impl LSTMChurnPredictor {
             network_size,
             avg_session_duration: recent_stats.avg_session_duration,
             node_uptime: recent_stats
-                .get_node_uptime(&NodeId::from_bytes(*node_id.node_id().to_bytes())),
+                .get_node_uptime(&NodeId::from_bytes(*node_id.peer_id().to_bytes())),
             join_leave_ratio,
         }
     }

@@ -332,16 +332,10 @@ async fn test_bidirectional_message_exchange() {
     // Connect node1 to node2
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let _channel_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Node1 sends a signed message → triggers PeerConnected on node2
-    node1
-        .send_message(&peer2_id, "messaging", b"From Node1".to_vec())
-        .await
-        .expect("Send from node1 failed");
-
-    // Wait for node2 to authenticate node1 via the signed message
-    let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
+    // Wait for auto identity announce to authenticate node1 on node2
+    let peer1_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
     .await
@@ -350,14 +344,28 @@ async fn test_bidirectional_message_exchange() {
         _ => panic!("Node2 did not receive PeerConnected event from Node1"),
     };
 
+    // Wait for auto identity announce to authenticate node2 on node1
+    let peer2_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
+        matches!(event, P2PEvent::PeerConnected(_))
+    })
+    .await
+    {
+        Some(P2PEvent::PeerConnected(id)) => id,
+        _ => panic!("Node1 did not receive PeerConnected event from Node2"),
+    };
+
     info!("Node1 sees Node2 as: {}", peer2_id);
     info!("Node2 sees Node1 as: {}", peer1_id);
 
-    sleep(Duration::from_millis(200)).await;
+    // Node1 -> Node2
+    node1
+        .send_message(&peer2_id, "messaging", b"From Node1".to_vec())
+        .await
+        .expect("Send from node1 failed");
 
     let msg_on_2 = wait_for_event(
         &mut events2,
-        Duration::from_secs(2),
+        EVENT_TIMEOUT,
         |event| matches!(event, P2PEvent::Message { topic, .. } if topic == "messaging"),
     )
     .await;
@@ -376,7 +384,7 @@ async fn test_bidirectional_message_exchange() {
 
     let msg_on_1 = wait_for_event(
         &mut events1,
-        Duration::from_secs(2),
+        EVENT_TIMEOUT,
         |event| matches!(event, P2PEvent::Message { topic, .. } if topic == "messaging"),
     )
     .await;
@@ -471,7 +479,7 @@ async fn test_stale_peer_removal() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    // Connect and send a signed message so the peer gets authenticated
+    // Connect — auto identity announce handles authentication
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
@@ -757,8 +765,7 @@ async fn test_node_creation_sanity() {
 
 /// Sanity check: Event subscription works.
 ///
-/// PeerConnected fires when the receiver authenticates a signed message,
-/// so we subscribe on node2, then have node1 send a signed message.
+/// PeerConnected fires automatically via the identity announce sent on connect.
 #[tokio::test]
 async fn test_event_subscription_sanity() {
     let config1 = create_test_node_config();
@@ -774,15 +781,9 @@ async fn test_event_subscription_sanity() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
 
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Send a signed message to trigger PeerConnected on node2
-    node1
-        .send_message(&peer2_id, "test", b"hello".to_vec())
-        .await
-        .expect("Send failed");
-
-    // Should receive PeerConnected event on node2
+    // Should receive PeerConnected event on node2 from auto identity announce
     let event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
@@ -827,16 +828,10 @@ async fn test_simple_ping_pong() {
     // Connect node1 to node2
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let _channel_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Node1 sends "ping" (signed message triggers PeerConnected on node2)
-    node1
-        .send_message(&peer2_id, "messaging", b"ping".to_vec())
-        .await
-        .expect("Failed to send ping");
-
-    // Wait for node2 to authenticate node1 via the signed message
-    let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
+    // Wait for auto identity announce to authenticate both sides
+    let peer1_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
     .await
@@ -845,10 +840,25 @@ async fn test_simple_ping_pong() {
         _ => panic!("Node2 did not receive PeerConnected event"),
     };
 
+    let peer2_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
+        matches!(event, P2PEvent::PeerConnected(_))
+    })
+    .await
+    {
+        Some(P2PEvent::PeerConnected(id)) => id,
+        _ => panic!("Node1 did not receive PeerConnected event"),
+    };
+
+    // Node1 sends "ping"
+    node1
+        .send_message(&peer2_id, "messaging", b"ping".to_vec())
+        .await
+        .expect("Failed to send ping");
+
     // Node2 receives "ping"
     let received_ping = wait_for_event(
         &mut events2,
-        Duration::from_secs(2),
+        EVENT_TIMEOUT,
         |event| matches!(event, P2PEvent::Message { data, .. } if data == b"ping"),
     )
     .await;
@@ -868,7 +878,7 @@ async fn test_simple_ping_pong() {
     // Node1 receives "pong"
     let received_pong = wait_for_event(
         &mut events1,
-        Duration::from_secs(2),
+        EVENT_TIMEOUT,
         |event| matches!(event, P2PEvent::Message { data, .. } if data == b"pong"),
     )
     .await;
@@ -1091,7 +1101,7 @@ async fn test_reconnection_works() {
 
 /// TEST 0.5: Peer Discovery Events
 ///
-/// Connect, send a signed message to trigger PeerConnected on the receiver,
+/// Connect (auto identity announce triggers PeerConnected on the receiver),
 /// then disconnect (drop sender) and verify PeerDisconnected on the receiver.
 #[tokio::test]
 async fn test_peer_events_sequence() {
@@ -1117,12 +1127,8 @@ async fn test_peer_events_sequence() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
 
-    // Connect and send a signed message to trigger PeerConnected on node2
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
-    node1
-        .send_message(&peer2_id, "test", b"hello".to_vec())
-        .await
-        .expect("Send failed");
+    // Connect — auto identity announce triggers PeerConnected on node2
+    node1.connect_peer(&addr2).await.expect("Connect failed");
 
     // Wait for PeerConnected event on node2
     let connected_event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
@@ -1604,16 +1610,10 @@ async fn test_concurrent_message_flood() {
 
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Send a signed message to trigger PeerConnected on node2
-    node1
-        .send_message(&peer2_id, "setup", b"init".to_vec())
-        .await
-        .expect("Init send failed");
-
-    // Get peer1_id for node2 (authenticated node ID from the signed message)
-    let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
+    // Wait for auto identity announce to authenticate both sides
+    let peer1_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
     .await
@@ -1622,7 +1622,14 @@ async fn test_concurrent_message_flood() {
         _ => panic!("Node2 did not receive PeerConnected"),
     };
 
-    sleep(Duration::from_millis(500)).await;
+    let peer2_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
+        matches!(event, P2PEvent::PeerConnected(_))
+    })
+    .await
+    {
+        Some(P2PEvent::PeerConnected(id)) => id,
+        _ => panic!("Node1 did not receive PeerConnected"),
+    };
 
     // Send messages concurrently from both directions
     // Reduced from 50 to 20 for more reliable testing
@@ -1974,13 +1981,7 @@ async fn test_many_peers_scaling() {
         match node1.connect_peer(&addr).await {
             Ok(peer_id) => {
                 debug!("Connected peer {}: {}", i, peer_id);
-                // Send a signed message to authenticate with the peer
-                if let Err(e) = node1
-                    .send_message(&peer_id, "init", b"hello".to_vec())
-                    .await
-                {
-                    warn!("Failed to send init to peer {}: {}", i, e);
-                }
+                // Auto identity announce handles authentication
                 connected_peers.push(peer_id);
             }
             Err(e) => {

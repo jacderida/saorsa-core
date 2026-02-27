@@ -25,7 +25,7 @@ use crate::dht::{DHT, DHTConfig, DhtKey, Key as DhtKeyBytes};
 use crate::dht_network_manager::{
     DhtNetworkConfig, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
 };
-use crate::{Multiaddr, P2PNode, PeerId};
+use crate::{Multiaddr, P2PNode};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use sha2::Digest;
@@ -234,7 +234,7 @@ struct LayerScores {
 
 #[derive(Debug, Clone)]
 struct ScoredCandidate {
-    peer_id: PeerId,
+    peer_id: String,
     node_id: NodeId,
     address: Option<Multiaddr>,
     region: GeographicRegion,
@@ -244,7 +244,7 @@ struct ScoredCandidate {
 
 #[derive(Debug, Clone)]
 struct CandidateNode {
-    peer_id: PeerId,
+    peer_id: String,
     address: String,
     reliability: f64,
 }
@@ -343,10 +343,10 @@ impl AdaptiveDHT {
         NodeId::from_bytes(*key)
     }
 
-    fn peer_id_to_node_id(peer_id: &PeerId) -> NodeId {
+    fn peer_id_to_node_id(peer_id: &str) -> NodeId {
         // PeerId strings are hex-encoded 32-byte node IDs. Decode to raw bytes
         // to match the DHT NodeId representation used by trust_peer_selector.
-        if let Ok(bytes) = hex::decode(peer_id.as_str())
+        if let Ok(bytes) = hex::decode(peer_id)
             && bytes.len() == 32
         {
             let mut arr = [0u8; 32];
@@ -690,7 +690,7 @@ impl AdaptiveDHT {
                         .await
                         .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
                 } else {
-                    let targets: Vec<PeerId> = selected.iter().map(|c| c.peer_id.clone()).collect();
+                    let targets: Vec<String> = selected.iter().map(|c| c.peer_id.clone()).collect();
                     manager
                         .put_with_targets(key, value, &targets)
                         .await
@@ -868,8 +868,7 @@ impl AdaptiveDHT {
 
     /// Update routing table with new node information
     pub async fn update_routing(&self, node: NodeDescriptor) -> Result<()> {
-        let _peer_id = PeerId::from_str(&node.id.to_string())
-            .map_err(|e| AdaptiveNetworkError::Other(format!("Invalid peer ID: {e}")))?;
+        let _peer_id = node.id.to_string();
 
         let addresses: Vec<Multiaddr> = node
             .addresses
@@ -942,7 +941,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let trust_provider = Arc::new(MockTrustProvider);
         let router = Arc::new(AdaptiveRouter::new_with_id(
-            NodeId::from_bytes(*identity.node_id().to_bytes()),
+            NodeId::from_bytes(*identity.peer_id().to_bytes()),
             trust_provider.clone(),
         ));
 

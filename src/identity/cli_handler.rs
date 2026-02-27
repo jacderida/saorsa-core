@@ -142,7 +142,7 @@ impl IdentityCliHandler {
 
         Ok(format!(
             "Generated new identity\nNode ID: {}\nSaved to: {}",
-            identity.node_id(),
+            identity.peer_id(),
             output_path.display()
         ))
     }
@@ -158,7 +158,7 @@ impl IdentityCliHandler {
 
         Ok(format!(
             "Identity Information\nNode ID: {}\nPublic Key: {}",
-            identity.node_id(),
+            identity.peer_id(),
             hex::encode(identity.public_key().as_bytes())
         ))
     }

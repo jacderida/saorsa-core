@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
-use super::node_identity::NodeId;
+use super::node_identity::PeerId;
 
 /// Verdict on the node's current fitness for the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -271,7 +271,7 @@ pub struct FitnessMonitor {
     config: FitnessConfig,
 
     /// Node ID being monitored.
-    node_id: NodeId,
+    peer_id: PeerId,
 
     /// History of membership events.
     membership_history: RwLock<VecDeque<MembershipEvent>>,
@@ -286,10 +286,10 @@ pub struct FitnessMonitor {
 impl FitnessMonitor {
     /// Create a new fitness monitor.
     #[must_use]
-    pub fn new(config: FitnessConfig, node_id: NodeId) -> Self {
+    pub fn new(config: FitnessConfig, peer_id: PeerId) -> Self {
         Self {
             config,
-            node_id,
+            peer_id,
             membership_history: RwLock::new(VecDeque::with_capacity(100)),
             current_metrics: RwLock::new(FitnessMetrics::default()),
             last_evaluation: RwLock::new(None),
@@ -298,8 +298,8 @@ impl FitnessMonitor {
 
     /// Get the node ID being monitored.
     #[must_use]
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
     }
 
     /// Get current fitness metrics.
@@ -521,7 +521,7 @@ pub type SharedFitnessMonitor = Arc<FitnessMonitor>;
 /// Builder for FitnessMonitor with custom configuration.
 pub struct FitnessMonitorBuilder {
     config: FitnessConfig,
-    node_id: Option<NodeId>,
+    peer_id: Option<PeerId>,
 }
 
 impl FitnessMonitorBuilder {
@@ -530,14 +530,14 @@ impl FitnessMonitorBuilder {
     pub fn new() -> Self {
         Self {
             config: FitnessConfig::default(),
-            node_id: None,
+            peer_id: None,
         }
     }
 
     /// Set the node ID to monitor.
     #[must_use]
-    pub fn node_id(mut self, id: NodeId) -> Self {
-        self.node_id = Some(id);
+    pub fn peer_id(mut self, id: PeerId) -> Self {
+        self.peer_id = Some(id);
         self
     }
 
@@ -585,7 +585,7 @@ impl FitnessMonitorBuilder {
     /// Returns `None` if node_id was not set.
     #[must_use]
     pub fn build(self) -> Option<FitnessMonitor> {
-        self.node_id.map(|id| FitnessMonitor::new(self.config, id))
+        self.peer_id.map(|id| FitnessMonitor::new(self.config, id))
     }
 }
 
@@ -599,8 +599,8 @@ impl Default for FitnessMonitorBuilder {
 mod tests {
     use super::*;
 
-    fn test_node_id() -> NodeId {
-        NodeId([0x42; 32])
+    fn test_peer_id() -> PeerId {
+        PeerId([0x42; 32])
     }
 
     #[test]
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn test_fitness_monitor_creation() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         assert_eq!(monitor.current_verdict(), FitnessVerdict::Healthy);
     }
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn test_fitness_monitor_update_metrics() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         monitor.update_position_quality(0.3);
         monitor.update_saturation(0.8);
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn test_fitness_evaluation_healthy() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         monitor.update_position_quality(0.9);
         monitor.update_saturation(0.2);
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn test_fitness_evaluation_unfit() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         monitor.update_position_quality(0.3); // Below unfit threshold
         monitor.update_diversity_compliance(true);
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn test_fitness_evaluation_critical() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         // Diversity non-compliance is always critical
         monitor.update_diversity_compliance(false);
@@ -694,7 +694,7 @@ mod tests {
             stability_window: Duration::from_secs(1),
             ..FitnessConfig::default()
         };
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         monitor.record_membership_event(MembershipEventType::Joined, None);
         monitor.record_membership_event(MembershipEventType::Left, None);
@@ -708,14 +708,14 @@ mod tests {
     #[test]
     fn test_fitness_monitor_builder() {
         let monitor = FitnessMonitorBuilder::new()
-            .node_id(test_node_id())
+            .peer_id(test_peer_id())
             .evaluation_interval(Duration::from_secs(30))
             .position_thresholds(0.7, 0.5)
             .saturation_threshold(0.85)
             .build()
             .unwrap();
 
-        assert_eq!(monitor.node_id(), &test_node_id());
+        assert_eq!(monitor.peer_id(), &test_peer_id());
     }
 
     #[test]
@@ -723,14 +723,14 @@ mod tests {
         let result = FitnessMonitorBuilder::new().build();
         assert!(result.is_none());
 
-        let result = FitnessMonitorBuilder::new().node_id(test_node_id()).build();
+        let result = FitnessMonitorBuilder::new().peer_id(test_peer_id()).build();
         assert!(result.is_some());
     }
 
     #[test]
     fn test_status_report() {
         let config = FitnessConfig::default();
-        let monitor = FitnessMonitor::new(config, test_node_id());
+        let monitor = FitnessMonitor::new(config, test_peer_id());
 
         monitor.update_position_quality(0.85);
         monitor.update_saturation(0.3);

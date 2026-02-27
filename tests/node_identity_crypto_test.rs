@@ -14,7 +14,7 @@ use rand::{RngCore, thread_rng};
 use saorsa_core::identity::{
     encryption::{decrypt_with_device_password, encrypt_with_device_password},
     four_words::FourWordAddress,
-    node_identity::{NodeId, NodeIdentity},
+    node_identity::{NodeIdentity, PeerId},
 };
 use saorsa_core::quantum_crypto::ant_quic_integration::ml_dsa_verify;
 use std::collections::{HashMap, HashSet};
@@ -52,11 +52,11 @@ async fn test_four_word_address_generation() -> Result<()> {
 
     for (seed, _expected_pattern) in &test_cases {
         let identity = create_test_identity(*seed);
-        let node_id = identity.node_id();
-        let four_word_addr = FourWordAddress::from_node_id(node_id);
+        let node_id = identity.peer_id();
+        let four_word_addr = FourWordAddress::from_peer_id(node_id);
 
         // Four-word address should be deterministic for same node ID
-        let four_word_addr2 = FourWordAddress::from_node_id(node_id);
+        let four_word_addr2 = FourWordAddress::from_peer_id(node_id);
         assert_eq!(
             four_word_addr, four_word_addr2,
             "Four-word address should be deterministic"
@@ -94,8 +94,8 @@ async fn test_four_word_address_generation() -> Result<()> {
     let mut addresses = HashSet::new();
     for seed in 0..1000 {
         let identity = create_test_identity(seed);
-        let node_id = identity.node_id();
-        let addr = FourWordAddress::from_node_id(node_id);
+        let node_id = identity.peer_id();
+        let addr = FourWordAddress::from_peer_id(node_id);
         let addr_string = addr.to_string();
 
         assert!(
@@ -118,12 +118,12 @@ async fn test_node_identity_cryptography() -> Result<()> {
 
     // Test identity creation and consistency
     let identity = create_test_identity(42);
-    let node_id = identity.node_id();
+    let node_id = identity.peer_id();
     let public_key = identity.public_key();
     let _signing_key = identity.secret_key_bytes();
 
     // Node ID should be derived from public key
-    let expected_node_id = NodeId::from_public_key(public_key);
+    let expected_node_id = PeerId::from_public_key(public_key);
     assert_eq!(
         *node_id, expected_node_id,
         "Node ID should match public key derivation"
@@ -191,11 +191,11 @@ async fn test_node_id_properties() -> Result<()> {
 
     // Test XOR distance calculation (important for Kademlia DHT)
     let id1_identity = create_test_identity(100);
-    let id1 = id1_identity.node_id();
+    let id1 = id1_identity.peer_id();
     let id2_identity = create_test_identity(200);
-    let id2 = id2_identity.node_id();
+    let id2 = id2_identity.peer_id();
     let id3_identity = create_test_identity(300);
-    let id3 = id3_identity.node_id();
+    let id3 = id3_identity.peer_id();
 
     // XOR distance should be symmetric
     let dist_12 = id1.xor_distance(id2);
@@ -237,7 +237,7 @@ async fn test_node_id_properties() -> Result<()> {
     let mut node_ids = HashSet::new();
     for seed in 0..1000 {
         let identity_binding = create_test_identity(seed);
-        let id = identity_binding.node_id().clone();
+        let id = identity_binding.peer_id().clone();
         assert!(!node_ids.contains(&id), "Node IDs should be unique");
         node_ids.insert(id);
     }
@@ -335,7 +335,7 @@ async fn test_proof_of_work() -> Result<()> {
     println!("⛏️ Testing Proof of Work");
 
     let identity = create_test_identity(123);
-    let node_id = identity.node_id();
+    let node_id = identity.peer_id();
 
     // Test proof of work generation with different difficulties
     let difficulties = [8, 12, 16]; // Start with easier difficulties for testing
@@ -376,7 +376,7 @@ async fn test_proof_of_work() -> Result<()> {
     // Test proof verification with wrong data
     let proof = ProofOfWork::solve(&node_id, 8)?;
     let other_identity = create_test_identity(456);
-    let other_node_id = other_identity.node_id();
+    let other_node_id = other_identity.peer_id();
 
     assert!(
         !proof.verify(&other_node_id, 8),
@@ -405,8 +405,8 @@ async fn test_identity_consistency() -> Result<()> {
     let identity2 = create_test_identity(seed);
 
     assert_eq!(
-        identity1.node_id(),
-        identity2.node_id(),
+        identity1.peer_id(),
+        identity2.peer_id(),
         "Same seed should produce same node ID"
     );
     assert_eq!(
@@ -416,16 +416,16 @@ async fn test_identity_consistency() -> Result<()> {
     );
 
     // Test four-word address consistency
-    let addr1 = FourWordAddress::from_node_id(identity1.node_id());
-    let addr2 = FourWordAddress::from_node_id(identity2.node_id());
+    let addr1 = FourWordAddress::from_peer_id(identity1.peer_id());
+    let addr2 = FourWordAddress::from_peer_id(identity2.peer_id());
     assert_eq!(
         addr1, addr2,
         "Same node ID should produce same four-word address"
     );
 
     // Test cross-system consistency (node ID -> four words -> parse -> verify)
-    let original_node_id = identity1.node_id();
-    let four_word_addr = FourWordAddress::from_node_id(original_node_id);
+    let original_node_id = identity1.peer_id();
+    let four_word_addr = FourWordAddress::from_peer_id(original_node_id);
     let addr_string = four_word_addr.to_string();
     let parsed_addr = FourWordAddress::parse_str(&addr_string)?;
 
@@ -437,8 +437,8 @@ async fn test_identity_consistency() -> Result<()> {
     // Test that different seeds produce different identities
     let different_identity = create_test_identity(seed + 1);
     assert_ne!(
-        identity1.node_id(),
-        different_identity.node_id(),
+        identity1.peer_id(),
+        different_identity.peer_id(),
         "Different seeds should produce different identities"
     );
 
@@ -494,7 +494,7 @@ async fn test_identity_performance() -> Result<()> {
     let mut addresses = Vec::new();
 
     for identity in &identities {
-        let addr = FourWordAddress::from_node_id(identity.node_id());
+        let addr = FourWordAddress::from_peer_id(identity.peer_id());
         addresses.push(addr);
     }
 
@@ -592,8 +592,8 @@ async fn test_identity_edge_cases() -> Result<()> {
     let min_identity = create_test_identity(u64::MIN);
 
     assert_ne!(
-        max_identity.node_id(),
-        min_identity.node_id(),
+        max_identity.peer_id(),
+        min_identity.peer_id(),
         "Max and min seeds should produce different identities"
     );
 
@@ -664,9 +664,9 @@ async fn test_identity_edge_cases() -> Result<()> {
 
     // Test XOR distance edge cases
     let id1_binding = create_test_identity(0);
-    let id1 = id1_binding.node_id();
-    let id_max = NodeId([0xFF; 32]); // All bits set
-    let id_zero = NodeId([0x00; 32]); // All bits clear
+    let id1 = id1_binding.peer_id();
+    let id_max = PeerId([0xFF; 32]); // All bits set
+    let id_zero = PeerId([0x00; 32]); // All bits clear
 
     let dist_max = id1.xor_distance(&id_max);
     let dist_zero = id1.xor_distance(&id_zero);
@@ -723,7 +723,7 @@ async fn test_identity_system_integration() -> Result<()> {
     println!("  Phase 1: Network bootstrap");
     for i in 0..network_size {
         let identity = create_test_identity(1000 + i as u64);
-        let four_word_addr = FourWordAddress::from_node_id(identity.node_id());
+        let four_word_addr = FourWordAddress::from_peer_id(identity.peer_id());
 
         // Ensure no collisions in four-word addresses
         let addr_string = four_word_addr.to_string();
@@ -733,8 +733,8 @@ async fn test_identity_system_integration() -> Result<()> {
             addr_string
         );
 
-        println!("    Node {}: {} -> {}", i, identity.node_id(), addr_string);
-        four_word_registry.insert(addr_string.clone(), identity.node_id().clone());
+        println!("    Node {}: {} -> {}", i, identity.peer_id(), addr_string);
+        four_word_registry.insert(addr_string.clone(), identity.peer_id().clone());
         network_identities.push((identity, four_word_addr));
     }
 
@@ -754,7 +754,7 @@ async fn test_identity_system_integration() -> Result<()> {
             addr
         );
 
-        signatures.push((identity.node_id().clone(), signature));
+        signatures.push((identity.peer_id().clone(), signature));
     }
 
     // Phase 3: Cross-verification
@@ -763,7 +763,7 @@ async fn test_identity_system_integration() -> Result<()> {
         // Find the identity that created this signature
         let (identity, _) = network_identities
             .iter()
-            .find(|(id, _)| *id.node_id() == *node_id)
+            .find(|(id, _)| *id.peer_id() == *node_id)
             .expect("Should find identity for node ID");
 
         // Verify with correct identity
@@ -774,7 +774,7 @@ async fn test_identity_system_integration() -> Result<()> {
 
         // Verify it doesn't work with other identities
         for (other_identity, _) in &network_identities {
-            if *other_identity.node_id() != *node_id {
+            if *other_identity.peer_id() != *node_id {
                 assert!(
                     !ml_dsa_verify(other_identity.public_key(), test_message, signature)
                         .unwrap_or(true),
@@ -808,7 +808,7 @@ async fn test_identity_system_integration() -> Result<()> {
 
     for (identity, addr) in network_identities.iter().take(5) {
         // Test first 5 nodes
-        let node_id = identity.node_id();
+        let node_id = identity.peer_id();
         let proof = ProofOfWork::solve(&node_id, difficulty)?;
 
         assert!(
@@ -825,7 +825,7 @@ async fn test_identity_system_integration() -> Result<()> {
     // All node IDs should be unique
     let mut node_id_set = HashSet::new();
     for (identity, _) in &network_identities {
-        let node_id = identity.node_id().clone();
+        let node_id = identity.peer_id().clone();
         assert!(!node_id_set.contains(&node_id), "Node IDs should be unique");
         node_id_set.insert(node_id);
     }
@@ -844,7 +844,7 @@ async fn test_identity_system_integration() -> Result<()> {
             .expect("Address should be registered");
         assert_eq!(
             registered_node_id,
-            identity.node_id(),
+            identity.peer_id(),
             "Registry should match identity node ID"
         );
     }

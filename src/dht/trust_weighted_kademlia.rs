@@ -22,7 +22,7 @@
 //! convergence properties while allowing trust to meaningfully reduce timeouts and improve
 //! reliability among similarly-distant nodes.
 
-use crate::identity::node_identity::NodeId;
+use crate::identity::node_identity::PeerId;
 use anyhow::Result;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,7 @@ use tokio::sync::RwLock;
 /// DHT key type (256-bit)
 pub type Key = [u8; 32];
 
-/// Peer identifier
-pub type PeerId = NodeId;
+// PeerId is imported from identity::node_identity
 
 /// Contact information for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +82,7 @@ pub enum Outcome {
 /// Trust-weighted Kademlia DHT implementation
 pub struct TrustWeightedKademlia {
     /// Local node ID
-    local_id: NodeId,
+    local_id: PeerId,
     /// Kademlia routing table (160 buckets for 160-bit prefix)
     routing_table: Arc<RwLock<[KBucket; 160]>>,
     /// Content storage
@@ -146,7 +145,7 @@ impl KBucket {
 
 impl TrustWeightedKademlia {
     /// Create new DHT instance
-    pub fn new(local_id: NodeId) -> Self {
+    pub fn new(local_id: PeerId) -> Self {
         let routing_table = Arc::new(RwLock::new(
             array_init::array_init(|_| KBucket::new(20)), // k=20
         ));
@@ -254,7 +253,7 @@ impl TrustWeightedKademlia {
     /// among those at similar distances. Since distance magnitude groups nodes by
     /// powers of 2, nodes within the same bucket are "close enough" from a routing
     /// perspective, allowing trust to meaningfully influence selection.
-    async fn find_closest_nodes(&self, target: &NodeId, k: usize) -> Vec<Contact> {
+    async fn find_closest_nodes(&self, target: &PeerId, k: usize) -> Vec<Contact> {
         let routing_table = self.routing_table.read().await;
         let eigen_trust_scores = self.eigen_trust_scores.read().await;
 
@@ -327,7 +326,7 @@ impl TrustWeightedKademlia {
     }
 
     /// Calculate XOR distance between two node IDs
-    fn xor_distance(&self, a: &NodeId, b: &NodeId) -> [u8; 32] {
+    fn xor_distance(&self, a: &PeerId, b: &PeerId) -> [u8; 32] {
         let mut result = [0u8; 32];
         let a_bytes = a.to_bytes();
         let b_bytes = b.to_bytes();
@@ -346,10 +345,10 @@ impl TrustWeightedKademlia {
     }
 }
 
-// NodeId::to_bytes() is already implemented in identity/node_identity.rs
+// PeerId::to_bytes() is already implemented in identity/node_identity.rs
 
 impl TrustWeightedKademlia {
-    fn _bucket_index(&self, peer: &NodeId) -> usize {
+    fn _bucket_index(&self, peer: &PeerId) -> usize {
         // Calculate bucket index based on XOR distance from local node
         let distance = self.xor_distance(&self.local_id, peer);
 
@@ -445,8 +444,8 @@ impl super::Dht for TrustWeightedKademlia {
 impl TrustWeightedKademlia {
     /// Select providers based on capacity and trust
     async fn select_providers(&self, key: &Key, count: usize) -> Result<Vec<PeerId>> {
-        // Create a NodeId from the key bytes for XOR distance calculation
-        let target_node = NodeId(*key);
+        // Create a PeerId from the key bytes for XOR distance calculation
+        let target_node = PeerId::from_bytes(*key);
         let providers = self.find_closest_nodes(&target_node, count * 2).await;
 
         let capacities = self.capacities.read().await;

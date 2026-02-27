@@ -22,7 +22,7 @@
 use crate::dht::{DHTNode, Key};
 use crate::error::SecurityError;
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer, IPv4NodeID};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -73,13 +73,13 @@ pub struct IPv4DHTIdentityManager {
     /// IP diversity enforcer
     pub ip_enforcer: IPDiversityEnforcer,
     /// Verified IPv4 nodes
-    verified_nodes: HashMap<PeerId, IPv4DHTNode>,
+    verified_nodes: HashMap<String, IPv4DHTNode>,
     /// Node identity cache
-    identity_cache: HashMap<PeerId, (IPv4NodeID, SystemTime)>,
+    identity_cache: HashMap<String, (IPv4NodeID, SystemTime)>,
     /// IP analysis cache (keyed by IPv4 address)
     ip_analysis_cache: HashMap<Ipv4Addr, (crate::security::IPAnalysis, SystemTime)>,
     /// Banned nodes for security violations
-    banned_nodes: HashMap<PeerId, SystemTime>,
+    banned_nodes: HashMap<String, SystemTime>,
     /// Local IPv4 identity
     local_identity: Option<IPv4NodeID>,
 }
@@ -105,7 +105,7 @@ pub enum IPv4SecurityEvent {
     /// Node joined with valid IPv4 identity
     NodeJoined {
         /// ID of the peer that joined
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv4 address of the peer
         ipv4_addr: Ipv4Addr,
         /// Confidence level of identity verification (0.0-1.0)
@@ -114,7 +114,7 @@ pub enum IPv4SecurityEvent {
     /// Node failed IPv4 verification
     VerificationFailed {
         /// ID of the peer that failed verification
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv4 address that failed verification
         ipv4_addr: Ipv4Addr,
         /// Reason for verification failure
@@ -123,7 +123,7 @@ pub enum IPv4SecurityEvent {
     /// IP diversity violation detected
     DiversityViolation {
         /// ID of the peer causing violation
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv4 address involved in violation
         ipv4_addr: Ipv4Addr,
         /// Type of subnet causing the violation
@@ -132,7 +132,7 @@ pub enum IPv4SecurityEvent {
     /// Node banned for security violations
     NodeBanned {
         /// ID of the banned peer
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv4 address of the banned peer
         ipv4_addr: Ipv4Addr,
         /// Reason for banning
@@ -143,7 +143,7 @@ pub enum IPv4SecurityEvent {
     /// Suspicious activity detected
     SuspiciousActivity {
         /// ID of the suspicious peer
-        peer_id: PeerId,
+        peer_id: String,
         /// IPv4 address of the suspicious peer
         ipv4_addr: Ipv4Addr,
         /// Type of suspicious activity detected
@@ -477,12 +477,12 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Get verified IPv4 node by peer ID
-    pub fn get_verified_node(&self, peer_id: &PeerId) -> Option<&IPv4DHTNode> {
+    pub fn get_verified_node(&self, peer_id: &String) -> Option<&IPv4DHTNode> {
         self.verified_nodes.get(peer_id)
     }
 
     /// Remove node from IPv4 tracking
-    pub fn remove_node(&mut self, peer_id: &PeerId) {
+    pub fn remove_node(&mut self, peer_id: &String) {
         if let Some(ipv4_node) = self.verified_nodes.remove(peer_id) {
             // Remove from IP diversity tracking
             self.ip_enforcer.remove_node(&ipv4_node.ip_analysis);
@@ -491,7 +491,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Check if node is banned
-    pub fn is_node_banned(&self, peer_id: &PeerId) -> bool {
+    pub fn is_node_banned(&self, peer_id: &String) -> bool {
         if let Some(ban_time) = self.banned_nodes.get(peer_id) {
             ban_time.elapsed().unwrap_or(Duration::MAX) < self.config.security_ban_duration
         } else {
@@ -500,7 +500,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Ban a node for security violations
-    pub fn ban_node(&mut self, peer_id: &PeerId, reason: &str) {
+    pub fn ban_node(&mut self, peer_id: &String, reason: &str) {
         self.banned_nodes.insert(peer_id.clone(), SystemTime::now());
         warn!("Banned node {} for: {}", peer_id, reason);
     }
@@ -539,7 +539,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Update node reputation based on IPv4 behavior
-    pub fn update_ipv4_reputation(&mut self, peer_id: &PeerId, positive_behavior: bool) {
+    pub fn update_ipv4_reputation(&mut self, peer_id: &String, positive_behavior: bool) {
         if let Some(ipv4_node) = self.verified_nodes.get_mut(peer_id) {
             // Update reputation score based on behavior
             if positive_behavior {

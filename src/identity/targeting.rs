@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::node_identity::{NodeId, NodeIdentity};
+use super::node_identity::{NodeIdentity, PeerId};
 use super::rejection::{KeyspaceRegion, TargetRegion};
 use crate::Result;
 
@@ -121,8 +121,8 @@ impl RejectedPrefix {
 
     /// Check if a NodeId matches this rejected prefix.
     #[must_use]
-    pub fn matches(&self, node_id: &NodeId) -> bool {
-        let node_bytes = node_id.to_bytes();
+    pub fn matches(&self, peer_id: &PeerId) -> bool {
+        let node_bytes = peer_id.to_bytes();
         let full_bytes = self.prefix_len as usize / 8;
         let remaining_bits = self.prefix_len as usize % 8;
 
@@ -148,8 +148,8 @@ impl RejectedPrefix {
 
     /// Calculate XOR distance to a NodeId in the first `prefix_len` bits.
     #[must_use]
-    pub fn xor_distance_bits(&self, node_id: &NodeId) -> u32 {
-        let node_bytes = node_id.to_bytes();
+    pub fn xor_distance_bits(&self, peer_id: &PeerId) -> u32 {
+        let node_bytes = peer_id.to_bytes();
         let mut distance = 0u32;
 
         let full_bytes = self.prefix_len as usize / 8;
@@ -181,7 +181,7 @@ struct TargeterState {
     rejected_prefixes: HashSet<RejectedPrefix>,
 
     /// Previously generated NodeIds that were rejected.
-    rejected_node_ids: Vec<NodeId>,
+    rejected_peer_ids: Vec<PeerId>,
 
     /// Last target region suggested by network.
     last_target: Option<TargetRegion>,
@@ -228,13 +228,13 @@ impl IdentityTargeter {
     }
 
     /// Record a rejected NodeId.
-    pub fn record_rejected_node_id(&self, node_id: NodeId) {
+    pub fn record_rejected_peer_id(&self, peer_id: PeerId) {
         let mut state = self.state.write();
-        state.rejected_node_ids.push(node_id);
+        state.rejected_peer_ids.push(peer_id);
 
         // Keep bounded list
-        if state.rejected_node_ids.len() > 100 {
-            state.rejected_node_ids.remove(0);
+        if state.rejected_peer_ids.len() > 100 {
+            state.rejected_peer_ids.remove(0);
         }
     }
 
@@ -247,7 +247,7 @@ impl IdentityTargeter {
     pub fn clear_rejected(&self) {
         let mut state = self.state.write();
         state.rejected_prefixes.clear();
-        state.rejected_node_ids.clear();
+        state.rejected_peer_ids.clear();
     }
 
     /// Generate a targeted identity that avoids rejected regions.
@@ -268,7 +268,7 @@ impl IdentityTargeter {
 
         let target = state.last_target.clone();
         let rejected_prefixes: Vec<_> = state.rejected_prefixes.iter().cloned().collect();
-        let rejected_ids: Vec<_> = state.rejected_node_ids.clone();
+        let rejected_ids: Vec<_> = state.rejected_peer_ids.clone();
 
         drop(state); // Release lock before generation
 
@@ -289,7 +289,7 @@ impl IdentityTargeter {
 
             // Score each candidate
             for identity in candidates {
-                let node_id = identity.node_id();
+                let node_id = identity.peer_id();
 
                 // Check if this matches any rejected prefix
                 let matches_rejected = rejected_prefixes.iter().any(|p| p.matches(node_id));
@@ -349,10 +349,10 @@ impl IdentityTargeter {
     /// Score a candidate NodeId based on targeting criteria.
     fn score_candidate(
         &self,
-        node_id: &NodeId,
+        peer_id: &PeerId,
         target: Option<&TargetRegion>,
         rejected_prefixes: &[RejectedPrefix],
-        rejected_ids: &[NodeId],
+        rejected_ids: &[PeerId],
     ) -> f64 {
         let mut score = 0.0;
 
@@ -362,7 +362,7 @@ impl IdentityTargeter {
         } else {
             let min_distance = rejected_prefixes
                 .iter()
-                .map(|p| p.xor_distance_bits(node_id))
+                .map(|p| p.xor_distance_bits(peer_id))
                 .min()
                 .unwrap_or(u32::MAX);
 
@@ -374,11 +374,11 @@ impl IdentityTargeter {
 
         // Target region alignment
         let target_score = if let Some(target) = target {
-            if target.region.contains(node_id) {
+            if target.region.contains(peer_id) {
                 target.confidence
             } else {
                 // Partial score for being close to target
-                let distance = self.xor_distance_to_region(node_id, &target.region);
+                let distance = self.xor_distance_to_region(peer_id, &target.region);
                 (1.0 - (distance as f64 / 256.0)).max(0.0) * target.confidence
             }
         } else {
@@ -392,7 +392,7 @@ impl IdentityTargeter {
         } else {
             let min_distance = rejected_ids
                 .iter()
-                .map(|id| self.leading_zero_distance(node_id, id))
+                .map(|id| self.leading_zero_distance(peer_id, id))
                 .min()
                 .unwrap_or(256);
 
@@ -405,8 +405,8 @@ impl IdentityTargeter {
     }
 
     /// Calculate XOR distance to a keyspace region.
-    fn xor_distance_to_region(&self, node_id: &NodeId, region: &KeyspaceRegion) -> u32 {
-        let node_bytes = node_id.to_bytes();
+    fn xor_distance_to_region(&self, peer_id: &PeerId, region: &KeyspaceRegion) -> u32 {
+        let node_bytes = peer_id.to_bytes();
         let mut distance = 0u32;
 
         let full_bytes = region.prefix_len as usize / 8;
@@ -431,7 +431,7 @@ impl IdentityTargeter {
     }
 
     /// Count leading zero bits in XOR distance between two NodeIds.
-    fn leading_zero_distance(&self, a: &NodeId, b: &NodeId) -> u32 {
+    fn leading_zero_distance(&self, a: &PeerId, b: &PeerId) -> u32 {
         let distance = a.xor_distance(b);
 
         let mut leading_zeros = 0u32;
@@ -455,7 +455,7 @@ impl IdentityTargeter {
             total_attempts: state.total_attempts,
             successful_generations: state.successful_generations,
             rejected_prefix_count: state.rejected_prefixes.len(),
-            rejected_id_count: state.rejected_node_ids.len(),
+            rejected_id_count: state.rejected_peer_ids.len(),
         }
     }
 
@@ -575,8 +575,8 @@ impl Default for IdentityTargeterBuilder {
 mod tests {
     use super::*;
 
-    fn test_node_id() -> NodeId {
-        NodeId([0x42; 32])
+    fn test_node_id() -> PeerId {
+        PeerId([0x42; 32])
     }
 
     #[test]
@@ -584,11 +584,11 @@ mod tests {
         let prefix = RejectedPrefix::new(vec![0xAB], 8);
 
         // Should match
-        let matching_id = NodeId([0xAB; 32]);
+        let matching_id = PeerId([0xAB; 32]);
         assert!(prefix.matches(&matching_id));
 
         // Should not match
-        let non_matching_id = NodeId([0x12; 32]);
+        let non_matching_id = PeerId([0x12; 32]);
         assert!(!prefix.matches(&non_matching_id));
     }
 
@@ -598,11 +598,11 @@ mod tests {
         let prefix = RejectedPrefix::new(vec![0xF0], 4);
 
         // 0xFF starts with 1111, should match
-        let matching_id = NodeId([0xFF; 32]);
+        let matching_id = PeerId([0xFF; 32]);
         assert!(prefix.matches(&matching_id));
 
         // 0x00 starts with 0000, should not match
-        let non_matching_id = NodeId([0x00; 32]);
+        let non_matching_id = PeerId([0x00; 32]);
         assert!(!prefix.matches(&non_matching_id));
     }
 
@@ -611,15 +611,15 @@ mod tests {
         let prefix = RejectedPrefix::new(vec![0xFF], 8);
 
         // Same prefix = 0 distance
-        let same = NodeId([0xFF; 32]);
+        let same = PeerId([0xFF; 32]);
         assert_eq!(prefix.xor_distance_bits(&same), 0);
 
         // All bits different = 8 distance
-        let opposite = NodeId([0x00; 32]);
+        let opposite = PeerId([0x00; 32]);
         assert_eq!(prefix.xor_distance_bits(&opposite), 8);
 
         // Half bits different = 4 distance
-        let half = NodeId([0xF0; 32]);
+        let half = PeerId([0xF0; 32]);
         assert_eq!(prefix.xor_distance_bits(&half), 4);
     }
 
@@ -667,8 +667,8 @@ mod tests {
         assert!(identity.is_ok());
 
         // The generated identity should not start with rejected prefixes
-        let node_id = identity.unwrap();
-        let id_bytes = node_id.node_id().to_bytes();
+        let identity = identity.unwrap();
+        let id_bytes = identity.peer_id().to_bytes();
 
         // Check it doesn't start with 0000 or 0001 (first nibbles)
         let first_nibble = id_bytes[0] >> 4;
@@ -701,7 +701,7 @@ mod tests {
         let config = TargetingConfig::default();
         let targeter = IdentityTargeter::new(config);
 
-        targeter.record_rejected_node_id(test_node_id());
+        targeter.record_rejected_peer_id(test_node_id());
 
         let stats = targeter.stats();
         assert_eq!(stats.rejected_id_count, 1);
@@ -713,7 +713,7 @@ mod tests {
         let targeter = IdentityTargeter::new(config);
 
         targeter.add_rejected_prefix(vec![0xAB], 8);
-        targeter.record_rejected_node_id(test_node_id());
+        targeter.record_rejected_peer_id(test_node_id());
 
         assert!(targeter.has_rejected_prefixes());
 

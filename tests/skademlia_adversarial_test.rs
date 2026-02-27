@@ -23,7 +23,7 @@ use saorsa_core::dht::authenticated_sibling_broadcast::{
 };
 use saorsa_core::dht::core_engine::{NodeCapacity, NodeId};
 use saorsa_core::dht::{DHTNode, Key};
-use saorsa_core::identity::node_identity::NodeId as PeerId;
+use saorsa_core::identity::node_identity::PeerId;
 use std::time::{Duration, SystemTime};
 
 // ============================================================================

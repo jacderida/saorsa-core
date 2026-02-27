@@ -223,13 +223,13 @@ pub struct CapacityStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::node_identity::NodeId;
+    use crate::identity::node_identity::PeerId;
 
     #[tokio::test]
     async fn test_capacity_histogram() {
-        let peer1 = NodeId::from_bytes([1u8; 32]);
-        let peer2 = NodeId::from_bytes([2u8; 32]);
-        let peer3 = NodeId::from_bytes([3u8; 32]);
+        let peer1 = PeerId::from_bytes([1u8; 32]);
+        let peer2 = PeerId::from_bytes([2u8; 32]);
+        let peer3 = PeerId::from_bytes([3u8; 32]);
 
         let manager = CapacityManager::new(peer1.clone(), 10_000_000_000); // 10GB
 

@@ -576,7 +576,7 @@ mod tests {
     fn random_peer_id() -> PeerId {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill(&mut bytes);
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     #[test]

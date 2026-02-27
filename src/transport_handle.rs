@@ -17,6 +17,7 @@
 //! message I/O, events) extracted from [`P2PNode`] to enable sharing between
 //! `P2PNode` and [`DhtNetworkManager`] without coupling to the full node.
 
+use crate::NetworkAddress;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::identity::node_identity::NodeIdentity;
@@ -32,7 +33,6 @@ use crate::transport::ant_quic_adapter::{
     ConnectionEvent, DualStackNetworkNode, ant_peer_id_to_string,
 };
 use crate::validation::{RateLimitConfig, RateLimiter};
-use crate::{NetworkAddress, PeerId};
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -61,6 +61,10 @@ const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
 const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const TEST_STALE_PEER_THRESHOLD_SECS: u64 = 60;
 
+/// Internal protocol for automatic identity announcement on connect.
+/// Filtered from P2PEvent::Message emission — not visible to applications.
+const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
+
 /// Touch a channel's `last_seen` timestamp to prove it is still alive.
 ///
 /// Acquires a write lock on the peer map, so callers should not already
@@ -74,7 +78,7 @@ async fn touch_channel_last_seen(peers: &RwLock<HashMap<String, PeerInfo>>, chan
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
     /// Application-level peer ID (pre-computed, possibly random).
-    pub peer_id: PeerId,
+    pub peer_id: String,
     /// Primary listen address.
     pub listen_addr: SocketAddr,
     /// Whether IPv6 dual-stack is enabled.
@@ -106,10 +110,10 @@ pub struct TransportConfig {
 /// [`DhtNetworkManager`](crate::dht_network_manager::DhtNetworkManager)
 /// hold `Arc<TransportHandle>` so they share the same transport state.
 pub struct TransportHandle {
-    peer_id: PeerId,
+    peer_id: String,
     dual_node: Arc<DualStackNetworkNode>,
-    peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
-    active_connections: Arc<RwLock<HashSet<PeerId>>>,
+    peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
+    active_connections: Arc<RwLock<HashSet<String>>>,
     event_tx: broadcast::Sender<P2PEvent>,
     listen_addrs: RwLock<Vec<SocketAddr>>,
     rate_limiter: Arc<RateLimiter>,
@@ -222,6 +226,7 @@ impl TransportHandle {
             let shutdown_token = shutdown.clone();
             let p2c = Arc::clone(&peer_to_channel);
             let c2p = Arc::clone(&channel_to_peers);
+            let identity_clone = config.node_identity.clone();
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -235,6 +240,7 @@ impl TransportHandle {
                     shutdown_token,
                     p2c,
                     c2p,
+                    identity_clone,
                 )
                 .await;
             });
@@ -367,7 +373,7 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Get the application-level peer ID.
-    pub fn peer_id(&self) -> &PeerId {
+    pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
 
@@ -415,7 +421,7 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Get list of authenticated app-level peer IDs.
-    pub async fn connected_peers(&self) -> Vec<PeerId> {
+    pub async fn connected_peers(&self) -> Vec<String> {
         self.peer_to_channel.read().await.keys().cloned().collect()
     }
 
@@ -440,7 +446,7 @@ impl TransportHandle {
     /// Accepts either a channel ID (direct lookup) or an app-level peer ID
     /// (resolved via `peer_to_channel` mapping). This allows DHT code to pass
     /// app-level peer IDs without manual channel resolution.
-    pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
+    pub async fn peer_info(&self, peer_id: &str) -> Option<PeerInfo> {
         let peers = self.peers.read().await;
         if let Some(info) = peers.get(peer_id) {
             return Some(info.clone());
@@ -471,7 +477,7 @@ impl TransportHandle {
 
     /// List all active connections with peer IDs and addresses (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(PeerId, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
         let active = self.active_connections.read().await;
         let peers = self.peers.read().await;
 
@@ -495,7 +501,7 @@ impl TransportHandle {
     }
 
     /// Check if a peer exists in the peers map.
-    pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+    pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
         self.peers.read().await.contains_key(peer_id)
     }
 
@@ -549,7 +555,7 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Connect to a peer at the given address.
-    pub async fn connect_peer(&self, address: &str) -> Result<PeerId> {
+    pub async fn connect_peer(&self, address: &str) -> Result<String> {
         // Check production limits if resource manager is enabled
         let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
             Some(resource_manager.acquire_connection().await?)
@@ -635,7 +641,7 @@ impl TransportHandle {
     }
 
     /// Disconnect from a peer, closing the underlying QUIC connection.
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
+    pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
         info!("Disconnecting from peer: {}", peer_id);
 
         self.dual_node.disconnect_peer_string(peer_id).await.ok();
@@ -654,7 +660,7 @@ impl TransportHandle {
 
     /// Disconnect from all peers.
     async fn disconnect_all_peers(&self) -> Result<()> {
-        let peer_ids: Vec<PeerId> = self.peers.read().await.keys().cloned().collect();
+        let peer_ids: Vec<String> = self.peers.read().await.keys().cloned().collect();
         for peer_id in peer_ids {
             self.disconnect_peer(&peer_id).await?;
         }
@@ -672,12 +678,7 @@ impl TransportHandle {
     /// `peer_id` can be either a channel ID (from QUIC) or an app-level
     /// NodeId hex string. When an app-level ID is given, the internal
     /// `peer_to_channel` mapping is used to resolve it.
-    pub async fn send_message(
-        &self,
-        peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
+    pub async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
         // Resolve: if peer_id is an app-level NodeId, look up the channel ID.
         let channel = self.resolve_channel_id(peer_id).await;
         let effective_id = channel.as_deref().unwrap_or(peer_id);
@@ -783,7 +784,7 @@ impl TransportHandle {
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
-    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
+    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<String> {
         self.channel_to_peers
             .read()
             .await
@@ -803,7 +804,7 @@ impl TransportHandle {
     /// need trust feedback should wrap this method (as `P2PNode` does).
     pub async fn send_request(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         protocol: &str,
         data: Vec<u8>,
         timeout: Duration,
@@ -865,7 +866,7 @@ impl TransportHandle {
             Ok(Ok(response_bytes)) => {
                 let latency = started_at.elapsed();
                 Ok(PeerResponse {
-                    peer_id: peer_id.clone(),
+                    peer_id: peer_id.to_string(),
                     data: response_bytes,
                     latency,
                 })
@@ -891,7 +892,7 @@ impl TransportHandle {
     /// Send a response to a previously received request.
     pub async fn send_response(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         protocol: &str,
         message_id: &str,
         data: Vec<u8>,
@@ -922,44 +923,79 @@ impl TransportHandle {
     ///
     /// If `node_identity` is set, signs the message with the node's ML-DSA-65 key.
     fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u8>> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                P2PError::Network(NetworkError::ProtocolError(
-                    format!("System time error: {}", e).into(),
-                ))
-            })?
-            .as_secs();
-
         let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
             from: self.peer_id.clone(),
-            timestamp,
+            timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
         };
 
-        // Sign the message if we have a node identity
         if let Some(ref identity) = self.node_identity {
-            let signable = Self::compute_signable_bytes(
-                &message.protocol,
-                &message.data,
-                &message.from,
-                message.timestamp,
-            )?;
-            let sig = identity.sign(&signable).map_err(|e| {
-                P2PError::Network(NetworkError::ProtocolError(
-                    format!("Failed to sign message: {e}").into(),
-                ))
-            })?;
-            message.public_key = identity.public_key().as_bytes().to_vec();
-            message.signature = sig.as_bytes().to_vec();
+            Self::sign_wire_message(&mut message, identity)?;
         }
 
-        postcard::to_stdvec(&message).map_err(|e| {
+        Self::serialize_wire_message(&message)
+    }
+
+    /// Build a signed identity announce as serialized bytes (static — no `&self`).
+    ///
+    /// Used by the lifecycle monitor to send an announce immediately after a
+    /// transport connection is established, before the full `TransportHandle`
+    /// is available in that context.
+    fn create_identity_announce_bytes(
+        config_peer_id: &str,
+        identity: &NodeIdentity,
+    ) -> Result<Vec<u8>> {
+        let mut message = WireMessage {
+            protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
+            data: vec![],
+            from: config_peer_id.to_string(),
+            timestamp: Self::current_timestamp_secs()?,
+            public_key: Vec::new(),
+            signature: Vec::new(),
+        };
+
+        Self::sign_wire_message(&mut message, identity)?;
+        Self::serialize_wire_message(&message)
+    }
+
+    /// Get the current Unix timestamp in seconds.
+    fn current_timestamp_secs() -> Result<u64> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|e| {
+                P2PError::Network(NetworkError::ProtocolError(
+                    format!("System time error: {e}").into(),
+                ))
+            })
+    }
+
+    /// Sign a `WireMessage` in place using the given identity.
+    fn sign_wire_message(message: &mut WireMessage, identity: &NodeIdentity) -> Result<()> {
+        let signable = Self::compute_signable_bytes(
+            &message.protocol,
+            &message.data,
+            &message.from,
+            message.timestamp,
+        )?;
+        let sig = identity.sign(&signable).map_err(|e| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to sign message: {e}").into(),
+            ))
+        })?;
+        message.public_key = identity.public_key().as_bytes().to_vec();
+        message.signature = sig.as_bytes().to_vec();
+        Ok(())
+    }
+
+    /// Serialize a `WireMessage` to postcard bytes.
+    fn serialize_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
+        postcard::to_stdvec(message).map_err(|e| {
             P2PError::Transport(crate::error::TransportError::StreamError(
-                format!("Failed to serialize message: {e}").into(),
+                format!("Failed to serialize wire message: {e}").into(),
             ))
         })
     }
@@ -998,7 +1034,7 @@ impl TransportHandle {
             data.len()
         );
 
-        let peer_list: Vec<PeerId> = {
+        let peer_list: Vec<String> = {
             let peers_guard = self.peers.read().await;
             peers_guard.keys().cloned().collect()
         };
@@ -1170,6 +1206,14 @@ impl TransportHandle {
                             if is_new_peer {
                                 broadcast_event(&event_tx, P2PEvent::PeerConnected(app_id.clone()));
                             }
+                        }
+
+                        // Identity announces are internal plumbing — don't
+                        // emit as app-level messages.
+                        if let P2PEvent::Message { ref topic, .. } = event
+                            && topic == IDENTITY_ANNOUNCE_PROTOCOL
+                        {
+                            continue;
                         }
 
                         if let P2PEvent::Message {
@@ -1345,10 +1389,11 @@ impl TransportHandle {
         peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         event_tx: broadcast::Sender<P2PEvent>,
         geo_provider: Arc<BgpGeoProvider>,
-        _local_peer_id: String,
+        config_peer_id: String,
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
         channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        node_identity: Option<Arc<NodeIdentity>>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1417,8 +1462,25 @@ impl TransportHandle {
                                     );
                                 }
 
-                                // PeerConnected is emitted later when the peer's identity is
-                                // authenticated via a signed message — not at transport level.
+                                // Send identity announce so the remote peer can authenticate us.
+                                if let Some(ref identity) = node_identity {
+                                    match Self::create_identity_announce_bytes(&config_peer_id, identity) {
+                                        Ok(announce_bytes) => {
+                                            if let Err(e) = dual_node
+                                                .send_to_peer_string_optimized(&channel_id, &announce_bytes)
+                                                .await
+                                            {
+                                                warn!("Failed to send identity announce to {channel_id}: {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to create identity announce: {e}");
+                                        }
+                                    }
+                                }
+
+                                // PeerConnected is emitted when the remote receives and
+                                // verifies our identity announce — not at transport level.
                             }
                             ConnectionEvent::Lost { peer_id, reason }
                             | ConnectionEvent::Failed { peer_id, reason } => {
@@ -1515,8 +1577,8 @@ impl TransportHandle {
 
     /// Periodic maintenance task — detects stale peers and removes them.
     async fn periodic_maintenance_task(
-        peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
-        active_connections: Arc<RwLock<HashSet<PeerId>>>,
+        peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
+        active_connections: Arc<RwLock<HashSet<String>>>,
         event_tx: broadcast::Sender<P2PEvent>,
         stale_threshold: Duration,
         shutdown: CancellationToken,
@@ -1604,11 +1666,11 @@ fn validate_protocol_name(protocol: &str) -> Result<()> {
 ///
 /// Returns `(peers_to_remove, peers_to_mark_disconnected)`.
 fn categorize_stale_peers(
-    peers: &HashMap<PeerId, PeerInfo>,
+    peers: &HashMap<String, PeerInfo>,
     now: Instant,
     stale_threshold: Duration,
     cleanup_threshold: Duration,
-) -> (Vec<PeerId>, Vec<PeerId>) {
+) -> (Vec<String>, Vec<String>) {
     let mut peers_to_remove = Vec::new();
     let mut peers_to_mark_disconnected = Vec::new();
 
@@ -1658,11 +1720,11 @@ fn categorize_stale_peers(
 
 #[async_trait::async_trait]
 impl NetworkSender for TransportHandle {
-    async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()> {
+    async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
         TransportHandle::send_message(self, peer_id, protocol, data).await
     }
 
-    fn local_peer_id(&self) -> &PeerId {
+    fn local_peer_id(&self) -> &str {
         self.peer_id()
     }
 }
@@ -1671,7 +1733,7 @@ impl NetworkSender for TransportHandle {
 #[cfg(test)]
 impl TransportHandle {
     /// Insert a peer into the peers map (test helper)
-    pub(crate) async fn inject_peer(&self, peer_id: PeerId, info: PeerInfo) {
+    pub(crate) async fn inject_peer(&self, peer_id: String, info: PeerInfo) {
         self.peers.write().await.insert(peer_id, info);
     }
 

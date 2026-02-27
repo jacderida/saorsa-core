@@ -43,7 +43,11 @@ pub mod targeting;
 mod four_words_error_tests;
 
 pub use four_words::{FourWordAddress, WordEncoder};
-pub use node_identity::{IdentityData, NodeId, NodeIdentity};
+pub use node_identity::{IdentityData, NodeIdentity, PeerId};
+
+/// Backward-compat re-export — use [`PeerId`] instead.
+#[deprecated(note = "use PeerId")]
+pub type NodeId = PeerId;
 pub use secure_node_identity::SecureNodeIdentity;
 
 // Identity restart system exports

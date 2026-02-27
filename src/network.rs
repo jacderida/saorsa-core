@@ -24,10 +24,10 @@ use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
-use crate::identity::node_identity::{NodeId as IdentityNodeId, NodeIdentity};
+use crate::NetworkAddress;
+use crate::identity::node_identity::{NodeIdentity, PeerId as IdentityPeerId};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature};
-use crate::{NetworkAddress, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,7 +101,7 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Local peer ID for this node
-    pub peer_id: Option<PeerId>,
+    pub peer_id: Option<String>,
 
     /// Addresses to listen on for incoming connections
     pub listen_addrs: Vec<std::net::SocketAddr>,
@@ -284,7 +284,7 @@ impl NodeConfig {
 /// Builder for constructing NodeConfig with fluent API
 #[derive(Debug, Clone, Default)]
 pub struct NodeConfigBuilder {
-    peer_id: Option<PeerId>,
+    peer_id: Option<String>,
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
@@ -299,7 +299,7 @@ pub struct NodeConfigBuilder {
 
 impl NodeConfigBuilder {
     /// Set the peer ID
-    pub fn peer_id(mut self, peer_id: PeerId) -> Self {
+    pub fn peer_id(mut self, peer_id: String) -> Self {
         self.peer_id = Some(peer_id);
         self
     }
@@ -608,7 +608,7 @@ pub enum NetworkEvent {
     /// A new peer has connected
     PeerConnected {
         /// The identifier of the newly connected peer
-        peer_id: PeerId,
+        peer_id: String,
         /// The network addresses where the peer can be reached
         addresses: Vec<String>,
     },
@@ -616,7 +616,7 @@ pub enum NetworkEvent {
     /// A peer has disconnected
     PeerDisconnected {
         /// The identifier of the disconnected peer
-        peer_id: PeerId,
+        peer_id: String,
         /// The reason for the disconnection
         reason: String,
     },
@@ -624,7 +624,7 @@ pub enum NetworkEvent {
     /// A message was received from a peer
     MessageReceived {
         /// The identifier of the sending peer
-        peer_id: PeerId,
+        peer_id: String,
         /// The protocol used for the message
         protocol: String,
         /// The raw message data
@@ -634,7 +634,7 @@ pub enum NetworkEvent {
     /// A connection attempt failed
     ConnectionFailed {
         /// The identifier of the peer (if known)
-        peer_id: Option<PeerId>,
+        peer_id: Option<String>,
         /// The address where connection was attempted
         address: String,
         /// The error message describing the failure
@@ -670,14 +670,14 @@ pub enum P2PEvent {
         topic: String,
         /// For signed messages this is the authenticated app-level peer ID;
         /// for unsigned messages it is the channel ID.
-        source: PeerId,
+        source: String,
         /// Raw message data payload
         data: Vec<u8>,
     },
     /// An authenticated peer has connected (first signed message verified on any channel).
-    PeerConnected(PeerId),
+    PeerConnected(String),
     /// An authenticated peer has fully disconnected (all channels closed).
-    PeerDisconnected(PeerId),
+    PeerDisconnected(String),
 }
 
 /// Response from a peer to a request sent via [`P2PNode::send_request`].
@@ -687,7 +687,7 @@ pub enum P2PEvent {
 #[derive(Debug, Clone)]
 pub struct PeerResponse {
     /// The peer that sent the response.
-    pub peer_id: PeerId,
+    pub peer_id: String,
     /// Raw response payload bytes.
     pub data: Vec<u8>,
     /// Round-trip latency from request to response.
@@ -731,7 +731,7 @@ pub struct P2PNode {
     config: NodeConfig,
 
     /// Our peer ID
-    peer_id: PeerId,
+    peer_id: String,
 
     /// Transport handle owning all QUIC / peer / event state
     transport: Arc<crate::transport_handle::TransportHandle>,
@@ -814,7 +814,7 @@ impl P2PNode {
         {
             let nid = crate::dht::derive_dht_key_from_peer_id(&peer_id);
             let _twdht = std::sync::Arc::new(crate::dht::TrustWeightedKademlia::new(
-                crate::identity::node_identity::NodeId::from_bytes(nid),
+                crate::identity::node_identity::PeerId::from_bytes(nid),
             ));
             // TODO: Update to use new clean API
             // let _ = crate::api::set_dht_instance(twdht);
@@ -953,7 +953,7 @@ impl P2PNode {
     }
 
     /// Get the peer ID of this node
-    pub fn peer_id(&self) -> &PeerId {
+    pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
 
@@ -1194,7 +1194,7 @@ impl P2PNode {
     /// ```
     pub async fn send_request(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         protocol: &str,
         data: Vec<u8>,
         timeout: Duration,
@@ -1223,7 +1223,7 @@ impl P2PNode {
 
     pub async fn send_response(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         protocol: &str,
         message_id: &str,
         data: Vec<u8>,
@@ -1371,7 +1371,7 @@ impl P2PNode {
     }
 
     /// Get connected peers
-    pub async fn connected_peers(&self) -> Vec<PeerId> {
+    pub async fn connected_peers(&self) -> Vec<String> {
         self.transport.connected_peers().await
     }
 
@@ -1381,7 +1381,7 @@ impl P2PNode {
     }
 
     /// Get peer info
-    pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
+    pub async fn peer_info(&self, peer_id: &str) -> Option<PeerInfo> {
         self.transport.peer_info(peer_id).await
     }
 
@@ -1393,7 +1393,7 @@ impl P2PNode {
 
     /// List all active transport-level connections (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(PeerId, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
         self.transport.list_active_connections().await
     }
 
@@ -1404,17 +1404,17 @@ impl P2PNode {
     }
 
     /// Check if an authenticated peer is connected (has at least one active channel).
-    pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+    pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
         self.transport.is_peer_connected(peer_id).await
     }
 
     /// Connect to a peer
-    pub async fn connect_peer(&self, address: &str) -> Result<PeerId> {
+    pub async fn connect_peer(&self, address: &str) -> Result<String> {
         self.transport.connect_peer(address).await
     }
 
     /// Disconnect from a peer
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
+    pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
         self.transport.disconnect_peer(peer_id).await
     }
 
@@ -1425,12 +1425,7 @@ impl P2PNode {
     }
 
     /// Send a message to a peer
-    pub async fn send_message(
-        &self,
-        peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
+    pub async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
         self.transport.send_message(peer_id, protocol, data).await
     }
 }
@@ -1569,7 +1564,7 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<String
     let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
         .map_err(|e| format!("invalid public key: {e:?}"))?;
 
-    let node_id = IdentityNodeId::from_public_key(&pubkey);
+    let node_id = IdentityPeerId::from_public_key(&pubkey);
 
     let signable = postcard::to_stdvec(&(
         &message.protocol,
@@ -1682,7 +1677,7 @@ impl P2PNode {
     }
 
     /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
+    pub async fn add_discovered_peer(&self, peer_id: String, addresses: Vec<String>) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.write().await;
             let socket_addresses: Vec<std::net::SocketAddr> = addresses
@@ -1700,7 +1695,7 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        peer_id: &PeerId,
+        peer_id: &str,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
@@ -1848,7 +1843,7 @@ impl P2PNode {
 
         // Connect to bootstrap peers and perform peer discovery
         let mut successful_connections = 0;
-        let mut connected_peer_ids: Vec<PeerId> = Vec::new();
+        let mut connected_peer_ids: Vec<String> = Vec::new();
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
@@ -1936,10 +1931,10 @@ impl P2PNode {
 #[async_trait::async_trait]
 pub trait NetworkSender: Send + Sync {
     /// Send a message to a specific peer
-    async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()>;
+    async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()>;
 
     /// Get our local peer ID
-    fn local_peer_id(&self) -> &PeerId;
+    fn local_peer_id(&self) -> &str;
 }
 
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
@@ -1964,7 +1959,7 @@ impl NodeBuilder {
     }
 
     /// Set the peer ID
-    pub fn with_peer_id(mut self, peer_id: PeerId) -> Self {
+    pub fn with_peer_id(mut self, peer_id: String) -> Self {
         self.config.peer_id = Some(peer_id);
         self
     }
@@ -2090,7 +2085,7 @@ mod diversity_tests {
 
 /// Helper function to register a new channel
 pub(crate) async fn register_new_channel(
-    peers: &Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
+    peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
     channel_id: &str,
     remote_addr: &NetworkAddress,
 ) {
@@ -3137,7 +3132,7 @@ mod tests {
         let parsed =
             parse_protocol_message(&bytes, "transport-xyz").expect("signed message should parse");
 
-        let expected_node_id = identity.node_id().to_hex();
+        let expected_node_id = identity.peer_id().to_hex();
         assert_eq!(
             parsed.authenticated_node_id.as_deref(),
             Some(expected_node_id.as_str())

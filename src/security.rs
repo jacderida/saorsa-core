@@ -17,7 +17,6 @@
 //! It implements IPv6-based node ID generation and IP diversity enforcement to prevent
 //! large-scale Sybil attacks while maintaining network openness.
 
-use crate::PeerId;
 use crate::quantum_crypto::ant_quic_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, ml_dsa_sign, ml_dsa_verify,
 };
@@ -315,7 +314,7 @@ pub enum UnifiedIPAnalysis {
 #[derive(Debug, Clone)]
 pub struct NodeReputation {
     /// Peer ID
-    pub peer_id: PeerId,
+    pub peer_id: String,
     /// Fraction of queries answered successfully
     pub response_rate: f64,
     /// Average response time
@@ -1233,7 +1232,7 @@ pub struct DiversityStats {
 /// Reputation manager for tracking node behavior
 #[derive(Debug)]
 pub struct ReputationManager {
-    reputations: HashMap<PeerId, NodeReputation>,
+    reputations: HashMap<String, NodeReputation>,
     reputation_decay: f64,
     min_reputation: f64,
 }
@@ -1249,25 +1248,25 @@ impl ReputationManager {
     }
 
     /// Get reputation for a peer
-    pub fn get_reputation(&self, peer_id: &PeerId) -> Option<&NodeReputation> {
+    pub fn get_reputation(&self, peer_id: &str) -> Option<&NodeReputation> {
         self.reputations.get(peer_id)
     }
 
     /// Update reputation based on interaction
-    pub fn update_reputation(&mut self, peer_id: &PeerId, success: bool, response_time: Duration) {
-        let reputation =
-            self.reputations
-                .entry(peer_id.clone())
-                .or_insert_with(|| NodeReputation {
-                    peer_id: peer_id.clone(),
-                    response_rate: 0.5,
-                    response_time: Duration::from_millis(500),
-                    consistency_score: 0.5,
-                    uptime_estimate: Duration::from_secs(0),
-                    routing_accuracy: 0.5,
-                    last_seen: SystemTime::now(),
-                    interaction_count: 0,
-                });
+    pub fn update_reputation(&mut self, peer_id: &str, success: bool, response_time: Duration) {
+        let reputation = self
+            .reputations
+            .entry(peer_id.to_owned())
+            .or_insert_with(|| NodeReputation {
+                peer_id: peer_id.to_owned(),
+                response_rate: 0.5,
+                response_time: Duration::from_millis(500),
+                consistency_score: 0.5,
+                uptime_estimate: Duration::from_secs(0),
+                routing_accuracy: 0.5,
+                last_seen: SystemTime::now(),
+                interaction_count: 0,
+            });
 
         // Use higher learning rate for faster convergence in tests
         let alpha = 0.3; // Increased from 0.1 for better test convergence

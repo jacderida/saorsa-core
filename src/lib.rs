@@ -322,18 +322,8 @@ pub use crate::placement::{
     WeightedPlacementStrategy,
 };
 
-// Network address types
-/// Peer identifier used throughout Saorsa
-///
-/// Currently implemented as a String for simplicity, but should be enhanced
-/// with cryptographic verification and validation in future versions.
-///
-/// TODO: Replace with a proper newtype that includes validation:
-/// - Non-empty string validation
-/// - Character set validation (alphanumeric + - _)
-/// - Length limits (max 256 characters)
-/// - Optional cryptographic verification
-pub type PeerId = String;
+// Canonical peer identity type — 32-byte SHA-256 hash of ML-DSA-65 public key.
+pub use identity::node_identity::PeerId;
 
 /// Transport channel identifier (e.g. a QUIC connection).
 ///
