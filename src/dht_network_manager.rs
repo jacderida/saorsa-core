@@ -2297,17 +2297,17 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
-        for peer_id in connected {
-            self.handle_peer_connected(peer_id).await;
+        for channel_id in connected {
+            self.handle_peer_connected(channel_id).await;
         }
     }
 
     /// Handle a connected peer event in an idempotent way.
-    async fn handle_peer_connected(&self, peer_id: PeerId) {
-        let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
+    async fn handle_peer_connected(&self, channel_id: String) {
+        let Some(app_peer_id) = self.canonical_app_peer_id(&channel_id).await else {
             debug!(
-                "Deferring DHT tracking for transport peer {} until app identity is authenticated",
-                peer_id
+                "Deferring DHT tracking for transport channel {} until app identity is authenticated",
+                channel_id
             );
             return;
         };
@@ -2415,8 +2415,8 @@ impl DhtNetworkManager {
                     recv = events.recv() => {
                         match recv {
                             Ok(event) => match event {
-                                crate::network::P2PEvent::PeerConnected(peer_id) => {
-                                    self_arc.handle_peer_connected(peer_id).await;
+                                crate::network::P2PEvent::PeerConnected(channel_id) => {
+                                    self_arc.handle_peer_connected(channel_id).await;
                                 }
                                 crate::network::P2PEvent::PeerDisconnected(channel_id) => {
                                     // Find all app-level peers that were on this channel

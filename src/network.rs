@@ -564,8 +564,8 @@ impl Default for SecurityConfig {
 /// Information about a connected peer
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    /// Peer identifier
-    pub peer_id: PeerId,
+    /// Transport-level channel identifier (e.g. QUIC connection ID)
+    pub channel_id: String,
 
     /// Peer's addresses
     pub addresses: Vec<String>,
@@ -667,15 +667,16 @@ pub enum P2PEvent {
     Message {
         /// Topic or channel the message was sent on
         topic: String,
-        /// Peer ID of the message sender
+        /// For signed messages this is the authenticated app-level peer ID;
+        /// for unsigned messages it is the channel ID.
         source: PeerId,
         /// Raw message data payload
         data: Vec<u8>,
     },
-    /// A new peer has connected to the network
-    PeerConnected(PeerId),
-    /// A peer has disconnected from the network
-    PeerDisconnected(PeerId),
+    /// A new peer has connected to the network (channel ID of the new connection)
+    PeerConnected(String),
+    /// A peer has disconnected from the network (channel ID of the lost connection)
+    PeerDisconnected(String),
 }
 
 /// Response from a peer to a request sent via [`P2PNode::send_request`].
@@ -1383,9 +1384,9 @@ impl P2PNode {
         self.transport.peer_info(peer_id).await
     }
 
-    /// Get the peer ID for a given socket address, if connected
-    pub async fn get_peer_id_by_address(&self, addr: &str) -> Option<PeerId> {
-        self.transport.get_peer_id_by_address(addr).await
+    /// Get the channel ID for a given socket address, if connected
+    pub async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
+        self.transport.get_channel_id_by_address(addr).await
     }
 
     /// List all active connections with their peer IDs and addresses
@@ -1393,9 +1394,9 @@ impl P2PNode {
         self.transport.list_active_connections().await
     }
 
-    /// Remove a peer from the peers map
-    pub async fn remove_peer(&self, peer_id: &PeerId) -> bool {
-        self.transport.remove_peer(peer_id).await
+    /// Remove a channel from the peers map
+    pub async fn remove_channel(&self, channel_id: &str) -> bool {
+        self.transport.remove_channel(channel_id).await
     }
 
     /// Check if a peer is connected
@@ -1414,8 +1415,8 @@ impl P2PNode {
     }
 
     /// Check if a connection to a peer is active
-    pub async fn is_connection_active(&self, peer_id: &str) -> bool {
-        self.transport.is_connection_active(peer_id).await
+    pub async fn is_connection_active(&self, channel_id: &str) -> bool {
+        self.transport.is_connection_active(channel_id).await
     }
 
     /// Send a message to a peer
@@ -2082,15 +2083,15 @@ mod diversity_tests {
     }
 }
 
-/// Helper function to register a new peer
-pub(crate) async fn register_new_peer(
+/// Helper function to register a new channel
+pub(crate) async fn register_new_channel(
     peers: &Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
-    peer_id: &PeerId,
+    channel_id: &str,
     remote_addr: &NetworkAddress,
 ) {
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
-        peer_id: peer_id.clone(),
+        channel_id: channel_id.to_owned(),
         addresses: vec![remote_addr.to_string()],
         connected_at: tokio::time::Instant::now(),
         last_seen: tokio::time::Instant::now(),
@@ -2098,7 +2099,7 @@ pub(crate) async fn register_new_peer(
         protocols: vec!["p2p-core/1.0.0".to_string()],
         heartbeat_count: 0,
     };
-    peers_guard.insert(peer_id.clone(), peer_info);
+    peers_guard.insert(channel_id.to_owned(), peer_info);
 }
 
 #[cfg(test)]
@@ -2303,7 +2304,7 @@ mod tests {
         let peer_info = node1.peer_info(&peer_id).await;
         assert!(peer_info.is_some());
         let info = peer_info.expect("Peer info should exist after adding peer");
-        assert_eq!(info.peer_id, peer_id);
+        assert_eq!(info.channel_id, peer_id);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.protocols.contains(&"p2p-foundation/1.0".to_string()));
 
@@ -2669,7 +2670,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_info_structure() {
         let peer_info = PeerInfo {
-            peer_id: "test_peer".to_string(),
+            channel_id: "test_peer".to_string(),
             addresses: vec!["/ip4/127.0.0.1/tcp/9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2678,7 +2679,7 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        assert_eq!(peer_info.peer_id, "test_peer");
+        assert_eq!(peer_info.channel_id, "test_peer");
         assert_eq!(peer_info.addresses.len(), 1);
         assert_eq!(peer_info.status, ConnectionStatus::Connected);
         assert_eq!(peer_info.protocols.len(), 1);
@@ -2699,16 +2700,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_found() -> Result<()> {
+    async fn test_get_channel_id_by_address_found() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Manually insert a peer for testing
-        let test_peer_id = "peer_test_123".to_string();
+        let test_channel_id = "peer_test_123".to_string();
         let test_address = "192.168.1.100:9000".to_string();
 
         let peer_info = PeerInfo {
-            peer_id: test_peer_id.clone(),
+            channel_id: test_channel_id.clone(),
             addresses: vec![test_address.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2718,42 +2719,42 @@ mod tests {
         };
 
         node.transport
-            .inject_peer(test_peer_id.clone(), peer_info)
+            .inject_peer(test_channel_id.clone(), peer_info)
             .await;
 
-        // Test: Find peer by address
-        let found_peer_id = node.get_peer_id_by_address(&test_address).await;
-        assert_eq!(found_peer_id, Some(test_peer_id));
+        // Test: Find channel by address
+        let found_channel_id = node.get_channel_id_by_address(&test_address).await;
+        assert_eq!(found_channel_id, Some(test_channel_id));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_not_found() -> Result<()> {
+    async fn test_get_channel_id_by_address_not_found() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Test: Try to find a peer that doesn't exist
-        let result = node.get_peer_id_by_address("192.168.1.200:9000").await;
+        // Test: Try to find a channel that doesn't exist
+        let result = node.get_channel_id_by_address("192.168.1.200:9000").await;
         assert_eq!(result, None);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_invalid_format() -> Result<()> {
+    async fn test_get_channel_id_by_address_invalid_format() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Test: Invalid address format should return None
-        let result = node.get_peer_id_by_address("invalid-address").await;
+        let result = node.get_channel_id_by_address("invalid-address").await;
         assert_eq!(result, None);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_multiple_peers() -> Result<()> {
+    async fn test_get_channel_id_by_address_multiple_peers() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
@@ -2765,7 +2766,7 @@ mod tests {
         let peer2_addr = "192.168.1.102:9002".to_string();
 
         let peer1_info = PeerInfo {
-            peer_id: peer1_id.clone(),
+            channel_id: peer1_id.clone(),
             addresses: vec![peer1_addr.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2775,7 +2776,7 @@ mod tests {
         };
 
         let peer2_info = PeerInfo {
-            peer_id: peer2_id.clone(),
+            channel_id: peer2_id.clone(),
             addresses: vec![peer2_addr.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2791,9 +2792,9 @@ mod tests {
             .inject_peer(peer2_id.clone(), peer2_info)
             .await;
 
-        // Test: Find each peer by their unique address
-        let found_peer1 = node.get_peer_id_by_address(&peer1_addr).await;
-        let found_peer2 = node.get_peer_id_by_address(&peer2_addr).await;
+        // Test: Find each channel by their unique address
+        let found_peer1 = node.get_channel_id_by_address(&peer1_addr).await;
+        let found_peer2 = node.get_channel_id_by_address(&peer2_addr).await;
 
         assert_eq!(found_peer1, Some(peer1_id));
         assert_eq!(found_peer2, Some(peer2_id));
@@ -2829,7 +2830,7 @@ mod tests {
         let peer2_addrs = vec!["192.168.1.102:9003".to_string()];
 
         let peer1_info = PeerInfo {
-            peer_id: peer1_id.clone(),
+            channel_id: peer1_id.clone(),
             addresses: peer1_addrs.clone(),
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2839,7 +2840,7 @@ mod tests {
         };
 
         let peer2_info = PeerInfo {
-            peer_id: peer2_id.clone(),
+            channel_id: peer2_id.clone(),
             addresses: peer2_addrs.clone(),
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2882,14 +2883,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_peer_success() -> Result<()> {
+    async fn test_remove_channel_success() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Add a peer
-        let peer_id = "peer_to_remove".to_string();
+        let channel_id = "peer_to_remove".to_string();
         let peer_info = PeerInfo {
-            peer_id: peer_id.clone(),
+            channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2898,28 +2899,30 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        node.transport.inject_peer(peer_id.clone(), peer_info).await;
+        node.transport
+            .inject_peer(channel_id.clone(), peer_info)
+            .await;
 
         // Verify peer exists
-        assert!(node.is_peer_connected(&peer_id).await);
+        assert!(node.is_peer_connected(&channel_id).await);
 
-        // Remove the peer
-        let removed = node.remove_peer(&peer_id).await;
+        // Remove the channel
+        let removed = node.remove_channel(&channel_id).await;
         assert!(removed);
 
         // Verify peer no longer exists
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_id).await);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_remove_peer_nonexistent() -> Result<()> {
+    async fn test_remove_channel_nonexistent() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Try to remove a peer that doesn't exist
-        let removed = node.remove_peer(&"nonexistent_peer".to_string()).await;
+        // Try to remove a channel that doesn't exist
+        let removed = node.remove_channel("nonexistent_peer").await;
         assert!(!removed);
 
         Ok(())
@@ -2930,14 +2933,14 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        let peer_id = "test_peer".to_string();
+        let channel_id = "test_peer".to_string();
 
         // Initially not connected
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_id).await);
 
         // Add peer
         let peer_info = PeerInfo {
-            peer_id: peer_id.clone(),
+            channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2946,16 +2949,18 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        node.transport.inject_peer(peer_id.clone(), peer_info).await;
+        node.transport
+            .inject_peer(channel_id.clone(), peer_info)
+            .await;
 
         // Now connected
-        assert!(node.is_peer_connected(&peer_id).await);
+        assert!(node.is_peer_connected(&channel_id).await);
 
-        // Remove peer
-        node.remove_peer(&peer_id).await;
+        // Remove channel
+        node.remove_channel(&channel_id).await;
 
         // No longer connected
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_id).await);
 
         Ok(())
     }

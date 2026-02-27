@@ -59,9 +59,9 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     assert!(!is_connected, "Non-existent peer should not be connected");
     info!("✓ is_peer_connected() method exists and works");
 
-    // Test 3: Verify remove_peer() method exists (even if peer doesn't exist)
-    node.remove_peer(&test_peer_id).await;
-    info!("✓ remove_peer() method exists");
+    // Test 3: Verify remove_channel() method exists (even if channel doesn't exist)
+    node.remove_channel(&test_peer_id).await;
+    info!("✓ remove_channel() method exists");
 
     // Test 4: send_message() properly handles non-existent peer
     let result = node
@@ -80,7 +80,7 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("1. active_connections HashSet tracking");
     info!("2. is_connection_active() validation");
     info!("3. is_peer_connected() checking");
-    info!("4. remove_peer() cleanup");
+    info!("4. remove_channel() cleanup");
     info!("5. send_message() connection validation");
     info!("6. Keepalive task (spawned in background)");
     info!("");
