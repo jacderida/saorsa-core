@@ -59,7 +59,7 @@ async fn create_test_dht_config(
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer_id.to_string(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -219,7 +219,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     );
 
     let dht_config = DhtNetworkConfig {
-        local_peer_id: "architecture_test_node".to_string(),
+        peer_id: "architecture_test_node".to_string(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),

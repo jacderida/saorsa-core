@@ -88,7 +88,7 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer_id.to_string(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),
@@ -211,14 +211,11 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     let peers_from_b = manager_b.get_connected_peers().await;
     info!("Node B sees {} connected peers", peers_from_b.len());
 
-    // Get Node A's transport peer ID (cryptographic ID used on the wire)
+    // Get Node A's channel ID (cryptographic ID used on the wire)
     let transport_peer_id_a = manager_a
-        .transport_peer_id()
-        .ok_or_else(|| anyhow::anyhow!("Node A has no transport peer ID"))?;
-    info!(
-        "Looking for Node A's transport_peer_id: {}",
-        transport_peer_id_a
-    );
+        .channel_id()
+        .ok_or_else(|| anyhow::anyhow!("Node A has no channel ID"))?;
+    info!("Looking for Node A's channel_id: {}", transport_peer_id_a);
 
     let peer_a_in_b = peers_from_b
         .iter()

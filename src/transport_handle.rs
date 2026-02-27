@@ -128,8 +128,12 @@ pub struct TransportHandle {
     listener_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Optional node identity for signing outgoing messages.
     node_identity: Option<Arc<NodeIdentity>>,
-    /// Maps app-level NodeId hex → transport peer ID for response routing.
-    app_to_transport: Arc<RwLock<HashMap<String, String>>>,
+    /// Maps app-level peer ID → set of channel IDs (QUIC, Bluetooth, …).
+    ///
+    /// A single peer may communicate over multiple channels simultaneously.
+    peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Reverse index: channel ID → set of app-level peer IDs on that channel.
+    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 // ============================================================================
@@ -281,7 +285,8 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: config.node_identity,
-            app_to_transport: Arc::new(RwLock::new(HashMap::new())),
+            peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
+            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -339,7 +344,8 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: None,
-            app_to_transport: Arc::new(RwLock::new(HashMap::new())),
+            peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
+            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -354,11 +360,11 @@ impl TransportHandle {
         &self.peer_id
     }
 
-    /// Get the hex-encoded transport-level peer ID.
+    /// Get the hex-encoded channel ID (QUIC connection identifier).
     ///
     /// This is the ID used in `P2PEvent::Message.source`, `connected_peers()`,
     /// and `send_message()`. It differs from `peer_id()` which is the app-level ID.
-    pub fn transport_peer_id(&self) -> Option<String> {
+    pub fn channel_id(&self) -> Option<String> {
         if let Some(ref v4) = self.dual_node.v4 {
             return Some(ant_peer_id_to_string(&v4.our_peer_id()));
         }
@@ -413,8 +419,19 @@ impl TransportHandle {
     }
 
     /// Get info for a specific peer.
+    ///
+    /// Accepts either a channel ID (direct lookup) or an app-level peer ID
+    /// (resolved via `peer_to_channel` mapping). This allows DHT code to pass
+    /// app-level peer IDs without manual channel resolution.
     pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
-        self.peers.read().await.get(peer_id).cloned()
+        let peers = self.peers.read().await;
+        if let Some(info) = peers.get(peer_id) {
+            return Some(info.clone());
+        }
+        // Try resolving app-level peer ID → any channel ID
+        let p2c = self.peer_to_channel.read().await;
+        let channel = p2c.get(peer_id).and_then(|chs| chs.iter().next())?;
+        peers.get(channel).cloned()
     }
 
     /// Get the peer ID for a given socket address, if connected.
@@ -454,6 +471,7 @@ impl TransportHandle {
     /// Remove a peer from the tracking maps.
     pub async fn remove_peer(&self, peer_id: &PeerId) -> bool {
         self.active_connections.write().await.remove(peer_id);
+        self.remove_channel_mappings(peer_id).await;
         self.peers.write().await.remove(peer_id).is_some()
     }
 
@@ -465,6 +483,26 @@ impl TransportHandle {
     /// Check if a connection to a peer is active at the transport layer.
     pub async fn is_connection_active(&self, peer_id: &str) -> bool {
         self.active_connections.read().await.contains(peer_id)
+    }
+
+    /// Remove channel mappings for a disconnected channel.
+    ///
+    /// Removes the channel from `channel_to_peers` and scrubs it from every
+    /// affected peer's channel set in `peer_to_channel`. A peer entry is only
+    /// deleted when its last channel is removed.
+    async fn remove_channel_mappings(&self, channel_id: &str) {
+        let mut p2c = self.peer_to_channel.write().await;
+        let mut c2p = self.channel_to_peers.write().await;
+        if let Some(app_peers) = c2p.remove(channel_id) {
+            for app_peer in &app_peers {
+                if let Some(channels) = p2c.get_mut(app_peer) {
+                    channels.remove(channel_id);
+                    if channels.is_empty() {
+                        p2c.remove(app_peer);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -564,6 +602,7 @@ impl TransportHandle {
 
         self.dual_node.disconnect_peer_string(peer_id).await.ok();
         self.active_connections.write().await.remove(peer_id);
+        self.remove_channel_mappings(peer_id).await;
 
         if let Some(mut peer_info) = self.peers.write().await.remove(peer_id) {
             peer_info.status = ConnectionStatus::Disconnected;
@@ -593,18 +632,18 @@ impl TransportHandle {
 impl TransportHandle {
     /// Send a message to a peer (raw, no trust reporting).
     ///
-    /// `peer_id` can be either a transport-level peer ID (from QUIC) or an
-    /// app-level NodeId hex string. When an app-level ID is given, the
-    /// internal `app_to_transport` mapping is used to resolve it.
+    /// `peer_id` can be either a channel ID (from QUIC) or an app-level
+    /// NodeId hex string. When an app-level ID is given, the internal
+    /// `peer_to_channel` mapping is used to resolve it.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
         protocol: &str,
         data: Vec<u8>,
     ) -> Result<()> {
-        // Resolve: if peer_id is an app-level NodeId, look up the transport ID.
-        let transport_id = self.resolve_transport_peer_id(peer_id).await;
-        let effective_id = transport_id.as_deref().unwrap_or(peer_id);
+        // Resolve: if peer_id is an app-level NodeId, look up the channel ID.
+        let channel = self.resolve_channel_id(peer_id).await;
+        let effective_id = channel.as_deref().unwrap_or(peer_id);
 
         debug!(
             "Sending message to peer {} (transport: {}) on protocol {}",
@@ -678,17 +717,47 @@ impl TransportHandle {
         result
     }
 
-    /// Resolve an app-level NodeId hex to the transport peer ID.
+    /// Resolve an app-level NodeId hex to a channel ID for sending.
     ///
-    /// Returns `None` if the given ID is already a transport peer ID (present
-    /// in the peers map) or if no mapping exists.
-    async fn resolve_transport_peer_id(&self, peer_id: &str) -> Option<String> {
-        // If it's directly in the peers map, it's already a transport ID.
+    /// Returns `None` if the given ID is already a channel ID (present
+    /// in the peers map) or if no mapping exists. When the peer has
+    /// multiple channels, returns an arbitrary active one.
+    async fn resolve_channel_id(&self, peer_id: &str) -> Option<String> {
+        // If it's directly in the peers map, it's already a channel ID.
         if self.peers.read().await.contains_key(peer_id) {
             return None;
         }
-        // Otherwise, try the app→transport mapping.
-        self.app_to_transport.read().await.get(peer_id).cloned()
+        // Otherwise, pick any channel from the peer's set.
+        self.peer_to_channel
+            .read()
+            .await
+            .get(peer_id)
+            .and_then(|channels| channels.iter().next().cloned())
+    }
+
+    /// Return all channel IDs for an app-level peer, if known.
+    pub async fn channels_for_peer(&self, app_peer_id: &str) -> Vec<String> {
+        self.peer_to_channel
+            .read()
+            .await
+            .get(app_peer_id)
+            .map(|channels| channels.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get all authenticated app-level peer IDs communicating over a channel.
+    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
+        self.channel_to_peers
+            .read()
+            .await
+            .get(channel_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Return true if `peer_id` is a known authenticated app-level peer ID.
+    pub async fn is_known_app_peer_id(&self, peer_id: &str) -> bool {
+        self.peer_to_channel.read().await.contains_key(peer_id)
     }
 
     /// Send a request and wait for a response (no trust reporting).
@@ -1019,7 +1088,8 @@ impl TransportHandle {
         let event_tx = self.event_tx.clone();
         let active_requests = Arc::clone(&self.active_requests);
         let peers_for_recv = Arc::clone(&self.peers);
-        let app_to_transport = Arc::clone(&self.app_to_transport);
+        let peer_to_channel = Arc::clone(&self.peer_to_channel);
+        let channel_to_peers = Arc::clone(&self.channel_to_peers);
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((peer_id, bytes)) = rx.recv().await {
@@ -1045,12 +1115,24 @@ impl TransportHandle {
                         event,
                         authenticated_node_id,
                     }) => {
-                        // If the message was signed, record the app→transport mapping
+                        // If the message was signed, record the app↔channel mapping.
+                        // A peer may be reachable over multiple channels simultaneously
+                        // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
                         if let Some(ref app_id) = authenticated_node_id {
-                            app_to_transport
+                            let inserted = peer_to_channel
                                 .write()
                                 .await
-                                .insert(app_id.clone(), transport_peer_id.clone());
+                                .entry(app_id.clone())
+                                .or_default()
+                                .insert(transport_peer_id.clone());
+                            if inserted {
+                                channel_to_peers
+                                    .write()
+                                    .await
+                                    .entry(transport_peer_id.clone())
+                                    .or_default()
+                                    .insert(app_id.clone());
+                            }
                         }
 
                         if let P2PEvent::Message {
@@ -1074,15 +1156,15 @@ impl TransportHandle {
                                     continue;
                                 }
                             };
-                            // Accept response if it matches the expected peer by either
-                            // transport ID or authenticated app-level NodeId.
-                            if expected_peer != transport_peer_id
-                                && authenticated_node_id.as_deref() != Some(&expected_peer)
-                            {
+                            // Accept response only if the authenticated app-level
+                            // identity matches. Channel IDs identify connections,
+                            // not peers, so they are not checked here.
+                            if authenticated_node_id.as_deref() != Some(&expected_peer) {
                                 warn!(
                                     message_id = %envelope.message_id,
                                     expected = %expected_peer,
-                                    actual = %transport_peer_id,
+                                    actual_channel = %transport_peer_id,
+                                    authenticated = ?authenticated_node_id,
                                     "Response origin mismatch — ignoring"
                                 );
                                 continue;

@@ -902,7 +902,7 @@ impl P2PNode {
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
-            local_peer_id: peer_id.clone(),
+            peer_id: peer_id.clone(),
             dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
@@ -960,9 +960,9 @@ impl P2PNode {
         &self.transport
     }
 
-    /// Get the hex-encoded transport-level peer ID.
-    pub fn transport_peer_id(&self) -> Option<String> {
-        self.transport.transport_peer_id()
+    /// Get the hex-encoded channel ID (QUIC connection identifier).
+    pub fn channel_id(&self) -> Option<String> {
+        self.transport.channel_id()
     }
 
     pub fn local_addr(&self) -> Option<String> {

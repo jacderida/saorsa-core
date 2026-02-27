@@ -63,7 +63,7 @@ async fn create_node_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtN
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer_id.to_string(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),

@@ -335,6 +335,12 @@ pub use crate::placement::{
 /// - Optional cryptographic verification
 pub type PeerId = String;
 
+/// Transport channel identifier (e.g. a QUIC connection).
+///
+/// Distinct from [`PeerId`]: a channel ID identifies a communication path,
+/// not a peer. In future, multiple peers may share a single channel.
+pub type ChannelId = String;
+
 /// Network address used for peer-to-peer communication
 ///
 /// Supports both traditional IP:port format and human-readable four-word format.
