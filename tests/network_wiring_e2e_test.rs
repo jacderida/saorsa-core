@@ -19,6 +19,7 @@
 //!
 //! Run with: cargo test --test network_wiring_e2e_test -- --nocapture
 
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, P2PEvent, P2PNode};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +27,24 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
-/// Helper to create a test node configuration with unique port
+/// Timeout for waiting for a single event (PeerConnected, etc.).
+const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum time to wait for stale peer cleanup after a disconnect.
+const STALE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Polling interval when busy-waiting for state changes.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Short stale-peer threshold used for fast disconnect detection in tests.
+const SHORT_STALE_THRESHOLD: Duration = Duration::from_secs(2);
+/// Timeout for PeerDisconnected events (stale threshold + buffer).
+const DISCONNECT_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Helper to create a test node configuration with unique port.
+///
+/// Includes a generated `node_identity` so that messages are signed and
+/// `PeerConnected`/`PeerDisconnected` events fire on authentication.
 fn create_test_node_config() -> NodeConfig {
+    let identity =
+        Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
         peer_id: None,
         listen_addr: "127.0.0.1:0"
@@ -43,12 +60,18 @@ fn create_test_node_config() -> NodeConfig {
         ],
         bootstrap_peers: vec![],
         bootstrap_peers_str: vec![],
+        node_identity: Some(identity),
         ..Default::default()
     }
 }
 
-/// Create a test config with a short stale peer threshold for faster tests
+/// Create a test config with a short stale peer threshold for faster tests.
+///
+/// Includes a generated `node_identity` so that messages are signed and
+/// `PeerConnected`/`PeerDisconnected` events fire on authentication.
 fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConfig {
+    let identity =
+        Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
         peer_id: None,
         listen_addr: "127.0.0.1:0"
@@ -65,6 +88,7 @@ fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConf
         bootstrap_peers: vec![],
         bootstrap_peers_str: vec![],
         stale_peer_threshold: threshold,
+        node_identity: Some(identity),
         ..Default::default()
     }
 }
@@ -310,7 +334,13 @@ async fn test_bidirectional_message_exchange() {
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Wait for node2 to see node1's peer ID via PeerConnected event
+    // Node1 sends a signed message → triggers PeerConnected on node2
+    node1
+        .send_message(&peer2_id, "messaging", b"From Node1".to_vec())
+        .await
+        .expect("Send from node1 failed");
+
+    // Wait for node2 to authenticate node1 via the signed message
     let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
@@ -324,12 +354,6 @@ async fn test_bidirectional_message_exchange() {
     info!("Node2 sees Node1 as: {}", peer1_id);
 
     sleep(Duration::from_millis(200)).await;
-
-    // Node1 -> Node2
-    node1
-        .send_message(&peer2_id, "messaging", b"From Node1".to_vec())
-        .await
-        .expect("Send from node1 failed");
 
     let msg_on_2 = wait_for_event(
         &mut events2,
@@ -408,7 +432,7 @@ async fn test_periodic_tasks_updates_last_seen() {
 
     // Verify peer is still tracked and last_seen was updated
     let is_connected_after = node1.is_peer_connected(&peer2_id).await;
-    let is_active = node1.is_connection_active(&peer2_id).await;
+    let is_active = node1.is_peer_connected(&peer2_id).await;
 
     info!(
         "After 2s: connected={}, active={}",
@@ -447,9 +471,7 @@ async fn test_stale_peer_removal() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let mut events1 = node1.subscribe_events();
-
-    // Connect
+    // Connect and send a signed message so the peer gets authenticated
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
@@ -464,27 +486,20 @@ async fn test_stale_peer_removal() {
     info!("Waiting for stale detection (5s threshold)...");
 
     // periodic_tasks() runs every 100ms and will detect stale peers
-    // Wait up to 10 seconds for the disconnect event
-    let disconnect_event = wait_for_event(
-        &mut events1,
-        Duration::from_secs(10),
-        |event| matches!(event, P2PEvent::PeerDisconnected(id) if id == &peer2_id),
-    )
-    .await;
-
-    match disconnect_event {
-        Some(P2PEvent::PeerDisconnected(id)) => {
-            info!("Stale peer {} detected and removed", id);
+    // Wait up to 10 seconds for the peer to be cleaned up
+    let deadline = tokio::time::Instant::now() + STALE_CLEANUP_TIMEOUT;
+    loop {
+        if !node1.is_peer_connected(&peer2_id).await {
+            info!("Stale peer {} detected and removed", peer2_id);
+            break;
         }
-        _ => {
-            // Check if the peer was removed from the peers map
-            let still_connected = node1.is_peer_connected(&peer2_id).await;
-            assert!(
-                !still_connected,
+        if tokio::time::Instant::now() > deadline {
+            panic!(
                 "FAIL: Stale peer should be removed from peers map.\n\
                 periodic_tasks() should detect unresponsive peers and remove them."
             );
         }
+        sleep(POLL_INTERVAL).await;
     }
 
     info!("=== TEST PASSED: Stale Peer Removal ===");
@@ -521,7 +536,7 @@ async fn test_heartbeat_keeps_connection_alive() {
     sleep(Duration::from_secs(35)).await;
 
     // Connection should still be alive due to heartbeat
-    let is_active = node1.is_connection_active(&peer2_id).await;
+    let is_active = node1.is_peer_connected(&peer2_id).await;
 
     assert!(
         is_active,
@@ -740,7 +755,10 @@ async fn test_node_creation_sanity() {
     info!("Node created with addresses: {:?}", addrs);
 }
 
-/// Sanity check: Event subscription works
+/// Sanity check: Event subscription works.
+///
+/// PeerConnected fires when the receiver authenticates a signed message,
+/// so we subscribe on node2, then have node1 send a signed message.
 #[tokio::test]
 async fn test_event_subscription_sanity() {
     let config1 = create_test_node_config();
@@ -751,22 +769,28 @@ async fn test_event_subscription_sanity() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let mut events1 = node1.subscribe_events();
+    let mut events2 = node2.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
 
-    let _peer_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Should receive PeerConnected event
-    let event = wait_for_event(&mut events1, Duration::from_secs(2), |event| {
+    // Send a signed message to trigger PeerConnected on node2
+    node1
+        .send_message(&peer2_id, "test", b"hello".to_vec())
+        .await
+        .expect("Send failed");
+
+    // Should receive PeerConnected event on node2
+    let event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
     .await;
 
     assert!(
         matches!(event, Some(P2PEvent::PeerConnected(_))),
-        "Should receive PeerConnected event when connecting"
+        "Should receive PeerConnected event when authenticated peer sends a message"
     );
 
     info!("Event subscription working correctly");
@@ -805,7 +829,13 @@ async fn test_simple_ping_pong() {
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Wait for node2 to see node1's peer ID
+    // Node1 sends "ping" (signed message triggers PeerConnected on node2)
+    node1
+        .send_message(&peer2_id, "messaging", b"ping".to_vec())
+        .await
+        .expect("Failed to send ping");
+
+    // Wait for node2 to authenticate node1 via the signed message
     let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
@@ -814,14 +844,6 @@ async fn test_simple_ping_pong() {
         Some(P2PEvent::PeerConnected(id)) => id,
         _ => panic!("Node2 did not receive PeerConnected event"),
     };
-
-    sleep(Duration::from_millis(200)).await;
-
-    // Node1 sends "ping"
-    node1
-        .send_message(&peer2_id, "messaging", b"ping".to_vec())
-        .await
-        .expect("Failed to send ping");
 
     // Node2 receives "ping"
     let received_ping = wait_for_event(
@@ -1069,8 +1091,8 @@ async fn test_reconnection_works() {
 
 /// TEST 0.5: Peer Discovery Events
 ///
-/// Subscribe to events, connect to peer, verify PeerConnected event,
-/// then disconnect and verify PeerDisconnected event.
+/// Connect, send a signed message to trigger PeerConnected on the receiver,
+/// then disconnect (drop sender) and verify PeerDisconnected on the receiver.
 #[tokio::test]
 async fn test_peer_events_sequence() {
     let _ = tracing_subscriber::fmt()
@@ -1080,25 +1102,30 @@ async fn test_peer_events_sequence() {
 
     info!("=== TEST: Peer Events Sequence ===");
 
-    // Use short threshold for faster disconnect detection
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(2));
-    let config2 = create_test_node_config();
+    // Use short threshold on node2 for faster disconnect detection
+    let config1 = create_test_node_config();
+    let config2 = create_test_node_config_with_stale_threshold(SHORT_STALE_THRESHOLD);
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
     node1.start().await.expect("Failed to start node1");
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let mut events1 = node1.subscribe_events();
+    // Subscribe to node2's events (the receiver side)
+    let mut events2 = node2.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
 
-    // Connect
+    // Connect and send a signed message to trigger PeerConnected on node2
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    node1
+        .send_message(&peer2_id, "test", b"hello".to_vec())
+        .await
+        .expect("Send failed");
 
-    // Wait for PeerConnected event
-    let connected_event = wait_for_event(&mut events1, Duration::from_secs(2), |event| {
+    // Wait for PeerConnected event on node2
+    let connected_event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
     .await;
@@ -1109,15 +1136,13 @@ async fn test_peer_events_sequence() {
     );
     info!("Received PeerConnected event");
 
-    // Drop node2 to simulate disconnect
-    drop(node2);
+    // Drop node1 to simulate disconnect
+    drop(node1);
 
-    // Wait for PeerDisconnected event (with 2s threshold + buffer)
-    let disconnected_event = wait_for_event(
-        &mut events1,
-        Duration::from_secs(8),
-        |event| matches!(event, P2PEvent::PeerDisconnected(id) if *id == peer2_id),
-    )
+    // Wait for PeerDisconnected event on node2 (with short stale threshold + buffer)
+    let disconnected_event = wait_for_event(&mut events2, DISCONNECT_EVENT_TIMEOUT, |event| {
+        matches!(event, P2PEvent::PeerDisconnected(_))
+    })
     .await;
 
     assert!(
@@ -1581,7 +1606,13 @@ async fn test_concurrent_message_flood() {
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
-    // Get peer1_id for node2
+    // Send a signed message to trigger PeerConnected on node2
+    node1
+        .send_message(&peer2_id, "setup", b"init".to_vec())
+        .await
+        .expect("Init send failed");
+
+    // Get peer1_id for node2 (authenticated node ID from the signed message)
     let peer1_id = match wait_for_event(&mut events2, Duration::from_secs(2), |event| {
         matches!(event, P2PEvent::PeerConnected(_))
     })
@@ -1943,6 +1974,13 @@ async fn test_many_peers_scaling() {
         match node1.connect_peer(&addr).await {
             Ok(peer_id) => {
                 debug!("Connected peer {}: {}", i, peer_id);
+                // Send a signed message to authenticate with the peer
+                if let Err(e) = node1
+                    .send_message(&peer_id, "init", b"hello".to_vec())
+                    .await
+                {
+                    warn!("Failed to send init to peer {}: {}", i, e);
+                }
                 connected_peers.push(peer_id);
             }
             Err(e) => {
@@ -1956,16 +1994,21 @@ async fn test_many_peers_scaling() {
     // Wait for connections to stabilize
     sleep(Duration::from_millis(500)).await;
 
-    // Verify all peers are tracked
-    let tracked_count = node1.peer_count().await;
+    // Verify all peers are reachable at transport level
+    let mut reachable_count = 0;
+    for peer_id in &connected_peers {
+        if node1.is_peer_connected(peer_id).await {
+            reachable_count += 1;
+        }
+    }
     info!(
-        "Connected {} peers, tracking {} peers",
+        "Connected {} peers, {} reachable",
         connected_peers.len(),
-        tracked_count
+        reachable_count
     );
 
     assert!(
-        tracked_count >= connected_peers.len(),
+        reachable_count >= connected_peers.len(),
         "Should track all connected peers"
     );
 

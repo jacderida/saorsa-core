@@ -98,7 +98,7 @@ async fn test_connection_lifecycle_with_keepalive() {
         "Peer should be in peers map"
     );
     assert!(
-        node1.is_connection_active(&peer2_id).await,
+        node1.is_peer_connected(&peer2_id).await,
         "Connection should be active"
     );
 
@@ -118,7 +118,7 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Verify connection is still active thanks to keepalive
     assert!(
-        node1.is_connection_active(&peer2_id).await,
+        node1.is_peer_connected(&peer2_id).await,
         "Connection should still be active after 40 seconds due to keepalive"
     );
 
@@ -201,7 +201,7 @@ async fn test_send_message_validates_connection_state() {
     info!("Connected to peer {}", peer2_id);
 
     // Verify connection is active
-    assert!(node1.is_connection_active(&peer2_id).await);
+    assert!(node1.is_peer_connected(&peer2_id).await);
 
     // Send initial message successfully
     node1
@@ -215,7 +215,7 @@ async fn test_send_message_validates_connection_state() {
 
     // Verify connection is no longer active
     assert!(
-        !node1.is_connection_active(&peer2_id).await,
+        !node1.is_peer_connected(&peer2_id).await,
         "Connection should be inactive after disconnect"
     );
 

@@ -209,6 +209,9 @@ impl TransportHandle {
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
 
+        let peer_to_channel = Arc::new(RwLock::new(HashMap::new()));
+        let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
+
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
             let peers_map = Arc::clone(&peers);
@@ -217,6 +220,8 @@ impl TransportHandle {
             let geo_provider_clone = Arc::clone(&geo_provider);
             let peer_id_clone = config.peer_id.clone();
             let shutdown_token = shutdown.clone();
+            let p2c = Arc::clone(&peer_to_channel);
+            let c2p = Arc::clone(&channel_to_peers);
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -228,6 +233,8 @@ impl TransportHandle {
                     geo_provider_clone,
                     peer_id_clone,
                     shutdown_token,
+                    p2c,
+                    c2p,
                 )
                 .await;
             });
@@ -251,6 +258,8 @@ impl TransportHandle {
             let event_tx_clone = event_tx.clone();
             let stale_threshold = config.stale_peer_threshold;
             let token = shutdown.clone();
+            let p2c = Arc::clone(&peer_to_channel);
+            let c2p = Arc::clone(&channel_to_peers);
 
             let handle = tokio::spawn(async move {
                 Self::periodic_maintenance_task(
@@ -259,6 +268,8 @@ impl TransportHandle {
                     event_tx_clone,
                     stale_threshold,
                     token,
+                    p2c,
+                    c2p,
                 )
                 .await;
             });
@@ -285,8 +296,8 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: config.node_identity,
-            peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
-            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_to_channel,
+            channel_to_peers,
         })
     }
 
@@ -403,19 +414,25 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
-    /// Get list of connected peer IDs.
+    /// Get list of authenticated app-level peer IDs.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
+        self.peer_to_channel.read().await.keys().cloned().collect()
+    }
+
+    /// Get count of authenticated app-level peers.
+    pub async fn peer_count(&self) -> usize {
+        self.peer_to_channel.read().await.len()
+    }
+
+    /// Get all active transport-level channel IDs (internal bookkeeping).
+    #[allow(dead_code)]
+    pub(crate) async fn active_channels(&self) -> Vec<String> {
         self.active_connections
             .read()
             .await
             .iter()
             .cloned()
             .collect()
-    }
-
-    /// Get count of active connections.
-    pub async fn peer_count(&self) -> usize {
-        self.active_connections.read().await.len()
     }
 
     /// Get info for a specific peer.
@@ -434,8 +451,9 @@ impl TransportHandle {
         peers.get(channel).cloned()
     }
 
-    /// Get the channel ID for a given socket address, if connected.
-    pub async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
+    /// Get the channel ID for a given socket address, if connected (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
         let socket_addr: SocketAddr = addr.parse().ok()?;
         let peers = self.peers.read().await;
 
@@ -451,8 +469,9 @@ impl TransportHandle {
         None
     }
 
-    /// List all active connections with peer IDs and addresses.
-    pub async fn list_active_connections(&self) -> Vec<(PeerId, Vec<String>)> {
+    /// List all active connections with peer IDs and addresses (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn list_active_connections(&self) -> Vec<(PeerId, Vec<String>)> {
         let active = self.active_connections.read().await;
         let peers = self.peers.read().await;
 
@@ -468,8 +487,8 @@ impl TransportHandle {
             .collect()
     }
 
-    /// Remove a channel from the tracking maps.
-    pub async fn remove_channel(&self, channel_id: &str) -> bool {
+    /// Remove a channel from the tracking maps (internal only).
+    pub(crate) async fn remove_channel(&self, channel_id: &str) -> bool {
         self.active_connections.write().await.remove(channel_id);
         self.remove_channel_mappings(channel_id).await;
         self.peers.write().await.remove(channel_id).is_some()
@@ -480,25 +499,43 @@ impl TransportHandle {
         self.peers.read().await.contains_key(peer_id)
     }
 
-    /// Check if a connection to a peer is active at the transport layer.
-    pub async fn is_connection_active(&self, channel_id: &str) -> bool {
+    /// Check if a connection to a peer is active at the transport layer (internal only).
+    pub(crate) async fn is_connection_active(&self, channel_id: &str) -> bool {
         self.active_connections.read().await.contains(channel_id)
     }
 
     /// Remove channel mappings for a disconnected channel.
     ///
     /// Removes the channel from `channel_to_peers` and scrubs it from every
-    /// affected peer's channel set in `peer_to_channel`. A peer entry is only
-    /// deleted when its last channel is removed.
+    /// affected peer's channel set in `peer_to_channel`. When a peer's last
+    /// channel is removed, emits `PeerDisconnected`.
     async fn remove_channel_mappings(&self, channel_id: &str) {
-        let mut p2c = self.peer_to_channel.write().await;
-        let mut c2p = self.channel_to_peers.write().await;
+        Self::remove_channel_mappings_static(
+            channel_id,
+            &self.peer_to_channel,
+            &self.channel_to_peers,
+            &self.event_tx,
+        )
+        .await;
+    }
+
+    /// Static version of channel mapping removal — usable from background tasks
+    /// that don't have `&self`.
+    async fn remove_channel_mappings_static(
+        channel_id: &str,
+        peer_to_channel: &RwLock<HashMap<String, HashSet<String>>>,
+        channel_to_peers: &RwLock<HashMap<String, HashSet<String>>>,
+        event_tx: &broadcast::Sender<P2PEvent>,
+    ) {
+        let mut p2c = peer_to_channel.write().await;
+        let mut c2p = channel_to_peers.write().await;
         if let Some(app_peers) = c2p.remove(channel_id) {
             for app_peer in &app_peers {
                 if let Some(channels) = p2c.get_mut(app_peer) {
                     channels.remove(channel_id);
                     if channels.is_empty() {
                         p2c.remove(app_peer);
+                        let _ = event_tx.send(P2PEvent::PeerDisconnected(app_peer.clone()));
                     }
                 }
             }
@@ -591,7 +628,8 @@ impl TransportHandle {
             resource_manager.record_bandwidth(0, 0);
         }
 
-        self.send_event(P2PEvent::PeerConnected(peer_id.clone()));
+        // PeerConnected is emitted later when the peer's identity is
+        // authenticated via a signed message — not at transport level.
         info!("Successfully connected to peer: {}", peer_id);
         Ok(peer_id)
     }
@@ -602,13 +640,12 @@ impl TransportHandle {
 
         self.dual_node.disconnect_peer_string(peer_id).await.ok();
         self.active_connections.write().await.remove(peer_id);
+        // remove_channel_mappings emits PeerDisconnected when the peer's
+        // last channel is removed.
         self.remove_channel_mappings(peer_id).await;
 
         if let Some(mut peer_info) = self.peers.write().await.remove(peer_id) {
             peer_info.status = ConnectionStatus::Disconnected;
-            let _ = self
-                .event_tx
-                .send(P2PEvent::PeerDisconnected(peer_id.clone()));
             info!("Disconnected from peer: {}", peer_id);
         }
 
@@ -1034,7 +1071,6 @@ impl TransportHandle {
             *la = addrs.clone();
         }
 
-        let event_tx = self.event_tx.clone();
         let peers = self.peers.clone();
         let active_connections = self.active_connections.clone();
         let rate_limiter = self.rate_limiter.clone();
@@ -1056,7 +1092,8 @@ impl TransportHandle {
 
                 let channel_id = ant_peer_id_to_string(&ant_peer_id);
                 let remote_addr = NetworkAddress::from(remote_sock);
-                broadcast_event(&event_tx, P2PEvent::PeerConnected(channel_id.clone()));
+                // PeerConnected is emitted later when the peer's identity is
+                // authenticated via a signed message — not at transport level.
                 register_new_channel(&peers, &channel_id, &remote_addr).await;
                 active_connections.write().await.insert(channel_id);
             }
@@ -1115,12 +1152,10 @@ impl TransportHandle {
                         // A peer may be reachable over multiple channels simultaneously
                         // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
                         if let Some(ref app_id) = authenticated_node_id {
-                            let inserted = peer_to_channel
-                                .write()
-                                .await
-                                .entry(app_id.clone())
-                                .or_default()
-                                .insert(channel_id.clone());
+                            let mut p2c = peer_to_channel.write().await;
+                            let is_new_peer = !p2c.contains_key(app_id);
+                            let channels = p2c.entry(app_id.clone()).or_default();
+                            let inserted = channels.insert(channel_id.clone());
                             if inserted {
                                 channel_to_peers
                                     .write()
@@ -1128,6 +1163,12 @@ impl TransportHandle {
                                     .entry(channel_id.clone())
                                     .or_default()
                                     .insert(app_id.clone());
+                            }
+                            // Drop the lock before emitting events.
+                            drop(p2c);
+
+                            if is_new_peer {
+                                broadcast_event(&event_tx, P2PEvent::PeerConnected(app_id.clone()));
                             }
                         }
 
@@ -1272,9 +1313,9 @@ impl TransportHandle {
 
         for peer_id in &peers_to_mark_disconnected {
             self.active_connections.write().await.remove(peer_id);
-            let _ = self
-                .event_tx
-                .send(P2PEvent::PeerDisconnected(peer_id.clone()));
+            // remove_channel_mappings emits PeerDisconnected when the peer's
+            // last channel is removed.
+            self.remove_channel_mappings(peer_id).await;
             info!(peer_id = %peer_id, "Stale peer disconnected");
         }
 
@@ -1306,6 +1347,8 @@ impl TransportHandle {
         geo_provider: Arc<BgpGeoProvider>,
         _local_peer_id: String,
         shutdown: CancellationToken,
+        peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1374,7 +1417,8 @@ impl TransportHandle {
                                     );
                                 }
 
-                                broadcast_event(&event_tx, P2PEvent::PeerConnected(channel_id));
+                                // PeerConnected is emitted later when the peer's identity is
+                                // authenticated via a signed message — not at transport level.
                             }
                             ConnectionEvent::Lost { peer_id, reason }
                             | ConnectionEvent::Failed { peer_id, reason } => {
@@ -1386,7 +1430,14 @@ impl TransportHandle {
                                     peer_info.status = ConnectionStatus::Disconnected;
                                     peer_info.last_seen = Instant::now();
                                 }
-                                broadcast_event(&event_tx, P2PEvent::PeerDisconnected(channel_id));
+                                // Remove channel mappings and emit PeerDisconnected
+                                // when the peer's last channel is closed.
+                                Self::remove_channel_mappings_static(
+                                    &channel_id,
+                                    &peer_to_channel,
+                                    &channel_to_peers,
+                                    &event_tx,
+                                ).await;
                             }
                         },
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1469,6 +1520,8 @@ impl TransportHandle {
         event_tx: broadcast::Sender<P2PEvent>,
         stale_threshold: Duration,
         shutdown: CancellationToken,
+        peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     ) {
         let cleanup_threshold = stale_threshold * CLEANUP_THRESHOLD_MULTIPLIER;
         let mut interval = tokio::time::interval(Duration::from_millis(MAINTENANCE_INTERVAL_MS));
@@ -1506,7 +1559,15 @@ impl TransportHandle {
 
             for peer_id in &peers_to_mark_disconnected {
                 active_connections.write().await.remove(peer_id);
-                broadcast_event(&event_tx, P2PEvent::PeerDisconnected(peer_id.clone()));
+                // remove_channel_mappings_static emits PeerDisconnected when
+                // the peer's last channel is removed.
+                Self::remove_channel_mappings_static(
+                    peer_id,
+                    &peer_to_channel,
+                    &channel_to_peers,
+                    &event_tx,
+                )
+                .await;
                 info!(peer_id = %peer_id, "Stale peer disconnected");
             }
 

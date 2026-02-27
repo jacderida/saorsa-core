@@ -2297,20 +2297,18 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
-        for channel_id in connected {
-            self.handle_peer_connected(channel_id).await;
+        for node_id in connected {
+            self.handle_peer_connected(node_id).await;
         }
     }
 
-    /// Handle a connected peer event in an idempotent way.
-    async fn handle_peer_connected(&self, channel_id: String) {
-        let Some(app_peer_id) = self.canonical_app_peer_id(&channel_id).await else {
-            debug!(
-                "Deferring DHT tracking for transport channel {} until app identity is authenticated",
-                channel_id
-            );
-            return;
-        };
+    /// Handle an authenticated peer connection event.
+    ///
+    /// The `node_id` is the authenticated app-level peer ID — no
+    /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
+    /// only fires after identity verification.
+    async fn handle_peer_connected(&self, node_id: String) {
+        let app_peer_id = node_id;
         info!("DHT peer connected: app_id={}", app_peer_id);
         let dht_key = crate::dht::derive_dht_key_from_peer_id(&app_peer_id);
 
@@ -2415,91 +2413,38 @@ impl DhtNetworkManager {
                     recv = events.recv() => {
                         match recv {
                             Ok(event) => match event {
-                                crate::network::P2PEvent::PeerConnected(channel_id) => {
-                                    self_arc.handle_peer_connected(channel_id).await;
+                                crate::network::P2PEvent::PeerConnected(node_id) => {
+                                    self_arc.handle_peer_connected(node_id).await;
                                 }
-                                crate::network::P2PEvent::PeerDisconnected(channel_id) => {
-                                    // Find all app-level peers that were on this channel
-                                    let app_peers =
-                                        self_arc.transport.peers_on_channel(&channel_id).await;
+                                crate::network::P2PEvent::PeerDisconnected(node_id) => {
+                                    // node_id IS the authenticated app-level peer ID.
+                                    // PeerDisconnected only fires when all channels for
+                                    // this peer have closed — no multi-channel check needed.
+                                    info!(
+                                        "DHT peer fully disconnected: app_id={}",
+                                        node_id
+                                    );
 
-                                    if app_peers.is_empty() {
-                                        // Fallback: treat channel ID as peer ID (unsigned connections)
-                                        let is_tracked = self_arc
-                                            .dht_peers
-                                            .read()
-                                            .await
-                                            .contains_key(&channel_id);
-                                        if is_tracked {
-                                            info!(
-                                                "DHT peer disconnected (unsigned): {}",
-                                                channel_id
-                                            );
-                                            let mut peers = self_arc.dht_peers.write().await;
-                                            if let Some(peer_info) =
-                                                peers.get_mut(&channel_id)
-                                            {
-                                                peer_info.is_connected = false;
-                                            }
-                                            if self_arc.event_tx.receiver_count() > 0 {
-                                                let _ = self_arc
-                                                    .event_tx
-                                                    .send(DhtNetworkEvent::PeerDisconnected {
-                                                        peer_id: channel_id.clone(),
-                                                    });
-                                            }
-                                        } else {
-                                            debug!(
-                                                "Ignoring disconnect for untracked transport peer {}",
-                                                channel_id
-                                            );
+                                    {
+                                        let mut peers = self_arc.dht_peers.write().await;
+                                        if let Some(peer_info) =
+                                            peers.get_mut(&node_id)
+                                        {
+                                            peer_info.is_connected = false;
                                         }
-                                        continue;
                                     }
 
-                                    for app_peer_id in app_peers {
-                                        // Check whether the peer still has other channels
-                                        let remaining = self_arc
-                                            .transport
-                                            .channels_for_peer(&app_peer_id)
-                                            .await;
-                                        if !remaining.is_empty() {
-                                            debug!(
-                                                "Channel {} lost for peer {}, but {} channel(s) remain",
-                                                channel_id,
-                                                app_peer_id,
-                                                remaining.len()
-                                            );
-                                            continue;
-                                        }
-
-                                        info!(
-                                            "DHT peer fully disconnected: app_id={} (last channel={})",
-                                            app_peer_id, channel_id
+                                    if self_arc.event_tx.receiver_count() > 0
+                                        && let Err(e) = self_arc
+                                            .event_tx
+                                            .send(DhtNetworkEvent::PeerDisconnected {
+                                                peer_id: node_id,
+                                            })
+                                    {
+                                        warn!(
+                                            "Failed to send PeerDisconnected event: {}",
+                                            e
                                         );
-
-                                        // Mark disconnected only when no channels remain
-                                        {
-                                            let mut peers = self_arc.dht_peers.write().await;
-                                            if let Some(peer_info) =
-                                                peers.get_mut(&app_peer_id)
-                                            {
-                                                peer_info.is_connected = false;
-                                            }
-                                        }
-
-                                        if self_arc.event_tx.receiver_count() > 0
-                                            && let Err(e) = self_arc
-                                                .event_tx
-                                                .send(DhtNetworkEvent::PeerDisconnected {
-                                                    peer_id: app_peer_id,
-                                                })
-                                        {
-                                            warn!(
-                                                "Failed to send PeerDisconnected event: {}",
-                                                e
-                                            );
-                                        }
                                     }
                                 }
                                 crate::network::P2PEvent::Message {

@@ -52,7 +52,7 @@ async fn test_geoip_rejection_flow() {
 
         for candidate in peers_a {
             if !candidate.starts_with("peer_from_") {
-                if node_a.is_connection_active(&candidate).await {
+                if node_a.is_peer_connected(&candidate).await {
                     connected_peer_id = candidate;
                     break;
                 }

@@ -34,9 +34,12 @@ use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey
 
 // No four-word address tied to identity; addressing is handled elsewhere.
 
+/// Length of a NodeId in bytes (SHA-256 output).
+pub const NODE_ID_BYTE_LEN: usize = 32;
+
 /// Node ID derived from public key (256-bit)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; 32]);
+pub struct NodeId(pub [u8; NODE_ID_BYTE_LEN]);
 
 impl NodeId {
     /// Create from ML-DSA public key
@@ -87,17 +90,17 @@ impl NodeId {
                 format!("Invalid hex for NodeId: {e}").into(),
             ))
         })?;
-        if bytes.len() != 32 {
+        if bytes.len() != NODE_ID_BYTE_LEN {
             return Err(P2PError::Identity(IdentityError::InvalidFormat(
                 format!(
-                    "NodeId hex must be 64 characters (32 bytes), got {} characters ({} bytes)",
+                    "NodeId hex must be 64 characters ({NODE_ID_BYTE_LEN} bytes), got {} characters ({} bytes)",
                     hex_str.len(),
                     bytes.len()
                 )
                 .into(),
             )));
         }
-        let mut id = [0u8; 32];
+        let mut id = [0u8; NODE_ID_BYTE_LEN];
         id.copy_from_slice(&bytes);
         Ok(Self(id))
     }

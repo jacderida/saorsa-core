@@ -27,6 +27,8 @@ const ADAPTATION_STEPS: usize = 400;
 const MIXED_SIZE_ITERATIONS: usize = 400;
 const CONVERGENCE_EPOCHS: usize = 50;
 const CONVERGENCE_STEPS_PER_EPOCH: usize = 60;
+/// Maximum acceptable Q-value change rate between final epochs (10%).
+const MAX_CONVERGENCE_CHANGE_RATE: f64 = 0.10;
 
 /// Simulate different workload patterns
 #[derive(Debug, Clone)]
@@ -593,7 +595,7 @@ async fn test_q_learning_convergence() {
     println!("Final epsilon: {:.4}", q_manager.current_epsilon().await);
 
     // Should converge (small change rate)
-    assert!(change_rate < 0.10); // Less than 10% change (allows for stochastic variance)
+    assert!(change_rate < MAX_CONVERGENCE_CHANGE_RATE);
 
     // Final policy check - should cache high-frequency items
     let final_cache = q_manager.stats().await.access_frequency.clone();

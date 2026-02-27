@@ -5,7 +5,7 @@
 //!
 //! This test validates that the fix for P2P_MESSAGING_STATUS_2025-10-02_FINAL.md is in place:
 //! - P2PNode has active_connections tracking
-//! - is_connection_active() method validates connection state
+//! - is_peer_connected() validates authenticated peer state
 //! - Keepalive task prevents 30-second idle timeout
 //! - send_message() checks connection state before sending
 
@@ -49,21 +49,20 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     // Create a fake peer ID for testing
     let test_peer_id = "peer_test_12345678".to_string();
 
-    // Test 1: is_connection_active() exists and returns false for non-existent peer
-    let is_active = node.is_connection_active(&test_peer_id).await;
-    assert!(!is_active, "Non-existent peer should not be active");
-    info!("✓ is_connection_active() method exists and works");
-
-    // Test 2: is_peer_connected() exists and returns false for non-existent peer
+    // Test 1: is_peer_connected() exists and returns false for non-existent peer
     let is_connected = node.is_peer_connected(&test_peer_id).await;
     assert!(!is_connected, "Non-existent peer should not be connected");
     info!("✓ is_peer_connected() method exists and works");
 
-    // Test 3: Verify remove_channel() method exists (even if channel doesn't exist)
-    node.remove_channel(&test_peer_id).await;
-    info!("✓ remove_channel() method exists");
+    // Test 2: connected_peers() returns empty for fresh node
+    let peers = node.connected_peers().await;
+    assert!(
+        peers.is_empty(),
+        "Fresh node should have no connected peers"
+    );
+    info!("✓ connected_peers() returns empty for fresh node");
 
-    // Test 4: send_message() properly handles non-existent peer
+    // Test 3: send_message() properly handles non-existent peer
     let result = node
         .send_message(&test_peer_id, "test", b"test".to_vec())
         .await;
@@ -78,11 +77,10 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("");
     info!("This proves the following fix components are in place:");
     info!("1. active_connections HashSet tracking");
-    info!("2. is_connection_active() validation");
-    info!("3. is_peer_connected() checking");
-    info!("4. remove_channel() cleanup");
-    info!("5. send_message() connection validation");
-    info!("6. Keepalive task (spawned in background)");
+    info!("2. is_peer_connected() validation (app-level peer IDs)");
+    info!("3. connected_peers() returns authenticated peers");
+    info!("4. send_message() connection validation");
+    info!("5. Keepalive task (spawned in background)");
     info!("");
     info!("These components fix the issue from P2P_MESSAGING_STATUS_2025-10-02_FINAL.md");
     info!("where P2PNode's peers map didn't track when ant-quic connections closed.");
