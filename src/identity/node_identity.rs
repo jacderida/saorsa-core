@@ -25,8 +25,8 @@
 
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
-use serde::{Deserialize, Serialize};
 use blake3;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;

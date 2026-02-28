@@ -33,9 +33,9 @@
 use crate::error::{SecurityError, StorageError};
 use crate::secure_memory::SecureMemory;
 use crate::{P2PError, Result};
+use blake3;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use blake3;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};

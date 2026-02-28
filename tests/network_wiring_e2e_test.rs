@@ -19,9 +19,9 @@
 //!
 //! Run with: cargo test --test network_wiring_e2e_test -- --nocapture
 
+use saorsa_core::PeerId;
 use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, P2PEvent, P2PNode};
-use saorsa_core::PeerId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -128,12 +128,20 @@ where
 /// [`PeerId`] in its `connected_peers()` list. Returns `to`'s [`PeerId`].
 async fn connect_and_identify(from: &P2PNode, to: &P2PNode) -> PeerId {
     let addrs = to.listen_addrs().await;
-    let addr = addrs.first().expect("target node needs a listen address").to_string();
+    let addr = addrs
+        .first()
+        .expect("target node needs a listen address")
+        .to_string();
     let _channel = from.connect_peer(&addr).await.expect("connect_peer failed");
     let target_id = to.peer_id().clone();
     timeout(Duration::from_secs(5), async {
         loop {
-            if from.transport().connected_peers().await.contains(&target_id) {
+            if from
+                .transport()
+                .connected_peers()
+                .await
+                .contains(&target_id)
+            {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
@@ -1059,7 +1067,11 @@ async fn test_reconnection_works() {
     // First connection
     let peer2_peer_id = connect_and_identify(&node1, &node2).await;
     assert!(
-        node1.transport().connected_peers().await.contains(&peer2_peer_id),
+        node1
+            .transport()
+            .connected_peers()
+            .await
+            .contains(&peer2_peer_id),
         "Should be connected initially"
     );
 
@@ -1073,11 +1085,7 @@ async fn test_reconnection_works() {
     // Send message after reconnection
     let mut events2 = node2.subscribe_events();
     node1
-        .send_message(
-            &peer2_peer_id,
-            "messaging",
-            b"after reconnect".to_vec(),
-        )
+        .send_message(&peer2_peer_id, "messaging", b"after reconnect".to_vec())
         .await
         .expect("Failed to send after reconnect");
 
@@ -1464,7 +1472,9 @@ async fn test_empty_message_handling() {
     let peer2_peer_id = connect_and_identify(&node1, &node2).await;
 
     // Send empty message
-    let send_result = node1.send_message(&peer2_peer_id, "messaging", vec![]).await;
+    let send_result = node1
+        .send_message(&peer2_peer_id, "messaging", vec![])
+        .await;
 
     // Empty message should either:
     // 1. Be sent successfully and possibly delivered
@@ -1854,7 +1864,12 @@ async fn test_zero_stale_threshold() {
             // Wait briefly for identity exchange (may not complete with zero threshold)
             let identified = timeout(Duration::from_secs(2), async {
                 loop {
-                    if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+                    if node1
+                        .transport()
+                        .connected_peers()
+                        .await
+                        .contains(&peer2_peer_id)
+                    {
                         break;
                     }
                     sleep(Duration::from_millis(50)).await;

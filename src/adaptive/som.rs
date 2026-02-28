@@ -539,9 +539,6 @@ pub struct VisualizationData {
     pub neurons: Vec<NeuronVisualization>,
 }
 
-// Legacy support types
-use super::*;
-
 /// SOM-based routing strategy
 pub struct SOMRoutingStrategy;
 

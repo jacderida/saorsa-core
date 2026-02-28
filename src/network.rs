@@ -2203,7 +2203,12 @@ mod tests {
 
         // Should have generated a cryptographic peer ID (64-char hex BLAKE3 of public key)
         assert_eq!(node.peer_id().to_hex().len(), 64);
-        assert!(node.peer_id().to_hex().chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            node.peer_id()
+                .to_hex()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
         assert!(!node.is_running());
 
         Ok(())
@@ -2440,7 +2445,12 @@ mod tests {
         let target_peer_id = node2.peer_id().clone();
         let exchange_ok = timeout(Duration::from_secs(2), async {
             loop {
-                if node1.transport().connected_peers().await.contains(&target_peer_id) {
+                if node1
+                    .transport()
+                    .connected_peers()
+                    .await
+                    .contains(&target_peer_id)
+                {
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -3046,10 +3056,7 @@ mod tests {
                 source,
                 data,
             } => {
-                assert!(
-                    source.is_none(),
-                    "unsigned message source must be None"
-                );
+                assert!(source.is_none(), "unsigned message source must be None");
                 assert_eq!(topic, "test/v1");
                 assert_eq!(data, vec![1u8, 2, 3]);
             }

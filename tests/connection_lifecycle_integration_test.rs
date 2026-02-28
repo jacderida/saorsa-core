@@ -94,7 +94,12 @@ async fn test_connection_lifecycle_with_keepalive() {
     let peer2_peer_id = node2.peer_id().clone();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+            if node1
+                .transport()
+                .connected_peers()
+                .await
+                .contains(&peer2_peer_id)
+            {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
@@ -128,7 +133,11 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Verify connection is still active thanks to keepalive
     assert!(
-        node1.transport().connected_peers().await.contains(&peer2_peer_id),
+        node1
+            .transport()
+            .connected_peers()
+            .await
+            .contains(&peer2_peer_id),
         "Connection should still be active after 40 seconds due to keepalive"
     );
 
@@ -151,7 +160,11 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Verify peer was removed from peers map
     assert!(
-        !node1.transport().connected_peers().await.contains(&peer2_peer_id),
+        !node1
+            .transport()
+            .connected_peers()
+            .await
+            .contains(&peer2_peer_id),
         "Peer should be removed after disconnect"
     );
 
@@ -212,7 +225,12 @@ async fn test_send_message_validates_connection_state() {
     let peer2_peer_id = node2.peer_id().clone();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+            if node1
+                .transport()
+                .connected_peers()
+                .await
+                .contains(&peer2_peer_id)
+            {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
@@ -224,7 +242,13 @@ async fn test_send_message_validates_connection_state() {
     info!("Connected to peer {}", peer2_peer_id);
 
     // Verify connection is active
-    assert!(node1.transport().connected_peers().await.contains(&peer2_peer_id));
+    assert!(
+        node1
+            .transport()
+            .connected_peers()
+            .await
+            .contains(&peer2_peer_id)
+    );
 
     // Send initial message successfully
     node1
@@ -239,7 +263,11 @@ async fn test_send_message_validates_connection_state() {
 
     // Verify connection is no longer active
     assert!(
-        !node1.transport().connected_peers().await.contains(&peer2_peer_id),
+        !node1
+            .transport()
+            .connected_peers()
+            .await
+            .contains(&peer2_peer_id),
         "Connection should be inactive after disconnect"
     );
 
@@ -310,7 +338,12 @@ async fn test_multiple_message_exchanges() {
     let peer2_peer_id = node2.peer_id().clone();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+            if node1
+                .transport()
+                .connected_peers()
+                .await
+                .contains(&peer2_peer_id)
+            {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
