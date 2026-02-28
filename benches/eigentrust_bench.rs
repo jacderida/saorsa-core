@@ -17,11 +17,8 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use saorsa_core::adaptive::{TrustProvider, trust::MockTrustProvider};
-use saorsa_core::peer_record::UserId;
+use saorsa_core::peer_record::PeerId;
 use std::sync::Arc;
-
-// Type alias for clarity
-type NodeId = UserId;
 
 /// Benchmark trust computation operations
 fn bench_trust_computation(c: &mut Criterion) {
@@ -76,9 +73,9 @@ fn bench_trust_provider(c: &mut Criterion) {
     group.finish();
 }
 
-/// Create a test NodeId from bytes
-fn create_test_node_id(bytes: [u8; 32]) -> NodeId {
-    UserId::from_bytes(bytes)
+/// Create a test peer ID from bytes
+fn create_test_node_id(bytes: [u8; 32]) -> PeerId {
+    PeerId::from_bytes(bytes)
 }
 
 criterion_group!(benches, bench_trust_computation, bench_trust_provider);

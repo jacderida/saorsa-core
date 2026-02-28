@@ -18,6 +18,7 @@
 //! `P2PNode` and [`DhtNetworkManager`] without coupling to the full node.
 
 use crate::NetworkAddress;
+use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::identity::node_identity::NodeIdentity;
@@ -77,8 +78,6 @@ async fn touch_channel_last_seen(peers: &RwLock<HashMap<String, PeerInfo>>, chan
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
-    /// Application-level peer ID (pre-computed, possibly random).
-    pub peer_id: String,
     /// Primary listen address.
     pub listen_addr: SocketAddr,
     /// Whether IPv6 dual-stack is enabled.
@@ -99,8 +98,9 @@ pub struct TransportConfig {
     /// the QUIC stream receive window and the
     /// per-stream read buffer for larger or smaller payloads.
     pub max_message_size: Option<usize>,
-    /// Optional node identity for app-level message signing.
-    pub node_identity: Option<Arc<NodeIdentity>>,
+    /// Cryptographic node identity (ML-DSA-65). The canonical peer ID is
+    /// derived from this identity's public key hash.
+    pub node_identity: Arc<NodeIdentity>,
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -110,7 +110,6 @@ pub struct TransportConfig {
 /// [`DhtNetworkManager`](crate::dht_network_manager::DhtNetworkManager)
 /// hold `Arc<TransportHandle>` so they share the same transport state.
 pub struct TransportHandle {
-    peer_id: String,
     dual_node: Arc<DualStackNetworkNode>,
     peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
     active_connections: Arc<RwLock<HashSet<String>>>,
@@ -130,14 +129,14 @@ pub struct TransportHandle {
     periodic_tasks_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     listener_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
-    /// Optional node identity for signing outgoing messages.
-    node_identity: Option<Arc<NodeIdentity>>,
-    /// Maps app-level peer ID → set of channel IDs (QUIC, Bluetooth, …).
+    /// Cryptographic node identity for signing outgoing messages.
+    node_identity: Arc<NodeIdentity>,
+    /// Maps app-level [`PeerId`] → set of channel IDs (QUIC, Bluetooth, …).
     ///
     /// A single peer may communicate over multiple channels simultaneously.
-    peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    /// Reverse index: channel ID → set of app-level peer IDs on that channel.
-    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+    /// Reverse index: channel ID → set of app-level [`PeerId`]s on that channel.
+    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
 }
 
 // ============================================================================
@@ -222,7 +221,6 @@ impl TransportHandle {
             let event_tx_clone = event_tx.clone();
             let dual_node_clone = Arc::clone(&dual_node);
             let geo_provider_clone = Arc::clone(&geo_provider);
-            let peer_id_clone = config.peer_id.clone();
             let shutdown_token = shutdown.clone();
             let p2c = Arc::clone(&peer_to_channel);
             let c2p = Arc::clone(&channel_to_peers);
@@ -236,7 +234,6 @@ impl TransportHandle {
                     peers_map,
                     event_tx_clone,
                     geo_provider_clone,
-                    peer_id_clone,
                     shutdown_token,
                     p2c,
                     c2p,
@@ -283,7 +280,6 @@ impl TransportHandle {
         };
 
         Ok(Self {
-            peer_id: config.peer_id,
             dual_node,
             peers,
             active_connections,
@@ -309,6 +305,11 @@ impl TransportHandle {
 
     /// Minimal constructor for tests that avoids real networking.
     pub fn new_for_tests() -> Result<Self> {
+        let identity = Arc::new(NodeIdentity::generate().map_err(|e| {
+            P2PError::Network(NetworkError::BindError(
+                format!("Failed to generate test node identity: {}", e).into(),
+            ))
+        })?);
         let (event_tx, _) = broadcast::channel(TEST_EVENT_CHANNEL_CAPACITY);
         let dual_node = {
             let v6: Option<SocketAddr> = "[::1]:0"
@@ -337,7 +338,6 @@ impl TransportHandle {
         };
 
         Ok(Self {
-            peer_id: "test_peer".to_string(),
             dual_node,
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_connections: Arc::new(RwLock::new(HashSet::new())),
@@ -360,7 +360,7 @@ impl TransportHandle {
             periodic_tasks_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
-            node_identity: None,
+            node_identity: identity,
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -372,15 +372,20 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
-    /// Get the application-level peer ID.
-    pub fn peer_id(&self) -> &str {
-        &self.peer_id
+    /// Get the application-level peer ID (cryptographic identity).
+    pub fn peer_id(&self) -> PeerId {
+        self.node_identity.peer_id().clone()
+    }
+
+    /// Get the cryptographic node identity.
+    pub fn node_identity(&self) -> &Arc<NodeIdentity> {
+        &self.node_identity
     }
 
     /// Get the hex-encoded channel ID (QUIC connection identifier).
     ///
-    /// This is the ID used in `P2PEvent::Message.source`, `connected_peers()`,
-    /// and `send_message()`. It differs from `peer_id()` which is the app-level ID.
+    /// This is the transport-level connection identifier. It differs from
+    /// `peer_id()` which is the app-level cryptographic identity.
     pub fn channel_id(&self) -> Option<String> {
         if let Some(ref v4) = self.dual_node.v4 {
             return Some(ant_peer_id_to_string(&v4.our_peer_id()));
@@ -421,7 +426,7 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Get list of authenticated app-level peer IDs.
-    pub async fn connected_peers(&self) -> Vec<String> {
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.peer_to_channel.read().await.keys().cloned().collect()
     }
 
@@ -444,16 +449,17 @@ impl TransportHandle {
     /// Get info for a specific peer.
     ///
     /// Accepts either a channel ID (direct lookup) or an app-level peer ID
-    /// (resolved via `peer_to_channel` mapping). This allows DHT code to pass
-    /// app-level peer IDs without manual channel resolution.
+    /// hex string (resolved via `peer_to_channel` mapping). This allows DHT
+    /// code to pass app-level peer IDs without manual channel resolution.
     pub async fn peer_info(&self, peer_id: &str) -> Option<PeerInfo> {
         let peers = self.peers.read().await;
         if let Some(info) = peers.get(peer_id) {
             return Some(info.clone());
         }
-        // Try resolving app-level peer ID → any channel ID
+        // Try parsing as app-level PeerId hex → resolve to any channel ID
+        let app_id = PeerId::from_hex(peer_id).ok()?;
         let p2c = self.peer_to_channel.read().await;
-        let channel = p2c.get(peer_id).and_then(|chs| chs.iter().next())?;
+        let channel = p2c.get(&app_id).and_then(|chs| chs.iter().next())?;
         peers.get(channel).cloned()
     }
 
@@ -529,8 +535,8 @@ impl TransportHandle {
     /// that don't have `&self`.
     async fn remove_channel_mappings_static(
         channel_id: &str,
-        peer_to_channel: &RwLock<HashMap<String, HashSet<String>>>,
-        channel_to_peers: &RwLock<HashMap<String, HashSet<String>>>,
+        peer_to_channel: &RwLock<HashMap<PeerId, HashSet<String>>>,
+        channel_to_peers: &RwLock<HashMap<String, HashSet<PeerId>>>,
         event_tx: &broadcast::Sender<P2PEvent>,
     ) {
         let mut p2c = peer_to_channel.write().await;
@@ -582,7 +588,7 @@ impl TransportHandle {
                 let connected_peer_id = ant_peer_id_to_string(&peer);
 
                 // Prevent self-connections
-                if connected_peer_id == self.peer_id {
+                if connected_peer_id == self.node_identity.peer_id().to_hex() {
                     warn!(
                         "Detected self-connection to own address {} (peer_id: {}), rejecting",
                         address, connected_peer_id
@@ -673,42 +679,67 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
-    /// Send a message to a peer (raw, no trust reporting).
+    /// Send a message to an authenticated peer (raw, no trust reporting).
     ///
-    /// `peer_id` can be either a channel ID (from QUIC) or an app-level
-    /// NodeId hex string. When an app-level ID is given, the internal
-    /// `peer_to_channel` mapping is used to resolve it.
-    pub async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
-        // Resolve: if peer_id is an app-level NodeId, look up the channel ID.
-        let channel = self.resolve_channel_id(peer_id).await;
-        let effective_id = channel.as_deref().unwrap_or(peer_id);
+    /// Resolves the app-level [`PeerId`] to a transport channel via the
+    /// `peer_to_channel` mapping and sends over that channel.
+    pub async fn send_message(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let peer_hex = peer_id.to_hex();
+        let channel = {
+            self.peer_to_channel
+                .read()
+                .await
+                .get(peer_id)
+                .and_then(|channels| channels.iter().next().cloned())
+        };
+        let channel_id = channel.ok_or_else(|| {
+            P2PError::Network(NetworkError::PeerNotFound(peer_hex.clone().into()))
+        })?;
+        self.send_on_channel(&channel_id, protocol, data).await
+    }
 
+    /// Send a message on a specific transport channel (raw, no trust reporting).
+    ///
+    /// `channel_id` is the transport-level QUIC connection identifier. Internal
+    /// callers (publish, keepalive, etc.) that already have a channel ID use
+    /// this method directly to avoid an extra PeerId → channel lookup.
+    pub(crate) async fn send_on_channel(
+        &self,
+        channel_id: &str,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
         debug!(
-            "Sending message to peer {} (transport: {}) on protocol {}",
-            peer_id, effective_id, protocol
+            "Sending message to channel {} on protocol {}",
+            channel_id, protocol
         );
 
         // Check rate limits if resource manager is enabled
         if let Some(ref resource_manager) = self.resource_manager
             && !resource_manager
-                .check_rate_limit(effective_id, "message")
+                .check_rate_limit(channel_id, "message")
                 .await?
         {
             return Err(P2PError::ResourceExhausted(
-                format!("Rate limit exceeded for peer {}", peer_id).into(),
+                format!("Rate limit exceeded for channel {}", channel_id).into(),
             ));
         }
 
-        if !self.peers.read().await.contains_key(effective_id) {
+        if !self.peers.read().await.contains_key(channel_id) {
             return Err(P2PError::Network(NetworkError::PeerNotFound(
-                peer_id.to_string().into(),
+                channel_id.to_string().into(),
             )));
         }
 
-        if !self.is_connection_active(effective_id).await {
-            self.remove_channel(effective_id).await;
+        if !self.is_connection_active(channel_id).await {
+            self.remove_channel(channel_id).await;
             return Err(P2PError::Network(NetworkError::ConnectionClosed {
-                peer_id: peer_id.to_string().into(),
+                peer_id: channel_id.to_string().into(),
             }));
         }
 
@@ -719,16 +750,16 @@ impl TransportHandle {
         let raw_data_len = data.len();
         let message_data = self.create_protocol_message(protocol, data)?;
         info!(
-            "Sending {} bytes to peer {} on protocol {} (raw data: {} bytes)",
+            "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
             message_data.len(),
-            effective_id,
+            channel_id,
             protocol,
             raw_data_len
         );
 
         let send_fut = self
             .dual_node
-            .send_to_peer_string_optimized(effective_id, &message_data);
+            .send_to_peer_string_optimized(channel_id, &message_data);
         let result = tokio::time::timeout(self.connection_timeout, send_fut)
             .await
             .map_err(|_| {
@@ -744,37 +775,19 @@ impl TransportHandle {
 
         if result.is_ok() {
             info!(
-                "Successfully sent {} bytes to peer {}",
+                "Successfully sent {} bytes to channel {}",
                 message_data.len(),
-                effective_id
+                channel_id
             );
         } else {
-            warn!("Failed to send message to peer {}", peer_id);
+            warn!("Failed to send message to channel {}", channel_id);
         }
 
         result
     }
 
-    /// Resolve an app-level NodeId hex to a channel ID for sending.
-    ///
-    /// Returns `None` if the given ID is already a channel ID (present
-    /// in the peers map) or if no mapping exists. When the peer has
-    /// multiple channels, returns an arbitrary active one.
-    async fn resolve_channel_id(&self, peer_id: &str) -> Option<String> {
-        // If it's directly in the peers map, it's already a channel ID.
-        if self.peers.read().await.contains_key(peer_id) {
-            return None;
-        }
-        // Otherwise, pick any channel from the peer's set.
-        self.peer_to_channel
-            .read()
-            .await
-            .get(peer_id)
-            .and_then(|channels| channels.iter().next().cloned())
-    }
-
     /// Return all channel IDs for an app-level peer, if known.
-    pub async fn channels_for_peer(&self, app_peer_id: &str) -> Vec<String> {
+    pub async fn channels_for_peer(&self, app_peer_id: &PeerId) -> Vec<String> {
         self.peer_to_channel
             .read()
             .await
@@ -784,7 +797,7 @@ impl TransportHandle {
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
-    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<String> {
+    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
         self.channel_to_peers
             .read()
             .await
@@ -794,7 +807,7 @@ impl TransportHandle {
     }
 
     /// Return true if `peer_id` is a known authenticated app-level peer ID.
-    pub async fn is_known_app_peer_id(&self, peer_id: &str) -> bool {
+    pub async fn is_known_app_peer_id(&self, peer_id: &PeerId) -> bool {
         self.peer_to_channel.read().await.contains_key(peer_id)
     }
 
@@ -804,7 +817,7 @@ impl TransportHandle {
     /// need trust feedback should wrap this method (as `P2PNode` does).
     pub async fn send_request(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         protocol: &str,
         data: Vec<u8>,
         timeout: Duration,
@@ -833,7 +846,7 @@ impl TransportHandle {
                 message_id.clone(),
                 PendingRequest {
                     response_tx: tx,
-                    expected_peer: peer_id.to_string(),
+                    expected_peer: peer_id.clone(),
                 },
             );
         }
@@ -866,13 +879,13 @@ impl TransportHandle {
             Ok(Ok(response_bytes)) => {
                 let latency = started_at.elapsed();
                 Ok(PeerResponse {
-                    peer_id: peer_id.to_string(),
+                    peer_id: peer_id.clone(),
                     data: response_bytes,
                     latency,
                 })
             }
             Ok(Err(_)) => Err(P2PError::Network(NetworkError::ConnectionClosed {
-                peer_id: peer_id.to_string().into(),
+                peer_id: peer_id.to_hex().into(),
             })),
             Err(_) => Err(P2PError::Transport(
                 crate::error::TransportError::StreamError(
@@ -892,7 +905,7 @@ impl TransportHandle {
     /// Send a response to a previously received request.
     pub async fn send_response(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         protocol: &str,
         message_id: &str,
         data: Vec<u8>,
@@ -921,20 +934,18 @@ impl TransportHandle {
 
     /// Create a protocol message wrapper (WireMessage serialized with postcard).
     ///
-    /// If `node_identity` is set, signs the message with the node's ML-DSA-65 key.
+    /// Signs the message with the node's ML-DSA-65 key.
     fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u8>> {
         let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
-            from: self.peer_id.clone(),
+            from: self.node_identity.peer_id().to_hex().clone(),
             timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
         };
 
-        if let Some(ref identity) = self.node_identity {
-            Self::sign_wire_message(&mut message, identity)?;
-        }
+        Self::sign_wire_message(&mut message, &self.node_identity)?;
 
         Self::serialize_wire_message(&message)
     }
@@ -944,14 +955,11 @@ impl TransportHandle {
     /// Used by the lifecycle monitor to send an announce immediately after a
     /// transport connection is established, before the full `TransportHandle`
     /// is available in that context.
-    fn create_identity_announce_bytes(
-        config_peer_id: &str,
-        identity: &NodeIdentity,
-    ) -> Result<Vec<u8>> {
+    fn create_identity_announce_bytes(identity: &NodeIdentity) -> Result<Vec<u8>> {
         let mut message = WireMessage {
             protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
             data: vec![],
-            from: config_peer_id.to_string(),
+            from: identity.peer_id().to_hex(),
             timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
@@ -1043,14 +1051,14 @@ impl TransportHandle {
             debug!("No peers connected, message will only be sent to local subscribers");
         } else {
             let mut send_count = 0;
-            for peer_id in &peer_list {
-                match self.send_message(peer_id, topic, data.to_vec()).await {
+            for channel_id in &peer_list {
+                match self.send_on_channel(channel_id, topic, data.to_vec()).await {
                     Ok(()) => {
                         send_count += 1;
-                        debug!("Sent message to peer: {}", peer_id);
+                        debug!("Sent message to channel: {}", channel_id);
                     }
                     Err(e) => {
-                        warn!("Failed to send message to peer {}: {}", peer_id, e);
+                        warn!("Failed to send message to channel {}: {}", channel_id, e);
                     }
                 }
             }
@@ -1063,7 +1071,7 @@ impl TransportHandle {
 
         self.send_event(P2PEvent::Message {
             topic: topic.to_string(),
-            source: self.peer_id.clone(),
+            source: Some(self.node_identity.peer_id().clone()),
             data: data.to_vec(),
         });
 
@@ -1240,7 +1248,7 @@ impl TransportHandle {
                             // Accept response only if the authenticated app-level
                             // identity matches. Channel IDs identify connections,
                             // not peers, so they are not checked here.
-                            if authenticated_node_id.as_deref() != Some(&expected_peer) {
+                            if authenticated_node_id.as_ref() != Some(&expected_peer) {
                                 warn!(
                                     message_id = %envelope.message_id,
                                     expected = %expected_peer,
@@ -1389,11 +1397,10 @@ impl TransportHandle {
         peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         event_tx: broadcast::Sender<P2PEvent>,
         geo_provider: Arc<BgpGeoProvider>,
-        config_peer_id: String,
         shutdown: CancellationToken,
-        peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-        node_identity: Option<Arc<NodeIdentity>>,
+        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        node_identity: Arc<NodeIdentity>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1463,19 +1470,17 @@ impl TransportHandle {
                                 }
 
                                 // Send identity announce so the remote peer can authenticate us.
-                                if let Some(ref identity) = node_identity {
-                                    match Self::create_identity_announce_bytes(&config_peer_id, identity) {
-                                        Ok(announce_bytes) => {
-                                            if let Err(e) = dual_node
-                                                .send_to_peer_string_optimized(&channel_id, &announce_bytes)
-                                                .await
-                                            {
-                                                warn!("Failed to send identity announce to {channel_id}: {e}");
-                                            }
+                                match Self::create_identity_announce_bytes(&node_identity) {
+                                    Ok(announce_bytes) => {
+                                        if let Err(e) = dual_node
+                                            .send_to_peer_string_optimized(&channel_id, &announce_bytes)
+                                            .await
+                                        {
+                                            warn!("Failed to send identity announce to {channel_id}: {e}");
                                         }
-                                        Err(e) => {
-                                            warn!("Failed to create identity announce: {e}");
-                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to create identity announce: {e}");
                                     }
                                 }
 
@@ -1582,8 +1587,8 @@ impl TransportHandle {
         event_tx: broadcast::Sender<P2PEvent>,
         stale_threshold: Duration,
         shutdown: CancellationToken,
-        peer_to_channel: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
     ) {
         let cleanup_threshold = stale_threshold * CLEANUP_THRESHOLD_MULTIPLIER;
         let mut interval = tokio::time::interval(Duration::from_millis(MAINTENANCE_INTERVAL_MS));
@@ -1720,11 +1725,11 @@ fn categorize_stale_peers(
 
 #[async_trait::async_trait]
 impl NetworkSender for TransportHandle {
-    async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
+    async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()> {
         TransportHandle::send_message(self, peer_id, protocol, data).await
     }
 
-    fn local_peer_id(&self) -> &str {
+    fn local_peer_id(&self) -> PeerId {
         self.peer_id()
     }
 }

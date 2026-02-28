@@ -40,8 +40,7 @@ pub use node_failure_tracker::{DefaultNodeFailureTracker, DhtClient, NodeFailure
 
 // Re-export existing DHT components
 pub use core_engine::{
-    DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity,
-    NodeId as DhtNodeId, NodeInfo,
+    DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity, NodeInfo,
 };
 
 // Legacy type aliases for backward compatibility
@@ -213,9 +212,7 @@ pub mod metrics;
 pub mod trust_peer_selector;
 
 // Re-export trust peer selector types
-pub use trust_peer_selector::{
-    TrustAwarePeerSelector, TrustSelectionConfig, adaptive_id_to_dht_node, dht_node_to_adaptive_id,
-};
+pub use trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
 
 // Re-export routing maintenance types for convenience
 pub use routing_maintenance::{

@@ -17,7 +17,8 @@
 //! saorsa-node owns application data storage/replication and uses these helpers
 //! to select target peers and react to churn events.
 
-use super::{AdaptiveDHT, ContentHash, NodeDescriptor, NodeId, Result};
+use super::{AdaptiveDHT, ContentHash, NodeDescriptor, Result};
+use crate::PeerId;
 use crate::{DhtNetworkEvent, DhtNetworkManager};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -46,14 +47,14 @@ impl ReplicaPlanner {
         content_hash: ContentHash,
         count: usize,
     ) -> Result<Vec<NodeDescriptor>> {
-        let target = NodeId::from_bytes(content_hash.0);
+        let target = PeerId::from_bytes(content_hash.0);
         self.dht.find_closest_nodes(&target, count).await
     }
 
     /// Select replica target peers for an explicit node id.
     pub async fn select_replica_targets_for_node(
         &self,
-        target: &NodeId,
+        target: &PeerId,
         count: usize,
     ) -> Result<Vec<NodeDescriptor>> {
         self.dht.find_closest_nodes(target, count).await

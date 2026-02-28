@@ -17,8 +17,8 @@
 //! Comprehensive benchmarks for measuring Saorsa Core DHT performance.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use saorsa_core::dht::{Key, PeerId, Record};
-use saorsa_core::identity::node_identity::PeerId as IdentityPeerId;
+use saorsa_core::PeerId;
+use saorsa_core::dht::{Key, Record};
 use std::net::SocketAddr;
 
 /// Benchmark DHT key operations
@@ -153,7 +153,7 @@ fn peer_id_benchmarks(c: &mut Criterion) {
 
 /// Create a test PeerId from bytes
 fn create_test_peer_id(bytes: [u8; 32]) -> PeerId {
-    IdentityPeerId::from_bytes(bytes)
+    PeerId::from_bytes(bytes)
 }
 
 /// Calculate XOR distance between two peer IDs

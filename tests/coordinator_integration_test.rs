@@ -130,7 +130,7 @@ async fn test_layer_coordination() {
     };
 
     // Test routing coordination
-    let target = saorsa_core::adaptive::NodeId { hash: [1u8; 32] };
+    let target = saorsa_core::PeerId::from_bytes([1u8; 32]);
     let paths = coordinator.coordinate_routing(&target).await;
 
     // Should return empty paths in test environment

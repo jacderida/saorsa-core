@@ -20,6 +20,7 @@
 //! - First successful response wins
 
 use super::*;
+use crate::PeerId;
 use crate::adaptive::{
     ContentType, learning::QLearnCacheManager, routing::AdaptiveRouter, storage::ContentStore,
 };
@@ -110,7 +111,7 @@ struct RetrievalResult {
     duration: Duration,
 
     /// Node that provided content
-    source_node: NodeId,
+    source_node: PeerId,
 }
 
 impl RetrievalManager {
@@ -302,9 +303,7 @@ impl RetrievalManager {
 
         // Find path to content using greedy routing
         let path = hyperbolic_strategy
-            .find_path(&NodeId {
-                hash: content_hash.0,
-            })
+            .find_path(&PeerId::from_bytes(content_hash.0))
             .await?;
 
         // Query nodes along the path
@@ -382,9 +381,9 @@ impl RetrievalManager {
     /// Query a specific node for content
     async fn query_node_for_content(
         &self,
-        node: NodeId,
+        node: PeerId,
         content_hash: ContentHash,
-    ) -> Result<(Vec<u8>, NodeId)> {
+    ) -> Result<(Vec<u8>, PeerId)> {
         // In real implementation, this would:
         // 1. Send GET_CONTENT message to node
         // 2. Wait for response

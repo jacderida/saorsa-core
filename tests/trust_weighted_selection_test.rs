@@ -13,14 +13,15 @@
 
 //! Integration tests for trust-weighted peer selection in DHT operations
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{EigenTrustEngine, NodeStatisticsUpdate};
-use saorsa_core::dht::{DhtCoreEngine, DhtKey, DhtNodeId, TrustSelectionConfig};
+use saorsa_core::dht::{DhtCoreEngine, DhtKey, TrustSelectionConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Create a DHT engine for testing
 fn make_dht_engine() -> DhtCoreEngine {
-    DhtCoreEngine::new(DhtNodeId::from_bytes([0u8; 32])).expect("Failed to create DHT engine")
+    DhtCoreEngine::new(PeerId::from_bytes([0u8; 32])).expect("Failed to create DHT engine")
 }
 
 #[tokio::test]
@@ -104,7 +105,7 @@ async fn test_trust_affects_peer_order_in_selection() {
     // This test verifies that trust scores affect peer selection order
     // by setting up nodes with known trust differences
 
-    let pre_trusted_id = saorsa_core::adaptive::NodeId { hash: [1u8; 32] };
+    let pre_trusted_id = saorsa_core::PeerId::from_bytes([1u8; 32]);
 
     let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::from([
         pre_trusted_id.clone()
@@ -112,7 +113,7 @@ async fn test_trust_affects_peer_order_in_selection() {
 
     // Update trust scores for test nodes
     // Pre-trusted node trusts node 2 with multiple interactions
-    let node2_id = saorsa_core::adaptive::NodeId { hash: [2u8; 32] };
+    let node2_id = saorsa_core::PeerId::from_bytes([2u8; 32]);
     for _ in 0..5 {
         trust_engine
             .update_local_trust(&pre_trusted_id, &node2_id, true)
@@ -184,7 +185,7 @@ async fn test_trust_engine_integration_with_statistics() {
     // Test that EigenTrust engine correctly processes node statistics updates
     let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::new()));
 
-    let node_id = saorsa_core::adaptive::NodeId { hash: [42u8; 32] };
+    let node_id = saorsa_core::PeerId::from_bytes([42u8; 32]);
 
     // Update node statistics
     trust_engine

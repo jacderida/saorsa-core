@@ -632,8 +632,8 @@ impl SiblingList {
         let expected_distance = target_key.distance(&local_key);
 
         for proposed in proposed_nodes {
-            // NodeInfo has id field of type NodeId
-            // Get the underlying bytes from the NodeId
+            // NodeInfo has id field of type PeerId
+            // Get the underlying bytes from the PeerId
             let proposed_id = *proposed.id.as_bytes();
 
             let proposed_key = DhtKey::from_bytes(proposed_id);
@@ -1808,7 +1808,7 @@ mod tests {
 
     fn create_test_dht_node(peer_id: &str, _distance_bytes: [u8; 32]) -> NodeInfo {
         NodeInfo {
-            id: crate::dht::core_engine::NodeId::from_key(crate::dht::core_engine::DhtKey::new(
+            id: crate::dht::core_engine::peer_id_from_key(crate::dht::core_engine::DhtKey::new(
                 &[42u8; 32],
             )),
             address: peer_id.to_string(),

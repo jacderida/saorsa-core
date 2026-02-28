@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::adaptive::{NodeId, performance::PerformanceMonitor, trust::EigenTrustEngine};
+use crate::PeerId;
+use crate::adaptive::{performance::PerformanceMonitor, trust::EigenTrustEngine};
 use crate::placement::{
     GeographicLocation, NetworkRegion, PlacementConfig, PlacementDecision, PlacementError,
     PlacementResult, PlacementStrategy,
@@ -67,13 +68,13 @@ macro_rules! validate_score {
 
 /// Validate that a score is within [0.0, 1.0] range
 #[inline]
-fn validate_unit_score(node_id: &NodeId, value: f64, name: &'static str) -> PlacementResult<()> {
+fn validate_unit_score(node_id: &PeerId, value: f64, name: &'static str) -> PlacementResult<()> {
     validate_score!(node_id, value, name, unit)
 }
 
 /// Validate that a factor is non-negative
 #[inline]
-fn validate_non_negative(node_id: &NodeId, value: f64, name: &'static str) -> PlacementResult<()> {
+fn validate_non_negative(node_id: &PeerId, value: f64, name: &'static str) -> PlacementResult<()> {
     validate_score!(node_id, value, name, non_negative)
 }
 
@@ -85,7 +86,7 @@ pub struct WeightedSampler {
     rng_state: u64,
     /// Cached weights for performance
     #[allow(dead_code)]
-    weight_cache: HashMap<NodeId, f64>,
+    weight_cache: HashMap<PeerId, f64>,
     /// Last update timestamp for cache invalidation
     #[allow(dead_code)]
     cache_updated: Instant,
@@ -120,7 +121,7 @@ impl WeightedSampler {
     /// - d_i: Diversity factor
     pub fn calculate_weight(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         trust_score: f64,
         stability_score: f64,
         capacity_factor: f64,
@@ -169,9 +170,9 @@ impl WeightedSampler {
     /// Sample k nodes using Efraimidis-Spirakis algorithm
     pub fn sample_nodes(
         &mut self,
-        candidates: &[(NodeId, f64)],
+        candidates: &[(PeerId, f64)],
         k: usize,
-    ) -> PlacementResult<Vec<NodeId>> {
+    ) -> PlacementResult<Vec<PeerId>> {
         if candidates.is_empty() {
             return Err(PlacementError::InsufficientNodes {
                 required: k,
@@ -191,7 +192,7 @@ impl WeightedSampler {
         }
 
         // Generate weighted random keys for each candidate
-        let mut weighted_keys: Vec<(f64, NodeId)> = candidates
+        let mut weighted_keys: Vec<(f64, PeerId)> = candidates
             .iter()
             .map(|(node_id, weight)| {
                 if *weight <= 0.0 {
@@ -256,11 +257,11 @@ impl DiversityEnforcer {
     /// Calculate diversity factor for a node given existing selections
     pub fn calculate_diversity_factor(
         &self,
-        _candidate: &NodeId,
+        _candidate: &PeerId,
         candidate_location: &GeographicLocation,
         candidate_asn: u32,
         candidate_region: &NetworkRegion,
-        selected_nodes: &[(NodeId, GeographicLocation, u32, NetworkRegion)],
+        selected_nodes: &[(PeerId, GeographicLocation, u32, NetworkRegion)],
     ) -> f64 {
         let mut diversity_factor = 1.0;
 
@@ -298,7 +299,7 @@ impl DiversityEnforcer {
     /// Validate diversity constraints for final selection
     pub fn validate_selection(
         &self,
-        selection: &[(NodeId, GeographicLocation, u32, NetworkRegion)],
+        selection: &[(PeerId, GeographicLocation, u32, NetworkRegion)],
     ) -> PlacementResult<()> {
         // Check geographic diversity
         for (i, (node_a, loc_a, _, _)) in selection.iter().enumerate() {
@@ -391,12 +392,12 @@ impl WeightedPlacementStrategy {
     /// Calculate weights for all candidate nodes
     async fn calculate_weights(
         &self,
-        candidates: &HashSet<NodeId>,
+        candidates: &HashSet<PeerId>,
         _trust_system: &EigenTrustEngine,
         _performance_monitor: &PerformanceMonitor,
-        node_metadata: &HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
-        selected_nodes: &[(NodeId, GeographicLocation, u32, NetworkRegion)],
-    ) -> PlacementResult<Vec<(NodeId, f64)>> {
+        node_metadata: &HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
+        selected_nodes: &[(PeerId, GeographicLocation, u32, NetworkRegion)],
+    ) -> PlacementResult<Vec<(PeerId, f64)>> {
         let mut weights = Vec::new();
 
         for node_id in candidates {
@@ -449,11 +450,11 @@ impl WeightedPlacementStrategy {
 impl PlacementStrategy for WeightedPlacementStrategy {
     async fn select_nodes(
         &mut self,
-        candidates: &HashSet<NodeId>,
+        candidates: &HashSet<PeerId>,
         replication_factor: u8,
         trust_system: &EigenTrustEngine,
         performance_monitor: &PerformanceMonitor,
-        node_metadata: &HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
+        node_metadata: &HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
     ) -> PlacementResult<PlacementDecision> {
         let start_time = Instant::now();
         let k = replication_factor as usize;
@@ -558,7 +559,7 @@ mod tests {
     #[test]
     fn test_weight_calculation() {
         let sampler = WeightedSampler::new();
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Test normal case
         let weight = sampler
@@ -603,10 +604,10 @@ mod tests {
         let mut sampler = WeightedSampler::new();
 
         let candidates = vec![
-            (NodeId::from_bytes([1u8; 32]), 0.8),
-            (NodeId::from_bytes([2u8; 32]), 0.6),
-            (NodeId::from_bytes([3u8; 32]), 0.4),
-            (NodeId::from_bytes([4u8; 32]), 0.2),
+            (PeerId::from_bytes([1u8; 32]), 0.8),
+            (PeerId::from_bytes([2u8; 32]), 0.6),
+            (PeerId::from_bytes([3u8; 32]), 0.4),
+            (PeerId::from_bytes([4u8; 32]), 0.2),
         ];
 
         // Test normal sampling
@@ -621,8 +622,8 @@ mod tests {
 
         // Test with zero weights
         let bad_candidates = vec![
-            (NodeId::from_bytes([1u8; 32]), 0.0),
-            (NodeId::from_bytes([2u8; 32]), 0.5),
+            (PeerId::from_bytes([1u8; 32]), 0.0),
+            (PeerId::from_bytes([2u8; 32]), 0.5),
         ];
         assert!(sampler.sample_nodes(&bad_candidates, 1).is_err());
     }
@@ -630,7 +631,7 @@ mod tests {
     #[test]
     fn test_diversity_factor_calculation() {
         let enforcer = DiversityEnforcer::new();
-        let candidate_id = NodeId::from_bytes([1u8; 32]);
+        let candidate_id = PeerId::from_bytes([1u8; 32]);
         let candidate_location = create_test_location(40.7128, -74.0060); // NYC
         let candidate_asn = 12345;
         let candidate_region = NetworkRegion::NorthAmerica;
@@ -648,7 +649,7 @@ mod tests {
         // Test with nearby node
         let nearby_location = create_test_location(40.7589, -73.9851); // Manhattan
         let existing = vec![(
-            NodeId::from_bytes([2u8; 32]),
+            PeerId::from_bytes([2u8; 32]),
             nearby_location,
             54321,
             NetworkRegion::NorthAmerica,
@@ -666,7 +667,7 @@ mod tests {
         // Test with same ASN
         let far_location = create_test_location(34.0522, -118.2437); // LA
         let existing_same_asn = vec![(
-            NodeId::from_bytes([3u8; 32]),
+            PeerId::from_bytes([3u8; 32]),
             far_location,
             candidate_asn, // Same ASN
             NetworkRegion::NorthAmerica,
@@ -694,13 +695,13 @@ mod tests {
         // Test valid selection
         let valid_selection = vec![
             (
-                NodeId::from_bytes([1u8; 32]),
+                PeerId::from_bytes([1u8; 32]),
                 create_test_location(40.7128, -74.0060),
                 12345,
                 NetworkRegion::NorthAmerica,
             ), // NYC
             (
-                NodeId::from_bytes([2u8; 32]),
+                PeerId::from_bytes([2u8; 32]),
                 create_test_location(34.0522, -118.2437),
                 54321,
                 NetworkRegion::NorthAmerica,
@@ -711,13 +712,13 @@ mod tests {
         // Test too close selection
         let too_close_selection = vec![
             (
-                NodeId::from_bytes([1u8; 32]),
+                PeerId::from_bytes([1u8; 32]),
                 create_test_location(40.7128, -74.0060),
                 12345,
                 NetworkRegion::NorthAmerica,
             ), // NYC
             (
-                NodeId::from_bytes([2u8; 32]),
+                PeerId::from_bytes([2u8; 32]),
                 create_test_location(40.7589, -73.9851),
                 54321,
                 NetworkRegion::NorthAmerica,

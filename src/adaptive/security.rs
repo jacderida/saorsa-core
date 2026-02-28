@@ -21,6 +21,7 @@
 //! - Security audit tools
 
 use super::*;
+use crate::PeerId;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -207,7 +208,7 @@ pub struct SecurityManager {
     auditor: Arc<SecurityAuditor>,
 
     /// Node identity for signing
-    _identity: crate::peer_record::UserId,
+    _identity: crate::peer_record::PeerId,
 }
 
 /// Rate limiter
@@ -216,13 +217,13 @@ pub struct RateLimiter {
     config: RateLimitConfig,
 
     /// Node request counts
-    node_requests: Arc<RwLock<HashMap<NodeId, RequestWindow>>>,
+    node_requests: Arc<RwLock<HashMap<PeerId, RequestWindow>>>,
 
     /// IP request counts
     ip_requests: Arc<RwLock<HashMap<IpAddr, RequestWindow>>>,
 
     /// Connection counts
-    _connections: Arc<RwLock<HashMap<NodeId, u32>>>,
+    _connections: Arc<RwLock<HashMap<PeerId, u32>>>,
 
     /// Join request tracking
     join_requests: Arc<RwLock<VecDeque<Instant>>>,
@@ -244,17 +245,17 @@ pub struct BlacklistManager {
     config: BlacklistConfig,
 
     /// Blacklisted nodes
-    blacklist: Arc<RwLock<HashMap<NodeId, BlacklistEntry>>>,
+    blacklist: Arc<RwLock<HashMap<PeerId, BlacklistEntry>>>,
 
     /// Violation counts
-    violations: Arc<RwLock<HashMap<NodeId, u32>>>,
+    violations: Arc<RwLock<HashMap<PeerId, u32>>>,
 }
 
 /// Blacklist entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlacklistEntry {
     /// Node ID
-    pub node_id: NodeId,
+    pub node_id: PeerId,
 
     /// Reason for blacklisting
     pub reason: BlacklistReason,
@@ -263,7 +264,7 @@ pub struct BlacklistEntry {
     pub timestamp: SystemTime,
 
     /// Reporter node
-    pub reporter: Option<NodeId>,
+    pub reporter: Option<PeerId>,
 }
 
 /// Blacklist reason
@@ -301,7 +302,7 @@ pub struct EclipseDetector {
 #[derive(Debug, Default)]
 struct AnomalyPatterns {
     /// Rapid connection attempts
-    _rapid_connections: HashMap<NodeId, Vec<Instant>>,
+    _rapid_connections: HashMap<PeerId, Vec<Instant>>,
 
     /// Subnet distribution
     subnet_distribution: HashMap<String, u32>,
@@ -314,7 +315,7 @@ struct AnomalyPatterns {
 #[derive(Debug, Clone)]
 struct RoutingAnomaly {
     /// Node exhibiting anomaly
-    _node_id: NodeId,
+    _node_id: PeerId,
 
     /// Type of anomaly
     _anomaly_type: AnomalyType,
@@ -386,7 +387,7 @@ pub struct AuditEntry {
     pub event_type: SecurityEvent,
 
     /// Associated node
-    pub node_id: Option<NodeId>,
+    pub node_id: Option<PeerId>,
 
     /// Event details
     pub details: String,
@@ -471,7 +472,7 @@ impl SecurityManager {
             eclipse_detector,
             integrity_verifier,
             auditor,
-            _identity: identity.to_user_id(),
+            _identity: identity.peer_id().clone(),
         }
     }
 
@@ -514,7 +515,7 @@ impl SecurityManager {
     /// Check if request should be rate limited
     pub async fn check_rate_limit(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         ip: Option<IpAddr>,
     ) -> Result<(), SecurityError> {
         // Check node rate limit
@@ -554,7 +555,7 @@ impl SecurityManager {
     /// Detect eclipse attack
     pub async fn detect_eclipse_attack(
         &self,
-        routing_table: &[NodeId],
+        routing_table: &[PeerId],
     ) -> Result<(), SecurityError> {
         let diversity_score = self
             .eclipse_detector
@@ -656,7 +657,7 @@ impl SecurityManager {
     }
 
     /// Blacklist a node
-    pub async fn blacklist_node(&self, node_id: NodeId, reason: BlacklistReason) {
+    pub async fn blacklist_node(&self, node_id: PeerId, reason: BlacklistReason) {
         self.blacklist
             .add_entry(node_id.clone(), reason.clone())
             .await;
@@ -682,12 +683,16 @@ impl SecurityManager {
         }
     }
 
-    /// Verify node identity by binding NodeId to the advertised ML-DSA public key
+    /// Verify node identity by binding PeerId to the advertised ML-DSA public key
     async fn verify_identity(&self, node: &NodeDescriptor) -> bool {
-        // Derive BLAKE3 hash of ML-DSA public key bytes to match UserId
+        // PeerId is defined as SHA-256(pubkey)
+        use sha2::Digest;
+
         let bytes = node.public_key.as_bytes();
-        let hash = blake3::hash(bytes);
-        node.id.as_bytes() == hash.as_bytes()
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        node.id.to_bytes() == digest.as_slice()
     }
 }
 
@@ -704,7 +709,7 @@ impl RateLimiter {
     }
 
     /// Check node rate limit
-    pub async fn check_node_rate(&self, node_id: &NodeId) -> bool {
+    pub async fn check_node_rate(&self, node_id: &PeerId) -> bool {
         let mut requests = self.node_requests.write().await;
         let now = Instant::now();
 
@@ -830,7 +835,7 @@ impl BlacklistManager {
     }
 
     /// Check if node is blacklisted
-    pub async fn is_blacklisted(&self, node_id: &NodeId) -> bool {
+    pub async fn is_blacklisted(&self, node_id: &PeerId) -> bool {
         let blacklist = self.blacklist.read().await;
 
         if let Some(entry) = blacklist.get(node_id) {
@@ -847,7 +852,7 @@ impl BlacklistManager {
     }
 
     /// Add blacklist entry
-    pub async fn add_entry(&self, node_id: NodeId, reason: BlacklistReason) {
+    pub async fn add_entry(&self, node_id: PeerId, reason: BlacklistReason) {
         let mut blacklist = self.blacklist.write().await;
 
         // Enforce max size
@@ -874,7 +879,7 @@ impl BlacklistManager {
     }
 
     /// Record violation
-    pub async fn record_violation(&self, node_id: &NodeId, reason: BlacklistReason) {
+    pub async fn record_violation(&self, node_id: &PeerId, reason: BlacklistReason) {
         let mut violations = self.violations.write().await;
         let count = violations.entry(node_id.clone()).or_insert(0);
         *count += 1;
@@ -934,7 +939,7 @@ impl EclipseDetector {
     }
 
     /// Calculate diversity score of routing table
-    pub async fn calculate_diversity_score(&self, routing_table: &[NodeId]) -> f64 {
+    pub async fn calculate_diversity_score(&self, routing_table: &[PeerId]) -> f64 {
         if routing_table.is_empty() {
             return 0.0;
         }
@@ -943,7 +948,7 @@ impl EclipseDetector {
         let mut prefixes = HashSet::new();
         for node_id in routing_table {
             // Use first 4 bytes as prefix
-            let prefix = &node_id.hash[..4];
+            let prefix = &node_id.to_bytes()[..4];
             prefixes.insert(prefix.to_vec());
         }
 
@@ -952,7 +957,7 @@ impl EclipseDetector {
     }
 
     /// Detect suspicious patterns
-    pub async fn detect_suspicious_patterns(&self, routing_table: &[NodeId]) -> bool {
+    pub async fn detect_suspicious_patterns(&self, routing_table: &[PeerId]) -> bool {
         let mut patterns = self.patterns.write().await;
 
         // Check for subnet concentration
@@ -961,7 +966,8 @@ impl EclipseDetector {
         patterns.subnet_distribution.clear();
 
         for node_id in routing_table {
-            let subnet = format!("{:02x}{:02x}", node_id.hash[0], node_id.hash[1]);
+            let bytes = node_id.to_bytes();
+            let subnet = format!("{:02x}{:02x}", bytes[0], bytes[1]);
             *patterns.subnet_distribution.entry(subnet).or_insert(0) += 1;
         }
 
@@ -977,7 +983,7 @@ impl EclipseDetector {
     }
 
     /// Record routing anomaly
-    pub async fn record_anomaly(&self, node_id: NodeId, anomaly_type: AnomalyType) {
+    pub async fn record_anomaly(&self, node_id: PeerId, anomaly_type: AnomalyType) {
         let mut patterns = self.patterns.write().await;
 
         patterns.routing_anomalies.push(RoutingAnomaly {
@@ -1053,7 +1059,7 @@ impl SecurityAuditor {
     pub async fn log_event(
         &self,
         event_type: SecurityEvent,
-        node_id: Option<NodeId>,
+        node_id: Option<PeerId>,
         details: String,
         severity: Severity,
     ) {
@@ -1186,7 +1192,7 @@ mod tests {
         };
 
         let limiter = RateLimiter::new(config);
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Should allow first 5 requests
         for _ in 0..5 {
@@ -1219,7 +1225,7 @@ mod tests {
         for i in 0..20u8 {
             let mut hash = [0u8; 32];
             hash[0] = i;
-            let node_id = NodeId { hash };
+            let node_id = PeerId::from_bytes(hash);
             limiter.check_node_rate(&node_id).await;
         }
 
@@ -1263,7 +1269,7 @@ mod tests {
         let config = BlacklistConfig::default();
         let blacklist = BlacklistManager::new(config);
 
-        let node_id = NodeId { hash: [2u8; 32] };
+        let node_id = PeerId::from_bytes([2u8; 32]);
 
         // Should not be blacklisted initially
         assert!(!blacklist.is_blacklisted(&node_id).await);
@@ -1299,7 +1305,7 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[0] = 1; // Same prefix
             hash[31] = i;
-            routing_table.push(NodeId { hash });
+            routing_table.push(PeerId::from_bytes(hash));
         }
 
         // Should have low diversity score
@@ -1311,7 +1317,7 @@ mod tests {
         for i in 0..10 {
             let mut hash = [0u8; 32];
             hash[0] = i * 25; // Different prefixes
-            diverse_table.push(NodeId { hash });
+            diverse_table.push(PeerId::from_bytes(hash));
         }
 
         // Should have high diversity score
@@ -1385,10 +1391,9 @@ mod tests {
         let manager = SecurityManager::new(config, &identity);
 
         // Test node join validation
-        // Generate a valid ML-DSA key and derive matching UserId via blake3(pubkey)
+        // Generate a valid ML-DSA key and derive matching PeerId via SHA-256(pubkey)
         let (ml_pub, _ml_sec) = crate::quantum_crypto::generate_ml_dsa_keypair().unwrap();
-        let derived_hash = blake3::hash(ml_pub.as_bytes());
-        let derived_id = crate::peer_record::UserId::from_bytes(*derived_hash.as_bytes());
+        let derived_id = crate::peer_record::PeerId::from_public_key(&ml_pub);
         let node = NodeDescriptor {
             id: derived_id,
             public_key: ml_pub,

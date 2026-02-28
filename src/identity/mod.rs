@@ -20,7 +20,7 @@
 //! # Core Types
 //!
 //! - `NodeIdentity`: Cryptographic identity with ML-DSA keypair
-//! - `NodeId`: 32-byte hash of public key (PeerId)
+//! - `PeerId`: 32-byte hash of public key
 //! - `FourWordAddress`: Human-readable address for bootstrap
 //!
 //! # Identity Restart System
@@ -44,10 +44,6 @@ mod four_words_error_tests;
 
 pub use four_words::{FourWordAddress, WordEncoder};
 pub use node_identity::{IdentityData, NodeIdentity, PeerId};
-
-/// Backward-compat re-export — use [`PeerId`] instead.
-#[deprecated(note = "use PeerId")]
-pub type NodeId = PeerId;
 pub use secure_node_identity::SecureNodeIdentity;
 
 // Identity restart system exports

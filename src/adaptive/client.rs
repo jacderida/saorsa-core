@@ -20,9 +20,10 @@
 //! - Pub/sub messaging
 //! - Network statistics and monitoring
 
+use crate::PeerId;
 use crate::adaptive::{
     AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentHash, ContentStore, MonitoringSystem,
-    NodeId, ReplicationManager, RetrievalManager, StorageConfig,
+    ReplicationManager, RetrievalManager, StorageConfig,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -119,7 +120,7 @@ pub struct Client {
 /// Internal network components
 struct NetworkComponents {
     /// Node ID
-    node_id: NodeId,
+    node_id: PeerId,
 
     /// Adaptive router
     router: Arc<AdaptiveRouter>,
@@ -389,7 +390,7 @@ impl Client {
         let _som = som;
 
         // Create gossip protocol
-        let node_id = NodeId { hash: [0u8; 32] }; // Temporary node ID
+        let node_id = PeerId::from_bytes([0u8; 32]); // Temporary node ID
         let gossip = Arc::new(AdaptiveGossipSub::new(
             node_id.clone(),
             trust_provider.clone(),
@@ -820,7 +821,7 @@ mod tests {
         let _hyperbolic = hyperbolic;
         let _som = som;
 
-        let node_id = NodeId { hash: [0u8; 32] };
+        let node_id = PeerId::from_bytes([0u8; 32]);
         let gossip = Arc::new(AdaptiveGossipSub::new(
             node_id.clone(),
             trust_provider.clone(),

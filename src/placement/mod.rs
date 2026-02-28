@@ -141,7 +141,8 @@ pub use types::{
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::adaptive::{NodeId, performance::PerformanceMonitor, trust::EigenTrustEngine};
+use crate::PeerId;
+use crate::adaptive::{performance::PerformanceMonitor, trust::EigenTrustEngine};
 
 /// Main placement engine that orchestrates the entire placement process
 #[derive(Debug)]
@@ -169,11 +170,11 @@ impl PlacementEngine {
     /// Select optimal nodes for shard placement
     pub async fn select_nodes(
         &mut self,
-        available_nodes: &HashSet<NodeId>,
+        available_nodes: &HashSet<PeerId>,
         replication_factor: u8,
         trust_system: &EigenTrustEngine,
         performance_monitor: &PerformanceMonitor,
-        node_metadata: &std::collections::HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
+        node_metadata: &std::collections::HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
     ) -> PlacementResult<PlacementDecision> {
         let start_time = Instant::now();
 

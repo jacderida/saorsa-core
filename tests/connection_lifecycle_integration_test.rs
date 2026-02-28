@@ -85,27 +85,37 @@ async fn test_connection_lifecycle_with_keepalive() {
     let addr2_str = addr2.to_string();
     debug!("Connecting node1 to node2 at {}", addr2_str);
 
-    let peer2_id = node1
+    let _channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    info!("Node1 connected to node2 (peer_id: {})", peer2_id);
+    // Wait for identity exchange so node1 knows node2's PeerId.
+    let peer2_peer_id = node2.peer_id().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Identity exchange timed out");
+
+    info!("Node1 connected to node2 (peer_id: {})", peer2_peer_id);
 
     // Verify connection is active
+    let peer2_hex = peer2_peer_id.to_hex();
     assert!(
-        node1.is_peer_connected(&peer2_id).await,
+        node1.is_peer_connected(&peer2_hex).await,
         "Peer should be in peers map"
-    );
-    assert!(
-        node1.is_peer_connected(&peer2_id).await,
-        "Connection should be active"
     );
 
     // Send a message to verify connection works
     let test_message = b"Hello from node1";
     node1
-        .send_message(&peer2_id, "test", test_message.to_vec())
+        .send_message(&peer2_peer_id, "test", test_message.to_vec())
         .await
         .expect("Failed to send initial message");
 
@@ -118,14 +128,14 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Verify connection is still active thanks to keepalive
     assert!(
-        node1.is_peer_connected(&peer2_id).await,
+        node1.transport().connected_peers().await.contains(&peer2_peer_id),
         "Connection should still be active after 40 seconds due to keepalive"
     );
 
     // Send another message to prove the connection is still usable
     let test_message2 = b"Still connected after 40 seconds!";
     node1
-        .send_message(&peer2_id, "test", test_message2.to_vec())
+        .send_message(&peer2_peer_id, "test", test_message2.to_vec())
         .await
         .expect("Failed to send message after 40 seconds");
 
@@ -134,14 +144,14 @@ async fn test_connection_lifecycle_with_keepalive() {
     // Test stale connection cleanup
     // Disconnect node2 to simulate connection closure
     debug!("Disconnecting peer to test cleanup...");
-    let _ = node1.disconnect_peer(&peer2_id).await;
+    let _ = node1.disconnect_peer(&peer2_hex).await;
 
     // Wait for disconnect to propagate
     sleep(Duration::from_secs(1)).await;
 
     // Verify peer was removed from peers map
     assert!(
-        !node1.is_peer_connected(&peer2_id).await,
+        !node1.transport().connected_peers().await.contains(&peer2_peer_id),
         "Peer should be removed after disconnect"
     );
 
@@ -193,36 +203,49 @@ async fn test_send_message_validates_connection_state() {
     let addr2 = addrs2.first().expect("Node2 should have an address");
     let addr2_str = addr2.to_string();
 
-    let peer2_id = node1
+    let _channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    info!("Connected to peer {}", peer2_id);
+    // Wait for identity exchange.
+    let peer2_peer_id = node2.peer_id().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Identity exchange timed out");
+
+    info!("Connected to peer {}", peer2_peer_id);
 
     // Verify connection is active
-    assert!(node1.is_peer_connected(&peer2_id).await);
+    assert!(node1.transport().connected_peers().await.contains(&peer2_peer_id));
 
     // Send initial message successfully
     node1
-        .send_message(&peer2_id, "test", b"First message".to_vec())
+        .send_message(&peer2_peer_id, "test", b"First message".to_vec())
         .await
         .expect("First message should succeed");
 
     // Now disconnect to simulate connection closure
-    let _ = node1.disconnect_peer(&peer2_id).await;
+    let peer2_hex = peer2_peer_id.to_hex();
+    let _ = node1.disconnect_peer(&peer2_hex).await;
     sleep(Duration::from_secs(1)).await;
 
     // Verify connection is no longer active
     assert!(
-        !node1.is_peer_connected(&peer2_id).await,
+        !node1.transport().connected_peers().await.contains(&peer2_peer_id),
         "Connection should be inactive after disconnect"
     );
 
     // Attempt to send message should fail gracefully
-    // (peer may still be in peers map briefly, but connection is closed)
     let result = node1
-        .send_message(&peer2_id, "test", b"Should fail".to_vec())
+        .send_message(&peer2_peer_id, "test", b"Should fail".to_vec())
         .await;
 
     // Should get either PeerNotFound (if already cleaned up) or ConnectionClosed error
@@ -278,18 +301,31 @@ async fn test_multiple_message_exchanges() {
     let addr2 = addrs2.first().expect("Node2 should have an address");
     let addr2_str = addr2.to_string();
 
-    let peer2_id = node1
+    let _channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    info!("Connected to peer {}", peer2_id);
+    // Wait for identity exchange.
+    let peer2_peer_id = node2.peer_id().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if node1.transport().connected_peers().await.contains(&peer2_peer_id) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Identity exchange timed out");
+
+    info!("Connected to peer {}", peer2_peer_id);
 
     // Send 100 messages in quick succession
     for i in 0..100 {
         let message = format!("Message {}", i);
         node1
-            .send_message(&peer2_id, "test", message.as_bytes().to_vec())
+            .send_message(&peer2_peer_id, "test", message.as_bytes().to_vec())
             .await
             .unwrap_or_else(|e| panic!("Message {} failed: {}", i, e));
     }
@@ -303,7 +339,7 @@ async fn test_multiple_message_exchanges() {
     for i in 100..200 {
         let message = format!("Message {}", i);
         node1
-            .send_message(&peer2_id, "test", message.as_bytes().to_vec())
+            .send_message(&peer2_peer_id, "test", message.as_bytes().to_vec())
             .await
             .unwrap_or_else(|e| panic!("Message {} failed: {}", i, e));
     }

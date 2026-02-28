@@ -22,7 +22,7 @@
 //! 4. **Minimal Overhead**: Smart replica placement to avoid excessive duplication
 
 use crate::dht::Key;
-use crate::peer_record::UserId as NodeId;
+use crate::peer_record::PeerId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -85,7 +85,7 @@ impl Default for CrossNetworkReplicationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeNetworkInfo {
     /// Node ID
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     /// IPv4 addresses (if any)
     pub ipv4_addresses: Vec<Ipv4Addr>,
     /// IPv6 addresses (if any)
@@ -131,7 +131,7 @@ pub struct RecordReplicationStatus {
     /// Record key
     pub key: Key,
     /// Nodes holding replicas by IP family
-    pub replicas_by_family: HashMap<IpFamily, Vec<NodeId>>,
+    pub replicas_by_family: HashMap<IpFamily, Vec<PeerId>>,
     /// Last replication check
     pub last_checked: SystemTime,
     /// Whether replication is healthy
@@ -172,13 +172,13 @@ pub struct CrossNetworkReplicator {
     /// Configuration
     config: CrossNetworkReplicationConfig,
     /// Known nodes by their network info
-    nodes: Arc<RwLock<HashMap<NodeId, NodeNetworkInfo>>>,
+    nodes: Arc<RwLock<HashMap<PeerId, NodeNetworkInfo>>>,
     /// Record replication status
     record_status: Arc<RwLock<HashMap<Key, RecordReplicationStatus>>>,
     /// Nodes by IP family
-    nodes_by_family: Arc<RwLock<HashMap<IpFamily, HashSet<NodeId>>>>,
+    nodes_by_family: Arc<RwLock<HashMap<IpFamily, HashSet<PeerId>>>>,
     /// Dual-stack nodes
-    dual_stack_nodes: Arc<RwLock<HashSet<NodeId>>>,
+    dual_stack_nodes: Arc<RwLock<HashSet<PeerId>>>,
 }
 
 impl CrossNetworkReplicator {
@@ -223,7 +223,7 @@ impl CrossNetworkReplicator {
     }
 
     /// Remove a node from tracking
-    pub fn remove_node(&self, node_id: &NodeId) {
+    pub fn remove_node(&self, node_id: &PeerId) {
         self.nodes.write().remove(node_id);
 
         let mut by_family = self.nodes_by_family.write();
@@ -235,7 +235,7 @@ impl CrossNetworkReplicator {
     }
 
     /// Select replica nodes for a record ensuring cross-network diversity
-    pub fn select_replica_nodes(&self, key: &Key, exclude: &[NodeId]) -> ReplicaSelection {
+    pub fn select_replica_nodes(&self, key: &Key, exclude: &[PeerId]) -> ReplicaSelection {
         let nodes = self.nodes.read();
         let by_family = self.nodes_by_family.read();
         let dual_stack = self.dual_stack_nodes.read();
@@ -316,7 +316,7 @@ impl CrossNetworkReplicator {
     pub fn check_replication_health(
         &self,
         key: &Key,
-        current_replicas: &[(NodeId, IpFamily)],
+        current_replicas: &[(PeerId, IpFamily)],
     ) -> RecordReplicationStatus {
         let mut status = RecordReplicationStatus::new(*key);
 
@@ -351,7 +351,7 @@ impl CrossNetworkReplicator {
     }
 
     /// Get nodes that need to receive replicas for a record
-    pub fn get_repair_targets(&self, status: &RecordReplicationStatus) -> Vec<(NodeId, IpFamily)> {
+    pub fn get_repair_targets(&self, status: &RecordReplicationStatus) -> Vec<(PeerId, IpFamily)> {
         let mut targets = Vec::new();
 
         for (family, missing_count) in &status.missing_replicas {
@@ -417,7 +417,7 @@ pub struct ReplicaSelection {
     /// Key being replicated
     pub key: Key,
     /// Selected nodes with their IP family contributions
-    pub nodes: HashMap<NodeId, Vec<IpFamily>>,
+    pub nodes: HashMap<PeerId, Vec<IpFamily>>,
 }
 
 impl ReplicaSelection {
@@ -430,12 +430,12 @@ impl ReplicaSelection {
     }
 
     /// Add a node to the selection
-    pub fn add_node(&mut self, node_id: NodeId, families: Vec<IpFamily>) {
+    pub fn add_node(&mut self, node_id: PeerId, families: Vec<IpFamily>) {
         self.nodes.insert(node_id, families);
     }
 
     /// Check if node is in selection
-    pub fn contains(&self, node_id: &NodeId) -> bool {
+    pub fn contains(&self, node_id: &PeerId) -> bool {
         self.nodes.contains_key(node_id)
     }
 
@@ -448,7 +448,7 @@ impl ReplicaSelection {
     }
 
     /// Get nodes for a specific family
-    pub fn nodes_for_family(&self, family: IpFamily) -> Vec<NodeId> {
+    pub fn nodes_for_family(&self, family: IpFamily) -> Vec<PeerId> {
         self.nodes
             .iter()
             .filter(|(_, families)| families.contains(&family))
@@ -487,13 +487,11 @@ mod tests {
 
     fn create_test_node(id: &str, ipv4: bool, ipv6: bool, trust: f64) -> NodeNetworkInfo {
         NodeNetworkInfo {
-            node_id: NodeId {
-                hash: {
-                    let mut h = [0u8; 32];
-                    h[..id.len().min(32)].copy_from_slice(id.as_bytes());
-                    h
-                },
-            },
+            node_id: PeerId::from_bytes({
+                let mut h = [0u8; 32];
+                h[..id.len().min(32)].copy_from_slice(id.as_bytes());
+                h
+            }),
             ipv4_addresses: if ipv4 {
                 vec![Ipv4Addr::new(192, 168, 1, 1)]
             } else {
@@ -601,10 +599,10 @@ mod tests {
         let replicator = CrossNetworkReplicator::new(CrossNetworkReplicationConfig::default());
 
         let key = [2u8; 32];
-        let node1 = NodeId { hash: [1u8; 32] };
-        let node2 = NodeId { hash: [2u8; 32] };
-        let node3 = NodeId { hash: [3u8; 32] };
-        let node4 = NodeId { hash: [4u8; 32] };
+        let node1 = PeerId::from_bytes([1u8; 32]);
+        let node2 = PeerId::from_bytes([2u8; 32]);
+        let node3 = PeerId::from_bytes([3u8; 32]);
+        let node4 = PeerId::from_bytes([4u8; 32]);
 
         // Good replication - 2 per family
         let replicas = vec![
@@ -645,11 +643,11 @@ mod tests {
 
         status.replicas_by_family.insert(
             IpFamily::IPv4,
-            vec![NodeId { hash: [1u8; 32] }, NodeId { hash: [2u8; 32] }],
+            vec![PeerId::from_bytes([1u8; 32]), PeerId::from_bytes([2u8; 32])],
         );
         status
             .replicas_by_family
-            .insert(IpFamily::IPv6, vec![NodeId { hash: [3u8; 32] }]);
+            .insert(IpFamily::IPv6, vec![PeerId::from_bytes([3u8; 32])]);
 
         assert_eq!(status.replica_count(IpFamily::IPv4), 2);
         assert_eq!(status.replica_count(IpFamily::IPv6), 1);
@@ -685,16 +683,14 @@ mod tests {
         }
 
         // Exclude first two nodes
-        let excluded: Vec<NodeId> = (0..2)
+        let excluded: Vec<PeerId> = (0..2)
             .map(|i| {
                 let name = format!("node{}", i);
-                NodeId {
-                    hash: {
-                        let mut h = [0u8; 32];
-                        h[..name.len().min(32)].copy_from_slice(name.as_bytes());
-                        h
-                    },
-                }
+                PeerId::from_bytes({
+                    let mut h = [0u8; 32];
+                    h[..name.len().min(32)].copy_from_slice(name.as_bytes());
+                    h
+                })
             })
             .collect();
 

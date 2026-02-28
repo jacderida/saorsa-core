@@ -10,10 +10,10 @@
 
 //! Integration tests for greedy-assist hyperbolic embedding
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::hyperbolic_greedy::{
     Embedding, EmbeddingConfig, HyperbolicGreedyRouter, embed_snapshot, greedy_next,
 };
-use saorsa_core::dht::DhtNodeId as NodeId;
 use std::collections::HashMap;
 
 /// Generate a synthetic graph for testing
@@ -60,12 +60,12 @@ async fn calculate_success_ratio(embedding: &Embedding, test_pairs: &[(String, S
     let mut successes = 0;
 
     for (source, target) in test_pairs {
-        // Convert target to NodeId
+        // Convert target to PeerId
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target_node = NodeId::from_bytes(node_id_bytes);
+        let target_node = PeerId::from_bytes(node_id_bytes);
 
         // Try greedy routing
         if let Some(_next_hop) = greedy_next(target_node, source.clone(), embedding).await {
@@ -122,12 +122,12 @@ async fn calculate_stretch(
     while current != target && greedy_hops < 100 {
         visited_greedy.insert(current.clone());
 
-        // Convert target to NodeId
+        // Convert target to PeerId
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target_node = NodeId::from_bytes(node_id_bytes);
+        let target_node = PeerId::from_bytes(node_id_bytes);
 
         match greedy_next(target_node, current.clone(), embedding).await {
             Some(next) if !visited_greedy.contains(&next) => {
@@ -245,7 +245,7 @@ async fn test_fallback_correctness() {
     router.set_embedding(embedding.clone()).await;
 
     // Test with a target not in the embedding (should fall back to Kad)
-    let unknown_target = NodeId::from_bytes([99u8; 32]);
+    let unknown_target = PeerId::from_bytes([99u8; 32]);
     let result = router
         .greedy_next(unknown_target, local_id.clone(), &embedding)
         .await;
@@ -368,7 +368,7 @@ async fn test_routing_metrics() {
         let target_bytes = nodes[target_idx].as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target = NodeId::from_bytes(node_id_bytes);
+        let target = PeerId::from_bytes(node_id_bytes);
 
         let _ = router
             .greedy_next(target, local_id.clone(), &embedding)

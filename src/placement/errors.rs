@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::adaptive::NodeId;
+use crate::PeerId;
 
 /// Result type for placement operations
 pub type PlacementResult<T> = Result<T, PlacementError>;
@@ -46,14 +46,14 @@ pub enum PlacementError {
     /// Invalid weight value for node
     #[error("Invalid weight for node {node_id:?}: {weight} ({reason})")]
     InvalidWeight {
-        node_id: NodeId,
+        node_id: PeerId,
         weight: f64,
         reason: String,
     },
 
     /// Node metadata not found
     #[error("Node metadata not found: {0:?}")]
-    NodeMetadataNotFound(NodeId),
+    NodeMetadataNotFound(PeerId),
 
     /// Placement timeout exceeded
     #[error("Placement operation timed out")]
@@ -63,7 +63,7 @@ pub enum PlacementError {
     #[error("Diversity violation - {constraint}: {details}")]
     DiversityViolation {
         constraint: String,
-        nodes: Vec<NodeId>,
+        nodes: Vec<PeerId>,
         details: String,
     },
 
@@ -73,14 +73,14 @@ pub enum PlacementError {
 
     /// Capacity constraint violation
     #[error("Capacity constraint violated for node {node_id:?}: {details}")]
-    CapacityViolation { node_id: NodeId, details: String },
+    CapacityViolation { node_id: PeerId, details: String },
 
     /// Performance constraint violation
     #[error(
         "Performance constraint violated for node {node_id:?}: {metric} = {value} (min: {minimum})"
     )]
     PerformanceViolation {
-        node_id: NodeId,
+        node_id: PeerId,
         metric: String,
         value: f64,
         minimum: f64,

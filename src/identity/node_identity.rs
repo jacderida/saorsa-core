@@ -39,20 +39,12 @@ use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey
 /// Length of a PeerId in bytes (SHA-256 output).
 pub const PEER_ID_BYTE_LEN: usize = 32;
 
-/// Backward-compat alias.
-#[deprecated(note = "use PEER_ID_BYTE_LEN")]
-pub const NODE_ID_BYTE_LEN: usize = PEER_ID_BYTE_LEN;
-
 /// Peer ID derived from public key (256-bit).
 ///
 /// The canonical peer identity in the Saorsa network. Computed as the
 /// SHA-256 hash of the node's ML-DSA-65 public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
-
-/// Backward-compat alias — use [`PeerId`] instead.
-#[deprecated(note = "use PeerId")]
-pub type NodeId = PeerId;
 
 impl PeerId {
     /// Create from ML-DSA public key
@@ -68,6 +60,11 @@ impl PeerId {
     /// Convert to bytes
     pub fn to_bytes(&self) -> &[u8; PEER_ID_BYTE_LEN] {
         &self.0
+    }
+
+    /// Backward-compatible byte accessor.
+    pub fn as_bytes(&self) -> &[u8; PEER_ID_BYTE_LEN] {
+        self.to_bytes()
     }
 
     /// XOR distance to another peer ID (for Kademlia)
@@ -123,9 +120,14 @@ impl PeerId {
         hex::encode(self.0)
     }
 
-    /// Helper for tests/backwards-compat: construct from raw bytes
+    /// Construct from raw bytes
     pub fn from_bytes(bytes: [u8; PEER_ID_BYTE_LEN]) -> Self {
         Self(bytes)
+    }
+
+    /// Create a random peer identifier (primarily for tests/simulation).
+    pub fn random() -> Self {
+        Self(rand::random())
     }
 }
 
@@ -167,12 +169,6 @@ pub struct PublicNodeIdentity {
 impl PublicNodeIdentity {
     /// Get peer ID
     pub fn peer_id(&self) -> &PeerId {
-        &self.peer_id
-    }
-
-    /// Get node ID (deprecated — use `peer_id()`)
-    #[deprecated(note = "use peer_id()")]
-    pub fn node_id(&self) -> &PeerId {
         &self.peer_id
     }
 
@@ -230,11 +226,6 @@ impl NodeIdentity {
         })
     }
 
-    /// Convert this identity's PeerId to a UserId for use in adaptive modules
-    pub fn to_user_id(&self) -> crate::peer_record::UserId {
-        crate::peer_record::UserId::from_bytes(self.peer_id.0)
-    }
-
     /// Generate from seed (deterministic)
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self> {
         // Deterministically derive key material via HKDF-SHA3
@@ -284,12 +275,6 @@ impl NodeIdentity {
 
     /// Get peer ID
     pub fn peer_id(&self) -> &PeerId {
-        &self.peer_id
-    }
-
-    /// Get node ID (deprecated — use `peer_id()`)
-    #[deprecated(note = "use peer_id()")]
-    pub fn node_id(&self) -> &PeerId {
         &self.peer_id
     }
 

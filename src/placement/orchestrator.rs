@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::interval;
 
+use crate::PeerId;
 use crate::adaptive::{
-    NodeId, learning::ChurnPredictor, performance::PerformanceMonitor, trust::EigenTrustEngine,
+    learning::ChurnPredictor, performance::PerformanceMonitor, trust::EigenTrustEngine,
 };
 use crate::dht::core_engine::DhtCoreEngine;
 use crate::placement::{
@@ -175,13 +176,13 @@ impl PlacementOrchestrator {
     async fn get_available_nodes(
         &self,
         _region: Option<NetworkRegion>,
-    ) -> PlacementResult<HashSet<NodeId>> {
+    ) -> PlacementResult<HashSet<PeerId>> {
         // In a real implementation, this would query the DHT or network discovery
         let mut nodes = HashSet::new();
         for i in 0..20 {
             let mut hash = [0u8; 32];
             hash[0] = i;
-            let user_id = crate::peer_record::UserId { hash };
+            let user_id = crate::peer_record::PeerId::from_bytes(hash);
             nodes.insert(user_id);
         }
         Ok(nodes)
@@ -190,8 +191,8 @@ impl PlacementOrchestrator {
     /// Mock method for getting node metadata
     async fn get_node_metadata(
         &self,
-        nodes: &HashSet<NodeId>,
-    ) -> PlacementResult<HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>> {
+        nodes: &HashSet<PeerId>,
+    ) -> PlacementResult<HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>> {
         let mut metadata = HashMap::new();
 
         for (i, node_id) in nodes.iter().enumerate() {
@@ -245,7 +246,7 @@ impl StorageOrchestrator {
         &self,
         data: &[u8],
         decision: &PlacementDecision,
-        _node_metadata: &HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
+        _node_metadata: &HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
     ) -> PlacementResult<Vec<String>> {
         // For now, simulate shard storage
         let mut shard_ids = Vec::new();
@@ -533,7 +534,7 @@ impl RepairSystem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardInfo {
     pub shard_id: String,
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     pub data_size: usize,
     pub created_at: u64,
     pub last_verified: u64,
@@ -546,7 +547,7 @@ pub struct ShardInfo {
 pub struct AuditResult {
     pub shard_id: String,
     pub status: AuditStatus,
-    pub node_responses: HashMap<NodeId, bool>,
+    pub node_responses: HashMap<PeerId, bool>,
     pub integrity_verified: bool,
     pub availability_score: f64,
     pub performance_metrics: HashMap<String, f64>,
@@ -584,7 +585,7 @@ mod tests {
     fn test_shard_info() {
         let shard_info = ShardInfo {
             shard_id: "test_shard".to_string(),
-            node_id: NodeId::from_bytes([1u8; 32]),
+            node_id: PeerId::from_bytes([1u8; 32]),
             data_size: 1024,
             created_at: 1234567890,
             last_verified: 0,

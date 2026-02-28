@@ -208,7 +208,7 @@ pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemet
 // Back-compat exports for tests
 pub use config::Config;
 pub use network::P2PNode as Node;
-pub use peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache, UserId};
+pub use peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache};
 pub use persistent_state::{
     FlushStrategy, IntegrityReport, PersistentStateManager, RecoveryMode, RecoveryStats,
     StateChangeEvent, StateConfig, TransactionType, WalEntry,

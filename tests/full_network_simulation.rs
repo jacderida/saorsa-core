@@ -18,7 +18,7 @@
 //! This test simulates a complete P2P network with multiple nodes
 //! demonstrating all adaptive layers working together.
 
-use saorsa_core::UserId;
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::coordinator::DegradationReason;
 use saorsa_core::adaptive::*;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 /// Simulated network environment
 struct NetworkSimulation {
-    nodes: HashMap<UserId, Arc<NetworkCoordinator>>,
+    nodes: HashMap<PeerId, Arc<NetworkCoordinator>>,
     _network_latency: Duration,
     _packet_loss_rate: f64,
 }
@@ -39,7 +39,7 @@ impl NetworkSimulation {
 
         for i in 0..num_nodes {
             let identity = NodeIdentity::generate().unwrap();
-            let user_id = identity.to_user_id();
+            let user_id = identity.peer_id().clone();
 
             let config = NetworkConfig {
                 bootstrap_nodes: bootstrap_nodes.clone(),
@@ -258,7 +258,7 @@ async fn test_adaptive_routing_layers() -> Result<()> {
     let Some(source) = sim.nodes.values().next() else {
         return Ok(());
     };
-    let target_id = NodeId { hash: [42u8; 32] };
+    let target_id = PeerId::from_bytes([42u8; 32]);
 
     match source.coordinate_routing(&target_id).await {
         Ok(path) => {

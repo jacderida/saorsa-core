@@ -16,7 +16,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::adaptive::{NodeId, performance::PerformanceMonitor, trust::EigenTrustEngine};
+use crate::PeerId;
+use crate::adaptive::{performance::PerformanceMonitor, trust::EigenTrustEngine};
 use crate::placement::{GeographicLocation, NetworkRegion, PlacementDecision, PlacementResult};
 
 /// Core trait for placement strategies
@@ -25,11 +26,11 @@ pub trait PlacementStrategy: Send + Sync + std::fmt::Debug {
     /// Select optimal nodes for placement
     async fn select_nodes(
         &mut self,
-        candidates: &HashSet<NodeId>,
+        candidates: &HashSet<PeerId>,
         replication_factor: u8,
         trust_system: &EigenTrustEngine,
         performance_monitor: &PerformanceMonitor,
-        node_metadata: &HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
+        node_metadata: &HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
     ) -> PlacementResult<PlacementDecision>;
 
     /// Get strategy name
@@ -43,45 +44,45 @@ pub trait PlacementStrategy: Send + Sync + std::fmt::Debug {
 #[async_trait]
 pub trait NetworkTopology: Send + Sync {
     /// Get geographic location of a node
-    async fn get_location(&self, node_id: &NodeId) -> Option<GeographicLocation>;
+    async fn get_location(&self, node_id: &PeerId) -> Option<GeographicLocation>;
 
     /// Get network region of a node
-    async fn get_region(&self, node_id: &NodeId) -> Option<NetworkRegion>;
+    async fn get_region(&self, node_id: &PeerId) -> Option<NetworkRegion>;
 
     /// Get ASN (Autonomous System Number) of a node
-    async fn get_asn(&self, node_id: &NodeId) -> Option<u32>;
+    async fn get_asn(&self, node_id: &PeerId) -> Option<u32>;
 
     /// Calculate network distance between two nodes
-    async fn network_distance(&self, node_a: &NodeId, node_b: &NodeId) -> Option<Duration>;
+    async fn network_distance(&self, node_a: &PeerId, node_b: &PeerId) -> Option<Duration>;
 
     /// Check if two nodes are in the same network segment
-    async fn same_network_segment(&self, node_a: &NodeId, node_b: &NodeId) -> bool;
+    async fn same_network_segment(&self, node_a: &PeerId, node_b: &PeerId) -> bool;
 }
 
 /// Performance estimation interface
 #[async_trait]
 pub trait PerformanceEstimator: Send + Sync {
     /// Get node performance metrics
-    async fn get_metrics(&self, node_id: &NodeId) -> Option<NodePerformanceMetrics>;
+    async fn get_metrics(&self, node_id: &PeerId) -> Option<NodePerformanceMetrics>;
 
     /// Predict node availability for the next period
-    async fn predict_availability(&self, node_id: &NodeId, period: Duration) -> f64;
+    async fn predict_availability(&self, node_id: &PeerId, period: Duration) -> f64;
 
     /// Get node capacity utilization
-    async fn get_capacity_utilization(&self, node_id: &NodeId) -> f64;
+    async fn get_capacity_utilization(&self, node_id: &PeerId) -> f64;
 
     /// Estimate operation latency for a node
-    async fn estimate_latency(&self, node_id: &NodeId) -> Duration;
+    async fn estimate_latency(&self, node_id: &PeerId) -> Duration;
 }
 
 /// Constraint validation interface
 #[async_trait]
 pub trait PlacementConstraint: Send + Sync {
     /// Check if a node satisfies this constraint
-    async fn validate_node(&self, node_id: &NodeId) -> bool;
+    async fn validate_node(&self, node_id: &PeerId) -> bool;
 
     /// Check if a set of nodes satisfies this constraint
-    async fn validate_selection(&self, nodes: &[NodeId]) -> bool;
+    async fn validate_selection(&self, nodes: &[PeerId]) -> bool;
 
     /// Get constraint name for debugging
     fn name(&self) -> &str;

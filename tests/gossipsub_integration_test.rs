@@ -25,8 +25,9 @@
 
 #[cfg(test)]
 mod gossipsub_tests {
+    use saorsa_core::PeerId;
+    use saorsa_core::adaptive::TrustProvider;
     use saorsa_core::adaptive::gossip::*;
-    use saorsa_core::adaptive::{NodeId, TrustProvider};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -34,7 +35,7 @@ mod gossipsub_tests {
 
     /// Mock trust provider for testing
     struct MockTrustProvider {
-        trust_scores: Arc<RwLock<HashMap<NodeId, f64>>>,
+        trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
     }
 
     impl MockTrustProvider {
@@ -44,7 +45,7 @@ mod gossipsub_tests {
             }
         }
 
-        async fn set_trust(&self, node: &NodeId, trust: f64) {
+        async fn set_trust(&self, node: &PeerId, trust: f64) {
             let mut scores = self.trust_scores.write().await;
             scores.insert(node.clone(), trust);
         }
@@ -52,20 +53,20 @@ mod gossipsub_tests {
 
     #[async_trait::async_trait]
     impl TrustProvider for MockTrustProvider {
-        fn get_trust(&self, node: &NodeId) -> f64 {
+        fn get_trust(&self, node: &PeerId) -> f64 {
             futures::executor::block_on(async {
                 let scores = self.trust_scores.read().await;
                 scores.get(node).cloned().unwrap_or(0.5)
             })
         }
 
-        fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
+        fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
 
-        fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+        fn get_global_trust(&self) -> HashMap<PeerId, f64> {
             futures::executor::block_on(async { self.trust_scores.read().await.clone() })
         }
 
-        fn remove_node(&self, node: &NodeId) {
+        fn remove_node(&self, node: &PeerId) {
             futures::executor::block_on(async {
                 let mut scores = self.trust_scores.write().await;
                 scores.remove(node);
@@ -74,20 +75,20 @@ mod gossipsub_tests {
     }
 
     /// Helper to create test nodes
-    fn create_test_nodes(count: usize) -> Vec<NodeId> {
+    fn create_test_nodes(count: usize) -> Vec<PeerId> {
         use rand::RngCore;
         (0..count)
             .map(|i| {
                 let mut hash = [0u8; 32];
                 hash[0] = i as u8;
                 rand::thread_rng().fill_bytes(&mut hash[1..]);
-                NodeId::from_bytes(hash)
+                PeerId::from_bytes(hash)
             })
             .collect()
     }
 
     /// Helper to create test message
-    fn create_test_message(topic: &str, data: Vec<u8>, from: &NodeId) -> GossipMessage {
+    fn create_test_message(topic: &str, data: Vec<u8>, from: &PeerId) -> GossipMessage {
         GossipMessage {
             topic: topic.to_string(),
             data,
@@ -102,7 +103,7 @@ mod gossipsub_tests {
 
     #[tokio::test]
     async fn test_basic_gossipsub_creation() {
-        let local_id = NodeId::from_bytes([1u8; 32]);
+        let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
         let gossipsub = AdaptiveGossipSub::new(local_id, trust_provider.clone());
 
@@ -127,7 +128,7 @@ mod gossipsub_tests {
 
     #[tokio::test]
     async fn test_topic_management() {
-        let local_id = NodeId::from_bytes([1u8; 32]);
+        let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
         let gossipsub = AdaptiveGossipSub::new(local_id, trust_provider.clone());
 
@@ -149,7 +150,7 @@ mod gossipsub_tests {
 
     #[tokio::test]
     async fn test_message_creation() {
-        let local_id = NodeId::from_bytes([1u8; 32]);
+        let local_id = PeerId::from_bytes([1u8; 32]);
         let _trust_provider = Arc::new(MockTrustProvider::new());
 
         let topic = "validation_topic";
@@ -165,7 +166,7 @@ mod gossipsub_tests {
 
     #[tokio::test]
     async fn test_message_publishing() {
-        let local_id = NodeId::from_bytes([1u8; 32]);
+        let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
         let gossipsub = AdaptiveGossipSub::new(local_id.clone(), trust_provider);
 
@@ -237,7 +238,7 @@ mod gossipsub_tests {
 
     #[tokio::test]
     async fn test_topic_prioritization() {
-        let local_id = NodeId::from_bytes([1u8; 32]);
+        let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
         let gossipsub = AdaptiveGossipSub::new(local_id.clone(), trust_provider);
 

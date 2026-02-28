@@ -47,10 +47,10 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("Listen addresses: {:?}", addrs);
 
     // Create a fake peer ID for testing
-    let test_peer_id = "peer_test_12345678".to_string();
+    let test_peer_id = saorsa_core::PeerId::from_bytes([0xAAu8; 32]);
 
     // Test 1: is_peer_connected() exists and returns false for non-existent peer
-    let is_connected = node.is_peer_connected(&test_peer_id).await;
+    let is_connected = node.is_peer_connected(&test_peer_id.to_hex()).await;
     assert!(!is_connected, "Non-existent peer should not be connected");
     info!("✓ is_peer_connected() method exists and works");
 

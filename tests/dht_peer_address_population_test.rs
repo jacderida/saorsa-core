@@ -78,7 +78,6 @@ async fn create_test_dht_config(
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: peer_id.to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -87,7 +86,7 @@ async fn create_test_dht_config(
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
-            node_identity: Some(identity.clone()),
+            node_identity: identity.clone(),
         })
         .await?,
     );

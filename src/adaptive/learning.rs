@@ -18,6 +18,7 @@
 
 use super::beta_distribution::BetaDistribution;
 use super::*;
+use crate::PeerId;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -832,7 +833,7 @@ pub struct NodeFeatures {
 #[derive(Debug, Clone)]
 pub struct FeatureHistory {
     /// Node ID
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     /// Feature snapshots over time
     pub snapshots: Vec<(std::time::Instant, NodeFeatures)>,
     /// Session history (start, end)
@@ -853,7 +854,7 @@ impl FeatureHistory {
     /// Create a new feature history
     pub fn new() -> Self {
         Self {
-            node_id: NodeId { hash: [0u8; 32] },
+            node_id: PeerId::from_bytes([0u8; 32]),
             snapshots: Vec::new(),
             sessions: Vec::new(),
             total_uptime: 0,
@@ -866,10 +867,10 @@ impl FeatureHistory {
 #[derive(Debug)]
 pub struct ChurnPredictor {
     /// Prediction cache
-    prediction_cache: Arc<tokio::sync::RwLock<HashMap<NodeId, ChurnPrediction>>>,
+    prediction_cache: Arc<tokio::sync::RwLock<HashMap<PeerId, ChurnPrediction>>>,
 
     /// Feature history for each node
-    feature_history: Arc<tokio::sync::RwLock<HashMap<NodeId, FeatureHistory>>>,
+    feature_history: Arc<tokio::sync::RwLock<HashMap<PeerId, FeatureHistory>>>,
 
     /// Model parameters (simulated LSTM weights)
     model_weights: Arc<tokio::sync::RwLock<ModelWeights>>,
@@ -923,7 +924,7 @@ impl Default for ModelWeights {
 /// Training example for online learning
 #[derive(Debug, Clone)]
 pub struct TrainingExample {
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     pub features: NodeFeatures,
     pub timestamp: std::time::Instant,
     pub actual_churn_1h: bool,
@@ -961,7 +962,7 @@ impl ChurnPredictor {
     }
 
     /// Check if content should be replicated based on node churn risk
-    pub async fn should_replicate(&self, node_id: &NodeId) -> bool {
+    pub async fn should_replicate(&self, node_id: &PeerId) -> bool {
         let prediction = self.predict(node_id).await;
         prediction.probability_1h > 0.7
     }
@@ -969,7 +970,7 @@ impl ChurnPredictor {
     /// Update node features for prediction
     pub async fn update_node_features(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         features: Vec<f64>,
     ) -> anyhow::Result<()> {
         if features.len() != 10 {
@@ -1019,7 +1020,7 @@ impl ChurnPredictor {
     }
 
     /// Extract features from node behavior
-    pub async fn extract_features(&self, node_id: &NodeId) -> Option<NodeFeatures> {
+    pub async fn extract_features(&self, node_id: &PeerId) -> Option<NodeFeatures> {
         let history = self.feature_history.read().await;
         let node_history = history.get(node_id)?;
 
@@ -1154,7 +1155,7 @@ impl ChurnPredictor {
     }
 
     /// Predict churn probability for a node
-    pub async fn predict(&self, node_id: &NodeId) -> ChurnPrediction {
+    pub async fn predict(&self, node_id: &PeerId) -> ChurnPrediction {
         // Check cache first
         {
             let cache = self.prediction_cache.read().await;
@@ -1262,7 +1263,7 @@ impl ChurnPredictor {
     /// Update node behavior tracking
     pub async fn update_node_behavior(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         features: NodeFeatures,
     ) -> anyhow::Result<()> {
         let mut history = self.feature_history.write().await;
@@ -1296,7 +1297,7 @@ impl ChurnPredictor {
     }
 
     /// Record node connection event
-    pub async fn record_node_event(&self, node_id: &NodeId, event: NodeEvent) -> Result<()> {
+    pub async fn record_node_event(&self, node_id: &PeerId, event: NodeEvent) -> Result<()> {
         let mut history = self.feature_history.write().await;
         let node_history = history
             .entry(node_id.clone())
@@ -1334,7 +1335,7 @@ impl ChurnPredictor {
     /// Add training example for online learning
     pub async fn add_training_example(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         features: NodeFeatures,
         actual_churn_1h: bool,
         actual_churn_6h: bool,
@@ -1720,13 +1721,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_churn_predictor() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         let predictor = ChurnPredictor::new();
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let node_id = UserId::from_bytes(hash);
+        let node_id = PeerId::from_bytes(hash);
 
         let prediction = predictor.predict(&node_id).await;
         assert!(prediction.probability_1h >= 0.0 && prediction.probability_1h <= 1.0);
@@ -1913,7 +1914,7 @@ mod tests {
         let predictor = ChurnPredictor::new();
 
         // Test prediction for unknown node
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let prediction = predictor.predict(&node_id).await;
 
         // Should return low confidence for unknown node
@@ -1926,7 +1927,7 @@ mod tests {
     #[tokio::test]
     async fn test_churn_predictor_node_events() -> Result<()> {
         let predictor = ChurnPredictor::new();
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Record connection
         predictor
@@ -1948,7 +1949,7 @@ mod tests {
     #[tokio::test]
     async fn test_churn_predictor_feature_extraction() -> Result<()> {
         let predictor = ChurnPredictor::new();
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Create node history
         predictor
@@ -2022,7 +2023,7 @@ mod tests {
     #[tokio::test]
     async fn test_churn_predictor_proactive_replication() -> Result<()> {
         let predictor = ChurnPredictor::new();
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Create high-risk node history
         predictor
@@ -2055,7 +2056,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_churn_predictor_online_learning() -> Result<()> {
         let predictor = ChurnPredictor::new();
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Add training examples with a timeout to avoid hanging
         let train_future = async {

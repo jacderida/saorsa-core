@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use crate::dht::replication_grace_period::*;
-use crate::peer_record::UserId as NodeId;
+use crate::peer_record::PeerId;
 
 /// Trait for tracking node failures with grace period logic
 #[async_trait]
@@ -30,22 +30,22 @@ pub trait NodeFailureTracker: Send + Sync {
     /// Record a node failure with grace period
     async fn record_node_failure(
         &self,
-        node_id: NodeId,
+        node_id: PeerId,
         reason: NodeFailureReason,
         config: &ReplicationGracePeriodConfig,
     ) -> Result<(), ReplicationError>;
 
     /// Check if replication should start for a failed node
-    async fn should_start_replication(&self, node_id: &NodeId) -> bool;
+    async fn should_start_replication(&self, node_id: &PeerId) -> bool;
 
     /// Check if node has re-registered endpoint during grace period
-    async fn check_endpoint_reregistration(&self, node_id: &NodeId) -> bool;
+    async fn check_endpoint_reregistration(&self, node_id: &PeerId) -> bool;
 
     /// Clean up expired failure records
     async fn cleanup_expired_failures(&self) -> usize;
 
     /// Get failure info for a node (for testing/debugging)
-    async fn get_failure_info(&self, node_id: &NodeId) -> Option<FailedNodeInfo>;
+    async fn get_failure_info(&self, node_id: &PeerId) -> Option<FailedNodeInfo>;
 
     /// Get all current failed nodes
     async fn get_all_failed_nodes(&self) -> Vec<FailedNodeInfo>;
@@ -55,13 +55,13 @@ pub trait NodeFailureTracker: Send + Sync {
 #[async_trait]
 pub trait DhtClient: Send + Sync {
     /// Get the last known endpoint for a node
-    async fn get_last_endpoint(&self, node_id: &NodeId)
+    async fn get_last_endpoint(&self, node_id: &PeerId)
     -> Result<Option<String>, ReplicationError>;
 
     /// Get endpoint registration info for a node
     async fn get_endpoint_registration(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
     ) -> Result<Option<EndpointRegistration>, ReplicationError>;
 }
 
@@ -69,7 +69,7 @@ pub trait DhtClient: Send + Sync {
 #[derive(Clone)]
 pub struct DefaultNodeFailureTracker {
     /// Storage for failed node information
-    failed_nodes: Arc<RwLock<HashMap<NodeId, FailedNodeInfo>>>,
+    failed_nodes: Arc<RwLock<HashMap<PeerId, FailedNodeInfo>>>,
 
     /// DHT client for endpoint operations
     dht_client: Arc<dyn DhtClient>,
@@ -86,7 +86,7 @@ impl DefaultNodeFailureTracker {
 
     /// Create a new failure tracker with custom storage (for testing)
     pub fn with_storage(
-        failed_nodes: Arc<RwLock<HashMap<NodeId, FailedNodeInfo>>>,
+        failed_nodes: Arc<RwLock<HashMap<PeerId, FailedNodeInfo>>>,
         dht_client: Arc<dyn DhtClient>,
     ) -> Self {
         Self {
@@ -100,7 +100,7 @@ impl DefaultNodeFailureTracker {
 impl NodeFailureTracker for DefaultNodeFailureTracker {
     async fn record_node_failure(
         &self,
-        node_id: NodeId,
+        node_id: PeerId,
         reason: NodeFailureReason,
         config: &ReplicationGracePeriodConfig,
     ) -> Result<(), ReplicationError> {
@@ -131,7 +131,7 @@ impl NodeFailureTracker for DefaultNodeFailureTracker {
         Ok(())
     }
 
-    async fn should_start_replication(&self, node_id: &NodeId) -> bool {
+    async fn should_start_replication(&self, node_id: &PeerId) -> bool {
         if let Some(failure_info) = self.failed_nodes.read().await.get(node_id) {
             let now = SystemTime::now();
 
@@ -152,7 +152,7 @@ impl NodeFailureTracker for DefaultNodeFailureTracker {
         }
     }
 
-    async fn check_endpoint_reregistration(&self, node_id: &NodeId) -> bool {
+    async fn check_endpoint_reregistration(&self, node_id: &PeerId) -> bool {
         if let Some(failure_info) = self.failed_nodes.read().await.get(node_id) {
             match self.dht_client.get_endpoint_registration(node_id).await {
                 Ok(Some(registration)) => {
@@ -185,7 +185,7 @@ impl NodeFailureTracker for DefaultNodeFailureTracker {
         initial_count - failures.len()
     }
 
-    async fn get_failure_info(&self, node_id: &NodeId) -> Option<FailedNodeInfo> {
+    async fn get_failure_info(&self, node_id: &PeerId) -> Option<FailedNodeInfo> {
         self.failed_nodes.read().await.get(node_id).cloned()
     }
 
@@ -202,8 +202,8 @@ mod tests {
 
     // Mock DHT client for testing
     struct MockDhtClient {
-        endpoint_registrations: Arc<RwLock<HashMap<NodeId, EndpointRegistration>>>,
-        last_endpoints: Arc<RwLock<HashMap<NodeId, String>>>,
+        endpoint_registrations: Arc<RwLock<HashMap<PeerId, EndpointRegistration>>>,
+        last_endpoints: Arc<RwLock<HashMap<PeerId, String>>>,
     }
 
     impl MockDhtClient {
@@ -217,7 +217,7 @@ mod tests {
         #[allow(dead_code)]
         async fn register_endpoint(
             &self,
-            node_id: NodeId,
+            node_id: PeerId,
             endpoint: String,
             timestamp: SystemTime,
         ) {
@@ -232,7 +232,7 @@ mod tests {
         }
 
         #[allow(dead_code)]
-        async fn set_last_endpoint(&self, node_id: NodeId, endpoint: String) {
+        async fn set_last_endpoint(&self, node_id: PeerId, endpoint: String) {
             self.last_endpoints.write().await.insert(node_id, endpoint);
         }
     }
@@ -241,14 +241,14 @@ mod tests {
     impl DhtClient for MockDhtClient {
         async fn get_last_endpoint(
             &self,
-            node_id: &NodeId,
+            node_id: &PeerId,
         ) -> Result<Option<String>, ReplicationError> {
             Ok(self.last_endpoints.read().await.get(node_id).cloned())
         }
 
         async fn get_endpoint_registration(
             &self,
-            node_id: &NodeId,
+            node_id: &PeerId,
         ) -> Result<Option<EndpointRegistration>, ReplicationError> {
             Ok(self
                 .endpoint_registrations
@@ -259,10 +259,10 @@ mod tests {
         }
     }
 
-    fn create_test_node_id(id: u8) -> NodeId {
+    fn create_test_node_id(id: u8) -> PeerId {
         let mut bytes = [0u8; 32];
         bytes[0] = id;
-        NodeId::from_bytes(bytes)
+        PeerId::from_bytes(bytes)
     }
 
     #[tokio::test]

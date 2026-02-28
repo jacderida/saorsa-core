@@ -17,7 +17,7 @@
 //! with Kademlia fallback. It uses HyperMap/Mercator-style background embedding
 //! with drift detection and partial re-fitting.
 
-use crate::dht::core_engine::NodeId;
+use crate::PeerId;
 use crate::{P2PError, Result};
 use blake3::Hasher;
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
@@ -480,7 +480,7 @@ impl HyperbolicGreedyRouter {
     /// Greedy next-hop selection with Kademlia fallback
     pub async fn greedy_next(
         &self,
-        target: NodeId,
+        target: PeerId,
         here: String,
         emb: &Embedding,
     ) -> Option<String> {
@@ -488,7 +488,7 @@ impl HyperbolicGreedyRouter {
         let here_coord = emb.coordinates.get(&here)?;
 
         // Check if we have target's coordinate; if not, approximate using any coordinate
-        let target_peer = node_id_to_peer_id(&target);
+        let target_peer = peer_id_to_hex(&target);
         let target_coord = emb
             .coordinates
             .get(&target_peer)
@@ -587,10 +587,9 @@ impl HyperbolicGreedyRouter {
     }
 }
 
-/// Convert NodeId to a peer identifier string
-fn node_id_to_peer_id(node_id: &NodeId) -> String {
-    // Convert NodeId bytes to hex string
-    hex::encode(node_id.as_bytes())
+/// Hex-encode a `PeerId` to a string.
+fn peer_id_to_hex(peer_id: &PeerId) -> String {
+    hex::encode(peer_id.as_bytes())
 }
 
 fn deterministic_distance(peer1: &str, peer2: &str) -> f64 {
@@ -630,12 +629,12 @@ pub async fn embed_snapshot(peers: &[String]) -> Result<Embedding> {
 ///
 /// Attempts greedy routing first - if a neighbor is closer to the target
 /// in hyperbolic space, route to them. Otherwise, fall back to Kademlia.
-pub async fn greedy_next(target: NodeId, here: String, emb: &Embedding) -> Option<String> {
+pub async fn greedy_next(target: PeerId, here: String, emb: &Embedding) -> Option<String> {
     // Get current coordinate
     let here_coord = emb.coordinates.get(&here)?;
 
     // Check if we have target's coordinate
-    let target_peer = node_id_to_peer_id(&target);
+    let target_peer = peer_id_to_hex(&target);
     let target_coord = emb.coordinates.get(&target_peer).or_else(|| {
         // If target not present, approximate by nearest available coordinate (best-effort)
         emb.coordinates.values().next()
@@ -774,12 +773,12 @@ mod tests {
             created_at: Instant::now(),
         };
 
-        // Create a NodeId from the target peer string
+        // Create a PeerId from the target peer string
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target_peer.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target = NodeId::from_bytes(node_id_bytes);
+        let target = PeerId::from_bytes(node_id_bytes);
         let next = router.greedy_next(target, local_id, &embedding).await;
 
         assert!(next.is_some());

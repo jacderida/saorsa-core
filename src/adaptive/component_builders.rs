@@ -68,7 +68,7 @@ impl NetworkComponents {
 
         // Initialize gossip
         let gossip = Arc::new(AdaptiveGossipSub::new(
-            identity.to_user_id(),
+            identity.peer_id().clone(),
             trust_engine.clone(),
         ));
 
@@ -243,7 +243,7 @@ impl OperationsComponents {
         // Initialize churn handler
         let churn_config = ChurnConfig::default();
         let churn_handler = Arc::new(ChurnHandler::new(
-            identity.to_user_id(),
+            identity.peer_id().clone(),
             churn_predictor,
             trust_engine,
             replication.clone(),

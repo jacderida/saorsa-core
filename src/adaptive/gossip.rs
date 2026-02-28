@@ -17,6 +17,7 @@
 //! and priority message types
 
 use super::*;
+use crate::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -24,8 +25,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
 
 // Type aliases to reduce type complexity for channels
-type GossipMessageRx = mpsc::Receiver<(NodeId, GossipMessage)>;
-type ControlMessageTx = mpsc::Sender<(NodeId, ControlMessage)>;
+type GossipMessageRx = mpsc::Receiver<(PeerId, GossipMessage)>;
+type ControlMessageTx = mpsc::Sender<(PeerId, ControlMessage)>;
 
 /// Topic identifier for gossip messages
 pub type Topic = String;
@@ -93,13 +94,13 @@ pub struct GossipStats {
 /// Adaptive GossipSub implementation
 pub struct AdaptiveGossipSub {
     /// Local node ID
-    _local_id: NodeId,
+    _local_id: PeerId,
 
     /// Mesh peers for each topic
-    mesh: Arc<RwLock<HashMap<Topic, HashSet<NodeId>>>>,
+    mesh: Arc<RwLock<HashMap<Topic, HashSet<PeerId>>>>,
 
     /// Fanout peers for topics we're not subscribed to
-    fanout: Arc<RwLock<HashMap<Topic, HashSet<NodeId>>>>,
+    fanout: Arc<RwLock<HashMap<Topic, HashSet<PeerId>>>>,
 
     /// Seen messages cache
     seen_messages: Arc<RwLock<HashMap<MessageId, Instant>>>,
@@ -108,7 +109,7 @@ pub struct AdaptiveGossipSub {
     message_cache: Arc<RwLock<HashMap<MessageId, GossipMessage>>>,
 
     /// Peer scores
-    peer_scores: Arc<RwLock<HashMap<NodeId, PeerScore>>>,
+    peer_scores: Arc<RwLock<HashMap<PeerId, PeerScore>>>,
 
     /// Topic parameters
     topics: Arc<RwLock<HashMap<Topic, TopicParams>>>,
@@ -143,7 +144,7 @@ pub struct AdaptiveGossipSub {
 pub struct GossipMessage {
     pub topic: Topic,
     pub data: Vec<u8>,
-    pub from: NodeId,
+    pub from: PeerId,
     pub seqno: u64,
     pub timestamp: u64,
 }
@@ -229,8 +230,8 @@ pub struct ChurnDetector {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum ChurnEvent {
-    PeerJoined(NodeId),
-    PeerLeft(NodeId),
+    PeerJoined(PeerId),
+    PeerLeft(PeerId),
 }
 
 /// Churn statistics for a time window
@@ -243,12 +244,12 @@ pub struct ChurnStats {
     /// Average session duration
     pub avg_session_duration: Duration,
     /// Node join times for uptime calculation
-    node_join_times: HashMap<NodeId, Instant>,
+    node_join_times: HashMap<PeerId, Instant>,
 }
 
 impl ChurnStats {
     /// Get uptime for a specific node
-    pub fn get_node_uptime(&self, node_id: &NodeId) -> Duration {
+    pub fn get_node_uptime(&self, node_id: &PeerId) -> Duration {
         self.node_join_times
             .get(node_id)
             .map(|join_time| Instant::now().duration_since(*join_time))
@@ -265,13 +266,13 @@ impl ChurnDetector {
         }
     }
 
-    fn record_join(&mut self, peer: NodeId) {
+    fn record_join(&mut self, peer: PeerId) {
         self.events
             .push_back((Instant::now(), ChurnEvent::PeerJoined(peer)));
         self.update_rate();
     }
 
-    fn record_leave(&mut self, peer: NodeId) {
+    fn record_leave(&mut self, peer: PeerId) {
         self.events
             .push_back((Instant::now(), ChurnEvent::PeerLeft(peer)));
         self.update_rate();
@@ -373,7 +374,7 @@ impl AdaptiveGossipSub {
     /// Control and message channels are not wired up yet — the `send_graft`/`send_prune`/
     /// `send_ihave`/`send_iwant` methods are no-ops until a transport integration sets
     /// concrete channels via a future `set_control_channel` API.
-    pub fn new(local_id: NodeId, trust_provider: Arc<dyn TrustProvider>) -> Self {
+    pub fn new(local_id: PeerId, trust_provider: Arc<dyn TrustProvider>) -> Self {
         Self {
             _local_id: local_id,
             mesh: Arc::new(RwLock::new(HashMap::new())),
@@ -458,7 +459,7 @@ impl AdaptiveGossipSub {
     }
 
     /// Send GRAFT control message
-    pub async fn send_graft(&self, peer: &NodeId, topic: &str) -> Result<()> {
+    pub async fn send_graft(&self, peer: &PeerId, topic: &str) -> Result<()> {
         let control_tx = self.control_tx.read().await;
         if let Some(tx) = control_tx.as_ref() {
             let msg = ControlMessage::Graft {
@@ -472,7 +473,7 @@ impl AdaptiveGossipSub {
     }
 
     /// Send PRUNE control message
-    pub async fn send_prune(&self, peer: &NodeId, topic: &str, backoff: Duration) -> Result<()> {
+    pub async fn send_prune(&self, peer: &PeerId, topic: &str, backoff: Duration) -> Result<()> {
         let control_tx = self.control_tx.read().await;
         if let Some(tx) = control_tx.as_ref() {
             let msg = ControlMessage::Prune {
@@ -489,7 +490,7 @@ impl AdaptiveGossipSub {
     /// Send IHAVE control message
     pub async fn send_ihave(
         &self,
-        peer: &NodeId,
+        peer: &PeerId,
         topic: &str,
         message_ids: Vec<MessageId>,
     ) -> Result<()> {
@@ -507,7 +508,7 @@ impl AdaptiveGossipSub {
     }
 
     /// Send IWANT control message
-    pub async fn send_iwant(&self, peer: &NodeId, message_ids: Vec<MessageId>) -> Result<()> {
+    pub async fn send_iwant(&self, peer: &PeerId, message_ids: Vec<MessageId>) -> Result<()> {
         let control_tx = self.control_tx.read().await;
         if let Some(tx) = control_tx.as_ref() {
             let msg = ControlMessage::IWant { message_ids };
@@ -614,8 +615,8 @@ impl AdaptiveGossipSub {
     async fn select_peer_for_mesh(
         &self,
         _topic: &str,
-        current_mesh: &HashSet<NodeId>,
-    ) -> Option<NodeId> {
+        current_mesh: &HashSet<PeerId>,
+    ) -> Option<PeerId> {
         // Select from known peers not in mesh, sorted by score
         let scores = self.peer_scores.read().await;
         let mut candidates: Vec<_> = scores
@@ -654,7 +655,7 @@ impl AdaptiveGossipSub {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(message.topic.as_bytes());
-        hasher.update(message.from.hash);
+        hasher.update(message.from.to_bytes());
         hasher.update(message.seqno.to_le_bytes());
         hasher.update(&message.data);
 
@@ -665,13 +666,13 @@ impl AdaptiveGossipSub {
     }
 
     /// Send message to a peer (placeholder)
-    async fn send_message(&self, _peer: &NodeId, _message: &GossipMessage) -> Result<()> {
+    async fn send_message(&self, _peer: &PeerId, _message: &GossipMessage) -> Result<()> {
         // In real implementation, send via network layer
         Ok(())
     }
 
     /// Get fanout peers for a topic
-    fn get_fanout_peers(&self, _topic: &str) -> Option<HashSet<NodeId>> {
+    fn get_fanout_peers(&self, _topic: &str) -> Option<HashSet<PeerId>> {
         // In real implementation, select high-scoring peers
         None
     }
@@ -679,7 +680,7 @@ impl AdaptiveGossipSub {
     /// Handle incoming control message
     pub async fn handle_control_message(
         &self,
-        from: &NodeId,
+        from: &PeerId,
         message: ControlMessage,
     ) -> Result<()> {
         match message {
@@ -807,22 +808,22 @@ mod tests {
     async fn test_gossipsub_subscribe() {
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.5
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -846,22 +847,22 @@ mod tests {
     fn test_message_id() {
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.5
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -872,7 +873,7 @@ mod tests {
         let msg = GossipMessage {
             topic: "test".to_string(),
             data: vec![1, 2, 3],
-            from: UserId::from_bytes(hash2),
+            from: PeerId::from_bytes(hash2),
             seqno: 1,
             timestamp: 12345,
         };
@@ -885,24 +886,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_adaptive_mesh_size() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.5
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -926,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_churn_detector() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         let mut detector = ChurnDetector::new();
@@ -936,7 +937,7 @@ mod tests {
             let mut hash = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut hash);
             hash[0] = i;
-            let peer = UserId::from_bytes(hash);
+            let peer = PeerId::from_bytes(hash);
 
             if i % 2 == 0 {
                 detector.record_join(peer);
@@ -951,24 +952,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_messages() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.8
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -979,7 +980,7 @@ mod tests {
         // Test GRAFT handling
         let mut peer_hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut peer_hash);
-        let peer_id = UserId::from_bytes(peer_hash);
+        let peer_id = PeerId::from_bytes(peer_hash);
 
         let graft_msg = ControlMessage::Graft {
             topic: "test-topic".to_string(),
@@ -996,19 +997,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_validation() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.8
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
         // Custom validator that rejects messages with "bad" in the data
@@ -1022,7 +1023,7 @@ mod tests {
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -1037,7 +1038,7 @@ mod tests {
         let valid_message = GossipMessage {
             topic: "test-topic".to_string(),
             data: vec![1, 2, 3, 4], // No "bad" in data
-            from: UserId::from_bytes([0; 32]),
+            from: PeerId::from_bytes([0; 32]),
             seqno: 1,
             timestamp: 12345,
         };
@@ -1049,7 +1050,7 @@ mod tests {
         let invalid_message = GossipMessage {
             topic: "test-topic".to_string(),
             data: vec![b'b', b'a', b'd', b'!'], // Contains "bad"
-            from: UserId::from_bytes([0; 32]),
+            from: PeerId::from_bytes([0; 32]),
             seqno: 2,
             timestamp: 12346,
         };
@@ -1060,24 +1061,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_ihave_iwant_flow() {
-        use crate::peer_record::UserId;
+        use crate::peer_record::PeerId;
         use rand::RngCore;
 
         struct MockTrustProvider;
         impl TrustProvider for MockTrustProvider {
-            fn get_trust(&self, _node: &NodeId) -> f64 {
+            fn get_trust(&self, _node: &PeerId) -> f64 {
                 0.8
             }
-            fn update_trust(&self, _from: &NodeId, _to: &NodeId, _success: bool) {}
-            fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+            fn update_trust(&self, _from: &PeerId, _to: &PeerId, _success: bool) {}
+            fn get_global_trust(&self) -> HashMap<PeerId, f64> {
                 HashMap::new()
             }
-            fn remove_node(&self, _node: &NodeId) {}
+            fn remove_node(&self, _node: &PeerId) {}
         }
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = UserId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
         let trust_provider = Arc::new(MockTrustProvider);
         let gossip = AdaptiveGossipSub::new(local_id, trust_provider);
@@ -1085,7 +1086,7 @@ mod tests {
         // Create a test message
         let mut peer_hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut peer_hash);
-        let from_peer = UserId::from_bytes(peer_hash);
+        let from_peer = PeerId::from_bytes(peer_hash);
 
         let message = GossipMessage {
             topic: "test-topic".to_string(),

@@ -20,7 +20,6 @@
 //! 1-hour, 6-hour, and 24-hour horizons to enable proactive replication.
 
 use crate::Result;
-use crate::adaptive::NodeId;
 use crate::adaptive::gossip::ChurnDetector;
 use crate::identity::NodeIdentity;
 use chrono::{Datelike, Timelike};
@@ -244,8 +243,7 @@ impl LSTMChurnPredictor {
             day_of_week,
             network_size,
             avg_session_duration: recent_stats.avg_session_duration,
-            node_uptime: recent_stats
-                .get_node_uptime(&NodeId::from_bytes(*node_id.peer_id().to_bytes())),
+            node_uptime: recent_stats.get_node_uptime(node_id.peer_id()),
             join_leave_ratio,
         }
     }

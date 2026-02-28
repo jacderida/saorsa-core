@@ -24,6 +24,7 @@
 
 #![allow(missing_docs)]
 
+use crate::PeerId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -173,7 +174,7 @@ pub struct NetworkMessage {
     /// Message ID
     pub id: String,
     /// Sender node ID
-    pub sender: NodeId,
+    pub sender: PeerId,
     /// Message content
     pub content: Vec<u8>,
     /// Message type
@@ -182,13 +183,10 @@ pub struct NetworkMessage {
     pub timestamp: u64,
 }
 
-/// Node ID type alias
-pub type NodeId = crate::peer_record::UserId;
-
 /// Node descriptor containing all information about a peer
 #[derive(Debug, Clone)]
 pub struct NodeDescriptor {
-    pub id: NodeId,
+    pub id: PeerId,
     // PQC-only: ML-DSA public key
     pub public_key: crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey,
     pub addresses: Vec<String>,
@@ -260,24 +258,22 @@ pub struct NetworkStats {
 #[async_trait]
 pub trait RoutingStrategy: Send + Sync {
     /// Find a path to the target node
-    async fn find_path(&self, target: &NodeId) -> Result<Vec<NodeId>>;
+    async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>>;
 
     /// Calculate routing score for a neighbor towards a target
-    fn route_score(&self, neighbor: &NodeId, target: &NodeId) -> f64;
+    fn route_score(&self, neighbor: &PeerId, target: &PeerId) -> f64;
 
     /// Update routing metrics based on success/failure
-    fn update_metrics(&self, path: &[NodeId], success: bool);
+    fn update_metrics(&self, path: &[PeerId], success: bool);
 
     /// Find closest nodes to a content hash
     async fn find_closest_nodes(
         &self,
         content_hash: &ContentHash,
         _count: usize,
-    ) -> Result<Vec<NodeId>> {
+    ) -> Result<Vec<PeerId>> {
         // Default implementation uses node ID from content hash
-        let target = NodeId {
-            hash: content_hash.0,
-        };
+        let target = PeerId::from_bytes(content_hash.0);
         self.find_path(&target).await
     }
 }
@@ -289,16 +285,16 @@ pub trait RoutingStrategy: Send + Sync {
 /// queried for individual nodes or in aggregate.
 pub trait TrustProvider: Send + Sync {
     /// Get trust score for a node (0.0 = untrusted, 1.0 = fully trusted)
-    fn get_trust(&self, node: &NodeId) -> f64;
+    fn get_trust(&self, node: &PeerId) -> f64;
 
     /// Update trust based on interaction outcome
-    fn update_trust(&self, from: &NodeId, to: &NodeId, success: bool);
+    fn update_trust(&self, from: &PeerId, to: &PeerId, success: bool);
 
     /// Get global trust vector for all known nodes
-    fn get_global_trust(&self) -> std::collections::HashMap<NodeId, f64>;
+    fn get_global_trust(&self) -> std::collections::HashMap<PeerId, f64>;
 
     /// Remove a node from the trust system
-    fn remove_node(&self, node: &NodeId);
+    fn remove_node(&self, node: &PeerId);
 
     // Note: get_trust_score was removed as redundant alias for get_trust
 }

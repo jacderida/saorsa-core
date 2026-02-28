@@ -19,15 +19,15 @@ use saorsa_core::dht::cross_network_replication::{
 use saorsa_core::dht::node_age_verifier::{
     NodeAgeCategory, NodeAgeConfig, NodeAgeVerifier, OperationType,
 };
-use saorsa_core::peer_record::UserId as NodeId;
+use saorsa_core::peer_record::PeerId;
 use saorsa_core::security::GeoProvider;
 
-// Helper to create a NodeId from a string
-fn make_node_id(name: &str) -> NodeId {
+// Helper to create a PeerId from a string
+fn make_node_id(name: &str) -> PeerId {
     let mut hash = [0u8; 32];
     let bytes = name.as_bytes();
     hash[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
-    NodeId { hash }
+    PeerId::from_bytes(hash)
 }
 
 // Helper to create NodeNetworkInfo

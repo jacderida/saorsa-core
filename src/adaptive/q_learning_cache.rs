@@ -27,8 +27,8 @@
 // use super::*; // Removed unused import
 use super::ContentHash;
 use super::eviction::{CacheState, EvictionStrategy, EvictionStrategyType};
+use crate::PeerId;
 use crate::Result;
-use crate::identity::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

@@ -22,6 +22,7 @@
 //! of nodes in the P2P network based on multi-dimensional features such as content
 //! specialization, compute capability, network latency, and storage availability.
 
+use crate::PeerId;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -125,7 +126,7 @@ pub struct Neuron {
     /// Weight vector
     weights: Vec<f64>,
     /// Node IDs assigned to this neuron
-    assigned_nodes: HashSet<NodeId>,
+    assigned_nodes: HashSet<PeerId>,
 }
 
 impl Neuron {
@@ -170,7 +171,7 @@ pub struct SelfOrganizingMap {
     /// Weight dimension (features + metadata)
     weight_dim: usize,
     /// Node to grid position mapping for fast lookups
-    node_positions: Arc<RwLock<HashMap<NodeId, (usize, usize)>>>,
+    node_positions: Arc<RwLock<HashMap<PeerId, (usize, usize)>>>,
 }
 
 impl SelfOrganizingMap {
@@ -277,7 +278,7 @@ impl SelfOrganizingMap {
     }
 
     /// Assign a node to its BMU
-    pub fn assign_node(&mut self, node_id: NodeId, features: NodeFeatures) {
+    pub fn assign_node(&mut self, node_id: PeerId, features: NodeFeatures) {
         let (x, y) = self.find_best_matching_unit(&features);
 
         // Remove from old position if exists
@@ -306,7 +307,7 @@ impl SelfOrganizingMap {
     }
 
     /// Get nodes assigned to a specific neuron
-    pub fn get_assigned_nodes(&self, x: usize, y: usize) -> HashSet<NodeId> {
+    pub fn get_assigned_nodes(&self, x: usize, y: usize) -> HashSet<PeerId> {
         let Ok(grid) = self.grid.read() else {
             return HashSet::new();
         };
@@ -317,7 +318,7 @@ impl SelfOrganizingMap {
     }
 
     /// Get all assigned nodes
-    pub fn get_all_assigned_nodes(&self) -> HashSet<NodeId> {
+    pub fn get_all_assigned_nodes(&self) -> HashSet<PeerId> {
         let Ok(grid) = self.grid.read() else {
             return HashSet::new();
         };
@@ -329,7 +330,7 @@ impl SelfOrganizingMap {
     }
 
     /// Find nodes similar to given features
-    pub fn find_similar_nodes(&self, features: &NodeFeatures, radius: usize) -> Vec<NodeId> {
+    pub fn find_similar_nodes(&self, features: &NodeFeatures, radius: usize) -> Vec<PeerId> {
         let (bmu_x, bmu_y) = self.find_best_matching_unit(features);
         let Ok(grid) = self.grid.read() else {
             return Vec::new();
@@ -527,7 +528,7 @@ pub struct NeuronVisualization {
     pub x: usize,
     pub y: usize,
     pub weights: Vec<f64>,
-    pub assigned_nodes: Vec<NodeId>,
+    pub assigned_nodes: Vec<PeerId>,
 }
 
 /// Complete visualization data for the SOM

@@ -2,6 +2,7 @@
 //!
 //! Provides the main DHT functionality with k=8 replication, load balancing, and fault tolerance.
 
+use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::metrics::SecurityMetricsCollector;
@@ -63,41 +64,31 @@ impl DhtKey {
     }
 }
 
-/// Node identifier in the DHT
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(DhtKey);
-
-impl NodeId {
-    pub fn random() -> Self {
-        let random_bytes: [u8; 32] = rand::random();
-        Self(DhtKey::from_bytes(random_bytes))
-    }
-
-    pub fn from_key(key: DhtKey) -> Self {
-        Self(key)
-    }
-
-    /// Backwards-compat helper for tests expecting from_bytes
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(DhtKey::from_bytes(bytes))
-    }
-
-    /// Get the underlying bytes
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
-    }
+/// Convert DHT key to DHT peer identifier (same 32-byte space).
+#[must_use]
+pub fn peer_id_from_key(key: DhtKey) -> PeerId {
+    PeerId::from_bytes(*key.as_bytes())
 }
 
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.as_bytes()))
+/// Convert DHT peer identifier to DHT key.
+#[must_use]
+pub fn dht_key_from_peer_id(peer_id: &PeerId) -> DhtKey {
+    DhtKey::from_bytes(*peer_id.to_bytes())
+}
+
+#[inline]
+fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        *byte = a[idx] ^ b[idx];
     }
+    out
 }
 
 /// Node information for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
-    pub id: NodeId,
+    pub id: PeerId,
     pub address: String,
     pub last_seen: SystemTime,
     pub capacity: NodeCapacity,
@@ -148,7 +139,7 @@ impl KBucket {
         }
     }
 
-    fn remove_node(&mut self, node_id: &NodeId) {
+    fn remove_node(&mut self, node_id: &PeerId) {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
@@ -160,12 +151,12 @@ impl KBucket {
 /// Kademlia routing table
 pub struct KademliaRoutingTable {
     buckets: Vec<KBucket>,
-    node_id: NodeId,
+    node_id: PeerId,
     _k_value: usize,
 }
 
 impl KademliaRoutingTable {
-    fn new(node_id: NodeId, k_value: usize) -> Self {
+    fn new(node_id: PeerId, k_value: usize) -> Self {
         let mut buckets = Vec::new();
         for _ in 0..KADEMLIA_BUCKET_COUNT {
             buckets.push(KBucket::new(k_value));
@@ -183,7 +174,7 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].add_node(node)
     }
 
-    fn remove_node(&mut self, node_id: &NodeId) {
+    fn remove_node(&mut self, node_id: &PeerId) {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].remove_node(node_id);
     }
@@ -200,7 +191,7 @@ impl KademliaRoutingTable {
             // Check bucket above target (or at target when offset == 0)
             let bucket_above = target_bucket.saturating_add(offset).min(255);
             for node in self.buckets[bucket_above].get_nodes() {
-                let distance = node.id.0.distance(key);
+                let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
                 candidates.push((node.clone(), distance));
             }
 
@@ -210,7 +201,7 @@ impl KademliaRoutingTable {
                 // Only check if it's a different bucket (saturating_sub may equal target_bucket)
                 if bucket_below != bucket_above {
                     for node in self.buckets[bucket_below].get_nodes() {
-                        let distance = node.id.0.distance(key);
+                        let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
                         candidates.push((node.clone(), distance));
                     }
                 }
@@ -234,7 +225,7 @@ impl KademliaRoutingTable {
     }
 
     fn get_bucket_index_for_key(&self, key: &DhtKey) -> usize {
-        let distance = self.node_id.0.distance(key);
+        let distance = xor_distance_bytes(self.node_id.to_bytes(), key.as_bytes());
 
         // Find first bit that differs
         for i in 0..256 {
@@ -249,8 +240,8 @@ impl KademliaRoutingTable {
         255 // Same key as node
     }
 
-    fn get_bucket_index(&self, node_id: &NodeId) -> usize {
-        let distance = self.node_id.0.distance(&node_id.0);
+    fn get_bucket_index(&self, node_id: &PeerId) -> usize {
+        let distance = xor_distance_bytes(self.node_id.to_bytes(), node_id.to_bytes());
 
         // Find first bit that differs
         for i in 0..256 {
@@ -286,7 +277,7 @@ pub struct LoadMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreReceipt {
     pub key: DhtKey,
-    pub stored_at: Vec<NodeId>,
+    pub stored_at: Vec<PeerId>,
     pub timestamp: SystemTime,
     pub success: bool,
 }
@@ -382,7 +373,7 @@ impl ReplicationManager {
 
 /// Load balancer for intelligent data distribution
 struct LoadBalancer {
-    node_loads: HashMap<NodeId, LoadMetric>,
+    node_loads: HashMap<PeerId, LoadMetric>,
     _rebalance_threshold: f64,
 }
 
@@ -394,11 +385,11 @@ impl LoadBalancer {
         }
     }
 
-    fn _update_load(&mut self, node_id: NodeId, load: LoadMetric) {
+    fn _update_load(&mut self, node_id: PeerId, load: LoadMetric) {
         self.node_loads.insert(node_id, load);
     }
 
-    fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<NodeId> {
+    fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<PeerId> {
         // Filter NaN values during collection to avoid intermediate allocations with invalid data
         let mut sorted: Vec<_> = candidates
             .iter()
@@ -514,7 +505,7 @@ pub struct DhtResponseWrapper {
 
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
-    node_id: NodeId,
+    node_id: PeerId,
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
     data_store: Arc<RwLock<DataStore>>,
     replication_manager: Arc<RwLock<ReplicationManager>>,
@@ -545,19 +536,19 @@ pub struct DhtCoreEngine {
 
 impl DhtCoreEngine {
     /// Create new DHT engine with specified node ID
-    pub fn new(node_id: NodeId) -> Result<Self> {
+    pub fn new(node_id: PeerId) -> Result<Self> {
         Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict)
     }
 
     /// Create new DHT engine for testing (permissive validation)
     #[cfg(test)]
-    pub fn new_for_tests(node_id: NodeId) -> Result<Self> {
+    pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
         Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly)
     }
 
     /// Create new DHT engine with specified validation mode
     pub(crate) fn new_with_validation_mode(
-        node_id: NodeId,
+        node_id: PeerId,
         enforcement_mode: CloseGroupEnforcementMode,
     ) -> Result<Self> {
         // Initialize security components
@@ -625,7 +616,7 @@ impl DhtCoreEngine {
 
     /// Get this node's ID
     #[must_use]
-    pub fn node_id(&self) -> &NodeId {
+    pub fn node_id(&self) -> &PeerId {
         &self.node_id
     }
 
@@ -1036,19 +1027,19 @@ impl DhtCoreEngine {
             }
         };
 
-        // Convert node ID to peer ID string
-        let peer_id = node.id.to_string();
-
         // Send request via transport
         if let Err(e) = transport
-            .send_message(&peer_id, "/dht/1.0.0", request_bytes)
+            .send_message(&node.id, "/dht/1.0.0", request_bytes)
             .await
         {
             // Clean up pending request
             let mut pending = self.pending_requests.write().await;
             pending.pop(&request_id);
-            tracing::debug!(peer_id = %peer_id, error = %e, "Failed to send DHT request");
-            return Err(anyhow!("Failed to send DHT request to peer {peer_id}: {e}"));
+            tracing::debug!(peer_id = %node.id, error = %e, "Failed to send DHT request");
+            return Err(anyhow!(
+                "Failed to send DHT request to peer {}: {e}",
+                node.id
+            ));
         }
 
         // Wait for response with timeout
@@ -1058,25 +1049,25 @@ impl DhtCoreEngine {
                 match response {
                     DhtResponse::RetrieveReply { value } => Ok(value),
                     DhtResponse::Error { message, .. } => {
-                        tracing::debug!(peer_id = %peer_id, error = %message, "DHT error response");
+                        tracing::debug!(peer_id = %node.id, error = %message, "DHT error response");
                         Ok(None)
                     }
                     _ => {
-                        tracing::debug!(peer_id = %peer_id, "Unexpected DHT response type");
+                        tracing::debug!(peer_id = %node.id, "Unexpected DHT response type");
                         Ok(None)
                     }
                 }
             }
             Ok(Err(_recv_error)) => {
                 // Channel closed without response
-                tracing::debug!(peer_id = %peer_id, "Response channel closed");
+                tracing::debug!(peer_id = %node.id, "Response channel closed");
                 Ok(None)
             }
             Err(_timeout) => {
                 // Timeout - clean up pending request
                 let mut pending = self.pending_requests.write().await;
                 pending.pop(&request_id);
-                tracing::debug!(peer_id = %peer_id, "DHT request timed out");
+                tracing::debug!(peer_id = %node.id, "DHT request timed out");
                 Ok(None)
             }
         }
@@ -1212,7 +1203,7 @@ impl DhtCoreEngine {
     }
 
     /// Handle node failure
-    pub async fn handle_node_failure(&mut self, failed_node: NodeId) -> Result<()> {
+    pub async fn handle_node_failure(&mut self, failed_node: PeerId) -> Result<()> {
         // Remove from routing table
         let mut routing = self.routing_table.write().await;
         routing.remove_node(&failed_node);
@@ -1228,7 +1219,7 @@ impl DhtCoreEngine {
     ///
     /// This is called when a node fails security validation or is detected
     /// as malicious through Sybil/collusion detection.
-    pub async fn evict_node(&self, node_id: &NodeId, reason: EvictionReason) -> Result<()> {
+    pub async fn evict_node(&self, node_id: &PeerId, reason: EvictionReason) -> Result<()> {
         // 1. Remove from routing table
         {
             let mut routing = self.routing_table.write().await;
@@ -1262,7 +1253,7 @@ impl DhtCoreEngine {
     /// This is a specialized eviction for security-related failures.
     pub async fn evict_node_for_security(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         failure_reason: CloseGroupFailure,
     ) -> Result<()> {
         let eviction_reason = match failure_reason {
@@ -1289,7 +1280,7 @@ impl DhtCoreEngine {
     /// Get eviction candidates from the refresh manager.
     ///
     /// Returns nodes that should be evicted based on validation failures.
-    pub async fn get_eviction_candidates(&self) -> Vec<(NodeId, CloseGroupFailure)> {
+    pub async fn get_eviction_candidates(&self) -> Vec<(PeerId, CloseGroupFailure)> {
         self.bucket_refresh_manager
             .read()
             .await
@@ -1434,7 +1425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_store_retrieve() -> Result<()> {
-        let mut dht = DhtCoreEngine::new(NodeId::from_bytes([42u8; 32]))?;
+        let mut dht = DhtCoreEngine::new(PeerId::from_bytes([42u8; 32]))?;
         let key = DhtKey::new(b"test_key");
         let value = b"test_value".to_vec();
 

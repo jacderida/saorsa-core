@@ -414,16 +414,18 @@ async fn test_high_throughput_messaging() -> Result<()> {
 
     let start_time = std::time::Instant::now();
 
-    // Send messages from node 0 to all other nodes
-    for i in 1..framework.nodes.len() {
+    // Get authenticated peer IDs from connected_peers
+    let peers = framework.nodes[0].connected_peers().await;
+
+    // Send messages from node 0 to all connected peers
+    for (i, peer_id) in peers.iter().enumerate() {
         for msg_id in 0..message_count {
             let message = vec![msg_id as u8; message_size];
-            let peer_id = format!("node_{}", i);
 
             framework.nodes[0]
-                .send_message(&peer_id, "test_topic", message)
+                .send_message(peer_id, "test_topic", message)
                 .await
-                .context(format!("Failed to send message {} to node {}", msg_id, i))?;
+                .context(format!("Failed to send message {} to peer {}", msg_id, i))?;
         }
     }
 

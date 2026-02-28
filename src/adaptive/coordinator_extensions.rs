@@ -27,6 +27,7 @@
 #![allow(async_fn_in_trait)]
 
 use super::*;
+use crate::PeerId;
 use crate::adaptive::storage::ContentMetadata;
 use crate::{P2PError, Result};
 use std::time::Duration;
@@ -167,7 +168,7 @@ pub trait MultiArmedBanditExtensions {
         success: bool,
         latency: Duration,
     );
-    async fn select_route(&self, paths: Vec<(RouteId, Vec<NodeId>)>) -> Result<RouteDecision>;
+    async fn select_route(&self, paths: Vec<(RouteId, Vec<PeerId>)>) -> Result<RouteDecision>;
 }
 
 impl MultiArmedBanditExtensions for MultiArmedBandit {
@@ -184,7 +185,7 @@ impl MultiArmedBanditExtensions for MultiArmedBandit {
         // TODO: Implement performance update
     }
 
-    async fn select_route(&self, paths: Vec<(RouteId, Vec<NodeId>)>) -> Result<RouteDecision> {
+    async fn select_route(&self, paths: Vec<(RouteId, Vec<PeerId>)>) -> Result<RouteDecision> {
         // Select first available path
         if let Some((route_id, _)) = paths.first() {
             Ok(RouteDecision {
@@ -248,13 +249,13 @@ impl MonitoringSystemExtensions for MonitoringSystem {
 
 // Extension trait for SecurityManager
 pub trait SecurityManagerExtensions {
-    async fn check_rate_limit(&self, node_id: &NodeId) -> Result<()>;
+    async fn check_rate_limit(&self, node_id: &PeerId) -> Result<()>;
     async fn set_temporary_relaxation(&self, duration: Duration) -> Result<()>;
     async fn enable_strict_rate_limiting(&self) -> Result<()>;
 }
 
 impl SecurityManagerExtensions for SecurityManager {
-    async fn check_rate_limit(&self, node_id: &NodeId) -> Result<()> {
+    async fn check_rate_limit(&self, node_id: &PeerId) -> Result<()> {
         // Use the underlying SecurityManager's rate limiting with no IP
         SecurityManager::check_rate_limit(self, node_id, None)
             .await
@@ -301,7 +302,7 @@ impl AdaptiveDHTExtensions for AdaptiveDHT {
 pub trait EigenTrustEngineExtensions {
     async fn start_computation(&self) -> Result<()>;
     async fn get_average_trust(&self) -> f64;
-    async fn get_storage_candidates(&self, count: usize) -> Vec<(NodeId, f64)>;
+    async fn get_storage_candidates(&self, count: usize) -> Vec<(PeerId, f64)>;
 }
 
 impl EigenTrustEngineExtensions for EigenTrustEngine {
@@ -323,9 +324,9 @@ impl EigenTrustEngineExtensions for EigenTrustEngine {
         sum / global_trust.len() as f64
     }
 
-    async fn get_storage_candidates(&self, count: usize) -> Vec<(NodeId, f64)> {
+    async fn get_storage_candidates(&self, count: usize) -> Vec<(PeerId, f64)> {
         let global_trust = self.get_global_trust();
-        let mut candidates: Vec<(NodeId, f64)> = global_trust.into_iter().collect();
+        let mut candidates: Vec<(PeerId, f64)> = global_trust.into_iter().collect();
         // Sort by trust descending
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(count);
@@ -353,22 +354,22 @@ impl AdaptiveGossipSubExtensions for AdaptiveGossipSub {
 
 // Extension trait for AdaptiveRouter
 pub trait AdaptiveRouterExtensions {
-    async fn get_kademlia_path(&self, target: &NodeId) -> Result<Vec<NodeId>>;
-    async fn get_hyperbolic_path(&self, target: &NodeId) -> Result<Vec<NodeId>>;
-    async fn get_trust_path(&self, target: &NodeId) -> Result<Vec<NodeId>>;
+    async fn get_kademlia_path(&self, target: &PeerId) -> Result<Vec<PeerId>>;
+    async fn get_hyperbolic_path(&self, target: &PeerId) -> Result<Vec<PeerId>>;
+    async fn get_trust_path(&self, target: &PeerId) -> Result<Vec<PeerId>>;
     async fn enable_aggressive_caching(&self);
 }
 
 impl AdaptiveRouterExtensions for AdaptiveRouter {
-    async fn get_kademlia_path(&self, _target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn get_kademlia_path(&self, _target: &PeerId) -> Result<Vec<PeerId>> {
         Ok(vec![]) // TODO: Implement
     }
 
-    async fn get_hyperbolic_path(&self, _target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn get_hyperbolic_path(&self, _target: &PeerId) -> Result<Vec<PeerId>> {
         Ok(vec![]) // TODO: Implement
     }
 
-    async fn get_trust_path(&self, _target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn get_trust_path(&self, _target: &PeerId) -> Result<Vec<PeerId>> {
         Ok(vec![]) // TODO: Implement
     }
 

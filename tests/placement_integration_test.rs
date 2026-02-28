@@ -16,7 +16,7 @@
 //! - Repair system with hysteresis
 //! - End-to-end placement lifecycle scenarios
 
-use saorsa_core::adaptive::NodeId;
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::learning::ChurnPredictor;
 use saorsa_core::adaptive::performance::PerformanceMonitor;
 use saorsa_core::adaptive::trust::EigenTrustEngine;
@@ -36,21 +36,21 @@ use tokio::time::sleep;
 // ============================================================================
 
 /// Create test nodes with sequential IDs
-fn create_test_nodes(count: usize) -> Vec<NodeId> {
+fn create_test_nodes(count: usize) -> Vec<PeerId> {
     (0..count)
         .map(|i| {
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
             hash[1] = (i >> 8) as u8;
-            NodeId::from_bytes(hash)
+            PeerId::from_bytes(hash)
         })
         .collect()
 }
 
 /// Create node metadata with diverse geographic locations
 fn create_diverse_node_metadata(
-    nodes: &[NodeId],
-) -> HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)> {
+    nodes: &[PeerId],
+) -> HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)> {
     let locations = [
         (40.7128, -74.0060, 12345, NetworkRegion::NorthAmerica), // NYC
         (34.0522, -118.2437, 12346, NetworkRegion::NorthAmerica), // LA
@@ -78,8 +78,8 @@ fn create_diverse_node_metadata(
 
 /// Create node metadata with all nodes in same region (for diversity violation tests)
 fn create_same_region_metadata(
-    nodes: &[NodeId],
-) -> HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)> {
+    nodes: &[PeerId],
+) -> HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)> {
     let mut metadata = HashMap::new();
     for (i, node_id) in nodes.iter().enumerate() {
         let lat = 40.0 + (i as f64 * 0.001);
@@ -116,8 +116,8 @@ fn create_custom_placement_engine(
 
 /// Verify diversity constraints in selection
 fn verify_diversity_constraints(
-    selection: &[NodeId],
-    metadata: &HashMap<NodeId, (GeographicLocation, u32, NetworkRegion)>,
+    selection: &[PeerId],
+    metadata: &HashMap<PeerId, (GeographicLocation, u32, NetworkRegion)>,
 ) -> bool {
     if selection.len() < 2 {
         return true;
@@ -139,14 +139,14 @@ fn verify_diversity_constraints(
 
 /// Verify Byzantine fault tolerance requirements
 fn verify_byzantine_tolerance(
-    selection: &[NodeId],
+    selection: &[PeerId],
     byzantine_tolerance: &ByzantineTolerance,
 ) -> bool {
     selection.len() >= byzantine_tolerance.required_nodes()
 }
 
 /// Calculate trust distribution across selections
-fn calculate_trust_distribution(selections: &[Vec<NodeId>]) -> HashMap<NodeId, usize> {
+fn calculate_trust_distribution(selections: &[Vec<PeerId>]) -> HashMap<PeerId, usize> {
     let mut distribution = HashMap::new();
     for selection in selections {
         for node_id in selection {
@@ -158,7 +158,7 @@ fn calculate_trust_distribution(selections: &[Vec<NodeId>]) -> HashMap<NodeId, u
 
 /// Create mock DHT engine for testing
 fn create_mock_dht_engine() -> Arc<DhtCoreEngine> {
-    let node_id = saorsa_core::dht::core_engine::NodeId::from_bytes([1u8; 32]);
+    let node_id = saorsa_core::PeerId::from_bytes([1u8; 32]);
     let engine = DhtCoreEngine::new(node_id).expect("DHT engine creation should succeed");
     Arc::new(engine)
 }
@@ -185,7 +185,7 @@ fn create_mock_churn_predictor() -> Arc<ChurnPredictor> {
 #[tokio::test]
 async fn test_basic_placement_selection() {
     let nodes = create_test_nodes(20);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -230,7 +230,7 @@ async fn test_basic_placement_selection() {
 #[tokio::test]
 async fn test_placement_with_storage() {
     let nodes = create_test_nodes(20);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -292,7 +292,7 @@ async fn test_placement_with_storage() {
 #[tokio::test]
 async fn test_byzantine_tolerance_enforcement() {
     let nodes = create_test_nodes(10);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     // Configure f=2 (requires 3f+1=7 nodes minimum)
@@ -326,7 +326,7 @@ async fn test_byzantine_tolerance_enforcement() {
 #[tokio::test]
 async fn test_insufficient_nodes_for_byzantine() {
     let nodes = create_test_nodes(8);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     // Configure f=3 (requires 10 nodes)
@@ -375,7 +375,7 @@ async fn test_insufficient_nodes_for_byzantine() {
 #[tokio::test]
 async fn test_geographic_diversity_enforcement() {
     let nodes = create_test_nodes(30);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -416,7 +416,7 @@ async fn test_geographic_diversity_enforcement() {
 #[tokio::test]
 async fn test_asn_diversity() {
     let nodes = create_test_nodes(20);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -446,7 +446,7 @@ async fn test_asn_diversity() {
 #[tokio::test]
 async fn test_diversity_violation_detection() {
     let nodes = create_test_nodes(10);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     // All nodes in same region/close location
     let metadata = create_same_region_metadata(&nodes);
 
@@ -487,7 +487,7 @@ async fn test_diversity_violation_detection() {
 #[tokio::test]
 async fn test_trust_weighted_placement() {
     let nodes = create_test_nodes(10);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -554,7 +554,7 @@ async fn test_trust_weighted_placement() {
 #[tokio::test]
 async fn test_trust_updates_affect_placement() {
     let nodes = create_test_nodes(10);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -611,7 +611,7 @@ async fn test_trust_updates_affect_placement() {
 #[tokio::test]
 async fn test_shard_audit_success() {
     let nodes = create_test_nodes(10);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -655,7 +655,7 @@ async fn test_shard_audit_success() {
 async fn test_audit_detects_missing_shards() {
     // This test simulates a scenario where shards would be missing
     let nodes = create_test_nodes(10);
-    let _node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let _node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
 
     // Create audit system components
     let dht_engine = create_mock_dht_engine();
@@ -699,7 +699,7 @@ async fn test_audit_loop_respects_interval() {
 #[tokio::test]
 async fn test_automatic_repair_trigger() {
     let nodes = create_test_nodes(15);
-    let _node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let _node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
 
     let dht_engine = create_mock_dht_engine();
     let trust_system = create_mock_trust_system();
@@ -868,7 +868,7 @@ async fn test_full_placement_lifecycle() {
 #[tokio::test]
 async fn test_placement_under_high_churn() {
     let nodes = create_test_nodes(30);
-    let node_set: HashSet<NodeId> = nodes.iter().cloned().collect();
+    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
     let metadata = create_diverse_node_metadata(&nodes);
 
     let mut engine = create_test_placement_engine();
@@ -878,7 +878,7 @@ async fn test_placement_under_high_churn() {
     // Simulate multiple placements with changing node availability
     for i in 0..10 {
         // Remove some nodes to simulate churn
-        let available_nodes: HashSet<NodeId> = node_set
+        let available_nodes: HashSet<PeerId> = node_set
             .iter()
             .enumerate()
             .filter(|(idx, _)| (idx + i) % 3 != 0)

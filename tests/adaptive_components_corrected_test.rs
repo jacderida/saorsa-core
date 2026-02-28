@@ -1,8 +1,9 @@
 //! Corrected integration tests for adaptive network components
 //! Tests the actual exported adaptive features using real APIs
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{
-    ContentHash, ContentType, NodeId, NodeIdentity, Outcome, StrategyChoice,
+    ContentHash, ContentType, NodeIdentity, Outcome, StrategyChoice,
     eviction::{CacheState, EvictionStrategy, LFUStrategy, LRUStrategy},
     learning::{ChurnPredictor, NodeEvent, NodeFeatures, QLearnCacheManager, ThompsonSampling},
     multi_armed_bandit::{MABConfig, MultiArmedBandit},
@@ -101,9 +102,9 @@ async fn test_multi_armed_bandit_real_api() -> anyhow::Result<()> {
 
     // Create test destinations and strategies
     let destinations = [
-        NodeId { hash: [1u8; 32] },
-        NodeId { hash: [2u8; 32] },
-        NodeId { hash: [3u8; 32] },
+        PeerId::from_bytes([1u8; 32]),
+        PeerId::from_bytes([2u8; 32]),
+        PeerId::from_bytes([3u8; 32]),
     ];
 
     let strategies = vec![
@@ -194,7 +195,7 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
 
     // Test node join validation
     let test_node = saorsa_core::adaptive::NodeDescriptor {
-        id: NodeId { hash: [1u8; 32] },
+        id: PeerId::from_bytes([1u8; 32]),
         public_key: MlDsaPublicKey::from_bytes(&vec![0u8; 1952])?,
         addresses: vec!["192.168.1.100:8080".to_string()],
         hyperbolic: None,
@@ -457,7 +458,7 @@ async fn test_churn_predictor_real_api() -> anyhow::Result<()> {
     println!("Testing Churn Predictor with real API...");
 
     let predictor = ChurnPredictor::new();
-    let node_id = NodeId { hash: [1u8; 32] };
+    let node_id = PeerId::from_bytes([1u8; 32]);
 
     // Record node events
     predictor
@@ -493,7 +494,7 @@ async fn test_churn_predictor_real_api() -> anyhow::Result<()> {
     );
 
     // Test with unstable node
-    let unstable_node = NodeId { hash: [2u8; 32] };
+    let unstable_node = PeerId::from_bytes([2u8; 32]);
     let unstable_features = NodeFeatures {
         online_duration: 300.0,      // 5 minutes
         avg_response_time: 500.0,    // 500ms
@@ -658,9 +659,7 @@ async fn test_integrated_adaptive_system() -> anyhow::Result<()> {
             .await?;
 
         // MAB for route selection
-        let destination = NodeId {
-            hash: [rand::random::<u8>(); 32],
-        };
+        let destination = PeerId::from_bytes([rand::random::<u8>(); 32]);
         let strategies = vec![StrategyChoice::Kademlia, StrategyChoice::Hyperbolic];
         let route_decision = mab
             .select_route(&destination, content_type, &strategies)

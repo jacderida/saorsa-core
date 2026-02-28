@@ -108,7 +108,7 @@ impl AuthenticatedSiblingBroadcast {
     pub fn to_bytes_for_signing(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(256); // Pre-allocate reasonable size
 
-        // Broadcaster identity (NodeId is 32 bytes)
+        // Broadcaster identity (PeerId is 32 bytes)
         bytes.extend_from_slice(self.broadcaster.to_bytes());
 
         // Broadcaster position (Key is [u8; 32])
@@ -310,7 +310,7 @@ impl SiblingBroadcastValidator {
         let broadcast_peer_ids: HashSet<PeerId> = broadcast
             .siblings
             .iter()
-            .map(|s| crate::identity::node_identity::PeerId::from_bytes(*s.node.id.as_bytes()))
+            .map(|s| s.node.id.clone())
             .collect();
 
         let overlap_count = self
@@ -595,7 +595,8 @@ impl SiblingBroadcastBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::core_engine::{NodeCapacity, NodeId};
+    use crate::PeerId;
+    use crate::dht::core_engine::NodeCapacity;
     use rand::Rng;
 
     fn random_peer_id() -> PeerId {
@@ -610,8 +611,8 @@ mod tests {
         Key::from(bytes)
     }
 
-    fn random_node_id() -> NodeId {
-        NodeId::random()
+    fn random_node_id() -> PeerId {
+        PeerId::random()
     }
 
     fn create_test_node() -> DHTNode {

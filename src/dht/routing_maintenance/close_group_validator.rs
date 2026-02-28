@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::RwLock;
 
-use crate::dht::DhtNodeId;
+use crate::PeerId;
 
 use super::config::MaintenanceConfig;
 use super::validator::{NodeValidationResult, ValidationFailure};
@@ -69,7 +69,7 @@ impl CloseGroupEnforcementMode {
 #[derive(Debug, Clone)]
 pub struct CloseGroupValidationResult {
     /// The node that was validated
-    pub node_id: DhtNodeId,
+    pub node_id: PeerId,
     /// Whether the node is valid
     pub is_valid: bool,
     /// Weighted confirmation ratio (0.0 - 1.0)
@@ -91,7 +91,7 @@ pub struct CloseGroupValidationResult {
 impl CloseGroupValidationResult {
     /// Create a new validation result
     #[must_use]
-    pub fn new(node_id: DhtNodeId) -> Self {
+    pub fn new(node_id: PeerId) -> Self {
         Self {
             node_id,
             is_valid: false,
@@ -171,7 +171,7 @@ impl AttackIndicators {
 #[derive(Debug, Clone)]
 pub struct CloseGroupResponse {
     /// The peer who responded
-    pub peer_id: DhtNodeId,
+    pub peer_id: PeerId,
     /// Whether the peer confirms the node is in their close group
     pub confirms_membership: bool,
     /// The peer's trust score (if available)
@@ -188,11 +188,11 @@ pub struct CloseGroupResponse {
 #[derive(Debug, Clone)]
 pub struct CloseGroupHistory {
     /// Node ID
-    pub node_id: DhtNodeId,
+    pub node_id: PeerId,
     /// Previous close group members
-    pub previous_members: HashSet<DhtNodeId>,
+    pub previous_members: HashSet<PeerId>,
     /// Current close group members
-    pub current_members: HashSet<DhtNodeId>,
+    pub current_members: HashSet<PeerId>,
     /// When the previous snapshot was taken
     pub previous_snapshot_at: Instant,
     /// When the current snapshot was taken
@@ -202,7 +202,7 @@ pub struct CloseGroupHistory {
 impl CloseGroupHistory {
     /// Create a new history entry
     #[must_use]
-    pub fn new(node_id: DhtNodeId, members: HashSet<DhtNodeId>) -> Self {
+    pub fn new(node_id: PeerId, members: HashSet<PeerId>) -> Self {
         let now = Instant::now();
         Self {
             node_id,
@@ -214,7 +214,7 @@ impl CloseGroupHistory {
     }
 
     /// Update with new membership
-    pub fn update(&mut self, new_members: HashSet<DhtNodeId>) {
+    pub fn update(&mut self, new_members: HashSet<PeerId>) {
         self.previous_members = std::mem::take(&mut self.current_members);
         self.previous_snapshot_at = self.current_snapshot_at;
         self.current_members = new_members;
@@ -223,7 +223,7 @@ impl CloseGroupHistory {
 
     /// Get nodes that were removed since last snapshot
     #[must_use]
-    pub fn removed_nodes(&self) -> HashSet<DhtNodeId> {
+    pub fn removed_nodes(&self) -> HashSet<PeerId> {
         self.previous_members
             .difference(&self.current_members)
             .cloned()
@@ -232,7 +232,7 @@ impl CloseGroupHistory {
 
     /// Get nodes that were added since last snapshot
     #[must_use]
-    pub fn added_nodes(&self) -> HashSet<DhtNodeId> {
+    pub fn added_nodes(&self) -> HashSet<PeerId> {
         self.current_members
             .difference(&self.previous_members)
             .cloned()
@@ -340,9 +340,9 @@ pub struct CloseGroupValidator {
     /// Current attack indicators
     attack_indicators: Arc<RwLock<AttackIndicators>>,
     /// Close group history for change detection
-    close_group_history: Arc<RwLock<HashMap<DhtNodeId, CloseGroupHistory>>>,
+    close_group_history: Arc<RwLock<HashMap<PeerId, CloseGroupHistory>>>,
     /// Cache of recent validation results
-    validation_cache: Arc<RwLock<HashMap<DhtNodeId, CloseGroupValidationResult>>>,
+    validation_cache: Arc<RwLock<HashMap<PeerId, CloseGroupValidationResult>>>,
     /// Cache TTL
     cache_ttl: Duration,
 }
@@ -416,7 +416,7 @@ impl CloseGroupValidator {
     /// Behavior depends on enforcement mode:
     /// - Strict: Unknown nodes are rejected (return false)
     /// - LogOnly: Unknown nodes are allowed (return true) with warning logged
-    pub fn validate(&self, node_id: &DhtNodeId) -> bool {
+    pub fn validate(&self, node_id: &PeerId) -> bool {
         if let Some(result) = self.get_cached_result(node_id) {
             if !result.is_valid && self.config.enforcement_mode.is_log_only() {
                 tracing::warn!(
@@ -466,7 +466,7 @@ impl CloseGroupValidator {
     #[must_use]
     pub fn validate_trust_only(
         &self,
-        node_id: &DhtNodeId,
+        node_id: &PeerId,
         trust_score: Option<f64>,
     ) -> (bool, Option<CloseGroupFailure>) {
         // Check cache first
@@ -529,7 +529,7 @@ impl CloseGroupValidator {
     /// Uses trust-weighted validation normally, BFT consensus when attack mode is active.
     pub fn validate_membership(
         &self,
-        node_id: &DhtNodeId,
+        node_id: &PeerId,
         responses: &[CloseGroupResponse],
         node_trust_score: Option<f64>,
     ) -> CloseGroupValidationResult {
@@ -691,7 +691,7 @@ impl CloseGroupValidator {
     }
 
     /// Update close group history for a node
-    pub fn update_close_group_history(&self, node_id: DhtNodeId, members: HashSet<DhtNodeId>) {
+    pub fn update_close_group_history(&self, node_id: PeerId, members: HashSet<PeerId>) {
         let mut history = self.close_group_history.write();
         if let Some(entry) = history.get_mut(&node_id) {
             entry.update(members);
@@ -702,7 +702,7 @@ impl CloseGroupValidator {
 
     /// Detect nodes that have been removed from close groups
     #[must_use]
-    pub fn detect_removed_nodes(&self) -> Vec<(DhtNodeId, HashSet<DhtNodeId>)> {
+    pub fn detect_removed_nodes(&self) -> Vec<(PeerId, HashSet<PeerId>)> {
         let history = self.close_group_history.read();
         history
             .iter()
@@ -725,7 +725,7 @@ impl CloseGroupValidator {
 
     /// Get cached validation result if still valid
     #[must_use]
-    pub fn get_cached_result(&self, node_id: &DhtNodeId) -> Option<CloseGroupValidationResult> {
+    pub fn get_cached_result(&self, node_id: &PeerId) -> Option<CloseGroupValidationResult> {
         let cache = self.validation_cache.read();
         cache.get(node_id).and_then(|result| {
             let age = result.validated_at.elapsed().ok()?;
@@ -791,7 +791,7 @@ mod tests {
         latency_ms: u64,
     ) -> CloseGroupResponse {
         CloseGroupResponse {
-            peer_id: DhtNodeId::random(),
+            peer_id: PeerId::random(),
             confirms_membership: confirms,
             peer_trust_score: Some(trust),
             peer_region: region.map(String::from),
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn test_trust_weighted_validation_passes() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let responses = vec![
             create_response(true, 0.9, Some("us-east"), 50),
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn test_trust_weighted_validation_fails_low_confirmation() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let responses = vec![
             create_response(true, 0.3, Some("us-east"), 50),
@@ -849,7 +849,7 @@ mod tests {
         let validator = CloseGroupValidator::with_defaults();
         validator.set_attack_mode(true);
 
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         // 4/7 confirmations - not enough for BFT (needs 5/7)
         let responses = vec![
@@ -873,7 +873,7 @@ mod tests {
         let validator = CloseGroupValidator::with_defaults();
         validator.set_attack_mode(true);
 
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         // 5/7 confirmations - enough for BFT
         let responses = vec![
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn test_insufficient_responses_fails() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let responses = vec![
             create_response(true, 0.9, Some("us-east"), 50),
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn test_low_trust_node_fails() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let responses = vec![
             create_response(true, 0.9, Some("us-east"), 50),
@@ -981,15 +981,15 @@ mod tests {
     #[test]
     fn test_close_group_history_tracking() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
-        let initial_members: HashSet<_> = (0..5).map(|_| DhtNodeId::random()).collect();
+        let initial_members: HashSet<_> = (0..5).map(|_| PeerId::random()).collect();
         validator.update_close_group_history(node_id.clone(), initial_members.clone());
 
         // Simulate some members changing
         let mut new_members: HashSet<_> = initial_members.iter().take(3).cloned().collect();
-        new_members.insert(DhtNodeId::random());
-        new_members.insert(DhtNodeId::random());
+        new_members.insert(PeerId::random());
+        new_members.insert(PeerId::random());
 
         validator.update_close_group_history(node_id.clone(), new_members);
 
@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn test_cache_functionality() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let mut result = CloseGroupValidationResult::new(node_id.clone());
         result.is_valid = true;
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn test_to_node_validation_result_conversion() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         let mut result = CloseGroupValidationResult::new(node_id);
         result.is_valid = true;
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn test_geographic_diversity_warning() {
         let validator = CloseGroupValidator::with_defaults();
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         // All from same region
         let responses = vec![
@@ -1132,7 +1132,7 @@ mod tests {
     fn test_strict_mode_rejects_unknown_nodes() {
         let config = CloseGroupValidatorConfig::strict();
         let validator = CloseGroupValidator::new(config);
-        let unknown_node = DhtNodeId::random();
+        let unknown_node = PeerId::random();
 
         // Unknown nodes should be rejected in strict mode
         assert!(!validator.validate(&unknown_node));
@@ -1143,7 +1143,7 @@ mod tests {
     fn test_log_only_mode_allows_unknown_nodes() {
         let config = CloseGroupValidatorConfig::log_only();
         let validator = CloseGroupValidator::new(config);
-        let unknown_node = DhtNodeId::random();
+        let unknown_node = PeerId::random();
 
         // Unknown nodes should be allowed in log-only mode
         assert!(validator.validate(&unknown_node));
@@ -1154,7 +1154,7 @@ mod tests {
     fn test_strict_mode_respects_cached_results() {
         let config = CloseGroupValidatorConfig::strict();
         let validator = CloseGroupValidator::new(config);
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         // Cache a valid result
         let mut valid_result = CloseGroupValidationResult::new(node_id.clone());
@@ -1165,7 +1165,7 @@ mod tests {
         assert!(validator.validate(&node_id));
 
         // Cache an invalid result for a different node
-        let invalid_node = DhtNodeId::random();
+        let invalid_node = PeerId::random();
         let mut invalid_result = CloseGroupValidationResult::new(invalid_node.clone());
         invalid_result.is_valid = false;
         validator.cache_result(invalid_result);
@@ -1178,7 +1178,7 @@ mod tests {
     fn test_log_only_mode_allows_failed_cached_results() {
         let config = CloseGroupValidatorConfig::log_only();
         let validator = CloseGroupValidator::new(config);
-        let node_id = DhtNodeId::random();
+        let node_id = PeerId::random();
 
         // Cache an invalid result
         let mut invalid_result = CloseGroupValidationResult::new(node_id.clone());

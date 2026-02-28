@@ -12,13 +12,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::dht::{DhtNodeId, PeerId};
+use crate::PeerId;
 
 /// Voting record for collusion analysis
 #[derive(Debug, Clone)]
 pub struct VotingRecord {
     /// The vote target (what was being voted on)
-    pub target: DhtNodeId,
+    pub target: PeerId,
     /// The vote (true = approve, false = reject)
     pub vote: bool,
     /// When the vote was cast
@@ -252,13 +252,7 @@ impl CollusionDetector {
     }
 
     /// Record a vote from a peer
-    pub fn record_vote(
-        &mut self,
-        peer_id: PeerId,
-        target: DhtNodeId,
-        vote: bool,
-        latency: Duration,
-    ) {
+    pub fn record_vote(&mut self, peer_id: PeerId, target: PeerId, vote: bool, latency: Duration) {
         let record = VotingRecord {
             target,
             vote,
@@ -584,7 +578,7 @@ mod tests {
         let mut pattern = VotingPattern::new(10);
 
         let record = VotingRecord {
-            target: DhtNodeId::random(),
+            target: PeerId::random(),
             vote: true,
             timestamp: Instant::now(),
             latency: Duration::from_millis(50),
@@ -603,7 +597,7 @@ mod tests {
         // Record 10 votes, 8 agreeing with peer
         for i in 0..10 {
             let record = VotingRecord {
-                target: DhtNodeId::random(),
+                target: PeerId::random(),
                 vote: true,
                 timestamp: Instant::now(),
                 latency: Duration::from_millis(50),
@@ -683,7 +677,7 @@ mod tests {
 
         // Record votes for both peers
         for _ in 0..10 {
-            let target = DhtNodeId::random();
+            let target = PeerId::random();
             detector.record_vote(
                 peer_a.clone(),
                 target.clone(),
@@ -808,7 +802,7 @@ mod tests {
         let peer = random_peer_id();
         detector.record_vote(
             peer.clone(),
-            DhtNodeId::random(),
+            PeerId::random(),
             true,
             Duration::from_millis(50),
         );
@@ -834,7 +828,7 @@ mod tests {
 
         // Record many agreements
         for _ in 0..10 {
-            let target = DhtNodeId::random();
+            let target = PeerId::random();
             detector.record_vote(
                 peer_a.clone(),
                 target.clone(),

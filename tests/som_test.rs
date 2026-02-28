@@ -17,7 +17,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use proptest::prelude::*;
-use saorsa_core::adaptive::NodeId;
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::som::{GridSize, NodeFeatures, SelfOrganizingMap, SomConfig};
 // use std::collections::HashSet;
 use std::time::Instant;
@@ -33,10 +33,10 @@ fn create_test_features(seed: u8) -> NodeFeatures {
 }
 
 /// Create a test node ID
-fn create_test_node_id(seed: u8) -> NodeId {
+fn create_test_node_id(seed: u8) -> PeerId {
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
-    NodeId::from_bytes(bytes)
+    PeerId::from_bytes(bytes)
 }
 
 #[cfg(test)]

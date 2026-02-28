@@ -27,26 +27,27 @@
 mod eigentrust_tests {
     use proptest::prelude::*;
     use rand::Rng;
+    use saorsa_core::PeerId;
     use saorsa_core::adaptive::trust::*;
-    use saorsa_core::adaptive::{NodeId, RoutingStrategy, TrustProvider};
+    use saorsa_core::adaptive::{RoutingStrategy, TrustProvider};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
 
     /// Helper to create test nodes
-    pub fn create_test_nodes(count: usize) -> Vec<NodeId> {
+    pub fn create_test_nodes(count: usize) -> Vec<PeerId> {
         (0..count)
             .map(|i| {
                 let mut hash = [0u8; 32];
                 hash[0] = i as u8;
-                NodeId::from_bytes(hash)
+                PeerId::from_bytes(hash)
             })
             .collect()
     }
 
     /// Helper to create pre-trusted nodes
-    pub fn create_pre_trusted_nodes(nodes: &[NodeId], count: usize) -> HashSet<NodeId> {
+    pub fn create_pre_trusted_nodes(nodes: &[PeerId], count: usize) -> HashSet<PeerId> {
         nodes.iter().take(count).cloned().collect()
     }
 

@@ -11,6 +11,7 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
+use crate::PeerId;
 //! Integration tests for the storage and retrieval system
 
 #[cfg(test)]
@@ -228,13 +229,13 @@ mod tests {
         // Simulate content with replicas
         let content = b"Content at risk".to_vec();
         let hash = ContentStore::calculate_hash(&content);
-        let departed_node = NodeId { hash: [1u8; 32] };
+        let departed_node = PeerId::from_bytes([1u8; 32]);
         
         // Manually add replica info
         let mut storing_nodes = std::collections::HashSet::new();
         storing_nodes.insert(departed_node.clone());
-        storing_nodes.insert(NodeId { hash: [2u8; 32] });
-        storing_nodes.insert(NodeId { hash: [3u8; 32] });
+        storing_nodes.insert(PeerId::from_bytes([2u8; 32]));
+        storing_nodes.insert(PeerId::from_bytes([3u8; 32]));
         
         let replica_info = ReplicaInfo {
             storing_nodes,

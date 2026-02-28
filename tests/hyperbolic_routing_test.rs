@@ -15,8 +15,9 @@
 
 use approx::assert_relative_eq;
 use proptest::prelude::*;
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{
-    AdaptiveNetworkError, HyperbolicCoordinate, HyperbolicRoutingStrategy, HyperbolicSpace, NodeId,
+    AdaptiveNetworkError, HyperbolicCoordinate, HyperbolicRoutingStrategy, HyperbolicSpace,
     RoutingStrategy,
 };
 use std::sync::Arc;
@@ -299,17 +300,17 @@ async fn test_success_rate_tracking() {
 
 // Helper functions
 
-fn generate_test_node_id(seed: u64) -> NodeId {
+fn generate_test_node_id(seed: u64) -> PeerId {
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut hash = [0u8; 32];
     rng.fill_bytes(&mut hash);
-    NodeId::from_bytes(hash)
+    PeerId::from_bytes(hash)
 }
 
-fn create_test_neighbors(count: usize, avg_radius: f64) -> Vec<(NodeId, HyperbolicCoordinate)> {
+fn create_test_neighbors(count: usize, avg_radius: f64) -> Vec<(PeerId, HyperbolicCoordinate)> {
     let mut neighbors = vec![];
     for i in 0..count {
         let node_id = generate_test_node_id(i as u64 + 1000);

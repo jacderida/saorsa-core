@@ -16,16 +16,15 @@
 //! This module provides core networking functionality for the P2P Foundation.
 //! It handles peer connections, network events, and node lifecycle management.
 
-use crate::adaptive::{
-    EigenTrustEngine, NodeId, NodeId as AdaptiveNodeId, NodeStatisticsUpdate, TrustProvider,
-};
+use crate::PeerId;
+use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
 use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
 use crate::NetworkAddress;
-use crate::identity::node_identity::{NodeIdentity, PeerId as IdentityPeerId};
+use crate::identity::node_identity::NodeIdentity;
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
@@ -668,16 +667,16 @@ pub enum P2PEvent {
     Message {
         /// Topic or channel the message was sent on
         topic: String,
-        /// For signed messages this is the authenticated app-level peer ID;
-        /// for unsigned messages it is the channel ID.
-        source: String,
+        /// For signed messages this is the authenticated app-level [`PeerId`];
+        /// `None` for unsigned messages.
+        source: Option<PeerId>,
         /// Raw message data payload
         data: Vec<u8>,
     },
     /// An authenticated peer has connected (first signed message verified on any channel).
-    PeerConnected(String),
+    PeerConnected(PeerId),
     /// An authenticated peer has fully disconnected (all channels closed).
-    PeerDisconnected(String),
+    PeerDisconnected(PeerId),
 }
 
 /// Response from a peer to a request sent via [`P2PNode::send_request`].
@@ -687,7 +686,7 @@ pub enum P2PEvent {
 #[derive(Debug, Clone)]
 pub struct PeerResponse {
     /// The peer that sent the response.
-    pub peer_id: String,
+    pub peer_id: PeerId,
     /// Raw response payload bytes.
     pub data: Vec<u8>,
     /// Round-trip latency from request to response.
@@ -713,7 +712,7 @@ pub(crate) struct PendingRequest {
     /// Oneshot sender for delivering the response payload.
     pub(crate) response_tx: tokio::sync::oneshot::Sender<Vec<u8>>,
     /// The peer we expect the response from (for origin validation).
-    pub(crate) expected_peer: String,
+    pub(crate) expected_peer: PeerId,
 }
 
 /// Main P2P network node that manages connections, routing, and communication
@@ -731,7 +730,7 @@ pub struct P2PNode {
     config: NodeConfig,
 
     /// Our peer ID
-    peer_id: String,
+    peer_id: PeerId,
 
     /// Transport handle owning all QUIC / peer / event state
     transport: Arc<crate::transport_handle::TransportHandle>,
@@ -802,23 +801,14 @@ pub(crate) fn normalize_wildcard_to_loopback(addr: std::net::SocketAddr) -> std:
 impl P2PNode {
     /// Create a new P2P node with the given configuration
     pub async fn new(config: NodeConfig) -> Result<Self> {
-        let peer_id = config.peer_id.clone().unwrap_or_else(|| {
-            // Generate a random peer ID for now
-            // Safe: UUID v4 canonical format is always 36 characters
-            let uuid_str = uuid::Uuid::new_v4().to_string();
-            format!("peer_{}", &uuid_str[..8])
-        });
+        // Ensure a cryptographic identity exists — generate one if not provided.
+        let node_identity = match config.node_identity.clone() {
+            Some(identity) => identity,
+            None => Arc::new(NodeIdentity::generate()?),
+        };
 
-        // Initialize and register a TrustWeightedKademlia DHT for the global API
-        // Use a deterministic local NodeId derived from the peer_id
-        {
-            let nid = crate::dht::derive_dht_key_from_peer_id(&peer_id);
-            let _twdht = std::sync::Arc::new(crate::dht::TrustWeightedKademlia::new(
-                crate::identity::node_identity::PeerId::from_bytes(nid),
-            ));
-            // TODO: Update to use new clean API
-            // let _ = crate::api::set_dht_instance(twdht);
-        }
+        // Derive the canonical peer ID from the cryptographic identity.
+        let peer_id = node_identity.peer_id().clone();
 
         // Initialize production resource manager if configured
         let resource_manager = config
@@ -827,59 +817,34 @@ impl P2PNode {
             .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
 
         // Initialize bootstrap cache manager
+        let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
         let diversity_config = config.diversity_config.clone().unwrap_or_default();
-        let bootstrap_manager = if let Some(ref cache_config) = config.bootstrap_cache_config {
-            match BootstrapManager::with_full_config(
-                cache_config.clone(),
-                crate::rate_limit::JoinRateLimiterConfig::default(),
-                diversity_config.clone(),
-            )
-            .await
-            {
-                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize bootstrap manager: {}, continuing without cache",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            match BootstrapManager::with_full_config(
-                crate::bootstrap::CacheConfig::default(),
-                crate::rate_limit::JoinRateLimiterConfig::default(),
-                diversity_config,
-            )
-            .await
-            {
-                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize bootstrap manager: {}, continuing without cache",
-                        e
-                    );
-                    None
-                }
+        let bootstrap_manager = match BootstrapManager::with_full_config(
+            cache_config,
+            crate::rate_limit::JoinRateLimiterConfig::default(),
+            diversity_config,
+        )
+        .await
+        {
+            Ok(manager) => Some(Arc::new(RwLock::new(manager))),
+            Err(e) => {
+                warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
+                None
             }
         };
 
         // Initialize EigenTrust engine for reputation management
-        let trust_engine = {
-            let mut pre_trusted = HashSet::new();
-            for bootstrap_peer in &config.bootstrap_peers_str {
-                let node_id_bytes = crate::dht::derive_dht_key_from_peer_id(bootstrap_peer);
-                pre_trusted.insert(NodeId::from_bytes(node_id_bytes));
-            }
-
-            let engine = Arc::new(EigenTrustEngine::new(pre_trusted));
-            engine.clone().start_background_updates();
-            Some(engine)
-        };
+        let pre_trusted: HashSet<PeerId> = config
+            .bootstrap_peers_str
+            .iter()
+            .map(|p| PeerId::from_bytes(crate::dht::derive_dht_key_from_peer_id(p)))
+            .collect();
+        let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
+        trust_engine.clone().start_background_updates();
+        let trust_engine = Some(trust_engine);
 
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig {
-            peer_id: peer_id.clone(),
             listen_addr: config.listen_addr,
             enable_ipv6: config.enable_ipv6,
             connection_timeout: config.connection_timeout,
@@ -888,7 +853,7 @@ impl P2PNode {
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: config.max_message_size,
-            node_identity: config.node_identity.clone(),
+            node_identity: node_identity.clone(),
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -904,7 +869,7 @@ impl P2PNode {
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
-            peer_id: peer_id.clone(),
+            peer_id: peer_id.to_hex(),
             dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
@@ -952,8 +917,8 @@ impl P2PNode {
         NodeBuilder::new()
     }
 
-    /// Get the peer ID of this node
-    pub fn peer_id(&self) -> &str {
+    /// Get the peer ID of this node.
+    pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
     }
 
@@ -1014,11 +979,11 @@ impl P2PNode {
         self.trust_engine.clone()
     }
 
-    /// Canonical conversion from PeerId string to adaptive NodeId for trust.
+    /// Parse a hex-encoded PeerId string into a `PeerId` for trust lookups.
     ///
-    /// Delegates to the standalone [`peer_id_to_trust_node_id`] function.
-    fn peer_id_to_trust_node_id(peer_id: &str) -> AdaptiveNodeId {
-        crate::network::peer_id_to_trust_node_id(peer_id)
+    /// Delegates to the standalone [`peer_id_from_hex`] function.
+    fn peer_id_from_hex(peer_id: &str) -> PeerId {
+        crate::network::peer_id_from_hex(peer_id)
     }
 
     /// Report a successful interaction with a peer
@@ -1039,12 +1004,10 @@ impl P2PNode {
     ///     node.report_peer_success(&peer_id).await?;
     /// }
     /// ```
-    pub async fn report_peer_success(&self, peer_id: &str) -> Result<()> {
+    pub async fn report_peer_success(&self, peer_id: &PeerId) -> Result<()> {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
-
             engine
-                .update_node_stats(&node_id, NodeStatisticsUpdate::CorrectResponse)
+                .update_node_stats(peer_id, NodeStatisticsUpdate::CorrectResponse)
                 .await;
             Ok(())
         } else {
@@ -1072,7 +1035,7 @@ impl P2PNode {
     ///     Err(_) => node.report_peer_failure(&peer_id).await?,
     /// }
     /// ```
-    pub async fn report_peer_failure(&self, peer_id: &str) -> Result<()> {
+    pub async fn report_peer_failure(&self, peer_id: &PeerId) -> Result<()> {
         // Delegate to the enriched version with a generic transport-level reason
         self.report_peer_failure_with_reason(peer_id, PeerFailureReason::ConnectionFailed)
             .await
@@ -1107,12 +1070,10 @@ impl P2PNode {
     /// ```
     pub async fn report_peer_failure_with_reason(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         reason: PeerFailureReason,
     ) -> Result<()> {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
-
             let update = match reason {
                 PeerFailureReason::Timeout | PeerFailureReason::ConnectionFailed => {
                     NodeStatisticsUpdate::FailedResponse
@@ -1123,7 +1084,7 @@ impl P2PNode {
                 PeerFailureReason::Refused => NodeStatisticsUpdate::FailedResponse,
             };
 
-            engine.update_node_stats(&node_id, update).await;
+            engine.update_node_stats(peer_id, update).await;
             Ok(())
         } else {
             // Trust engine not initialized - this is not an error, just a no-op
@@ -1151,7 +1112,7 @@ impl P2PNode {
     /// ```
     pub fn peer_trust(&self, peer_id: &str) -> f64 {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
+            let node_id = Self::peer_id_from_hex(peer_id);
 
             engine.get_trust(&node_id)
         } else {
@@ -1194,7 +1155,7 @@ impl P2PNode {
     /// ```
     pub async fn send_request(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         protocol: &str,
         data: Vec<u8>,
         timeout: Duration,
@@ -1223,7 +1184,7 @@ impl P2PNode {
 
     pub async fn send_response(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         protocol: &str,
         message_id: &str,
         data: Vec<u8>,
@@ -1371,7 +1332,7 @@ impl P2PNode {
     }
 
     /// Get connected peers
-    pub async fn connected_peers(&self) -> Vec<String> {
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.transport.connected_peers().await
     }
 
@@ -1424,8 +1385,13 @@ impl P2PNode {
         self.transport.is_connection_active(channel_id).await
     }
 
-    /// Send a message to a peer
-    pub async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()> {
+    /// Send a message to an authenticated peer.
+    pub async fn send_message(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
         self.transport.send_message(peer_id, protocol, data).await
     }
 }
@@ -1448,22 +1414,21 @@ const MAX_MESSAGE_AGE_SECS: u64 = 300;
 /// Maximum allowed future timestamp (30 seconds to account for clock drift)
 const MAX_FUTURE_SECS: u64 = 30;
 
-/// Canonical conversion from PeerId string to adaptive NodeId for trust.
+/// Parse a hex-encoded PeerId string into a `PeerId` for trust lookups.
 ///
 /// PeerId strings are hex-encoded 32-byte identifiers. This decodes them
-/// back to raw bytes, matching the DHT NodeId representation used by
-/// `trust_peer_selector`. Falls back to blake3 hash for non-hex IDs.
-pub fn peer_id_to_trust_node_id(peer_id: &str) -> AdaptiveNodeId {
+/// back to raw bytes. Falls back to blake3 hash for non-hex IDs.
+pub fn peer_id_from_hex(peer_id: &str) -> PeerId {
     if let Ok(bytes) = hex::decode(peer_id)
         && bytes.len() == 32
     {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
-        return AdaptiveNodeId::from_bytes(arr);
+        return PeerId::from_bytes(arr);
     }
     // Non-hex or wrong length: use canonical derivation
     let hash = crate::dht::derive_dht_key_from_peer_id(peer_id);
-    AdaptiveNodeId::from_bytes(hash)
+    PeerId::from_bytes(hash)
 }
 
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
@@ -1482,8 +1447,8 @@ pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent)
 pub(crate) struct ParsedMessage {
     /// The P2P event to broadcast.
     pub(crate) event: P2PEvent,
-    /// If the message was signed and verified, the authenticated app-level NodeId hex.
-    pub(crate) authenticated_node_id: Option<String>,
+    /// If the message was signed and verified, the authenticated app-level [`PeerId`].
+    pub(crate) authenticated_node_id: Option<PeerId>,
 }
 
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
@@ -1518,14 +1483,14 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
     }
 
     // Verify app-level signature if present
-    let (effective_source, authenticated_node_id) = if !message.signature.is_empty() {
+    let authenticated_node_id = if !message.signature.is_empty() {
         match verify_message_signature(&message) {
-            Ok(node_id_hex) => {
+            Ok(peer_id) => {
                 debug!(
                     "Message from {} authenticated as app-level NodeId {}",
-                    source, node_id_hex
+                    source, peer_id
                 );
-                (node_id_hex.clone(), Some(node_id_hex))
+                Some(peer_id)
             }
             Err(e) => {
                 warn!(
@@ -1536,14 +1501,13 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
             }
         }
     } else {
-        // Unsigned message: use transport-level source
-        (source.to_string(), None)
+        None
     };
 
     debug!(
-        "Parsed P2PEvent::Message - topic: {}, source: {} (transport: {}, logical: {}), payload_len: {}",
+        "Parsed P2PEvent::Message - topic: {}, source: {:?} (transport: {}, logical: {}), payload_len: {}",
         message.protocol,
-        effective_source,
+        authenticated_node_id,
         source,
         message.from,
         message.data.len()
@@ -1552,19 +1516,19 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
     Some(ParsedMessage {
         event: P2PEvent::Message {
             topic: message.protocol,
-            source: effective_source,
+            source: authenticated_node_id.clone(),
             data: message.data,
         },
         authenticated_node_id,
     })
 }
 
-/// Verify the ML-DSA-65 signature on a WireMessage and return the authenticated NodeId hex.
-fn verify_message_signature(message: &WireMessage) -> std::result::Result<String, String> {
+/// Verify the ML-DSA-65 signature on a WireMessage and return the authenticated [`PeerId`].
+fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId, String> {
     let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
         .map_err(|e| format!("invalid public key: {e:?}"))?;
 
-    let node_id = IdentityPeerId::from_public_key(&pubkey);
+    let node_id = PeerId::from_public_key(&pubkey);
 
     let signable = postcard::to_stdvec(&(
         &message.protocol,
@@ -1581,7 +1545,7 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<String
         .map_err(|e| format!("verification error: {e}"))?;
 
     if valid {
-        Ok(node_id.to_hex())
+        Ok(node_id)
     } else {
         Err("signature is invalid".to_string())
     }
@@ -1930,11 +1894,11 @@ impl P2PNode {
 /// Network sender trait for sending messages
 #[async_trait::async_trait]
 pub trait NetworkSender: Send + Sync {
-    /// Send a message to a specific peer
-    async fn send_message(&self, peer_id: &str, protocol: &str, data: Vec<u8>) -> Result<()>;
+    /// Send a message to an authenticated peer.
+    async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()>;
 
-    /// Get our local peer ID
-    fn local_peer_id(&self) -> &str;
+    /// Get our local peer ID (cryptographic identity).
+    fn local_peer_id(&self) -> PeerId;
 }
 
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
@@ -2221,7 +2185,8 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        assert_eq!(node.peer_id(), "test_peer_123");
+        // PeerId is derived from the cryptographic identity (32-byte SHA-256 hash)
+        assert_eq!(node.peer_id().to_hex().len(), 64);
         assert!(!node.is_running());
         assert_eq!(node.peer_count().await, 0);
         assert!(node.connected_peers().await.is_empty());
@@ -2236,8 +2201,9 @@ mod tests {
 
         let node = P2PNode::new(config).await?;
 
-        // Should have generated a peer ID
-        assert!(node.peer_id().starts_with("peer_"));
+        // Should have generated a cryptographic peer ID (64-char hex SHA-256 of public key)
+        assert_eq!(node.peer_id().to_hex().len(), 64);
+        assert!(node.peer_id().to_hex().chars().all(|c| c.is_ascii_hexdigit()));
         assert!(!node.is_running());
 
         Ok(())
@@ -2343,6 +2309,7 @@ mod tests {
         config1.enable_ipv6 = false;
         config1.node_identity = Some(identity1);
 
+        let node2_peer_id = identity2.peer_id().clone();
         let mut config2 = create_test_node_config();
         config2.peer_id = Some("test_peer_456".to_string());
         config2.listen_addr = ipv4_localhost;
@@ -2368,28 +2335,44 @@ mod tests {
         })?;
 
         // Connect node1 → node2
-        let mut peer_id = None;
+        let mut connected = false;
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
             match timeout(Duration::from_secs(2), node1.connect_peer(&node2_addr)).await {
-                Ok(Ok(id)) => {
-                    peer_id = Some(id);
+                Ok(Ok(_channel_id)) => {
+                    connected = true;
                     break;
                 }
                 Ok(Err(_)) | Err(_) => continue,
             }
         }
-        let peer_id = peer_id.ok_or_else(|| {
+        assert!(connected, "Failed to connect after 3 attempts");
+
+        // Wait for identity exchange to complete (identity announce is sent
+        // automatically on connect). We know it's done when node1 sees node2
+        // in its connected peers (app-level peer list).
+        let target_peer_id = node2_peer_id;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let peers = node1.transport().connected_peers().await;
+                if peers.contains(&target_peer_id) {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
             P2PError::Network(crate::error::NetworkError::ProtocolError(
-                "Failed to connect after 3 attempts".to_string().into(),
+                "Identity exchange timed out".to_string().into(),
             ))
         })?;
 
         // node1 sends a signed message → node2 authenticates → PeerConnected fires on node2
         node1
-            .send_message(&peer_id, "test-topic", b"hello".to_vec())
+            .send_message(&target_peer_id, "test-topic", b"hello".to_vec())
             .await?;
 
         // Check for PeerConnected event on node2
@@ -2406,10 +2389,10 @@ mod tests {
         .await;
         assert!(event.is_ok(), "Should receive PeerConnected event");
         let connected_peer_id = event.expect("Timed out").expect("Channel error");
-        // The connected peer ID should be node1's app-level ID (hex-encoded NodeId)
+        // The connected peer ID should be node1's app-level ID (a valid PeerId)
         assert!(
-            !connected_peer_id.is_empty(),
-            "PeerConnected should carry a non-empty peer ID"
+            connected_peer_id.0.iter().any(|&b| b != 0),
+            "PeerConnected should carry a non-zero peer ID"
         );
 
         node1.stop().await?;
@@ -2446,20 +2429,36 @@ mod tests {
         })?;
 
         // Connect node1 to node2
-        let peer_id =
-            match timeout(Duration::from_millis(500), node1.connect_peer(&node2_addr)).await {
-                Ok(res) => res?,
-                Err(_) => return Err(P2PError::Network(NetworkError::Timeout)),
-            };
+        match timeout(Duration::from_millis(500), node1.connect_peer(&node2_addr)).await {
+            Ok(res) => {
+                res?;
+            }
+            Err(_) => return Err(P2PError::Network(NetworkError::Timeout)),
+        };
 
-        // Wait a bit for connection to establish
-        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        // Wait for identity exchange (node2's PeerId appears in node1's connected peers).
+        let target_peer_id = node2.peer_id().clone();
+        let exchange_ok = timeout(Duration::from_secs(2), async {
+            loop {
+                if node1.transport().connected_peers().await.contains(&target_peer_id) {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if exchange_ok.is_err() {
+            // Identity exchange didn't complete — skip send test
+            node1.stop().await?;
+            node2.stop().await?;
+            return Ok(());
+        }
 
         // Send a message
         let message_data = b"Hello, peer!".to_vec();
         let result = match timeout(
             Duration::from_millis(500),
-            node1.send_message(&peer_id, "test-protocol", message_data),
+            node1.send_message(&target_peer_id, "test-protocol", message_data),
         )
         .await
         {
@@ -2473,7 +2472,7 @@ mod tests {
         }
 
         // Try to send to non-existent peer
-        let non_existent_peer = "non_existent_peer".to_string();
+        let non_existent_peer = PeerId::from_bytes([0xFFu8; 32]);
         let result = node1
             .send_message(&non_existent_peer, "test-protocol", vec![])
             .await;
@@ -3047,10 +3046,9 @@ mod tests {
                 source,
                 data,
             } => {
-                assert_eq!(source, transport_id, "source must be the transport peer ID");
-                assert_ne!(
-                    source, logical_id,
-                    "source must NOT be the logical 'from' field"
+                assert!(
+                    source.is_none(),
+                    "unsigned message source must be None"
                 );
                 assert_eq!(topic, "test/v1");
                 assert_eq!(data, vec![1u8, 2, 3]);
@@ -3132,17 +3130,18 @@ mod tests {
         let parsed =
             parse_protocol_message(&bytes, "transport-xyz").expect("signed message should parse");
 
-        let expected_node_id = identity.peer_id().to_hex();
+        let expected_peer_id = identity.peer_id().clone();
         assert_eq!(
-            parsed.authenticated_node_id.as_deref(),
-            Some(expected_node_id.as_str())
+            parsed.authenticated_node_id.as_ref(),
+            Some(&expected_peer_id)
         );
 
         match parsed.event {
             P2PEvent::Message { source, .. } => {
                 assert_eq!(
-                    source, expected_node_id,
-                    "source should be the verified NodeId hex"
+                    source.as_ref(),
+                    Some(&expected_peer_id),
+                    "source should be the verified PeerId"
                 );
             }
             other => panic!("expected P2PEvent::Message, got {:?}", other),

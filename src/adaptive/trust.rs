@@ -17,6 +17,7 @@
 //! pre-trusted nodes and time decay
 
 use super::*;
+use crate::PeerId;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,16 +28,16 @@ use tokio::sync::RwLock;
 #[derive(Debug)]
 pub struct EigenTrustEngine {
     /// Local trust scores between pairs of nodes
-    local_trust: Arc<RwLock<HashMap<(NodeId, NodeId), LocalTrustData>>>,
+    local_trust: Arc<RwLock<HashMap<(PeerId, PeerId), LocalTrustData>>>,
 
     /// Global trust scores
-    global_trust: Arc<RwLock<HashMap<NodeId, f64>>>,
+    global_trust: Arc<RwLock<HashMap<PeerId, f64>>>,
 
     /// Pre-trusted nodes
-    pre_trusted_nodes: Arc<RwLock<HashSet<NodeId>>>,
+    pre_trusted_nodes: Arc<RwLock<HashSet<PeerId>>>,
 
     /// Node statistics for multi-factor trust
-    node_stats: Arc<RwLock<HashMap<NodeId, NodeStatistics>>>,
+    node_stats: Arc<RwLock<HashMap<PeerId, NodeStatistics>>>,
 
     /// Teleportation probability (alpha parameter)
     alpha: f64,
@@ -51,7 +52,7 @@ pub struct EigenTrustEngine {
     update_interval: Duration,
 
     /// Cached trust scores for fast synchronous access
-    trust_cache: Arc<RwLock<HashMap<NodeId, f64>>>,
+    trust_cache: Arc<RwLock<HashMap<PeerId, f64>>>,
 }
 
 /// Local trust data with interaction history
@@ -109,7 +110,7 @@ pub enum NodeStatisticsUpdate {
 
 impl EigenTrustEngine {
     /// Create a new EigenTrust++ engine
-    pub fn new(pre_trusted_nodes: HashSet<NodeId>) -> Self {
+    pub fn new(pre_trusted_nodes: HashSet<PeerId>) -> Self {
         let mut initial_cache = HashMap::new();
         // Pre-trusted nodes start with high trust
         for node in &pre_trusted_nodes {
@@ -140,7 +141,7 @@ impl EigenTrustEngine {
     }
 
     /// Update local trust based on interaction
-    pub async fn update_local_trust(&self, from: &NodeId, to: &NodeId, success: bool) {
+    pub async fn update_local_trust(&self, from: &PeerId, to: &PeerId, success: bool) {
         let key = (from.clone(), to.clone());
         let new_value = if success { 1.0 } else { 0.0 };
 
@@ -161,7 +162,7 @@ impl EigenTrustEngine {
     }
 
     /// Update node statistics
-    pub async fn update_node_stats(&self, node_id: &NodeId, stats_update: NodeStatisticsUpdate) {
+    pub async fn update_node_stats(&self, node_id: &PeerId, stats_update: NodeStatisticsUpdate) {
         let mut stats = self.node_stats.write().await;
         let node_stats = stats.entry(node_id.clone()).or_default();
 
@@ -189,7 +190,7 @@ impl EigenTrustEngine {
     }
 
     /// Compute global trust scores
-    pub async fn compute_global_trust(&self) -> HashMap<NodeId, f64> {
+    pub async fn compute_global_trust(&self) -> HashMap<PeerId, f64> {
         // Add timeout protection to prevent infinite hangs
         // Use 2 seconds to allow proper convergence in tests
         let result = tokio::time::timeout(
@@ -207,7 +208,7 @@ impl EigenTrustEngine {
         }
     }
 
-    async fn compute_global_trust_internal(&self) -> HashMap<NodeId, f64> {
+    async fn compute_global_trust_internal(&self) -> HashMap<PeerId, f64> {
         // Collect all nodes
         let local_trust = self.local_trust.read().await;
         let node_stats = self.node_stats.read().await;
@@ -231,8 +232,8 @@ impl EigenTrustEngine {
 
         // Build sparse adjacency list for incoming edges (who trusts this node)
         // This avoids O(n²) iteration - we only iterate over actual edges
-        let mut incoming_edges: HashMap<NodeId, Vec<(NodeId, f64)>> = HashMap::new();
-        let mut outgoing_sums: HashMap<NodeId, f64> = HashMap::new();
+        let mut incoming_edges: HashMap<PeerId, Vec<(PeerId, f64)>> = HashMap::new();
+        let mut outgoing_sums: HashMap<PeerId, f64> = HashMap::new();
 
         // Calculate outgoing sums for normalization
         for ((from, _), data) in local_trust.iter() {
@@ -262,7 +263,7 @@ impl EigenTrustEngine {
         }
 
         // Initialize trust vector uniformly
-        let mut trust_vector: HashMap<NodeId, f64> = HashMap::new();
+        let mut trust_vector: HashMap<PeerId, f64> = HashMap::new();
         let initial_trust = 1.0 / n as f64;
         for node in &node_set {
             trust_vector.insert(node.clone(), initial_trust);
@@ -281,7 +282,7 @@ impl EigenTrustEngine {
         const CONVERGENCE_THRESHOLD: f64 = 0.0001; // Tighter convergence
 
         for iteration in 0..MAX_ITERATIONS {
-            let mut new_trust: HashMap<NodeId, f64> = HashMap::new();
+            let mut new_trust: HashMap<PeerId, f64> = HashMap::new();
 
             // Propagate trust through edges (1-alpha portion)
             for node in &node_set {
@@ -412,7 +413,7 @@ impl EigenTrustEngine {
     }
 
     /// Add a pre-trusted node
-    pub async fn add_pre_trusted(&self, node_id: NodeId) {
+    pub async fn add_pre_trusted(&self, node_id: PeerId) {
         let mut pre_trusted = self.pre_trusted_nodes.write().await;
         pre_trusted.insert(node_id.clone());
 
@@ -422,20 +423,20 @@ impl EigenTrustEngine {
     }
 
     /// Remove a pre-trusted node
-    pub async fn remove_pre_trusted(&self, node_id: &NodeId) {
+    pub async fn remove_pre_trusted(&self, node_id: &PeerId) {
         let mut pre_trusted = self.pre_trusted_nodes.write().await;
         pre_trusted.remove(node_id);
     }
 
     /// Get current trust score (fast synchronous access)
-    pub async fn get_trust_async(&self, node_id: &NodeId) -> f64 {
+    pub async fn get_trust_async(&self, node_id: &PeerId) -> f64 {
         let cache = self.trust_cache.read().await;
         cache.get(node_id).copied().unwrap_or(0.5)
     }
 }
 
 impl TrustProvider for EigenTrustEngine {
-    fn get_trust(&self, node: &NodeId) -> f64 {
+    fn get_trust(&self, node: &PeerId) -> f64 {
         // Use cached value for synchronous access
         // The cache is updated by background task
         if let Ok(cache) = self.trust_cache.try_read() {
@@ -446,7 +447,7 @@ impl TrustProvider for EigenTrustEngine {
         }
     }
 
-    fn update_trust(&self, from: &NodeId, to: &NodeId, success: bool) {
+    fn update_trust(&self, from: &PeerId, to: &PeerId, success: bool) {
         // Spawn a task to handle async update
         let local_trust = self.local_trust.clone();
         let from = from.clone();
@@ -472,7 +473,7 @@ impl TrustProvider for EigenTrustEngine {
         });
     }
 
-    fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+    fn get_global_trust(&self) -> HashMap<PeerId, f64> {
         // Return cached values for synchronous access
         if let Ok(cache) = self.trust_cache.try_read() {
             cache.clone()
@@ -481,7 +482,7 @@ impl TrustProvider for EigenTrustEngine {
         }
     }
 
-    fn remove_node(&self, node: &NodeId) {
+    fn remove_node(&self, node: &PeerId) {
         // Schedule removal in background task
         let node_id = node.clone();
         let local_trust = self.local_trust.clone();
@@ -535,7 +536,7 @@ pub struct TrustBasedRoutingStrategy {
     trust_engine: Arc<EigenTrustEngine>,
 
     /// Local node ID
-    local_id: NodeId,
+    local_id: PeerId,
 
     /// Routing configuration
     config: TrustRoutingConfig,
@@ -543,14 +544,14 @@ pub struct TrustBasedRoutingStrategy {
 
 impl TrustBasedRoutingStrategy {
     /// Create a new trust-based routing strategy with default config
-    pub fn new(trust_engine: Arc<EigenTrustEngine>, local_id: NodeId) -> Self {
+    pub fn new(trust_engine: Arc<EigenTrustEngine>, local_id: PeerId) -> Self {
         Self::with_config(trust_engine, local_id, TrustRoutingConfig::default())
     }
 
     /// Create a new trust-based routing strategy with custom config
     pub fn with_config(
         trust_engine: Arc<EigenTrustEngine>,
-        local_id: NodeId,
+        local_id: PeerId,
         config: TrustRoutingConfig,
     ) -> Self {
         Self {
@@ -568,12 +569,12 @@ impl TrustBasedRoutingStrategy {
 
 #[async_trait]
 impl RoutingStrategy for TrustBasedRoutingStrategy {
-    async fn find_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Get global trust scores
         let trust_scores = self.trust_engine.get_global_trust();
 
         // Filter nodes by minimum trust
-        let mut trusted_nodes: Vec<(NodeId, f64)> = trust_scores
+        let mut trusted_nodes: Vec<(PeerId, f64)> = trust_scores
             .into_iter()
             .filter(|(id, trust)| {
                 id != &self.local_id && id != target && *trust >= self.config.min_trust_threshold
@@ -584,7 +585,7 @@ impl RoutingStrategy for TrustBasedRoutingStrategy {
         trusted_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Create path through highest trust nodes
-        let path: Vec<NodeId> = trusted_nodes
+        let path: Vec<PeerId> = trusted_nodes
             .into_iter()
             .take(self.config.max_intermediate_hops)
             .map(|(id, _)| id)
@@ -601,11 +602,11 @@ impl RoutingStrategy for TrustBasedRoutingStrategy {
         }
     }
 
-    fn route_score(&self, neighbor: &NodeId, _target: &NodeId) -> f64 {
+    fn route_score(&self, neighbor: &PeerId, _target: &PeerId) -> f64 {
         self.trust_engine.get_trust(neighbor)
     }
 
-    fn update_metrics(&self, path: &[NodeId], success: bool) {
+    fn update_metrics(&self, path: &[PeerId], success: bool) {
         // Update trust based on routing outcome
         if path.len() >= 2 {
             for window in path.windows(2) {
@@ -618,7 +619,7 @@ impl RoutingStrategy for TrustBasedRoutingStrategy {
 
 /// Mock trust provider for testing
 pub struct MockTrustProvider {
-    trust_scores: Arc<RwLock<HashMap<NodeId, f64>>>,
+    trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
 }
 
 impl Default for MockTrustProvider {
@@ -636,7 +637,7 @@ impl MockTrustProvider {
 }
 
 impl TrustProvider for MockTrustProvider {
-    fn get_trust(&self, node: &NodeId) -> f64 {
+    fn get_trust(&self, node: &PeerId) -> f64 {
         self.trust_scores
             .blocking_read()
             .get(node)
@@ -644,7 +645,7 @@ impl TrustProvider for MockTrustProvider {
             .unwrap_or(0.0) // Return 0.0 for unknown/removed nodes
     }
 
-    fn update_trust(&self, _from: &NodeId, to: &NodeId, success: bool) {
+    fn update_trust(&self, _from: &PeerId, to: &PeerId, success: bool) {
         let mut scores = self.trust_scores.blocking_write();
         let current = scores.get(to).copied().unwrap_or(0.5);
         let new_score = if success {
@@ -655,11 +656,11 @@ impl TrustProvider for MockTrustProvider {
         scores.insert(to.clone(), new_score);
     }
 
-    fn get_global_trust(&self) -> HashMap<NodeId, f64> {
+    fn get_global_trust(&self) -> HashMap<PeerId, f64> {
         self.trust_scores.blocking_read().clone()
     }
 
-    fn remove_node(&self, node: &NodeId) {
+    fn remove_node(&self, node: &PeerId) {
         self.trust_scores.blocking_write().remove(node);
     }
 }
@@ -675,18 +676,18 @@ mod tests {
 
         let mut hash_pre = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash_pre);
-        let pre_trusted = HashSet::from([NodeId::from_bytes(hash_pre)]);
+        let pre_trusted = HashSet::from([PeerId::from_bytes(hash_pre)]);
 
         let engine = EigenTrustEngine::new(pre_trusted.clone());
 
         // Add some trust relationships
         let mut hash1 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash1);
-        let node1 = NodeId { hash: hash1 };
+        let node1 = PeerId::from_bytes(hash1);
 
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);
-        let node2 = NodeId { hash: hash2 };
+        let node2 = PeerId::from_bytes(hash2);
 
         let pre_trusted_node = pre_trusted.iter().next().unwrap();
 
@@ -714,15 +715,15 @@ mod tests {
 
         let mut hash1 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash1);
-        let node1 = NodeId { hash: hash1 };
+        let node1 = PeerId::from_bytes(hash1);
 
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);
-        let node2 = NodeId { hash: hash2 };
+        let node2 = PeerId::from_bytes(hash2);
 
         let mut hash3 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash3);
-        let node3 = NodeId { hash: hash3 };
+        let node3 = PeerId::from_bytes(hash3);
 
         engine.update_local_trust(&node1, &node2, true).await;
         engine.update_local_trust(&node1, &node3, true).await;
@@ -753,7 +754,7 @@ mod tests {
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let node = NodeId { hash };
+        let node = PeerId::from_bytes(hash);
 
         // Update node statistics
         engine
@@ -775,7 +776,7 @@ mod tests {
         // Add some trust relationships
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);
-        let other = NodeId { hash: hash2 };
+        let other = PeerId::from_bytes(hash2);
 
         engine.update_local_trust(&other, &node, true).await;
 
@@ -807,11 +808,11 @@ mod tests {
 
         let mut hash1 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash1);
-        let node1 = NodeId { hash: hash1 };
+        let node1 = PeerId::from_bytes(hash1);
 
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);
-        let node2 = NodeId { hash: hash2 };
+        let node2 = PeerId::from_bytes(hash2);
 
         engine.update_local_trust(&node1, &node2, true).await;
 
@@ -852,7 +853,7 @@ mod tests {
         // Create pre-trusted nodes
         let mut hash_pre = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash_pre);
-        let pre_trusted_id = NodeId::from_bytes(hash_pre);
+        let pre_trusted_id = PeerId::from_bytes(hash_pre);
 
         let engine = Arc::new(EigenTrustEngine::new(HashSet::from([
             pre_trusted_id.clone()
@@ -861,11 +862,11 @@ mod tests {
         // Create some nodes
         let mut hash_local = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash_local);
-        let local_id = NodeId::from_bytes(hash_local);
+        let local_id = PeerId::from_bytes(hash_local);
 
         let mut hash_target = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash_target);
-        let target_id = NodeId::from_bytes(hash_target);
+        let target_id = PeerId::from_bytes(hash_target);
 
         // Build trust relationships
         engine

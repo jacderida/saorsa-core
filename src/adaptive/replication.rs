@@ -20,6 +20,7 @@
 //! - Available storage capacity
 
 use super::*;
+use crate::PeerId;
 use crate::adaptive::{
     TrustProvider,
     learning::ChurnPredictor,
@@ -59,7 +60,7 @@ pub struct ReplicationManager {
 #[derive(Debug, Clone)]
 pub struct ReplicaInfo {
     /// Set of nodes storing this content
-    pub storing_nodes: HashSet<NodeId>,
+    pub storing_nodes: HashSet<PeerId>,
 
     /// Current replication factor
     pub replication_factor: u32,
@@ -159,8 +160,8 @@ impl ReplicationManager {
         &self,
         _content_hash: &ContentHash,
         count: usize,
-        exclude: &HashSet<NodeId>,
-    ) -> Result<Vec<NodeId>> {
+        exclude: &HashSet<PeerId>,
+    ) -> Result<Vec<PeerId>> {
         // Get candidate nodes using different strategies
         let mut candidates = HashMap::new();
 
@@ -181,7 +182,7 @@ impl ReplicationManager {
         }
 
         // Score nodes based on composite criteria
-        let mut scored_nodes: Vec<(NodeId, f64)> = Vec::new();
+        let mut scored_nodes: Vec<(PeerId, f64)> = Vec::new();
         for (node, strategies_found) in candidates {
             let score = self
                 .calculate_node_score(&node, _content_hash, &strategies_found)
@@ -202,7 +203,7 @@ impl ReplicationManager {
     /// Calculate composite node score for replication
     async fn calculate_node_score(
         &self,
-        node: &NodeId,
+        node: &PeerId,
         _content_hash: &ContentHash,
         strategies_found: &[String],
     ) -> f64 {
@@ -286,9 +287,7 @@ impl ReplicationManager {
 
             // Ensure at least one replica is tracked in constrained environments
             if successful_nodes.is_empty() {
-                let mut placeholder = NodeId { hash: [0u8; 32] };
-                // Derive a deterministic placeholder from content hash bytes
-                placeholder.hash.copy_from_slice(&_content_hash.0);
+                let placeholder = PeerId::from_bytes(_content_hash.0);
                 successful_nodes.insert(placeholder);
             }
 
@@ -376,7 +375,7 @@ impl ReplicationManager {
     }
 
     /// Handle node departure by checking affected content
-    pub async fn handle_node_departure(&self, departed_node: &NodeId) -> Result<()> {
+    pub async fn handle_node_departure(&self, departed_node: &PeerId) -> Result<()> {
         let replica_map = self.replica_map.read().await;
         let affected_content: Vec<_> = replica_map
             .iter()
@@ -417,7 +416,7 @@ impl ReplicationManager {
     /// Simulate sending replica to a node (would use network in real implementation)
     async fn send_replica_to_node(
         &self,
-        node: &NodeId,
+        node: &PeerId,
         _content_hash: &ContentHash,
         _content: &[u8],
     ) -> bool {
@@ -520,8 +519,8 @@ mod tests {
         let manager = create_test_replication_manager();
         let content_hash = ContentHash([1u8; 32]);
         let mut exclude = HashSet::new();
-        exclude.insert(NodeId { hash: [1u8; 32] });
-        exclude.insert(NodeId { hash: [2u8; 32] });
+        exclude.insert(PeerId::from_bytes([1u8; 32]));
+        exclude.insert(PeerId::from_bytes([2u8; 32]));
 
         let nodes = manager
             .select_replication_nodes(&content_hash, 5, &exclude)
@@ -593,9 +592,9 @@ mod tests {
 
         // Add some nodes
         for i in 0..3 {
-            replica_info.storing_nodes.insert(NodeId {
-                hash: [i as u8; 32],
-            });
+            replica_info
+                .storing_nodes
+                .insert(PeerId::from_bytes([i as u8; 32]));
         }
 
         manager
@@ -621,14 +620,14 @@ mod tests {
     #[tokio::test]
     async fn test_node_departure_handling() {
         let manager = create_test_replication_manager();
-        let departed_node = NodeId { hash: [1u8; 32] };
+        let departed_node = PeerId::from_bytes([1u8; 32]);
 
         // Add content that includes the departed node
         let content_hash = ContentHash([1u8; 32]);
         let mut storing_nodes = HashSet::new();
         storing_nodes.insert(departed_node.clone());
-        storing_nodes.insert(NodeId { hash: [2u8; 32] });
-        storing_nodes.insert(NodeId { hash: [3u8; 32] });
+        storing_nodes.insert(PeerId::from_bytes([2u8; 32]));
+        storing_nodes.insert(PeerId::from_bytes([3u8; 32]));
 
         let replica_info = ReplicaInfo {
             storing_nodes,

@@ -16,7 +16,7 @@
 //! before starting DHT replication when nodes fail, allowing time for endpoint
 //! re-registration during upgrades or port changes.
 
-use crate::peer_record::UserId as NodeId;
+use crate::peer_record::PeerId;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
@@ -74,7 +74,7 @@ impl ReplicationGracePeriodConfig {
 #[derive(Debug, Clone)]
 pub struct FailedNodeInfo {
     /// The node that failed
-    pub node_id: NodeId,
+    pub node_id: PeerId,
 
     /// When the failure was detected
     pub failed_at: SystemTime,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_failed_node_info_creation() {
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let now = SystemTime::now();
         let grace_expires = now + Duration::from_secs(300);
 

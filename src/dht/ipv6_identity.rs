@@ -600,9 +600,10 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_dht_node(peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
-        use crate::dht::{DhtNodeId, NodeCapacity};
+        use crate::PeerId;
+        use crate::dht::NodeCapacity;
         DHTNode {
-            id: DhtNodeId::from_bytes(id_bytes),
+            id: PeerId::from_bytes(id_bytes),
             address: format!("::1:8080:{}", peer_id),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),

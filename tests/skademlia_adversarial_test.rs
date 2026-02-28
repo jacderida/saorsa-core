@@ -17,13 +17,13 @@
 //! - Authenticated broadcast integrity
 //! - Eclipse attack detection
 
+use saorsa_core::PeerId;
 use saorsa_core::dht::authenticated_sibling_broadcast::{
     AuthenticatedSiblingBroadcast, BroadcastValidationFailure, SiblingBroadcastBuilder,
     SiblingBroadcastConfig, SiblingBroadcastValidator, SignedSiblingEntry,
 };
-use saorsa_core::dht::core_engine::{NodeCapacity, NodeId};
+use saorsa_core::dht::core_engine::NodeCapacity;
 use saorsa_core::dht::{DHTNode, Key};
-use saorsa_core::identity::node_identity::PeerId;
 use std::time::{Duration, SystemTime};
 
 // ============================================================================
@@ -48,7 +48,7 @@ fn random_key() -> Key {
 
 fn create_test_node() -> DHTNode {
     DHTNode {
-        id: NodeId::random(),
+        id: PeerId::random(),
         address: "127.0.0.1:8000".to_string(),
         last_seen: SystemTime::now(),
         capacity: NodeCapacity::default(),

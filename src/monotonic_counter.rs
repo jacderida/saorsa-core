@@ -31,7 +31,7 @@
 #![allow(missing_docs)]
 
 use crate::error::StorageError;
-use crate::peer_record::UserId;
+use crate::peer_record::PeerId;
 use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ const MAX_SEQUENCE_AGE: Duration = Duration::from_secs(3600); // 1 hour
 /// Monotonic counter system for preventing replay attacks
 pub struct MonotonicCounterSystem {
     /// In-memory counter cache
-    counters: Arc<RwLock<HashMap<UserId, PeerCounter>>>,
+    counters: Arc<RwLock<HashMap<PeerId, PeerCounter>>>,
     /// Persistent storage path
     storage_path: PathBuf,
     /// Sync interval for persistence
@@ -131,7 +131,7 @@ pub enum SequenceValidationResult {
 /// Batch update request for multiple counters
 pub struct BatchUpdateRequest {
     /// User ID
-    pub user_id: UserId,
+    pub user_id: PeerId,
     /// Sequence number
     pub sequence: u64,
     /// Message hash for deduplication
@@ -143,7 +143,7 @@ pub struct BatchUpdateRequest {
 /// Result of batch update
 pub struct BatchUpdateResult {
     /// User ID
-    pub user_id: UserId,
+    pub user_id: PeerId,
     /// Validation result
     pub result: SequenceValidationResult,
     /// Whether the update was applied
@@ -220,7 +220,7 @@ impl MonotonicCounterSystem {
     /// Validate and update sequence number for a peer
     pub async fn validate_sequence(
         &self,
-        user_id: &UserId,
+        user_id: &PeerId,
         sequence: u64,
         message_hash: [u8; 32],
     ) -> Result<SequenceValidationResult> {
@@ -373,13 +373,13 @@ impl MonotonicCounterSystem {
     }
 
     /// Get counter state for a specific peer
-    pub async fn get_peer_counter(&self, user_id: &UserId) -> Option<PeerCounter> {
+    pub async fn get_peer_counter(&self, user_id: &PeerId) -> Option<PeerCounter> {
         let counters = self.counters.read().ok()?;
         counters.get(user_id).cloned()
     }
 
     /// Reset counter for a peer (use with caution)
-    pub async fn reset_peer_counter(&self, user_id: &UserId) -> Result<()> {
+    pub async fn reset_peer_counter(&self, user_id: &PeerId) -> Result<()> {
         let mut counters = self.counters.write().map_err(|_| {
             P2PError::Storage(StorageError::LockPoisoned(
                 "write lock failed".to_string().into(),
@@ -407,7 +407,7 @@ impl MonotonicCounterSystem {
     }
 
     /// Load counters from persistent storage
-    async fn load_counters(storage_path: &PathBuf) -> Result<HashMap<UserId, PeerCounter>> {
+    async fn load_counters(storage_path: &PathBuf) -> Result<HashMap<PeerId, PeerCounter>> {
         if !storage_path.exists() {
             return Ok(HashMap::new());
         }
@@ -418,7 +418,7 @@ impl MonotonicCounterSystem {
             ))
         })?;
 
-        let counters: HashMap<UserId, PeerCounter> = postcard::from_bytes(&data).map_err(|e| {
+        let counters: HashMap<PeerId, PeerCounter> = postcard::from_bytes(&data).map_err(|e| {
             P2PError::Storage(StorageError::Database(
                 format!("Failed to deserialize counters: {e}").into(),
             ))
@@ -429,7 +429,7 @@ impl MonotonicCounterSystem {
 
     /// Sync counters to persistent storage
     async fn sync_counters(
-        counters: &Arc<RwLock<HashMap<UserId, PeerCounter>>>,
+        counters: &Arc<RwLock<HashMap<PeerId, PeerCounter>>>,
         storage_path: &PathBuf,
         stats: &Arc<Mutex<CounterStats>>,
     ) -> Result<()> {
@@ -565,7 +565,7 @@ mod tests {
         let storage_path = temp_dir.path().join("counters.bin");
         let system = MonotonicCounterSystem::new(storage_path).await.unwrap();
 
-        let user_id = UserId::from_bytes([1; 32]);
+        let user_id = PeerId::from_bytes([1; 32]);
         let message_hash = *blake3::hash(b"test message").as_bytes();
 
         // First sequence should be valid
@@ -609,8 +609,8 @@ mod tests {
         let storage_path = temp_dir.path().join("counters.bin");
         let system = MonotonicCounterSystem::new(storage_path).await.unwrap();
 
-        let user_id1 = UserId::from_bytes([1; 32]);
-        let user_id2 = UserId::from_bytes([2; 32]);
+        let user_id1 = PeerId::from_bytes([1; 32]);
+        let user_id2 = PeerId::from_bytes([2; 32]);
         let message_hash = *blake3::hash(b"test message").as_bytes();
 
         let requests = vec![
@@ -648,7 +648,7 @@ mod tests {
             let system = MonotonicCounterSystem::new(storage_path.clone())
                 .await
                 .unwrap();
-            let user_id = UserId::from_bytes([1; 32]);
+            let user_id = PeerId::from_bytes([1; 32]);
             let message_hash = *blake3::hash(b"test message").as_bytes();
 
             system
@@ -669,7 +669,7 @@ mod tests {
         // Create new system and verify counters are loaded
         {
             let system = MonotonicCounterSystem::new(storage_path).await.unwrap();
-            let user_id = UserId::from_bytes([1; 32]);
+            let user_id = PeerId::from_bytes([1; 32]);
             let counter = system.get_peer_counter(&user_id).await.unwrap();
 
             assert_eq!(counter.last_valid_sequence, 2);
@@ -683,7 +683,7 @@ mod tests {
         let storage_path = temp_dir.path().join("counters.bin");
         let system = MonotonicCounterSystem::new(storage_path).await.unwrap();
 
-        let user_id = UserId::from_bytes([1; 32]);
+        let user_id = PeerId::from_bytes([1; 32]);
         let message_hash = *blake3::hash(b"test message").as_bytes();
 
         // Add some sequences
@@ -710,7 +710,7 @@ mod tests {
         let storage_path = temp_dir.path().join("counters.bin");
         let system = MonotonicCounterSystem::new(storage_path).await.unwrap();
 
-        let user_id = UserId::from_bytes([1; 32]);
+        let user_id = PeerId::from_bytes([1; 32]);
         let message_hash = *blake3::hash(b"test message").as_bytes();
 
         // Process some sequences

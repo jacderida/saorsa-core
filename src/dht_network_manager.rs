@@ -19,10 +19,10 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Multiaddr, P2PError, Result,
+    Multiaddr, P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
-    dht::{DHTConfig, DhtCoreEngine, DhtKey, DhtNodeId, Key},
+    dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
     error::{DhtError, NetworkError},
     network::NodeConfig,
 };
@@ -425,7 +425,7 @@ enum LookupRequestKind {
 impl DhtNetworkManager {
     fn init_dht_core(local_peer_id: &str) -> Result<(Arc<RwLock<DhtCoreEngine>>, DhtKey)> {
         let dht_key = crate::dht::derive_dht_key_from_peer_id(local_peer_id);
-        let node_id = DhtNodeId::from_bytes(dht_key);
+        let node_id = PeerId::from_bytes(dht_key);
         // Use LogOnly mode so nodes can join the routing table without prior validation.
         // Strict mode rejects every unknown node, making it impossible to bootstrap a
         // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
@@ -601,7 +601,7 @@ impl DhtNetworkManager {
         trust_engine: Option<Arc<EigenTrustEngine>>,
         mut config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let transport_app_peer_id = transport.peer_id().to_string();
+        let transport_app_peer_id = transport.peer_id().to_hex();
         if config.peer_id.is_empty() {
             config.peer_id = transport_app_peer_id.clone();
         } else if config.peer_id != transport_app_peer_id {
@@ -1682,7 +1682,7 @@ impl DhtNetworkManager {
 
     async fn record_peer_success(&self, peer_id: &str) {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = crate::network::peer_id_to_trust_node_id(peer_id);
+            let node_id = crate::network::peer_id_from_hex(peer_id);
             engine
                 .update_node_stats(
                     &node_id,
@@ -1694,7 +1694,7 @@ impl DhtNetworkManager {
 
     async fn record_peer_failure(&self, peer_id: &str) {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = crate::network::peer_id_to_trust_node_id(peer_id);
+            let node_id = crate::network::peer_id_from_hex(peer_id);
             engine
                 .update_node_stats(
                     &node_id,
@@ -1781,6 +1781,13 @@ impl DhtNetworkManager {
             ops.insert(message_id.clone(), operation_context);
         }
 
+        // Resolve hex peer ID to typed PeerId at the DHT boundary.
+        let typed_peer_id = PeerId::from_hex(peer_id).map_err(|e| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Invalid peer ID hex '{}': {}", peer_id, e).into(),
+            ))
+        })?;
+
         // Send message via network layer
         info!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
@@ -1788,7 +1795,7 @@ impl DhtNetworkManager {
         );
         let result = match self
             .transport
-            .send_message(peer_id, "/dht/1.0.0", message_data)
+            .send_message(&typed_peer_id, "/dht/1.0.0", message_data)
             .await
         {
             Ok(_) => {
@@ -1841,8 +1848,10 @@ impl DhtNetworkManager {
     /// directly. For unsigned connections the channel ID itself is used as
     /// identity (e.g. in tests).
     async fn canonical_app_peer_id(&self, peer_id: &str) -> Option<String> {
-        // Already a known app-level ID (from signed messages)
-        if self.transport.is_known_app_peer_id(peer_id).await {
+        // Try parsing as app-level PeerId hex and check the mapping
+        if let Ok(app_id) = PeerId::from_hex(peer_id)
+            && self.transport.is_known_app_peer_id(&app_id).await
+        {
             return Some(peer_id.to_owned());
         }
         // Fallback: connected transport peer (unsigned connections)
@@ -2297,33 +2306,33 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
-        for node_id in connected {
-            self.handle_peer_connected(node_id).await;
+        for peer_id in connected {
+            self.handle_peer_connected(peer_id).await;
         }
     }
 
     /// Handle an authenticated peer connection event.
     ///
-    /// The `node_id` is the authenticated app-level peer ID — no
+    /// The `node_id` is the authenticated app-level [`PeerId`] — no
     /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
     /// only fires after identity verification.
-    async fn handle_peer_connected(&self, node_id: String) {
-        let app_peer_id = node_id;
-        info!("DHT peer connected: app_id={}", app_peer_id);
-        let dht_key = crate::dht::derive_dht_key_from_peer_id(&app_peer_id);
+    async fn handle_peer_connected(&self, node_id: PeerId) {
+        let app_peer_id_hex = node_id.to_hex();
+        info!("DHT peer connected: app_id={}", app_peer_id_hex);
+        let dht_key = crate::dht::derive_dht_key_from_peer_id(&app_peer_id_hex);
 
         // peer_info() resolves app-level IDs internally via peer_to_channel
-        let addresses = if let Some(info) = self.transport.peer_info(&app_peer_id).await {
+        let addresses = if let Some(info) = self.transport.peer_info(&app_peer_id_hex).await {
             Self::parse_peer_addresses(&info.addresses)
         } else {
-            warn!("peer_info unavailable for app_peer_id {}", app_peer_id);
+            warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
             Vec::new()
         };
 
         // Track peer and decide whether it should be promoted to routing table.
         let should_add_to_routing = {
             let mut peers = self.dht_peers.write().await;
-            match peers.entry(app_peer_id.clone()) {
+            match peers.entry(app_peer_id_hex.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let peer_info = entry.get_mut();
                     let had_addresses = !peer_info.addresses.is_empty();
@@ -2336,7 +2345,7 @@ impl DhtNetworkManager {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(DhtPeerInfo {
-                        peer_id: app_peer_id.clone(),
+                        peer_id: app_peer_id_hex.clone(),
                         dht_key,
                         addresses: addresses.clone(),
                         last_seen: Instant::now(),
@@ -2355,23 +2364,26 @@ impl DhtNetworkManager {
             None => {
                 warn!(
                     "Peer {} has no addresses, skipping DHT routing table addition",
-                    app_peer_id
+                    app_peer_id_hex
                 );
                 return;
             }
         };
 
         if !should_add_to_routing {
-            debug!("Peer {} already tracked in DHT routing state", app_peer_id);
+            debug!(
+                "Peer {} already tracked in DHT routing state",
+                app_peer_id_hex
+            );
             return;
         }
 
         // Add to DHT routing table.
         {
-            use crate::dht::core_engine::{NodeCapacity, NodeId, NodeInfo};
+            use crate::dht::core_engine::{NodeCapacity, NodeInfo};
 
             let node_info = NodeInfo {
-                id: NodeId::from_bytes(dht_key),
+                id: PeerId::from_bytes(dht_key),
                 address: address_str,
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
@@ -2380,16 +2392,16 @@ impl DhtNetworkManager {
             if let Err(e) = self.dht.write().await.add_node(node_info).await {
                 warn!(
                     "Failed to add peer {} to DHT routing table: {}",
-                    app_peer_id, e
+                    app_peer_id_hex, e
                 );
             } else {
-                info!("Added peer {} to DHT routing table", app_peer_id);
+                info!("Added peer {} to DHT routing table", app_peer_id_hex);
             }
         }
 
         if self.event_tx.receiver_count() > 0 {
             let _ = self.event_tx.send(DhtNetworkEvent::PeerDiscovered {
-                peer_id: app_peer_id,
+                peer_id: app_peer_id_hex,
                 dht_key,
             });
         }
@@ -2413,22 +2425,23 @@ impl DhtNetworkManager {
                     recv = events.recv() => {
                         match recv {
                             Ok(event) => match event {
-                                crate::network::P2PEvent::PeerConnected(node_id) => {
-                                    self_arc.handle_peer_connected(node_id).await;
+                                crate::network::P2PEvent::PeerConnected(peer_id) => {
+                                    self_arc.handle_peer_connected(peer_id).await;
                                 }
-                                crate::network::P2PEvent::PeerDisconnected(node_id) => {
-                                    // node_id IS the authenticated app-level peer ID.
+                                crate::network::P2PEvent::PeerDisconnected(peer_id) => {
+                                    // peer_id IS the authenticated app-level PeerId.
                                     // PeerDisconnected only fires when all channels for
                                     // this peer have closed — no multi-channel check needed.
+                                    let node_id_hex = peer_id.to_hex();
                                     info!(
                                         "DHT peer fully disconnected: app_id={}",
-                                        node_id
+                                        node_id_hex
                                     );
 
                                     {
                                         let mut peers = self_arc.dht_peers.write().await;
                                         if let Some(peer_info) =
-                                            peers.get_mut(&node_id)
+                                            peers.get_mut(&node_id_hex)
                                         {
                                             peer_info.is_connected = false;
                                         }
@@ -2438,7 +2451,7 @@ impl DhtNetworkManager {
                                         && let Err(e) = self_arc
                                             .event_tx
                                             .send(DhtNetworkEvent::PeerDisconnected {
-                                                peer_id: node_id,
+                                                peer_id: node_id_hex,
                                             })
                                     {
                                         warn!(
@@ -2453,16 +2466,22 @@ impl DhtNetworkManager {
                                     data,
                                 } => {
                                     trace!(
-                                        "  [EVENT] Message received: topic={}, source={}, {} bytes",
+                                        "  [EVENT] Message received: topic={}, source={:?}, {} bytes",
                                         topic,
                                         source,
                                         data.len()
                                     );
                                     if topic == "/dht/1.0.0" {
-                                        trace!("  [EVENT] Processing DHT message from {}", source);
+                                        // DHT messages must be authenticated.
+                                        let Some(source_peer) = source else {
+                                            warn!("Ignoring unsigned DHT message");
+                                            continue;
+                                        };
+                                        trace!("  [EVENT] Processing DHT message from {}", source_peer);
+                                        // The DHT layer uses hex strings internally for peer IDs.
+                                        let source_hex = source_peer.to_hex();
                                         // Process the DHT message with backpressure via semaphore
                                         let manager_clone = Arc::clone(&self_arc);
-                                        let source_clone = source.clone();
                                         let semaphore = Arc::clone(&self_arc.message_handler_semaphore);
                                         tokio::spawn(async move {
                                             // Acquire permit for backpressure - limits concurrent handlers
@@ -2478,7 +2497,7 @@ impl DhtNetworkManager {
                                             // This ensures permits are released even if a handler gets stuck
                                             match tokio::time::timeout(
                                                 REQUEST_TIMEOUT,
-                                                manager_clone.handle_dht_message(&data, &source_clone),
+                                                manager_clone.handle_dht_message(&data, &source_hex),
                                             )
                                             .await
                                             {
@@ -2486,12 +2505,12 @@ impl DhtNetworkManager {
                                                     // Send response back to the source peer
                                                     if let Err(e) = manager_clone
                                                         .transport
-                                                        .send_message(&source_clone, "/dht/1.0.0", response)
+                                                        .send_message(&source_peer, "/dht/1.0.0", response)
                                                         .await
                                                     {
                                                         warn!(
                                                             "Failed to send DHT response to {}: {}",
-                                                            source_clone, e
+                                                            source_peer, e
                                                         );
                                                     }
                                                 }
@@ -2501,14 +2520,14 @@ impl DhtNetworkManager {
                                                 Ok(Err(e)) => {
                                                     warn!(
                                                         "Failed to handle DHT message from {}: {}",
-                                                        source_clone, e
+                                                        source_peer, e
                                                     );
                                                 }
                                                 Err(_) => {
                                                     // Timeout occurred - log warning and release permit
                                                     warn!(
                                                         "DHT message handler timed out after {:?} for peer {}: potential DoS attempt or slow processing",
-                                                        REQUEST_TIMEOUT, source_clone
+                                                        REQUEST_TIMEOUT, source_peer
                                                     );
                                                 }
                                             }
