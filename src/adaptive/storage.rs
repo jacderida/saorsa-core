@@ -15,7 +15,7 @@
 //!
 //! This module implements the storage and retrieval system for the adaptive P2P network,
 //! featuring:
-//! - Content-addressed storage using SHA-256
+//! - Content-addressed storage using BLAKE3
 //! - Parallel retrieval strategies
 //! - Adaptive replication based on network churn
 //! - Efficient chunk management
@@ -24,7 +24,6 @@
 use super::*;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 
@@ -326,14 +325,10 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Calculate SHA-256 hash of content
+    /// Calculate BLAKE3 hash of content
     pub fn calculate_hash(content: &[u8]) -> ContentHash {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let result = hasher.finalize();
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes.copy_from_slice(&result);
-        ContentHash(hash_bytes)
+        let hash = blake3::hash(content);
+        ContentHash(*hash.as_bytes())
     }
 
     /// Get metadata key for a content hash

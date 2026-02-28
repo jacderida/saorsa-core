@@ -76,7 +76,6 @@ subtle = "2.6"
 curve25519-dalek = "4.1.3"
 # TODO: Remove once fully migrated to saorsa-pqc - keeping temporarily for compatibility
 blake3 = "1.6"
-hmac = "0.12"
 hkdf = "0.12"
 
 # Performance optimization
@@ -125,10 +124,7 @@ rusqlite = { version = "0.37", features = ["chrono", "serde_json", "uuid", "bund
 # Exact pin required: >=0.5.1 doesn't override transitive resolution under -Z minimal-versions
 wyz = "=0.5.1"
 
-
-# CLI dependencies (needed for identity CLI types used in tests)
 clap = { version = "4.5", features = ["derive"] }
-sha2 = "0.10"
 
 [build-dependencies]
 # No build dependencies currently required

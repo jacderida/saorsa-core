@@ -16,7 +16,6 @@ pub struct GroupMember {
 use anyhow::Result;
 use saorsa_pqc::MlDsaOperations; // bring trait into scope for verify()
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// Provider that supplies a snapshot of a group's identity packet
@@ -58,14 +57,12 @@ impl DefaultMlsVerifier {
 
     fn make_msg(group_id: &[u8], epoch: u64, record: &[u8]) -> Vec<u8> {
         const DST: &[u8] = b"saorsa-mls:dht-proof:v1";
-        let mut hasher = Sha256::new();
-        hasher.update(record);
-        let record_hash = hasher.finalize();
+        let record_hash = blake3::hash(record);
         let mut msg = Vec::with_capacity(DST.len() + group_id.len() + 8 + 32);
         msg.extend_from_slice(DST);
         msg.extend_from_slice(group_id);
         msg.extend_from_slice(&epoch.to_be_bytes());
-        msg.extend_from_slice(&record_hash);
+        msg.extend_from_slice(record_hash.as_bytes());
         msg
     }
 }

@@ -20,7 +20,6 @@ use super::*;
 use crate::identity::node_identity as pqc_identity;
 use crate::quantum_crypto::ant_quic_integration::MlDsaSignature;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Node identity with cryptographic keys
@@ -55,7 +54,7 @@ impl NodeIdentity {
         Err(AdaptiveNetworkError::Other("unsupported".into()))
     }
 
-    /// Compute node ID from public key (SHA-256 hash)
+    /// Compute node ID from public key (BLAKE3 hash)
     pub fn compute_node_id(_unused: &()) -> PeerId {
         self::super::PeerId::from_bytes([0u8; 32])
     }

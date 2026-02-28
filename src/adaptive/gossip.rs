@@ -652,17 +652,13 @@ impl AdaptiveGossipSub {
 
     /// Compute message ID
     pub fn compute_message_id(&self, message: &GossipMessage) -> MessageId {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(message.topic.as_bytes());
         hasher.update(message.from.to_bytes());
-        hasher.update(message.seqno.to_le_bytes());
+        hasher.update(&message.seqno.to_le_bytes());
         hasher.update(&message.data);
 
-        let result = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&result);
-        id
+        *hasher.finalize().as_bytes()
     }
 
     /// Send message to a peer (placeholder)

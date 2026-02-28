@@ -15,7 +15,6 @@
 
 use super::node_identity::{PeerId, NodeIdentity};
 use crate::{P2PError, Result};
-use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;

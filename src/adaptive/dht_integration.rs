@@ -29,7 +29,6 @@ use crate::dht_network_manager::{
 use crate::{Multiaddr, P2PNode};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
-use sha2::Digest;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::str::FromStr;
@@ -793,14 +792,12 @@ impl AdaptiveDHT {
 
         self.put(dht_key, value.clone()).await?;
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(dht_key);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&dht_key);
         hasher.update(&value);
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
+        let hash = hasher.finalize();
 
-        Ok(ContentHash(hash))
+        Ok(ContentHash(*hash.as_bytes()))
     }
 
     /// Retrieve value from DHT using a content hash key.

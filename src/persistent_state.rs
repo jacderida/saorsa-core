@@ -35,7 +35,7 @@ use crate::secure_memory::SecureMemory;
 use crate::{P2PError, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use blake3;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -738,9 +738,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq + Send + Sync 
         })?;
 
         // Calculate checksum
-        let mut hasher = Sha256::new();
-        hasher.update(&snapshot_data);
-        let checksum: [u8; 32] = hasher.finalize().into();
+        let checksum: [u8; 32] = *blake3::hash(&snapshot_data).as_bytes();
 
         // Create snapshot header
         let header = SnapshotHeader {
@@ -862,9 +860,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq + Send + Sync 
                         ))
                     })?;
 
-                    let mut hasher = Sha256::new();
-                    hasher.update(&data);
-                    let checksum: [u8; 32] = hasher.finalize().into();
+                    let checksum: [u8; 32] = *blake3::hash(&data).as_bytes();
 
                     if checksum != header.checksum {
                         stats.corruption_events.push(CorruptionEvent {
@@ -1076,35 +1072,30 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq + Send + Sync 
 
     /// Calculate HMAC for WAL entry
     fn calculate_entry_hmac(&self, entry: &WalEntry) -> Result<[u8; 32]> {
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<Sha256>;
+        let mut data = Vec::new();
+        data.extend_from_slice(&entry.version.to_le_bytes());
+        data.extend_from_slice(&entry.transaction_id.to_le_bytes());
+        data.extend_from_slice(&entry.timestamp.to_le_bytes());
+        data.extend_from_slice(&[entry.transaction_type as u8]);
+        data.extend_from_slice(entry.key.as_bytes());
 
-        let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_slice()).map_err(|e| {
+        if let Some(ref value) = entry.value {
+            data.extend_from_slice(value);
+        }
+
+        let key: [u8; 32] = self.hmac_key.as_slice().try_into().map_err(|_| {
             P2PError::Security(SecurityError::InvalidKey(
-                format!("Failed to create HMAC: {e}").into(),
+                "HMAC key must be exactly 32 bytes".into(),
             ))
         })?;
 
-        mac.update(&entry.version.to_le_bytes());
-        mac.update(&entry.transaction_id.to_le_bytes());
-        mac.update(&entry.timestamp.to_le_bytes());
-        mac.update(&[entry.transaction_type as u8]);
-        mac.update(entry.key.as_bytes());
-
-        if let Some(ref value) = entry.value {
-            mac.update(value);
-        }
-
-        Ok(mac.finalize().into_bytes().into())
+        Ok(*blake3::keyed_hash(&key, &data).as_bytes())
     }
 
     /// Verify WAL entry HMAC
     fn verify_wal_entry(&self, entry: &WalEntry) -> bool {
-        let mut temp_entry = entry.clone();
-        temp_entry.hmac = [0u8; 32];
-
-        match self.calculate_entry_hmac(&temp_entry) {
-            Ok(calculated_hmac) => calculated_hmac == entry.hmac,
+        match self.calculate_entry_hmac(entry) {
+            Ok(computed) => computed == entry.hmac,
             Err(_) => false,
         }
     }
@@ -1434,9 +1425,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone + PartialEq + Send + Sync 
             ))
         })?;
 
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        let checksum: [u8; 32] = hasher.finalize().into();
+        let checksum: [u8; 32] = *blake3::hash(&data).as_bytes();
 
         if checksum != header.checksum {
             return Err(P2PError::Storage(

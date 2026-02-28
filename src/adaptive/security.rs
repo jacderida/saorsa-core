@@ -24,7 +24,6 @@ use super::*;
 use crate::PeerId;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -685,14 +684,9 @@ impl SecurityManager {
 
     /// Verify node identity by binding PeerId to the advertised ML-DSA public key
     async fn verify_identity(&self, node: &NodeDescriptor) -> bool {
-        // PeerId is defined as SHA-256(pubkey)
-        use sha2::Digest;
-
-        let bytes = node.public_key.as_bytes();
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(bytes);
-        let digest = hasher.finalize();
-        node.id.to_bytes() == digest.as_slice()
+        // PeerId is defined as BLAKE3(pubkey)
+        let hash = blake3::hash(node.public_key.as_bytes());
+        node.id.to_bytes() == hash.as_bytes()
     }
 }
 
@@ -1019,11 +1013,9 @@ impl IntegrityVerifier {
         let mut stats = self.stats.write().await;
         stats.total_verified += 1;
 
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let computed_hash = hasher.finalize();
+        let computed_hash = blake3::hash(content);
 
-        if computed_hash.as_slice() == expected_hash {
+        if computed_hash.as_bytes() == expected_hash {
             true
         } else {
             stats.failed_verifications += 1;
@@ -1331,12 +1323,10 @@ mod tests {
         let verifier = IntegrityVerifier::new(config);
 
         let content = b"Test content";
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let correct_hash = hasher.finalize();
+        let correct_hash = blake3::hash(content);
 
         // Should verify correct hash
-        assert!(verifier.verify_hash(content, &correct_hash).await);
+        assert!(verifier.verify_hash(content, correct_hash.as_bytes()).await);
 
         // Should fail with incorrect hash
         let wrong_hash = [0u8; 32];
@@ -1391,7 +1381,7 @@ mod tests {
         let manager = SecurityManager::new(config, &identity);
 
         // Test node join validation
-        // Generate a valid ML-DSA key and derive matching PeerId via SHA-256(pubkey)
+        // Generate a valid ML-DSA key and derive matching PeerId via BLAKE3(pubkey)
         let (ml_pub, _ml_sec) = crate::quantum_crypto::generate_ml_dsa_keypair().unwrap();
         let derived_id = crate::peer_record::PeerId::from_public_key(&ml_pub);
         let node = NodeDescriptor {

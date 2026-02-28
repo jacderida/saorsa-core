@@ -104,10 +104,7 @@ impl MlDsaState {
         let signature = MlDsaSignature(signature_bytes);
 
         // Cache signature
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(message);
-        let message_hash = hasher.finalize().into();
+        let message_hash: [u8; 32] = *blake3::hash(message).as_bytes();
 
         self.signatures.push(CachedSignature {
             message_hash,
@@ -135,10 +132,7 @@ impl MlDsaState {
 
     /// Get cached signature if available
     pub fn get_cached_signature(&self, message: &[u8]) -> Option<&MlDsaSignature> {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(message);
-        let message_hash: [u8; 32] = hasher.finalize().into();
+        let message_hash: [u8; 32] = *blake3::hash(message).as_bytes();
 
         self.signatures
             .iter()

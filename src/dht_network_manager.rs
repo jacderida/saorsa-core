@@ -76,7 +76,7 @@ pub struct DHTNode {
     pub address: String,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
-    /// Cached DHT key to avoid repeated SHA-256 hashing during distance comparisons.
+    /// Cached DHT key to avoid repeated BLAKE3 hashing during distance comparisons.
     ///
     /// Lifecycle / invariants:
     /// - This cache is **lazily populated** via `ensure_cached_dht_key` the first time a
@@ -294,7 +294,7 @@ pub struct DhtNetworkManager {
     maintenance_scheduler: Arc<RwLock<MaintenanceScheduler>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
-    /// Cached local DHT key to avoid repeated SHA-256 hashing
+    /// Cached local DHT key to avoid repeated BLAKE3 hashing
     /// PERF-001: Eliminates redundant computation in message handlers
     local_dht_key: DhtKey,
     /// Hex-encoded local DHT key, cached to avoid repeated allocation in
@@ -1470,7 +1470,7 @@ impl DhtNetworkManager {
 
     /// Compare two nodes by their XOR distance to a target key
     ///
-    /// PERF-001: Uses cached DHT keys to avoid repeated SHA-256 hashing.
+    /// PERF-001: Uses cached DHT keys to avoid repeated BLAKE3 hashing.
     /// Falls back to parse_peer_id_to_key only if cached key is missing.
     ///
     /// If a peer ID cannot be decoded, it is placed at the end (treated as maximum distance).
@@ -1836,7 +1836,7 @@ impl DhtNetworkManager {
 
     /// Check whether `peer_id` refers to this node in either ID format:
     /// 1. App-level peer ID (`"peer_xxxx"`)
-    /// 2. DHT key (hex of SHA-256 of the peer ID)
+    /// 2. DHT key (hex of BLAKE3 of the peer ID)
     fn is_local_peer_id(&self, peer_id: &str) -> bool {
         peer_id == self.config.peer_id || peer_id == self.local_dht_key_hex
     }

@@ -26,7 +26,7 @@
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use blake3;
 use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
@@ -36,25 +36,21 @@ use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey
 
 // No four-word address tied to identity; addressing is handled elsewhere.
 
-/// Length of a PeerId in bytes (SHA-256 output).
+/// Length of a PeerId in bytes (BLAKE3 output).
 pub const PEER_ID_BYTE_LEN: usize = 32;
 
 /// Peer ID derived from public key (256-bit).
 ///
 /// The canonical peer identity in the Saorsa network. Computed as the
-/// SHA-256 hash of the node's ML-DSA-65 public key.
+/// BLAKE3 hash of the node's ML-DSA-65 public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
 
 impl PeerId {
     /// Create from ML-DSA public key
     pub fn from_public_key(public_key: &MlDsaPublicKey) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(public_key.as_bytes());
-        let hash = hasher.finalize();
-        let mut id = [0u8; PEER_ID_BYTE_LEN];
-        id.copy_from_slice(&hash);
-        Self(id)
+        let hash = blake3::hash(public_key.as_bytes());
+        Self(*hash.as_bytes())
     }
 
     /// Convert to bytes

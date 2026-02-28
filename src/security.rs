@@ -23,7 +23,7 @@ use crate::quantum_crypto::ant_quic_integration::{
 use anyhow::{Result, anyhow};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use blake3;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -96,7 +96,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
         let public_key = public.as_bytes().to_vec();
         let ip_octets = ip_addr.octets_vec();
 
-        // Generate node ID: SHA256(ip_address || public_key || salt || timestamp)
+        // Generate node ID: BLAKE3(ip_address || public_key || salt || timestamp)
         let node_id = Self::compute_node_id(&ip_octets, &public_key, &salt, timestamp_secs);
 
         // Create signature proving ownership
@@ -178,12 +178,12 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
         salt: &[u8],
         timestamp_secs: u64,
     ) -> Vec<u8> {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(ip_octets);
         hasher.update(public_key);
         hasher.update(salt);
-        hasher.update(timestamp_secs.to_le_bytes());
-        hasher.finalize().to_vec()
+        hasher.update(&timestamp_secs.to_le_bytes());
+        hasher.finalize().as_bytes().to_vec()
     }
 
     #[inline]

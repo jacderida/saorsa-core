@@ -432,13 +432,8 @@ pub struct BootstrapStats {
 
 /// Convert saorsa PeerId (String) to ant-quic PeerId ([u8; 32])
 fn string_to_ant_peer_id(peer_id: &str) -> ant_quic::nat_traversal_api::PeerId {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(peer_id.as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    ant_quic::nat_traversal_api::PeerId(bytes)
+    let hash = blake3::hash(peer_id.as_bytes());
+    ant_quic::nat_traversal_api::PeerId(*hash.as_bytes())
 }
 
 /// Convert IP address to IPv6 (IPv4 mapped if needed)

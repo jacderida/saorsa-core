@@ -5,7 +5,6 @@
 
 use super::node_identity::{IdentityData, NodeIdentity, PeerId};
 use crate::Result;
-use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -191,8 +190,8 @@ impl IdentityCliHandler {
         let identity = if let Some(seed_str) = seed {
             // Deterministic generation from seed
             let mut seed_bytes = [0u8; 32];
-            let seed_hash = sha2::Sha256::digest(seed_str.as_bytes());
-            seed_bytes.copy_from_slice(&seed_hash);
+            let seed_hash = blake3::hash(seed_str.as_bytes());
+            seed_bytes.copy_from_slice(seed_hash.as_bytes());
             NodeIdentity::from_seed(&seed_bytes)?
         } else {
             NodeIdentity::generate()?
@@ -308,7 +307,7 @@ impl IdentityCliHandler {
                 })?;
         }
 
-        let message_hash = hex::encode(sha2::Sha256::digest(&message_bytes));
+        let message_hash = blake3::hash(&message_bytes).to_hex();
         Ok(format!(
             "Signature: {}\nMessage hash: {}",
             sig_hex, message_hash

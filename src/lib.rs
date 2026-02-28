@@ -322,7 +322,7 @@ pub use crate::placement::{
     WeightedPlacementStrategy,
 };
 
-// Canonical peer identity type — 32-byte SHA-256 hash of ML-DSA-65 public key.
+// Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
 pub use identity::node_identity::PeerId;
 
 /// Transport channel identifier (e.g. a QUIC connection).

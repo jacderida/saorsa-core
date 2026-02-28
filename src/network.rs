@@ -2185,7 +2185,7 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // PeerId is derived from the cryptographic identity (32-byte SHA-256 hash)
+        // PeerId is derived from the cryptographic identity (32-byte BLAKE3 hash)
         assert_eq!(node.peer_id().to_hex().len(), 64);
         assert!(!node.is_running());
         assert_eq!(node.peer_count().await, 0);
@@ -2201,7 +2201,7 @@ mod tests {
 
         let node = P2PNode::new(config).await?;
 
-        // Should have generated a cryptographic peer ID (64-char hex SHA-256 of public key)
+        // Should have generated a cryptographic peer ID (64-char hex BLAKE3 of public key)
         assert_eq!(node.peer_id().to_hex().len(), 64);
         assert!(node.peer_id().to_hex().chars().all(|c| c.is_ascii_hexdigit()));
         assert!(!node.is_running());

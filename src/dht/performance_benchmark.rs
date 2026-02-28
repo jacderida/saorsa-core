@@ -4,7 +4,6 @@
 //! from the optimized DHT storage implementation.
 
 use crate::dht::{Key, Record, DHTConfig, DHTStorage, PeerId, optimized_storage::OptimizedDHTStorage};
-use sha2::Digest;
 use std::collections::HashMap;
 use std::time::{Instant, Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -78,10 +77,8 @@ impl DHTPerformanceBenchmark {
             let key = Key::new(format!("test_key_{}", i).as_bytes());
             let value = format!("test_value_{}", i).into_bytes();
             let publisher = {
-                let hash = sha2::Sha256::digest(format!("publisher_{}", i % 10).as_bytes());
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&hash);
-                PeerId::from_bytes(bytes)
+                let hash = blake3::hash(format!("publisher_{}", i % 10).as_bytes());
+                PeerId::from_bytes(*hash.as_bytes())
             }; // 10 different publishers
             let record = Record::new(key, value, publisher);
             test_data.push(record);
@@ -234,10 +231,8 @@ impl DHTPerformanceBenchmark {
             let key = Key::new(format!("expired_key_{}", i).as_bytes());
             let value = format!("expired_value_{}", i).into_bytes();
             let publisher = {
-                let hash = sha2::Sha256::digest(b"expired_publisher");
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&hash);
-                PeerId::from_bytes(bytes)
+                let hash = blake3::hash(b"expired_publisher");
+                PeerId::from_bytes(*hash.as_bytes())
             };
             let mut record = Record::new(key, value, publisher);
             
@@ -328,10 +323,8 @@ pub async fn demonstrate_memory_bounds() {
         let key = Key::new(format!("memory_test_{}", i).as_bytes());
         let value = vec![0u8; 1024]; // 1KB records
         let publisher = {
-            let hash = sha2::Sha256::digest(b"memory_tester");
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&hash);
-            PeerId::from_bytes(bytes)
+            let hash = blake3::hash(b"memory_tester");
+            PeerId::from_bytes(*hash.as_bytes())
         };
         let record = Record::new(key, value, publisher);
         
