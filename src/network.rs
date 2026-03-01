@@ -1369,9 +1369,30 @@ impl P2PNode {
         self.transport.is_peer_connected(peer_id).await
     }
 
-    /// Connect to a peer
+    /// Connect to a peer, returning the transport-level channel ID.
+    ///
+    /// The returned channel ID is **not** the app-level [`PeerId`]. To obtain
+    /// the authenticated peer identity, call
+    /// [`wait_for_peer_identity`](Self::wait_for_peer_identity) with the
+    /// returned channel ID.
     pub async fn connect_peer(&self, address: &str) -> Result<String> {
         self.transport.connect_peer(address).await
+    }
+
+    /// Wait for the identity exchange on `channel_id` to complete, returning
+    /// the authenticated [`PeerId`].
+    ///
+    /// Use this after [`connect_peer`](Self::connect_peer) to bridge the gap
+    /// between the transport-level channel ID and the app-level peer identity
+    /// required by [`send_message`](Self::send_message).
+    pub async fn wait_for_peer_identity(
+        &self,
+        channel_id: &str,
+        timeout: Duration,
+    ) -> Result<PeerId> {
+        self.transport
+            .wait_for_peer_identity(channel_id, timeout)
+            .await
     }
 
     /// Disconnect from a peer
@@ -1524,11 +1545,25 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
 }
 
 /// Verify the ML-DSA-65 signature on a WireMessage and return the authenticated [`PeerId`].
+///
+/// Besides verifying the cryptographic signature, this also checks that the
+/// self-asserted `from` field matches the [`PeerId`] derived from the public
+/// key. This prevents a sender from signing with their real key while
+/// claiming a different identity in the `from` field.
 fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId, String> {
     let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
         .map_err(|e| format!("invalid public key: {e:?}"))?;
 
-    let node_id = PeerId::from_public_key(&pubkey);
+    let peer_id = PeerId::from_public_key(&pubkey);
+
+    // Validate that the self-asserted `from` field matches the public key.
+    let expected_from = peer_id.to_hex();
+    if message.from != expected_from {
+        return Err(format!(
+            "from field mismatch: message claims '{}' but public key derives '{}'",
+            message.from, expected_from
+        ));
+    }
 
     let signable = postcard::to_stdvec(&(
         &message.protocol,
@@ -1545,7 +1580,7 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId
         .map_err(|e| format!("verification error: {e}"))?;
 
     if valid {
-        Ok(node_id)
+        Ok(peer_id)
     } else {
         Err("signature is invalid".to_string())
     }
@@ -1805,22 +1840,26 @@ impl P2PNode {
             return Ok(());
         }
 
-        // Connect to bootstrap peers and perform peer discovery
+        // Connect to bootstrap peers and perform peer discovery.
+        // `connect_peer` returns a transport-level channel ID, not an
+        // app-level PeerId.  We store channel IDs in the bootstrap cache
+        // as a provisional identifier until app-level identity exchange
+        // is implemented in the bootstrap handshake.
         let mut successful_connections = 0;
-        let mut connected_peer_ids: Vec<String> = Vec::new();
+        let mut connected_channel_ids: Vec<String> = Vec::new();
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
                 match self.connect_peer(&addr.to_string()).await {
-                    Ok(peer_id) => {
+                    Ok(channel_id) => {
                         successful_connections += 1;
-                        connected_peer_ids.push(peer_id.clone());
+                        connected_channel_ids.push(channel_id.clone());
 
                         // Update bootstrap cache with successful connection
                         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
                             let manager = bootstrap_manager.write().await;
                             let mut updated_contact = contact.clone();
-                            updated_contact.peer_id = peer_id.clone();
+                            updated_contact.peer_id = channel_id.clone();
                             updated_contact.update_connection_result(true, Some(100), None); // Assume 100ms latency for now
 
                             if let Err(e) = manager.add_contact(updated_contact).await {
@@ -1865,11 +1904,11 @@ impl P2PNode {
             successful_connections
         );
 
-        // Perform DHT peer discovery from connected bootstrap peers
-        // Uses the DHT manager's postcard protocol for correct deserialization
+        // Perform DHT peer discovery from connected bootstrap peers.
+        // Uses channel IDs which the DHT manager resolves internally.
         match self
             .dht_manager
-            .bootstrap_from_peers(&connected_peer_ids)
+            .bootstrap_from_peers(&connected_channel_ids)
             .await
         {
             Ok(count) => info!("DHT peer discovery found {} peers", count),
@@ -1882,7 +1921,7 @@ impl P2PNode {
         info!(
             "Bootstrap complete: connected to {} peers, initiated {} discovery requests",
             successful_connections,
-            connected_peer_ids.len()
+            connected_channel_ids.len()
         );
 
         Ok(())
@@ -3117,11 +3156,13 @@ mod tests {
         let identity = NodeIdentity::generate().expect("should generate identity");
         let protocol = "test/signed";
         let data: Vec<u8> = vec![10, 20, 30];
-        let from = "some-peer";
+        // The `from` field must match the PeerId derived from the public key.
+        let from = identity.peer_id().to_hex();
         let timestamp = current_timestamp();
 
         // Compute signable bytes the same way create_protocol_message does
-        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), from, timestamp)).unwrap();
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), from.as_str(), timestamp)).unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         let msg = WireMessage {
@@ -3160,18 +3201,19 @@ mod tests {
         let identity = NodeIdentity::generate().expect("should generate identity");
         let protocol = "test/bad-sig";
         let data: Vec<u8> = vec![1, 2, 3];
-        let from = "some-peer";
+        let from = identity.peer_id().to_hex();
         let timestamp = current_timestamp();
 
         // Sign correct signable bytes
-        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), from, timestamp)).unwrap();
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), from.as_str(), timestamp)).unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
-        // Tamper with the data
+        // Tamper with the data (signature was over [1,2,3], not [99,99,99])
         let msg = WireMessage {
             protocol: protocol.to_string(),
-            data: vec![99, 99, 99], // different data than what was signed
-            from: from.to_string(),
+            data: vec![99, 99, 99],
+            from,
             timestamp,
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
@@ -3181,6 +3223,36 @@ mod tests {
         assert!(
             parse_protocol_message(&bytes, "transport-xyz").is_none(),
             "message with bad signature should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_message_with_mismatched_from_is_rejected() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/from-mismatch";
+        let data: Vec<u8> = vec![1, 2, 3];
+        // Use a `from` field that does NOT match the public key's PeerId.
+        let fake_from = "deadbeef".repeat(8);
+        let timestamp = current_timestamp();
+
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), fake_from.as_str(), timestamp))
+                .unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data,
+            from: fake_from,
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        assert!(
+            parse_protocol_message(&bytes, "transport-xyz").is_none(),
+            "message with mismatched from field should be rejected"
         );
     }
 }

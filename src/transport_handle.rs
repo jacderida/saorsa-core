@@ -506,9 +506,21 @@ impl TransportHandle {
         self.peers.write().await.remove(channel_id).is_some()
     }
 
-    /// Check if a peer exists in the peers map.
+    /// Check if a peer is connected.
+    ///
+    /// Accepts either a transport-level channel ID (direct lookup in the
+    /// peers map) or a hex-encoded app-level [`PeerId`] (resolved via the
+    /// `peer_to_channel` index).
     pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
-        self.peers.read().await.contains_key(peer_id)
+        // Fast path: direct channel ID lookup.
+        if self.peers.read().await.contains_key(peer_id) {
+            return true;
+        }
+        // Slow path: try parsing as hex-encoded app-level PeerId.
+        if let Ok(app_id) = PeerId::from_hex(peer_id) {
+            return self.peer_to_channel.read().await.contains_key(&app_id);
+        }
+        false
     }
 
     /// Check if a connection to a peer is active at the transport layer (internal only).
@@ -587,10 +599,15 @@ impl TransportHandle {
             Ok(Ok(peer)) => {
                 let connected_peer_id = ant_peer_id_to_string(&peer);
 
-                // Prevent self-connections
-                if connected_peer_id == self.node_identity.peer_id().to_hex() {
+                // Prevent self-connections by comparing QUIC-level channel IDs.
+                // Both values live in the same namespace (transport-level peer
+                // identifiers from ant-quic), so the comparison is meaningful.
+                let is_self = self
+                    .channel_id()
+                    .is_some_and(|local| local == connected_peer_id);
+                if is_self {
                     warn!(
-                        "Detected self-connection to own address {} (peer_id: {}), rejecting",
+                        "Detected self-connection to own address {} (channel_id: {}), rejecting",
                         address, connected_peer_id
                     );
                     self.dual_node.disconnect_peer(&peer).await;
@@ -599,7 +616,7 @@ impl TransportHandle {
                     )));
                 }
 
-                info!("Successfully connected to peer: {}", connected_peer_id);
+                info!("Successfully connected to channel: {}", connected_peer_id);
                 connected_peer_id
             }
             Ok(Err(e)) => {
@@ -642,7 +659,6 @@ impl TransportHandle {
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
-        info!("Successfully connected to peer: {}", peer_id);
         Ok(peer_id)
     }
 
@@ -811,6 +827,35 @@ impl TransportHandle {
         self.peer_to_channel.read().await.contains_key(peer_id)
     }
 
+    /// Wait for the identity exchange to complete on `channel_id` and return
+    /// the authenticated app-level [`PeerId`].
+    ///
+    /// After [`connect_peer`](Self::connect_peer) returns a channel ID, the
+    /// remote's identity is not yet known — it arrives asynchronously via a
+    /// signed identity-announce message. This helper polls the
+    /// `channel_to_peers` index until the channel has an associated peer,
+    /// or the timeout expires.
+    pub async fn wait_for_peer_identity(
+        &self,
+        channel_id: &str,
+        timeout: Duration,
+    ) -> Result<PeerId> {
+        let deadline = Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(50);
+
+        loop {
+            // Check if any app-level peer has been authenticated on this channel.
+            let peers = self.peers_on_channel(channel_id).await;
+            if let Some(peer_id) = peers.into_iter().next() {
+                return Ok(peer_id);
+            }
+            if Instant::now() >= deadline {
+                return Err(P2PError::Timeout(timeout));
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Send a request and wait for a response (no trust reporting).
     ///
     /// This is the raw request-response correlation mechanism. Callers that
@@ -939,7 +984,7 @@ impl TransportHandle {
         let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
-            from: self.node_identity.peer_id().to_hex().clone(),
+            from: self.node_identity.peer_id().to_hex(),
             timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
@@ -1035,6 +1080,10 @@ impl TransportHandle {
     }
 
     /// Publish a message to all connected peers on the given topic.
+    ///
+    /// De-duplicates by app-level peer: when a peer has multiple channels,
+    /// the message is sent on only one channel. Unauthenticated channels
+    /// (not yet mapped to an app-level peer) are also included once each.
     pub async fn publish(&self, topic: &str, data: &[u8]) -> Result<()> {
         info!(
             "Publishing message to topic: {} ({} bytes)",
@@ -1042,16 +1091,35 @@ impl TransportHandle {
             data.len()
         );
 
-        let peer_list: Vec<String> = {
-            let peers_guard = self.peers.read().await;
-            peers_guard.keys().cloned().collect()
-        };
+        // Collect one channel per authenticated app-level peer.
+        let mut target_channels: Vec<String> = Vec::new();
+        let mut mapped_channels: HashSet<String> = HashSet::new();
+        {
+            let p2c = self.peer_to_channel.read().await;
+            for channels in p2c.values() {
+                if let Some(ch) = channels.iter().next() {
+                    mapped_channels.insert(ch.clone());
+                    target_channels.push(ch.clone());
+                }
+            }
+        }
 
-        if peer_list.is_empty() {
+        // Include unauthenticated channels that aren't mapped to any peer.
+        {
+            let peers_guard = self.peers.read().await;
+            for channel_id in peers_guard.keys() {
+                if !mapped_channels.contains(channel_id) {
+                    target_channels.push(channel_id.clone());
+                }
+            }
+        }
+
+        if target_channels.is_empty() {
             debug!("No peers connected, message will only be sent to local subscribers");
         } else {
             let mut send_count = 0;
-            for channel_id in &peer_list {
+            let total = target_channels.len();
+            for channel_id in &target_channels {
                 match self.send_on_channel(channel_id, topic, data.to_vec()).await {
                     Ok(()) => {
                         send_count += 1;
@@ -1064,8 +1132,7 @@ impl TransportHandle {
             }
             info!(
                 "Published message to {}/{} connected peers",
-                send_count,
-                peer_list.len()
+                send_count, total
             );
         }
 
