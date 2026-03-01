@@ -2379,40 +2379,26 @@ mod tests {
         })?;
 
         // Connect node1 → node2
-        let mut connected = false;
+        let mut channel_id = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
             match timeout(Duration::from_secs(2), node1.connect_peer(&node2_addr)).await {
-                Ok(Ok(_channel_id)) => {
-                    connected = true;
+                Ok(Ok(id)) => {
+                    channel_id = Some(id);
                     break;
                 }
                 Ok(Err(_)) | Err(_) => continue,
             }
         }
-        assert!(connected, "Failed to connect after 3 attempts");
+        let channel_id = channel_id.expect("Failed to connect after 3 attempts");
 
-        // Wait for identity exchange to complete (identity announce is sent
-        // automatically on connect). We know it's done when node1 sees node2
-        // in its connected peers (app-level peer list).
-        let target_peer_id = node2_peer_id;
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let peers = node1.transport().connected_peers().await;
-                if peers.contains(&target_peer_id) {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            P2PError::Network(crate::error::NetworkError::ProtocolError(
-                "Identity exchange timed out".to_string().into(),
-            ))
-        })?;
+        // Wait for identity exchange to complete via wait_for_peer_identity.
+        let target_peer_id = node1
+            .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
+            .await?;
+        assert_eq!(target_peer_id, node2_peer_id);
 
         // node1 sends a signed message → node2 authenticates → PeerConnected fires on node2
         node1
@@ -2473,35 +2459,17 @@ mod tests {
         })?;
 
         // Connect node1 to node2
-        match timeout(Duration::from_millis(500), node1.connect_peer(&node2_addr)).await {
-            Ok(res) => {
-                res?;
-            }
-            Err(_) => return Err(P2PError::Network(NetworkError::Timeout)),
-        };
+        let channel_id =
+            match timeout(Duration::from_millis(500), node1.connect_peer(&node2_addr)).await {
+                Ok(res) => res?,
+                Err(_) => return Err(P2PError::Network(NetworkError::Timeout)),
+            };
 
-        // Wait for identity exchange (node2's PeerId appears in node1's connected peers).
-        let target_peer_id = node2.peer_id().clone();
-        let exchange_ok = timeout(Duration::from_secs(2), async {
-            loop {
-                if node1
-                    .transport()
-                    .connected_peers()
-                    .await
-                    .contains(&target_peer_id)
-                {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await;
-        if exchange_ok.is_err() {
-            // Identity exchange didn't complete — skip send test
-            node1.stop().await?;
-            node2.stop().await?;
-            return Ok(());
-        }
+        // Wait for identity exchange via wait_for_peer_identity.
+        let target_peer_id = node1
+            .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
+            .await?;
+        assert_eq!(target_peer_id, node2.peer_id().clone());
 
         // Send a message
         let message_data = b"Hello, peer!".to_vec();
