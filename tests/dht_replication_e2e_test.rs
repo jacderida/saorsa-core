@@ -41,7 +41,7 @@ fn key_from_str(s: &str) -> Key {
 
 /// Create a DhtNetworkConfig and TransportHandle for testing
 async fn create_node_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .peer_id(peer.clone())
         .listen_port(0) // Ephemeral port

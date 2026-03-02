@@ -432,7 +432,7 @@ async fn test_periodic_tasks_updates_last_seen() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
+    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
 
     // Get initial peer info to check last_seen
     // NOTE: This requires exposing peer info - we may need to add a method
@@ -489,7 +489,7 @@ async fn test_stale_peer_removal() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
+    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
 
     assert!(node1.is_peer_connected(&peer2_id).await);
     info!("Initial connection established");
@@ -1389,7 +1389,7 @@ async fn test_peer_cleanup_timing() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
     let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
+    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
 
     assert!(
         node1.is_peer_connected(&peer2_id).await,

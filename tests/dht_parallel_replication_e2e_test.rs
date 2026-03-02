@@ -37,7 +37,7 @@ async fn create_test_dht_config(
     port: u16,
     replication_factor: usize,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .peer_id(peer.clone())
         .listen_port(port)

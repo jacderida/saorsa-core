@@ -837,7 +837,7 @@ impl P2PNode {
         let pre_trusted: HashSet<PeerId> = config
             .bootstrap_peers_str
             .iter()
-            .map(|p| peer_id_from_hex(p))
+            .map(|p| PeerId::from_name(p))
             .collect();
         let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
         trust_engine.clone().start_background_updates();
@@ -1426,23 +1426,6 @@ const MAX_MESSAGE_AGE_SECS: u64 = 300;
 /// Maximum allowed future timestamp (30 seconds to account for clock drift)
 const MAX_FUTURE_SECS: u64 = 30;
 
-/// Parse a hex-encoded PeerId string into a `PeerId` for trust lookups.
-///
-/// PeerId strings are hex-encoded 32-byte identifiers. This decodes them
-/// back to raw bytes. Falls back to blake3 hash for non-hex IDs.
-pub fn peer_id_from_hex(peer_id: &str) -> PeerId {
-    if let Ok(bytes) = hex::decode(peer_id)
-        && bytes.len() == 32
-    {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        return PeerId::from_bytes(arr);
-    }
-    // Non-hex or wrong length: hash the raw string bytes
-    let hash = blake3::hash(peer_id.as_bytes());
-    PeerId::from_bytes(*hash.as_bytes())
-}
-
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
     P2PError::Network(NetworkError::ProtocolError(msg.to_string().into()))
@@ -1770,7 +1753,7 @@ impl P2PNode {
                 if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
                     seen_addresses.insert(socket_addr);
                     let contact = ContactEntry::new(
-                        peer_id_from_hex(&format!(
+                        PeerId::from_name(&format!(
                             "cli_peer_{}",
                             addr.chars().take(8).collect::<String>()
                         )),
@@ -1847,13 +1830,13 @@ impl P2PNode {
                 match self.connect_peer(&addr.to_string()).await {
                     Ok(channel_id) => {
                         successful_connections += 1;
-                        connected_peer_ids.push(peer_id_from_hex(&channel_id));
+                        connected_peer_ids.push(PeerId::from_hex(&channel_id)?);
 
                         // Update bootstrap cache with successful connection
                         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
                             let manager = bootstrap_manager.write().await;
                             let mut updated_contact = contact.clone();
-                            updated_contact.peer_id = peer_id_from_hex(&channel_id);
+                            updated_contact.peer_id = PeerId::from_hex(&channel_id)?;
                             updated_contact.update_connection_result(true, Some(100), None); // Assume 100ms latency for now
 
                             if let Err(e) = manager.add_contact(updated_contact).await {
@@ -2115,7 +2098,7 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            peer_id: Some(peer_id_from_hex("test_peer_123")),
+            peer_id: Some(PeerId::from_name("test_peer_123")),
             listen_addrs: vec![
                 std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
@@ -2276,7 +2259,7 @@ mod tests {
     async fn test_peer_connection() -> Result<()> {
         let config1 = create_test_node_config();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some(peer_id_from_hex("test_peer_456"));
+        config2.peer_id = Some(PeerId::from_name("test_peer_456"));
 
         let node1 = P2PNode::new(config1).await?;
         let node2 = P2PNode::new(config2).await?;
@@ -2349,7 +2332,7 @@ mod tests {
 
         let node2_peer_id = identity2.peer_id().clone();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some(peer_id_from_hex("test_peer_456"));
+        config2.peer_id = Some(PeerId::from_name("test_peer_456"));
         config2.listen_addr = ipv4_localhost;
         config2.listen_addrs = vec![ipv4_localhost];
         config2.enable_ipv6 = false;
@@ -2576,7 +2559,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_builder() -> Result<()> {
         // Create a config using the builder but don't actually build a real node
-        let builder_peer_id = peer_id_from_hex("builder_test_peer");
+        let builder_peer_id = PeerId::from_name("builder_test_peer");
         let builder = P2PNode::builder()
             .with_peer_id(builder_peer_id.clone())
             .listen_on("/ip4/127.0.0.1/tcp/0")
@@ -2641,7 +2624,7 @@ mod tests {
     #[tokio::test]
     async fn test_network_event_variants() {
         // Test that all network event variants can be created
-        let peer_id = peer_id_from_hex("test_peer");
+        let peer_id = PeerId::from_name("test_peer");
         let address = "/ip4/127.0.0.1/tcp/9000".to_string();
 
         let _peer_connected = NetworkEvent::PeerConnected {
@@ -2899,7 +2882,7 @@ mod tests {
 
         // Add a peer
         let channel_id = "peer_to_remove".to_string();
-        let channel_peer_id = peer_id_from_hex(&channel_id);
+        let channel_peer_id = PeerId::from_name(&channel_id);
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
@@ -2948,7 +2931,7 @@ mod tests {
         let node = P2PNode::new(config).await?;
 
         let channel_id = "test_peer".to_string();
-        let channel_peer_id = peer_id_from_hex(&channel_id);
+        let channel_peer_id = PeerId::from_name(&channel_id);
 
         // Initially not connected
         assert!(!node.is_peer_connected(&channel_peer_id).await);

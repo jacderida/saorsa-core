@@ -18,7 +18,6 @@
 //! - `P2PNode::parse_request_envelope` helper
 
 use saorsa_core::error::PeerFailureReason;
-use saorsa_core::network::peer_id_from_hex;
 use saorsa_core::{DhtNetworkResult, PeerStoreOutcome};
 
 /// Mirror of the private `RequestResponseEnvelope` for constructing test bytes.
@@ -116,7 +115,7 @@ fn test_failure_reason_serde_roundtrip() {
 #[test]
 fn test_peer_store_outcome_success() {
     let outcome = PeerStoreOutcome {
-        peer_id: peer_id_from_hex("peer_abc123"),
+        peer_id: saorsa_core::PeerId::from_name("peer_abc123"),
         success: true,
         error: None,
     };
@@ -127,7 +126,7 @@ fn test_peer_store_outcome_success() {
 #[test]
 fn test_peer_store_outcome_failure() {
     let outcome = PeerStoreOutcome {
-        peer_id: peer_id_from_hex("peer_def456"),
+        peer_id: saorsa_core::PeerId::from_name("peer_def456"),
         success: false,
         error: Some("Connection refused".to_string()),
     };
@@ -137,7 +136,7 @@ fn test_peer_store_outcome_failure() {
 
 #[test]
 fn test_peer_store_outcome_serde_roundtrip() {
-    let peer_test = peer_id_from_hex("peer_test");
+    let peer_test = saorsa_core::PeerId::from_name("peer_test");
     let outcome = PeerStoreOutcome {
         peer_id: peer_test.clone(),
         success: false,
@@ -153,7 +152,7 @@ fn test_peer_store_outcome_serde_roundtrip() {
 #[test]
 fn test_peer_store_outcome_serde_default_fields() {
     // Construct a PeerStoreOutcome without optional error field and roundtrip it
-    let peer_old = peer_id_from_hex("peer_old");
+    let peer_old = saorsa_core::PeerId::from_name("peer_old");
     let outcome = PeerStoreOutcome {
         peer_id: peer_old.clone(),
         success: true,
@@ -173,12 +172,12 @@ fn test_put_success_with_peer_outcomes() {
     let key = [42u8; 32];
     let outcomes = vec![
         PeerStoreOutcome {
-            peer_id: peer_id_from_hex("peer_a"),
+            peer_id: saorsa_core::PeerId::from_name("peer_a"),
             success: true,
             error: None,
         },
         PeerStoreOutcome {
-            peer_id: peer_id_from_hex("peer_b"),
+            peer_id: saorsa_core::PeerId::from_name("peer_b"),
             success: false,
             error: Some("timeout".to_string()),
         },

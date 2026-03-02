@@ -69,7 +69,7 @@ fn key_from_str(s: &str) -> Key {
 
 /// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .peer_id(peer.clone())
         .listen_port(0) // Random port

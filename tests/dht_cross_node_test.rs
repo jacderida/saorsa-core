@@ -36,7 +36,7 @@ async fn create_test_dht_config(
     peer_id: &str,
     port: u16,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .peer_id(peer.clone())
         .listen_port(port)
@@ -197,7 +197,7 @@ async fn test_cross_node_dht_store_retrieve() -> Result<()> {
 async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     // Create DhtNetworkManager (DHT layer)
     // The caller creates a TransportHandle (transport layer) and passes it in
-    let arch_peer = saorsa_core::network::peer_id_from_hex("architecture_test_node");
+    let arch_peer = saorsa_core::PeerId::from_name("architecture_test_node");
     let node_config = NodeConfig::builder()
         .peer_id(arch_peer.clone())
         .listen_port(0)
@@ -268,9 +268,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
 async fn test_p2p_node_local_dht_only() -> Result<()> {
     // Create P2PNode (transport layer only)
     let node_config = NodeConfig::builder()
-        .peer_id(saorsa_core::network::peer_id_from_hex(
-            "local_only_test_node",
-        ))
+        .peer_id(saorsa_core::PeerId::from_name("local_only_test_node"))
         .listen_port(0)
         .ipv6(false)
         .build()?;

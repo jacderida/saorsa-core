@@ -121,6 +121,15 @@ impl PeerId {
         Self(bytes)
     }
 
+    /// Create a deterministic PeerId by blake3-hashing an arbitrary name.
+    ///
+    /// Use this for synthetic identifiers (e.g. CLI peer placeholders, test
+    /// peers) where you don't have a real hex-encoded peer ID.
+    pub fn from_name(name: &str) -> Self {
+        let hash = blake3::hash(name.as_bytes());
+        Self(*hash.as_bytes())
+    }
+
     /// Create a random peer identifier (primarily for tests/simulation).
     pub fn random() -> Self {
         Self(rand::random())

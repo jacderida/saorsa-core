@@ -343,10 +343,6 @@ impl AdaptiveDHT {
         PeerId::from_bytes(*key)
     }
 
-    fn peer_id_from_hex(peer_id: &str) -> PeerId {
-        crate::network::peer_id_from_hex(peer_id)
-    }
-
     fn xor_distance_score(a: &PeerId, b: &PeerId) -> f64 {
         let mut distance = 0u32;
         for i in 0..32 {
@@ -478,7 +474,8 @@ impl AdaptiveDHT {
         let mut trust_rejections = 0u64;
 
         for candidate in candidates {
-            let node_id = Self::peer_id_from_hex(&candidate.peer_id);
+            let node_id = PeerId::from_hex(&candidate.peer_id)
+                .unwrap_or_else(|_| PeerId::from_name(&candidate.peer_id));
             let address = Multiaddr::from_str(&candidate.address).ok();
             let region = self.detect_region(&address).await;
             let trust = self.trust_provider.get_trust(&node_id).clamp(0.0, 1.0);

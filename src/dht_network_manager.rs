@@ -574,7 +574,7 @@ impl DhtNetworkManager {
         let candidate_nodes = self
             .find_closest_nodes_local(key, DHT_CLOSEST_NODES_COUNT)
             .await;
-        let requester_peer_id = crate::network::peer_id_from_hex(requester);
+        let requester_peer_id = PeerId::from_hex(requester)?;
         let closer_nodes = Self::filter_response_nodes(candidate_nodes, &requester_peer_id);
 
         if closer_nodes.is_empty() {
@@ -2105,7 +2105,7 @@ impl DhtNetworkManager {
             DhtNetworkOperation::Join => {
                 info!("Handling JOIN request from: {}", message.source);
                 // Add the joining node to our routing table
-                let source_peer_id = crate::network::peer_id_from_hex(&message.source);
+                let source_peer_id = PeerId::from_hex(&message.source)?;
                 let dht_key = crate::dht::derive_dht_key_from_peer_id(&source_peer_id);
                 let _node = DHTNode {
                     peer_id: source_peer_id.clone(),
