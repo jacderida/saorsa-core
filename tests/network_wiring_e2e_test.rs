@@ -132,24 +132,13 @@ async fn connect_and_identify(from: &P2PNode, to: &P2PNode) -> PeerId {
         .first()
         .expect("target node needs a listen address")
         .to_string();
-    let _channel = from.connect_peer(&addr).await.expect("connect_peer failed");
-    let target_id = to.peer_id().clone();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if from
-                .transport()
-                .connected_peers()
-                .await
-                .contains(&target_id)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("identity exchange timed out");
-    target_id
+    let channel_id = from.connect_peer(&addr).await.expect("connect_peer failed");
+    let peer_id = from
+        .wait_for_peer_identity(&channel_id, Duration::from_secs(5))
+        .await
+        .expect("identity exchange timed out");
+    assert_eq!(peer_id, *to.peer_id(), "identity mismatch after exchange");
+    peer_id
 }
 
 // =============================================================================
@@ -1858,24 +1847,13 @@ async fn test_zero_stale_threshold() {
     // Connection might succeed or fail immediately - both are valid
     let peer2_peer_id = node2.peer_id().clone();
     match node1.connect_peer(&addr2).await {
-        Ok(_channel) => {
+        Ok(channel_id) => {
             info!("Connection succeeded with zero threshold");
 
             // Wait briefly for identity exchange (may not complete with zero threshold)
-            let identified = timeout(Duration::from_secs(2), async {
-                loop {
-                    if node1
-                        .transport()
-                        .connected_peers()
-                        .await
-                        .contains(&peer2_peer_id)
-                    {
-                        break;
-                    }
-                    sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
+            let identified = node1
+                .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
+                .await;
 
             if identified.is_ok() {
                 // Try to send a message quickly

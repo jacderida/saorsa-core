@@ -41,24 +41,16 @@ async fn test_geoip_rejection_flow() {
     let mut event_rx = node_b.subscribe_events();
 
     // 3. Connect Node B to Node A
-    let _peer_id_a = node_b.connect_peer(&addr_a.to_string()).await.unwrap();
+    let channel_id_a = node_b.connect_peer(&addr_a.to_string()).await.unwrap();
 
-    // Wait for connection to be established and recognized by Node A
-    let start = std::time::Instant::now();
-    let mut connected_peer_id: Option<saorsa_core::PeerId> = None;
+    // Wait for identity exchange to complete (bidirectional). Once Node B sees
+    // Node A's identity, Node A should also know Node B's PeerId.
+    let _peer_a_id = node_b
+        .wait_for_peer_identity(&channel_id_a, Duration::from_secs(5))
+        .await
+        .expect("Identity exchange timed out");
 
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers_a = node_a.connected_peers().await;
-
-        if let Some(peer) = peers_a.into_iter().next() {
-            connected_peer_id = Some(peer);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let connected_peer_id =
-        connected_peer_id.expect("Node A did not recognize connection from Node B");
+    let connected_peer_id = node_b.peer_id().clone();
 
     // 4. Simulate Rejection: Node A sends RejectionMessage to Node B
     let rejection = RejectionMessage {

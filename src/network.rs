@@ -2495,6 +2495,9 @@ mod tests {
             .await;
         assert!(result.is_err(), "Sending to non-existent peer should fail");
 
+        node1.stop().await?;
+        node2.stop().await?;
+
         Ok(())
     }
 

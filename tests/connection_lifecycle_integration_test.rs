@@ -85,28 +85,17 @@ async fn test_connection_lifecycle_with_keepalive() {
     let addr2_str = addr2.to_string();
     debug!("Connecting node1 to node2 at {}", addr2_str);
 
-    let _channel_id = node1
+    let channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    // Wait for identity exchange so node1 knows node2's PeerId.
-    let peer2_peer_id = node2.peer_id().clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if node1
-                .transport()
-                .connected_peers()
-                .await
-                .contains(&peer2_peer_id)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("Identity exchange timed out");
+    // Wait for identity exchange via wait_for_peer_identity.
+    let peer2_peer_id = node1
+        .wait_for_peer_identity(&channel_id, Duration::from_secs(5))
+        .await
+        .expect("Identity exchange timed out");
+    assert_eq!(peer2_peer_id, *node2.peer_id());
 
     info!("Node1 connected to node2 (peer_id: {})", peer2_peer_id);
 
@@ -216,39 +205,19 @@ async fn test_send_message_validates_connection_state() {
     let addr2 = addrs2.first().expect("Node2 should have an address");
     let addr2_str = addr2.to_string();
 
-    let _channel_id = node1
+    let channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    // Wait for identity exchange.
-    let peer2_peer_id = node2.peer_id().clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if node1
-                .transport()
-                .connected_peers()
-                .await
-                .contains(&peer2_peer_id)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("Identity exchange timed out");
+    // Wait for identity exchange via wait_for_peer_identity.
+    let peer2_peer_id = node1
+        .wait_for_peer_identity(&channel_id, Duration::from_secs(5))
+        .await
+        .expect("Identity exchange timed out");
+    assert_eq!(peer2_peer_id, *node2.peer_id());
 
     info!("Connected to peer {}", peer2_peer_id);
-
-    // Verify connection is active
-    assert!(
-        node1
-            .transport()
-            .connected_peers()
-            .await
-            .contains(&peer2_peer_id)
-    );
 
     // Send initial message successfully
     node1
@@ -329,28 +298,17 @@ async fn test_multiple_message_exchanges() {
     let addr2 = addrs2.first().expect("Node2 should have an address");
     let addr2_str = addr2.to_string();
 
-    let _channel_id = node1
+    let channel_id = node1
         .connect_peer(&addr2_str)
         .await
         .expect("Failed to connect to node2");
 
-    // Wait for identity exchange.
-    let peer2_peer_id = node2.peer_id().clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if node1
-                .transport()
-                .connected_peers()
-                .await
-                .contains(&peer2_peer_id)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("Identity exchange timed out");
+    // Wait for identity exchange via wait_for_peer_identity.
+    let peer2_peer_id = node1
+        .wait_for_peer_identity(&channel_id, Duration::from_secs(5))
+        .await
+        .expect("Identity exchange timed out");
+    assert_eq!(peer2_peer_id, *node2.peer_id());
 
     info!("Connected to peer {}", peer2_peer_id);
 
