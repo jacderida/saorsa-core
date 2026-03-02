@@ -114,7 +114,7 @@ pub struct ConnectionPoolStats {
 #[derive(Debug, Clone)]
 pub struct TransportMessage {
     /// Sender peer ID
-    pub sender: String,
+    pub sender: crate::PeerId,
     /// Message data
     pub data: Vec<u8>,
     /// Protocol identifier
@@ -258,13 +258,13 @@ mod tests {
     #[test]
     fn test_transport_message_structure() {
         let message = TransportMessage {
-            sender: "test_peer".to_string(),
+            sender: crate::PeerId::from_name("test_peer"),
             data: vec![1, 2, 3, 4],
             protocol: "/p2p/test/1.0.0".to_string(),
             received_at: Instant::now(),
         };
 
-        assert_eq!(message.sender, "test_peer");
+        assert_eq!(message.sender, crate::PeerId::from_name("test_peer"));
         assert_eq!(message.data, vec![1, 2, 3, 4]);
         assert_eq!(message.protocol, "/p2p/test/1.0.0");
     }

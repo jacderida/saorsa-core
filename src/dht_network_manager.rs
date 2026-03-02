@@ -121,7 +121,7 @@ pub struct DhtNetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapNode {
     /// Node's peer ID
-    pub peer_id: String,
+    pub peer_id: PeerId,
     /// Network addresses
     pub addresses: Vec<Multiaddr>,
     /// Known DHT key (optional)
@@ -175,7 +175,7 @@ pub enum DhtNetworkResult {
     GetSuccess {
         key: Key,
         value: Vec<u8>,
-        source: String,
+        source: PeerId,
     },
     /// GET operation found no value
     GetNotFound {
@@ -196,11 +196,11 @@ pub enum DhtNetworkResult {
     ValueFound {
         key: Key,
         value: Vec<u8>,
-        source: String,
+        source: PeerId,
     },
     /// Ping response
     PongReceived {
-        responder: String,
+        responder: PeerId,
         latency: Duration,
     },
     /// Join confirmation
@@ -235,9 +235,9 @@ pub struct DhtNetworkMessage {
     /// Message ID for request/response correlation
     pub message_id: String,
     /// Source peer ID
-    pub source: String,
+    pub source: PeerId,
     /// Target peer ID (optional for broadcast)
-    pub target: Option<String>,
+    pub target: Option<PeerId>,
     /// Message type
     pub message_type: DhtMessageType,
     /// DHT operation payload (for requests)
@@ -326,7 +326,7 @@ struct DhtOperationContext {
     contacted_nodes: Vec<PeerId>,
     /// Oneshot sender for delivering the response
     /// None if response already sent (channel consumed)
-    response_tx: Option<oneshot::Sender<(String, DhtNetworkResult)>>,
+    response_tx: Option<oneshot::Sender<(PeerId, DhtNetworkResult)>>,
 }
 
 impl std::fmt::Debug for DhtOperationContext {
@@ -527,7 +527,7 @@ impl DhtNetworkManager {
     async fn handle_lookup_request(
         &self,
         key: &Key,
-        requester: &str,
+        requester: &PeerId,
         kind: LookupRequestKind,
     ) -> Result<DhtNetworkResult> {
         if kind != LookupRequestKind::FindNode {
@@ -537,14 +537,14 @@ impl DhtNetworkManager {
                         return Ok(DhtNetworkResult::GetSuccess {
                             key: *key,
                             value,
-                            source: self.config.peer_id.to_hex(),
+                            source: self.config.peer_id.clone(),
                         });
                     }
 
                     return Ok(DhtNetworkResult::ValueFound {
                         key: *key,
                         value,
-                        source: self.config.peer_id.to_hex(),
+                        source: self.config.peer_id.clone(),
                     });
                 }
                 Ok(None) => {}
@@ -574,8 +574,7 @@ impl DhtNetworkManager {
         let candidate_nodes = self
             .find_closest_nodes_local(key, DHT_CLOSEST_NODES_COUNT)
             .await;
-        let requester_peer_id = PeerId::from_hex(requester)?;
-        let closer_nodes = Self::filter_response_nodes(candidate_nodes, &requester_peer_id);
+        let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
 
         if closer_nodes.is_empty() {
             return Ok(DhtNetworkResult::GetNotFound {
@@ -879,7 +878,7 @@ impl DhtNetworkManager {
                 return Ok(DhtNetworkResult::GetSuccess {
                     key: *key,
                     value,
-                    source: self.config.peer_id.to_hex(),
+                    source: self.config.peer_id.clone(),
                 });
             }
             Ok(None) => {
@@ -1750,8 +1749,8 @@ impl DhtNetworkManager {
 
         let message = DhtNetworkMessage {
             message_id: message_id.clone(),
-            source: self.config.peer_id.to_hex(),
-            target: Some(peer_id.to_hex()),
+            source: self.config.peer_id.clone(),
+            target: Some(peer_id.clone()),
             message_type: DhtMessageType::Request,
             payload: operation,
             result: None, // Requests don't have results
@@ -1863,18 +1862,14 @@ impl DhtNetworkManager {
     /// (set by `parse_protocol_message`), so `is_known_app_peer_id` succeeds
     /// directly. For unsigned connections the channel ID itself is used as
     /// identity (e.g. in tests).
-    async fn canonical_app_peer_id(&self, peer_id: &str) -> Option<PeerId> {
-        // Try parsing as app-level PeerId hex and check the mapping
-        if let Ok(app_id) = PeerId::from_hex(peer_id)
-            && self.transport.is_known_app_peer_id(&app_id).await
-        {
-            return Some(app_id);
+    async fn canonical_app_peer_id(&self, peer_id: &PeerId) -> Option<PeerId> {
+        // Check if this is a known app-level peer ID
+        if self.transport.is_known_app_peer_id(peer_id).await {
+            return Some(peer_id.clone());
         }
         // Fallback: connected transport peer (unsigned connections)
-        if let Ok(fallback_id) = PeerId::from_hex(peer_id)
-            && self.transport.is_peer_connected(&fallback_id).await
-        {
-            return Some(fallback_id);
+        if self.transport.is_peer_connected(peer_id).await {
+            return Some(peer_id.clone());
         }
         None
     }
@@ -1943,7 +1938,7 @@ impl DhtNetworkManager {
     async fn wait_for_response(
         &self,
         _message_id: &str,
-        response_rx: oneshot::Receiver<(String, DhtNetworkResult)>,
+        response_rx: oneshot::Receiver<(PeerId, DhtNetworkResult)>,
     ) -> Result<DhtNetworkResult> {
         let response_timeout = self.config.request_timeout;
 
@@ -1983,7 +1978,7 @@ impl DhtNetworkManager {
     pub async fn handle_dht_message(
         &self,
         data: &[u8],
-        sender: &String,
+        sender: &PeerId,
     ) -> Result<Option<Vec<u8>>> {
         // SEC: Reject oversized messages before deserialization to prevent memory exhaustion
         if data.len() > MAX_MESSAGE_SIZE {
@@ -2098,17 +2093,16 @@ impl DhtNetworkManager {
             DhtNetworkOperation::Ping => {
                 info!("Handling PING request from: {}", message.source);
                 Ok(DhtNetworkResult::PongReceived {
-                    responder: self.config.peer_id.to_hex(),
+                    responder: self.config.peer_id.clone(),
                     latency: Duration::from_millis(0), // Local response
                 })
             }
             DhtNetworkOperation::Join => {
                 info!("Handling JOIN request from: {}", message.source);
                 // Add the joining node to our routing table
-                let source_peer_id = PeerId::from_hex(&message.source)?;
-                let dht_key = crate::dht::derive_dht_key_from_peer_id(&source_peer_id);
+                let dht_key = crate::dht::derive_dht_key_from_peer_id(&message.source);
                 let _node = DHTNode {
-                    peer_id: source_peer_id.clone(),
+                    peer_id: message.source.clone(),
                     address: String::new(),
                     distance: Some(dht_key.to_vec()),
                     reliability: 1.0,
@@ -2159,7 +2153,7 @@ impl DhtNetworkManager {
     async fn handle_dht_response(
         &self,
         message: &DhtNetworkMessage,
-        sender: &String,
+        sender: &PeerId,
     ) -> Result<()> {
         let message_id = &message.message_id;
         debug!("Handling DHT response for message_id: {message_id}");
@@ -2278,7 +2272,7 @@ impl DhtNetworkManager {
 
         Ok(DhtNetworkMessage {
             message_id: request.message_id.clone(),
-            source: self.config.peer_id.to_hex(),
+            source: self.config.peer_id.clone(),
             target: Some(request.source.clone()),
             message_type: DhtMessageType::Response,
             payload,
@@ -2297,7 +2291,7 @@ impl DhtNetworkManager {
     }
 
     /// Update peer information
-    async fn update_peer_info(&self, peer_id: String, _message: &DhtNetworkMessage) {
+    async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
                 "Ignoring DHT peer update for unauthenticated transport peer {}",
@@ -2526,8 +2520,6 @@ impl DhtNetworkManager {
                                             continue;
                                         };
                                         trace!("  [EVENT] Processing DHT message from {}", source_peer);
-                                        // The DHT layer uses hex strings internally for peer IDs.
-                                        let source_hex = source_peer.to_hex();
                                         // Process the DHT message with backpressure via semaphore
                                         let manager_clone = Arc::clone(&self_arc);
                                         let semaphore = Arc::clone(&self_arc.message_handler_semaphore);
@@ -2545,7 +2537,7 @@ impl DhtNetworkManager {
                                             // This ensures permits are released even if a handler gets stuck
                                             match tokio::time::timeout(
                                                 REQUEST_TIMEOUT,
-                                                manager_clone.handle_dht_message(&data, &source_hex),
+                                                manager_clone.handle_dht_message(&data, &source_peer),
                                             )
                                             .await
                                             {

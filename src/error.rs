@@ -206,7 +206,7 @@ pub enum NetworkError {
     PeerNotFound(Cow<'static, str>),
 
     #[error("Peer disconnected - peer: {peer}, reason: {reason}")]
-    PeerDisconnected { peer: String, reason: String },
+    PeerDisconnected { peer: crate::PeerId, reason: String },
 
     #[error("Network timeout")]
     Timeout,

@@ -992,7 +992,7 @@ impl TransportHandle {
         let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
-            from: self.node_identity.peer_id().to_hex(),
+            from: self.node_identity.peer_id().clone(),
             timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
@@ -1012,7 +1012,7 @@ impl TransportHandle {
         let mut message = WireMessage {
             protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
             data: vec![],
-            from: identity.peer_id().to_hex(),
+            from: identity.peer_id().clone(),
             timestamp: Self::current_timestamp_secs()?,
             public_key: Vec::new(),
             signature: Vec::new(),
@@ -1065,7 +1065,7 @@ impl TransportHandle {
     fn compute_signable_bytes(
         protocol: &str,
         data: &[u8],
-        from: &str,
+        from: &PeerId,
         timestamp: u64,
     ) -> Result<Vec<u8>> {
         postcard::to_stdvec(&(protocol, data, from, timestamp)).map_err(|e| {

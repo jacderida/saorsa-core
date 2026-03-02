@@ -26,7 +26,7 @@
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use blake3;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
@@ -43,8 +43,24 @@ pub const PEER_ID_BYTE_LEN: usize = 32;
 ///
 /// The canonical peer identity in the Saorsa network. Computed as the
 /// BLAKE3 hash of the node's ML-DSA-65 public key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serializes as a hex string (64 characters) in all formats to maintain
+/// wire compatibility with the existing postcard-based `WireMessage` protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
+
+impl Serialize for PeerId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        PeerId::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
 
 impl PeerId {
     /// Create from ML-DSA public key
@@ -538,5 +554,22 @@ mod tests {
         let hex = "ab".repeat(32);
         let id: PeerId = hex.parse().expect("should parse valid hex");
         assert_eq!(id.0, [0xAB; 32]);
+    }
+
+    #[test]
+    fn test_peer_id_json_roundtrip() {
+        let id = PeerId([0xAB; 32]);
+        let json = serde_json::to_string(&id).expect("serialize");
+        assert_eq!(json, format!("\"{}\"", "ab".repeat(32)));
+        let deserialized: PeerId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn test_peer_id_postcard_roundtrip() {
+        let id = PeerId([0xAB; 32]);
+        let bytes = postcard::to_stdvec(&id).expect("serialize");
+        let deserialized: PeerId = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(id, deserialized);
     }
 }

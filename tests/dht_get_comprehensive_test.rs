@@ -160,8 +160,7 @@ async fn test_handler_has_value_returns_get_success() -> Result<()> {
                 assert_eq!(key, test_key, "Key should match");
                 assert_eq!(value, test_value, "Value should match");
                 assert!(
-                    source == manager_a.peer_id().to_hex()
-                        || source == manager_b.peer_id().to_hex(),
+                    source == *manager_a.peer_id() || source == *manager_b.peer_id(),
                     "Source should be either A (original) or B (cached)"
                 );
             }
@@ -711,11 +710,7 @@ async fn test_local_cache_hit() -> Result<()> {
             DhtNetworkResult::GetSuccess { value, source, .. } => {
                 info!("✅ SUCCESS! Local cache hit");
                 assert_eq!(value, test_value, "Value should match");
-                assert_eq!(
-                    source,
-                    manager_a.peer_id().to_hex(),
-                    "Source should be self"
-                );
+                assert_eq!(source, *manager_a.peer_id(), "Source should be self");
             }
             other => {
                 panic!("Expected GetSuccess from local cache, got: {:?}", other);

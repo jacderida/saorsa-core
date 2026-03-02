@@ -49,7 +49,7 @@ pub(crate) struct WireMessage {
     /// Raw payload bytes
     pub(crate) data: Vec<u8>,
     /// Sender's peer ID (verified against transport-level identity)
-    pub(crate) from: String,
+    pub(crate) from: PeerId,
     /// Unix timestamp in seconds
     pub(crate) timestamp: u64,
     /// Sender's ML-DSA-65 public key (1952 bytes). Empty if unsigned.
@@ -1531,11 +1531,10 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId
     let peer_id = PeerId::from_public_key(&pubkey);
 
     // Validate that the self-asserted `from` field matches the public key.
-    let expected_from = peer_id.to_hex();
-    if message.from != expected_from {
+    if message.from != peer_id {
         return Err(format!(
             "from field mismatch: message claims '{}' but public key derives '{}'",
-            message.from, expected_from
+            message.from, peer_id
         ));
     }
 
@@ -3024,7 +3023,7 @@ mod tests {
         let msg = WireMessage {
             protocol: protocol.to_string(),
             data,
-            from: from.to_string(),
+            from: PeerId::from_name(from),
             timestamp,
             public_key: Vec::new(),
             signature: Vec::new(),
@@ -3114,18 +3113,17 @@ mod tests {
         let protocol = "test/signed";
         let data: Vec<u8> = vec![10, 20, 30];
         // The `from` field must match the PeerId derived from the public key.
-        let from = identity.peer_id().to_hex();
+        let from = identity.peer_id().clone();
         let timestamp = current_timestamp();
 
         // Compute signable bytes the same way create_protocol_message does
-        let signable =
-            postcard::to_stdvec(&(protocol, data.as_slice(), from.as_str(), timestamp)).unwrap();
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         let msg = WireMessage {
             protocol: protocol.to_string(),
             data: data.clone(),
-            from: from.to_string(),
+            from: from.clone(),
             timestamp,
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
@@ -3158,12 +3156,11 @@ mod tests {
         let identity = NodeIdentity::generate().expect("should generate identity");
         let protocol = "test/bad-sig";
         let data: Vec<u8> = vec![1, 2, 3];
-        let from = identity.peer_id().to_hex();
+        let from = identity.peer_id().clone();
         let timestamp = current_timestamp();
 
         // Sign correct signable bytes
-        let signable =
-            postcard::to_stdvec(&(protocol, data.as_slice(), from.as_str(), timestamp)).unwrap();
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         // Tamper with the data (signature was over [1,2,3], not [99,99,99])
@@ -3189,12 +3186,11 @@ mod tests {
         let protocol = "test/from-mismatch";
         let data: Vec<u8> = vec![1, 2, 3];
         // Use a `from` field that does NOT match the public key's PeerId.
-        let fake_from = "deadbeef".repeat(8);
+        let fake_from = PeerId::from_bytes([0xDE; 32]);
         let timestamp = current_timestamp();
 
         let signable =
-            postcard::to_stdvec(&(protocol, data.as_slice(), fake_from.as_str(), timestamp))
-                .unwrap();
+            postcard::to_stdvec(&(protocol, data.as_slice(), &fake_from, timestamp)).unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         let msg = WireMessage {

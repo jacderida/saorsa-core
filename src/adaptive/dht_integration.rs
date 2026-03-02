@@ -234,8 +234,7 @@ struct LayerScores {
 
 #[derive(Debug, Clone)]
 struct ScoredCandidate {
-    peer_id: String,
-    node_id: PeerId,
+    peer_id: PeerId,
     address: Option<Multiaddr>,
     region: GeographicRegion,
     scores: LayerScores,
@@ -244,7 +243,7 @@ struct ScoredCandidate {
 
 #[derive(Debug, Clone)]
 struct CandidateNode {
-    peer_id: String,
+    peer_id: PeerId,
     address: String,
     reliability: f64,
 }
@@ -474,16 +473,15 @@ impl AdaptiveDHT {
         let mut trust_rejections = 0u64;
 
         for candidate in candidates {
-            let node_id = PeerId::from_hex(&candidate.peer_id)
-                .unwrap_or_else(|_| PeerId::from_name(&candidate.peer_id));
+            let node_id = &candidate.peer_id;
             let address = Multiaddr::from_str(&candidate.address).ok();
             let region = self.detect_region(&address).await;
-            let trust = self.trust_provider.get_trust(&node_id).clamp(0.0, 1.0);
+            let trust = self.trust_provider.get_trust(node_id).clamp(0.0, 1.0);
             if trust < self.config.min_trust_threshold {
                 trust_rejections += 1;
             }
 
-            let prediction = self.churn_predictor.predict(&node_id).await;
+            let prediction = self.churn_predictor.predict(node_id).await;
             let churn_risk = (prediction.probability_1h * 0.6
                 + prediction.probability_6h * 0.3
                 + prediction.probability_24h * 0.1)
@@ -491,10 +489,10 @@ impl AdaptiveDHT {
             let churn_score =
                 (1.0 - churn_risk) * (0.5 + 0.5 * prediction.confidence.clamp(0.0, 1.0));
 
-            let hyperbolic_score = self.hyperbolic_score(&node_id, &target_id).await;
+            let hyperbolic_score = self.hyperbolic_score(node_id, &target_id).await;
 
             let node_features =
-                Self::node_features_from_candidate(&node_id, candidate.reliability, region);
+                Self::node_features_from_candidate(node_id, candidate.reliability, region);
             let node_bmu = self.som.find_best_matching_unit(&node_features);
             let som_distance = {
                 let dx = node_bmu.0 as f64 - target_bmu.0 as f64;
@@ -503,7 +501,7 @@ impl AdaptiveDHT {
             };
             let som_score = (1.0 - (som_distance / max_grid_distance).min(1.0)).clamp(0.0, 1.0);
 
-            let proximity_score = Self::xor_distance_score(&node_id, &target_id);
+            let proximity_score = Self::xor_distance_score(node_id, &target_id);
             let geo_score = self
                 .config
                 .local_region
@@ -535,7 +533,6 @@ impl AdaptiveDHT {
 
             scored.push(ScoredCandidate {
                 peer_id: candidate.peer_id,
-                node_id,
                 address,
                 region,
                 scores,
@@ -605,7 +602,7 @@ impl AdaptiveDHT {
                 Ok(nodes
                     .into_iter()
                     .map(|node| CandidateNode {
-                        peer_id: node.id.to_string(),
+                        peer_id: node.id.clone(),
                         address: node.address,
                         reliability: node.capacity.reliability_score,
                     })
@@ -618,7 +615,7 @@ impl AdaptiveDHT {
                     nodes
                         .into_iter()
                         .map(|node| CandidateNode {
-                            peer_id: node.peer_id.to_hex(),
+                            peer_id: node.peer_id,
                             address: node.address,
                             reliability: node.reliability,
                         })
@@ -676,10 +673,8 @@ impl AdaptiveDHT {
                         .await
                         .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
                 } else {
-                    let targets: Vec<crate::PeerId> = selected
-                        .iter()
-                        .filter_map(|c| crate::PeerId::from_hex(&c.peer_id).ok())
-                        .collect();
+                    let targets: Vec<crate::PeerId> =
+                        selected.iter().map(|c| c.peer_id.clone()).collect();
                     manager
                         .put_with_targets(key, value, &targets)
                         .await
@@ -738,15 +733,11 @@ impl AdaptiveDHT {
                 for candidate in selected {
                     let op = DhtNetworkOperation::Get { key };
                     let manager = Arc::clone(manager);
-                    let peer_id_str = candidate.peer_id.clone();
+                    let peer_id = candidate.peer_id.clone();
                     attempted_hops += 1;
                     futures.push(async move {
-                        let typed_id = crate::PeerId::from_hex(&peer_id_str);
-                        let result = match typed_id {
-                            Ok(ref id) => manager.send_request(id, op).await,
-                            Err(e) => Err(e),
-                        };
-                        (peer_id_str, result)
+                        let result = manager.send_request(&peer_id, op).await;
+                        (peer_id, result)
                     });
                 }
 
@@ -829,7 +820,7 @@ impl AdaptiveDHT {
         let nodes = selected
             .into_iter()
             .map(|candidate| {
-                let node_id = candidate.node_id.clone();
+                let node_id = candidate.peer_id.clone();
                 NodeDescriptor {
                     id: node_id.clone(),
                     public_key: public_key.clone(),

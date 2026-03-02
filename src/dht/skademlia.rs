@@ -139,7 +139,7 @@ pub struct PathState {
     /// Nodes in this path
     pub nodes: Vec<DHTNode>,
     /// Nodes queried in this path
-    pub queried: HashSet<String>,
+    pub queried: HashSet<PeerId>,
     /// Nodes to query next
     pub to_query: VecDeque<DHTNode>,
     /// Path completion status
@@ -280,9 +280,9 @@ pub struct SKademlia {
     /// Active disjoint lookups
     pub active_lookups: HashMap<Key, DisjointPathLookup>,
     /// Distance verification challenges
-    pub pending_challenges: HashMap<String, DistanceChallenge>,
+    pub pending_challenges: HashMap<PeerId, DistanceChallenge>,
     /// Registry of peer public keys for signature verification (ML-DSA-65)
-    pub peer_public_keys: HashMap<String, Vec<u8>>,
+    pub peer_public_keys: HashMap<PeerId, Vec<u8>>,
 }
 
 impl DisjointPathLookup {
@@ -370,12 +370,9 @@ impl DisjointPathLookup {
         // Get next unqueried node
         let mut next_node = None;
         while let Some(node) = self.path_states[path_id].to_query.pop_front() {
-            if !self.path_states[path_id]
-                .queried
-                .contains(&node.id.to_string())
-            {
+            if !self.path_states[path_id].queried.contains(&node.id) {
                 // Check if using this node would violate disjointness
-                if self.would_violate_disjointness(path_id, &node.id.to_string()) {
+                if self.would_violate_disjointness(path_id, &node.id) {
                     continue;
                 }
 
@@ -385,9 +382,7 @@ impl DisjointPathLookup {
         }
 
         if let Some(node) = next_node {
-            self.path_states[path_id]
-                .queried
-                .insert(node.id.to_string().clone());
+            self.path_states[path_id].queried.insert(node.id.clone());
             return Some(node);
         }
 
@@ -397,7 +392,7 @@ impl DisjointPathLookup {
     }
 
     /// Check if adding a node to a path would violate disjointness constraints
-    fn would_violate_disjointness(&self, path_id: usize, peer_id: &String) -> bool {
+    fn would_violate_disjointness(&self, path_id: usize, peer_id: &PeerId) -> bool {
         for (i, path_state) in self.path_states.iter().enumerate() {
             if i == path_id {
                 continue;
@@ -431,10 +426,7 @@ impl DisjointPathLookup {
             }
 
             // Add to query queue if not already queried
-            if !self.path_states[path_id]
-                .queried
-                .contains(&node.id.to_string())
-            {
+            if !self.path_states[path_id].queried.contains(&node.id) {
                 self.path_states[path_id].to_query.push_back(node);
             }
         }
@@ -785,12 +777,12 @@ impl SKademlia {
     }
 
     /// Register a peer's public key for signature verification
-    pub fn register_peer_public_key(&mut self, peer_id: String, public_key: Vec<u8>) {
+    pub fn register_peer_public_key(&mut self, peer_id: PeerId, public_key: Vec<u8>) {
         self.peer_public_keys.insert(peer_id, public_key);
     }
 
     /// Get a peer's public key for signature verification
-    pub fn get_peer_public_key(&self, peer_id: &String) -> Option<&Vec<u8>> {
+    pub fn get_peer_public_key(&self, peer_id: &PeerId) -> Option<&Vec<u8>> {
         self.peer_public_keys.get(peer_id)
     }
 
@@ -979,19 +971,16 @@ impl SKademlia {
     }
 
     /// Create a distance verification challenge with multi-round protocol
-    pub fn create_distance_challenge(&mut self, target: &String, key: &Key) -> DistanceChallenge {
+    pub fn create_distance_challenge(&mut self, target: &PeerId, key: &Key) -> DistanceChallenge {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         let challenge = DistanceChallenge {
-            challenger: target.clone(), // This should be our peer ID
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
-                let mut target_key = [0u8; 32];
-                let len = target_bytes.len().min(32);
-                target_key[..len].copy_from_slice(&target_bytes[..len]);
-                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(target_key))
+                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(*target_bytes))
             },
             nonce,
             timestamp: SystemTime::now(),
@@ -1005,7 +994,7 @@ impl SKademlia {
     /// Create an enhanced distance challenge with witness nodes
     pub fn create_enhanced_distance_challenge(
         &mut self,
-        target: &String,
+        target: &PeerId,
         key: &Key,
         witness_nodes: Vec<PeerId>,
     ) -> EnhancedDistanceChallenge {
@@ -1013,14 +1002,11 @@ impl SKademlia {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         let challenge = EnhancedDistanceChallenge {
-            challenger: target.clone(),
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
-                let mut target_key = [0u8; 32];
-                let len = target_bytes.len().min(32);
-                target_key[..len].copy_from_slice(&target_bytes[..len]);
-                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(target_key))
+                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(*target_bytes))
             },
             nonce,
             timestamp: SystemTime::now(),
@@ -1088,7 +1074,8 @@ impl SKademlia {
             .enumerate()
         {
             // Look up the peer's public key from registry
-            let public_key_bytes = match self.peer_public_keys.get(peer_id) {
+            let peer_key = PeerId::from_hex(peer_id).unwrap_or_else(|_| PeerId::from_name(peer_id));
+            let public_key_bytes = match self.peer_public_keys.get(&peer_key) {
                 Some(pk) => pk,
                 None => {
                     debug!(
@@ -1420,7 +1407,7 @@ impl SKademlia {
     /// 3. Reputation filtering (must meet minimum threshold)
     pub fn create_adaptive_distance_challenge(
         &mut self,
-        target: &String,
+        target: &PeerId,
         key: &Key,
         suspected_attack: bool,
     ) -> EnhancedDistanceChallenge {
@@ -1433,9 +1420,8 @@ impl SKademlia {
         // 1. First, collect trusted nodes from security buckets (highest priority)
         for security_bucket in self.security_buckets.values() {
             for node in &security_bucket.trusted_nodes {
-                let node_id_str = hex::encode(node.id.as_bytes());
                 // Don't select the target as a witness
-                if &node_id_str == target {
+                if node.id == *target {
                     continue;
                 }
 
@@ -1460,9 +1446,8 @@ impl SKademlia {
         // 2. Then collect sibling nodes from sibling lists
         for sibling_list in self.sibling_lists.values() {
             for node in &sibling_list.siblings {
-                let node_id_str = hex::encode(node.id.as_bytes());
                 // Don't select the target as a witness
-                if &node_id_str == target {
+                if node.id == *target {
                     continue;
                 }
 
@@ -1514,7 +1499,7 @@ impl SKademlia {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         EnhancedDistanceChallenge {
-            challenger: target.clone(),
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
@@ -1906,7 +1891,7 @@ mod tests {
         assert!(next_node.is_some());
 
         if let Some(node) = next_node {
-            assert!(lookup.path_states[0].queried.contains(&node.id.to_string()));
+            assert!(lookup.path_states[0].queried.contains(&node.id));
         }
 
         Ok(())
@@ -2205,12 +2190,12 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
 
         let challenge = skademlia.create_distance_challenge(&target, &key);
 
-        assert_eq!(challenge.challenger, target);
+        assert_eq!(challenge.challenger, target.to_hex());
         assert_eq!(challenge.target_key, key);
         assert!(skademlia.pending_challenges.contains_key(&target));
     }
@@ -2220,14 +2205,14 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
         let witness_nodes = vec![PeerId::random(), PeerId::random()];
 
         let challenge =
             skademlia.create_enhanced_distance_challenge(&target, &key, witness_nodes.clone());
 
-        assert_eq!(challenge.challenger, target);
+        assert_eq!(challenge.challenger, target.to_hex());
         assert_eq!(challenge.target_key, key);
         assert_eq!(challenge.witness_nodes, witness_nodes);
         assert_eq!(challenge.challenge_round, 1);
@@ -2239,7 +2224,7 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
 
         // Test normal challenge (empty network - no witness nodes available)
@@ -2279,7 +2264,7 @@ mod tests {
 
         // Add some test data
         let key = create_test_key([1u8; 32]);
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
 
         skademlia.create_distance_challenge(&target, &key);
 

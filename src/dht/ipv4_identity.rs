@@ -19,6 +19,7 @@
 //!
 //! This mirrors the IPv6 identity system to ensure security parity across both address families.
 
+use crate::PeerId;
 use crate::dht::{DHTNode, Key};
 use crate::error::SecurityError;
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer, IPv4NodeID};
@@ -73,13 +74,13 @@ pub struct IPv4DHTIdentityManager {
     /// IP diversity enforcer
     pub ip_enforcer: IPDiversityEnforcer,
     /// Verified IPv4 nodes
-    verified_nodes: HashMap<String, IPv4DHTNode>,
-    /// Node identity cache
+    verified_nodes: HashMap<PeerId, IPv4DHTNode>,
+    /// Node identity cache (keyed by IP address string, NOT peer ID)
     identity_cache: HashMap<String, (IPv4NodeID, SystemTime)>,
     /// IP analysis cache (keyed by IPv4 address)
     ip_analysis_cache: HashMap<Ipv4Addr, (crate::security::IPAnalysis, SystemTime)>,
     /// Banned nodes for security violations
-    banned_nodes: HashMap<String, SystemTime>,
+    banned_nodes: HashMap<PeerId, SystemTime>,
     /// Local IPv4 identity
     local_identity: Option<IPv4NodeID>,
 }
@@ -105,7 +106,7 @@ pub enum IPv4SecurityEvent {
     /// Node joined with valid IPv4 identity
     NodeJoined {
         /// ID of the peer that joined
-        peer_id: String,
+        peer_id: PeerId,
         /// IPv4 address of the peer
         ipv4_addr: Ipv4Addr,
         /// Confidence level of identity verification (0.0-1.0)
@@ -114,7 +115,7 @@ pub enum IPv4SecurityEvent {
     /// Node failed IPv4 verification
     VerificationFailed {
         /// ID of the peer that failed verification
-        peer_id: String,
+        peer_id: PeerId,
         /// IPv4 address that failed verification
         ipv4_addr: Ipv4Addr,
         /// Reason for verification failure
@@ -123,7 +124,7 @@ pub enum IPv4SecurityEvent {
     /// IP diversity violation detected
     DiversityViolation {
         /// ID of the peer causing violation
-        peer_id: String,
+        peer_id: PeerId,
         /// IPv4 address involved in violation
         ipv4_addr: Ipv4Addr,
         /// Type of subnet causing the violation
@@ -132,7 +133,7 @@ pub enum IPv4SecurityEvent {
     /// Node banned for security violations
     NodeBanned {
         /// ID of the banned peer
-        peer_id: String,
+        peer_id: PeerId,
         /// IPv4 address of the banned peer
         ipv4_addr: Ipv4Addr,
         /// Reason for banning
@@ -143,7 +144,7 @@ pub enum IPv4SecurityEvent {
     /// Suspicious activity detected
     SuspiciousActivity {
         /// ID of the suspicious peer
-        peer_id: String,
+        peer_id: PeerId,
         /// IPv4 address of the suspicious peer
         ipv4_addr: Ipv4Addr,
         /// Type of suspicious activity detected
@@ -270,11 +271,9 @@ impl IPv4DHTIdentityManager {
             is_verified: verification_result.is_valid,
         };
 
-        // Cache the verified node (use id.to_string() as the key)
-        self.verified_nodes.insert(
-            enhanced_node.base_node.id.to_string(),
-            enhanced_node.clone(),
-        );
+        // Cache the verified node
+        self.verified_nodes
+            .insert(enhanced_node.base_node.id.clone(), enhanced_node.clone());
 
         info!(
             "Enhanced DHT node with IPv4 identity: {}",
@@ -420,7 +419,7 @@ impl IPv4DHTIdentityManager {
         node: &DHTNode,
         ipv4_identity: &IPv4NodeID,
     ) -> Result<IPv4SecurityEvent> {
-        let node_peer_id = node.id.to_string();
+        let node_peer_id = node.id.clone();
 
         // Check if node is banned
         if let Some(ban_time) = self.banned_nodes.get(&node_peer_id) {
@@ -477,12 +476,12 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Get verified IPv4 node by peer ID
-    pub fn get_verified_node(&self, peer_id: &String) -> Option<&IPv4DHTNode> {
+    pub fn get_verified_node(&self, peer_id: &PeerId) -> Option<&IPv4DHTNode> {
         self.verified_nodes.get(peer_id)
     }
 
     /// Remove node from IPv4 tracking
-    pub fn remove_node(&mut self, peer_id: &String) {
+    pub fn remove_node(&mut self, peer_id: &PeerId) {
         if let Some(ipv4_node) = self.verified_nodes.remove(peer_id) {
             // Remove from IP diversity tracking
             self.ip_enforcer.remove_node(&ipv4_node.ip_analysis);
@@ -491,7 +490,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Check if node is banned
-    pub fn is_node_banned(&self, peer_id: &String) -> bool {
+    pub fn is_node_banned(&self, peer_id: &PeerId) -> bool {
         if let Some(ban_time) = self.banned_nodes.get(peer_id) {
             ban_time.elapsed().unwrap_or(Duration::MAX) < self.config.security_ban_duration
         } else {
@@ -500,7 +499,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Ban a node for security violations
-    pub fn ban_node(&mut self, peer_id: &String, reason: &str) {
+    pub fn ban_node(&mut self, peer_id: &PeerId, reason: &str) {
         self.banned_nodes.insert(peer_id.clone(), SystemTime::now());
         warn!("Banned node {} for: {}", peer_id, reason);
     }
@@ -539,7 +538,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Update node reputation based on IPv4 behavior
-    pub fn update_ipv4_reputation(&mut self, peer_id: &String, positive_behavior: bool) {
+    pub fn update_ipv4_reputation(&mut self, peer_id: &PeerId, positive_behavior: bool) {
         if let Some(ipv4_node) = self.verified_nodes.get_mut(peer_id) {
             // Update reputation score based on behavior
             if positive_behavior {
@@ -766,7 +765,7 @@ mod tests {
                 ipv4_addr,
                 verification_confidence,
             } => {
-                assert_eq!(peer_id, node.id.to_string());
+                assert_eq!(peer_id, node.id);
                 assert_eq!(ipv4_addr, identity.ipv4_addr);
                 assert!(verification_confidence > 0.0);
             }
@@ -787,7 +786,7 @@ mod tests {
         let config = IPv4DHTConfig::default();
         let mut manager = IPv4DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
 
         // Initially not banned
         assert!(!manager.is_node_banned(&peer_id));
@@ -807,13 +806,13 @@ mod tests {
         let config = IPv4DHTConfig::default();
         let mut manager = IPv4DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_bytes([1u8; 32]);
 
         // Initially no verified node
         assert!(manager.get_verified_node(&peer_id).is_none());
 
         // Add a verified node
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
@@ -829,8 +828,8 @@ mod tests {
         let config = IPv4DHTConfig::default();
         let mut manager = IPv4DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
@@ -849,8 +848,8 @@ mod tests {
         let config = IPv4DHTConfig::default();
         let mut manager = IPv4DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
@@ -890,7 +889,7 @@ mod tests {
         let ipv4_addr = Ipv4Addr::from_str("192.168.1.100").unwrap();
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
 
         manager
             .identity_cache
@@ -990,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_ipv4_security_event_variants() {
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
         let ipv4_addr = Ipv4Addr::from_str("192.168.1.100").unwrap();
 
         // Test NodeJoined event
