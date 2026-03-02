@@ -49,8 +49,9 @@ fn key_from_str(s: &str) -> Key {
 
 /// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
+        .peer_id(peer.clone())
         .listen_port(0) // Random port
         .ipv6(false)
         .build()?;
@@ -71,7 +72,7 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),
@@ -159,7 +160,8 @@ async fn test_handler_has_value_returns_get_success() -> Result<()> {
                 assert_eq!(key, test_key, "Key should match");
                 assert_eq!(value, test_value, "Value should match");
                 assert!(
-                    source == *manager_a.peer_id() || source == *manager_b.peer_id(),
+                    source == manager_a.peer_id().to_hex()
+                        || source == manager_b.peer_id().to_hex(),
                     "Source should be either A (original) or B (cached)"
                 );
             }
@@ -709,7 +711,11 @@ async fn test_local_cache_hit() -> Result<()> {
             DhtNetworkResult::GetSuccess { value, source, .. } => {
                 info!("✅ SUCCESS! Local cache hit");
                 assert_eq!(value, test_value, "Value should match");
-                assert_eq!(source, *manager_a.peer_id(), "Source should be self");
+                assert_eq!(
+                    source,
+                    manager_a.peer_id().to_hex(),
+                    "Source should be self"
+                );
             }
             other => {
                 panic!("Expected GetSuccess from local cache, got: {:?}", other);

@@ -621,7 +621,7 @@ impl AdaptiveDHT {
                     nodes
                         .into_iter()
                         .map(|node| CandidateNode {
-                            peer_id: node.peer_id,
+                            peer_id: node.peer_id.to_hex(),
                             address: node.address,
                             reliability: node.reliability,
                         })
@@ -679,7 +679,10 @@ impl AdaptiveDHT {
                         .await
                         .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
                 } else {
-                    let targets: Vec<String> = selected.iter().map(|c| c.peer_id.clone()).collect();
+                    let targets: Vec<crate::PeerId> = selected
+                        .iter()
+                        .filter_map(|c| crate::PeerId::from_hex(&c.peer_id).ok())
+                        .collect();
                     manager
                         .put_with_targets(key, value, &targets)
                         .await
@@ -738,11 +741,15 @@ impl AdaptiveDHT {
                 for candidate in selected {
                     let op = DhtNetworkOperation::Get { key };
                     let manager = Arc::clone(manager);
-                    let peer_id = candidate.peer_id.clone();
+                    let peer_id_str = candidate.peer_id.clone();
                     attempted_hops += 1;
                     futures.push(async move {
-                        let result = manager.send_request(&peer_id, op).await;
-                        (peer_id, result)
+                        let typed_id = crate::PeerId::from_hex(&peer_id_str);
+                        let result = match typed_id {
+                            Ok(ref id) => manager.send_request(id, op).await,
+                            Err(e) => Err(e),
+                        };
+                        (peer_id_str, result)
                     });
                 }
 

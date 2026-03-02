@@ -18,8 +18,9 @@ use tokio::time::timeout;
 async fn create_node_with_transport(
     peer_id: &str,
 ) -> saorsa_core::Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
+        .peer_id(peer.clone())
         .listen_port(0)
         .ipv6(false)
         .build()
@@ -41,7 +42,7 @@ async fn create_node_with_transport(
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),

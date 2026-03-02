@@ -557,13 +557,17 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         }
     }
 
-    /// Send data to a specific peer
+    /// Send data to a specific peer using the ant-quic transport-level PeerId.
+    ///
+    /// This is the low-level send that operates on ant-quic [`PeerId`]s.
+    /// Higher-level code should prefer [`send_to_peer`](Self::send_to_peer)
+    /// which accepts a Saorsa app-level [`crate::PeerId`].
     ///
     /// This method first looks up the peer's address from our local peers list,
     /// then connects by address. This is necessary because `dial(peer_id)` only
     /// works if ant-quic already knows the peer's address, but for peers that
     /// connected TO us, we only have their address in our application-level peers list.
-    pub async fn send_to_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
+    pub async fn send_to_ant_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
         // Look up the peer's address from our peers list
         let peer_addr = {
             let peers = self.peers.read().await;
@@ -613,7 +617,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        self.send_to_peer(peer_id, data).await?;
+        self.send_to_ant_peer(peer_id, data).await?;
         crate::telemetry::telemetry()
             .record_stream_bandwidth(class, data.len() as u64)
             .await;
@@ -860,11 +864,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         Some(sum / quality_map.len() as f32)
     }
 
-    /// Send data to a peer using String PeerId
-    pub async fn send_to_peer_string(&self, peer_id_str: &str, data: &[u8]) -> Result<()> {
-        let ant_peer_id = string_to_ant_peer_id(peer_id_str)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer(&ant_peer_id, data).await
+    /// Send data to a peer using a Saorsa app-level [`crate::PeerId`].
+    ///
+    /// Converts the app-level identity to an ant-quic [`PeerId`] via
+    /// direct byte copy and delegates to [`send_to_ant_peer`](Self::send_to_ant_peer).
+    pub async fn send_to_peer(&self, peer_id: &crate::PeerId, data: &[u8]) -> Result<()> {
+        let ant_peer_id = saorsa_to_ant_peer_id(peer_id);
+        self.send_to_ant_peer(&ant_peer_id, data).await
     }
 
     /// Connect to a peer and return String PeerId
@@ -873,9 +879,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         Ok(ant_peer_id_to_string(&ant_peer_id))
     }
 
-    /// Send a message (compatibility method for network.rs)
-    pub async fn send_message(&self, peer_id: &str, data: Vec<u8>) -> Result<()> {
-        self.send_to_peer_string(peer_id, &data).await
+    /// Send a message using a Saorsa app-level [`crate::PeerId`].
+    pub async fn send_message(&self, peer_id: &crate::PeerId, data: Vec<u8>) -> Result<()> {
+        self.send_to_peer(peer_id, &data).await
     }
 
     /// Subscribe to connection lifecycle events
@@ -982,11 +988,15 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         Ok(Self { v6, v4 })
     }
 
-    /// Send to peer using P2pEndpoint's optimized send method
+    /// Send to peer using P2pEndpoint's optimized send method with an
+    /// ant-quic transport-level [`PeerId`].
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
     /// bidirectional communication. Tries IPv6 first, then IPv4.
-    pub async fn send_to_peer_optimized(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
+    ///
+    /// Higher-level code should prefer [`send_to_peer_optimized`](Self::send_to_peer_optimized)
+    /// which accepts a Saorsa app-level [`crate::PeerId`].
+    pub async fn send_to_ant_peer_optimized(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
         let peer_id_short = hex::encode(&peer_id.0[..8]);
         if let Some(v6) = &self.v6 {
             info!(
@@ -1033,19 +1043,27 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         ))
     }
 
-    /// Send to peer by string PeerId using optimized method
-    pub async fn send_to_peer_string_optimized(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer_optimized(&ant_peer, data).await
+    /// Send to a peer by Saorsa app-level [`crate::PeerId`] using the
+    /// optimized `P2pEndpoint::send()` path.
+    ///
+    /// Converts the app-level identity to an ant-quic [`PeerId`] via
+    /// direct byte copy and delegates to
+    /// [`send_to_ant_peer_optimized`](Self::send_to_ant_peer_optimized).
+    pub async fn send_to_peer_optimized(&self, peer_id: &crate::PeerId, data: &[u8]) -> Result<()> {
+        let ant_peer = saorsa_to_ant_peer_id(peer_id);
+        self.send_to_ant_peer_optimized(&ant_peer, data).await
     }
 
-    /// Disconnect a peer by closing the underlying QUIC connection.
+    /// Disconnect a peer by ant-quic transport-level [`PeerId`], closing the
+    /// underlying QUIC connection.
     ///
     /// Tries both IPv6 and IPv4 stacks. Uses `P2pEndpoint::disconnect()`
     /// to actively tear down the QUIC connection rather than waiting for
     /// idle timeout.
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) {
+    ///
+    /// Higher-level code should prefer [`disconnect_peer`](Self::disconnect_peer)
+    /// which accepts a Saorsa app-level [`crate::PeerId`].
+    pub async fn disconnect_ant_peer(&self, peer_id: &PeerId) {
         if let Some(ref v6) = self.v6 {
             v6.disconnect_peer_quic(peer_id).await;
         }
@@ -1054,12 +1072,14 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
-    /// Disconnect a peer by string PeerId.
-    pub async fn disconnect_peer_string(&self, peer_id: &str) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.disconnect_peer(&ant_peer).await;
-        Ok(())
+    /// Disconnect a peer by Saorsa app-level [`crate::PeerId`].
+    ///
+    /// Converts the app-level identity to an ant-quic [`PeerId`] via
+    /// direct byte copy and delegates to
+    /// [`disconnect_ant_peer`](Self::disconnect_ant_peer).
+    pub async fn disconnect_peer(&self, peer_id: &crate::PeerId) {
+        let ant_peer = saorsa_to_ant_peer_id(peer_id);
+        self.disconnect_ant_peer(&ant_peer).await;
     }
 }
 
@@ -1200,26 +1220,33 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         out
     }
 
-    /// Send to peer by PeerId; tries IPv6 first, then IPv4
-    pub async fn send_to_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
+    /// Send to peer by ant-quic transport-level [`PeerId`]; tries IPv6 first,
+    /// then IPv4.
+    ///
+    /// Higher-level code should prefer [`send_to_peer`](Self::send_to_peer)
+    /// which accepts a Saorsa app-level [`crate::PeerId`].
+    pub async fn send_to_ant_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6
-            && v6.send_to_peer(peer_id, data).await.is_ok()
+            && v6.send_to_ant_peer(peer_id, data).await.is_ok()
         {
             return Ok(());
         }
         if let Some(v4) = &self.v4
-            && v4.send_to_peer(peer_id, data).await.is_ok()
+            && v4.send_to_ant_peer(peer_id, data).await.is_ok()
         {
             return Ok(());
         }
-        Err(anyhow::anyhow!("send_to_peer failed on both stacks"))
+        Err(anyhow::anyhow!("send_to_ant_peer failed on both stacks"))
     }
 
-    /// Send to peer by string PeerId
-    pub async fn send_to_peer_string(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer(&ant_peer, data).await
+    /// Send to peer by Saorsa app-level [`crate::PeerId`].
+    ///
+    /// Converts the app-level identity to an ant-quic [`PeerId`] via
+    /// direct byte copy and delegates to
+    /// [`send_to_ant_peer`](Self::send_to_ant_peer).
+    pub async fn send_to_peer(&self, peer_id: &crate::PeerId, data: &[u8]) -> Result<()> {
+        let ant_peer = saorsa_to_ant_peer_id(peer_id);
+        self.send_to_ant_peer(&ant_peer, data).await
     }
 
     /// Send to peer with StreamClass
@@ -1229,7 +1256,7 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        let res = self.send_to_peer(peer_id, data).await;
+        let res = self.send_to_ant_peer(peer_id, data).await;
         if res.is_ok() {
             crate::telemetry::telemetry()
                 .record_stream_bandwidth(class, data.len() as u64)
@@ -1332,6 +1359,15 @@ impl std::fmt::Display for PeerIdConversionError {
 }
 
 impl std::error::Error for PeerIdConversionError {}
+
+/// Convert from a Saorsa app-level [`crate::PeerId`] to an ant-quic
+/// [`PeerId`] by copying the raw 32-byte identity.
+///
+/// Both types are `[u8; 32]` newtypes, so this is a zero-cost byte copy
+/// with no hex round-tripping.
+pub fn saorsa_to_ant_peer_id(peer_id: &crate::PeerId) -> PeerId {
+    PeerId(*peer_id.as_bytes())
+}
 
 /// Convert from our PeerId (String) to ant_quic PeerId
 ///

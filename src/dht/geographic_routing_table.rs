@@ -20,6 +20,7 @@ use super::geographic_routing::{GeographicRegion, PeerQualityMetrics, RegionalBu
 use super::latency_aware_selection::{
     LatencyAwarePeerSelection, LatencySelectionConfig, SelectedPeer,
 };
+use crate::PeerId;
 use crate::dht::Key;
 use crate::error::{P2PError, P2pResult as Result};
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,7 @@ impl GeographicRoutingTable {
     /// Add a peer to the routing table with geographic awareness
     pub fn add_peer(
         &mut self,
-        peer_id: String,
+        peer_id: PeerId,
         region: GeographicRegion,
         metrics: PeerQualityMetrics,
     ) -> Result<bool> {
@@ -146,7 +147,7 @@ impl GeographicRoutingTable {
     }
 
     /// Remove a peer from the routing table
-    pub fn remove_peer(&mut self, peer_id: &String, region: GeographicRegion) -> bool {
+    pub fn remove_peer(&mut self, peer_id: &PeerId, region: GeographicRegion) -> bool {
         // Remove from regional bucket
         let removed = if let Some(bucket) = self.regional_buckets.get_mut(&region) {
             bucket.remove_peer(peer_id)
@@ -221,7 +222,7 @@ impl GeographicRoutingTable {
     pub fn get_regional_peers(
         &self,
         region: GeographicRegion,
-    ) -> Vec<(String, PeerQualityMetrics)> {
+    ) -> Vec<(PeerId, PeerQualityMetrics)> {
         self.regional_buckets
             .get(&region)
             .map(|bucket| {
@@ -428,7 +429,7 @@ pub struct RoutingTableState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionalBucketState {
     pub region: GeographicRegion,
-    pub peers: Vec<(String, PeerQualityMetrics)>,
+    pub peers: Vec<(PeerId, PeerQualityMetrics)>,
     pub last_maintenance: SystemTime,
 }
 
@@ -465,7 +466,7 @@ mod tests {
         let config = GeographicRoutingConfig::default();
         let mut table = GeographicRoutingTable::new(GeographicRegion::Europe, config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
         let metrics = PeerQualityMetrics::new(GeographicRegion::Europe);
 
         // Add peer
@@ -504,14 +505,10 @@ mod tests {
         na_metrics.record_rtt(Duration::from_millis(100));
 
         table
-            .add_peer("eu_peer".to_string(), GeographicRegion::Europe, eu_metrics)
+            .add_peer(PeerId::random(), GeographicRegion::Europe, eu_metrics)
             .unwrap();
         table
-            .add_peer(
-                "na_peer".to_string(),
-                GeographicRegion::NorthAmerica,
-                na_metrics,
-            )
+            .add_peer(PeerId::random(), GeographicRegion::NorthAmerica, na_metrics)
             .unwrap();
 
         // Test cross-region selection
@@ -538,7 +535,7 @@ mod tests {
         // Test concurrent operations
         let added = {
             let mut table_guard = table.write().await;
-            table_guard.add_peer("test_peer".to_string(), GeographicRegion::Europe, metrics)
+            table_guard.add_peer(PeerId::random(), GeographicRegion::Europe, metrics)
         };
         assert!(added.is_ok());
 

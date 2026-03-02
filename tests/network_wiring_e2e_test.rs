@@ -431,7 +431,8 @@ async fn test_periodic_tasks_updates_last_seen() {
     // Connect
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
 
     // Get initial peer info to check last_seen
     // NOTE: This requires exposing peer info - we may need to add a method
@@ -487,7 +488,8 @@ async fn test_stale_peer_removal() {
     // Connect — auto identity announce handles authentication
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
 
     assert!(node1.is_peer_connected(&peer2_id).await);
     info!("Initial connection established");
@@ -540,7 +542,6 @@ async fn test_heartbeat_keeps_connection_alive() {
     node2.start().await.expect("Failed to start node2");
 
     let peer2_peer_id = connect_and_identify(&node1, &node2).await;
-    let peer2_hex = peer2_peer_id.to_hex();
 
     info!("Connection established, waiting 35 seconds (beyond 30s idle timeout)...");
 
@@ -548,7 +549,7 @@ async fn test_heartbeat_keeps_connection_alive() {
     sleep(Duration::from_secs(35)).await;
 
     // Connection should still be alive due to heartbeat
-    let is_active = node1.is_peer_connected(&peer2_hex).await;
+    let is_active = node1.is_peer_connected(&peer2_peer_id).await;
 
     assert!(
         is_active,
@@ -1387,7 +1388,8 @@ async fn test_peer_cleanup_timing() {
 
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
+    let peer2_id = saorsa_core::network::peer_id_from_hex(&peer2_channel);
 
     assert!(
         node1.is_peer_connected(&peer2_id).await,
@@ -1972,7 +1974,7 @@ async fn test_many_peers_scaling() {
     // Verify all peers are reachable at transport level
     let mut reachable_count = 0;
     for peer_id in &connected_peers {
-        if node1.is_peer_connected(&peer_id.to_hex()).await {
+        if node1.is_peer_connected(peer_id).await {
             reachable_count += 1;
         }
     }

@@ -4,6 +4,7 @@
 //! Provides a drop-in enhancement for existing P2P network nodes that adds geographic optimization.
 
 use crate::Multiaddr;
+use crate::PeerId;
 use crate::dht::{
     geographic_network_integration::{
         DhtOperationType, GeographicNetworkIntegration, GeographicRoutingStats,
@@ -167,7 +168,7 @@ impl GeographicNetworkService {
     }
 
     /// Add a peer to geographic routing
-    pub async fn add_peer(&self, peer_id: String, address: Multiaddr) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: PeerId, address: Multiaddr) -> Result<()> {
         if !self.config.enable_geographic_routing {
             return Ok(()); // No-op if disabled
         }
@@ -192,7 +193,7 @@ impl GeographicNetworkService {
         target_key: &[u8],
         operation_type: DhtOperationType,
         count: usize,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<PeerId>> {
         if !self.config.enable_geographic_routing {
             return Ok(vec![]); // Return empty if disabled
         }
@@ -225,7 +226,7 @@ impl GeographicNetworkService {
     /// Update peer quality metrics
     pub async fn update_peer_quality(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         success: bool,
         latency: Option<Duration>,
     ) -> Result<()> {
@@ -277,7 +278,7 @@ impl GeographicNetworkService {
     }
 
     /// Get peers in specific region
-    pub async fn get_peers_by_region(&self, region: GeographicRegion) -> Result<Vec<String>> {
+    pub async fn get_peers_by_region(&self, region: GeographicRegion) -> Result<Vec<PeerId>> {
         if !self.config.enable_geographic_routing {
             return Ok(vec![]);
         }

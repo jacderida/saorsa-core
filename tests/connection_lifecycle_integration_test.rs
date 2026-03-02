@@ -100,9 +100,8 @@ async fn test_connection_lifecycle_with_keepalive() {
     info!("Node1 connected to node2 (peer_id: {})", peer2_peer_id);
 
     // Verify connection is active
-    let peer2_hex = peer2_peer_id.to_hex();
     assert!(
-        node1.is_peer_connected(&peer2_hex).await,
+        node1.is_peer_connected(&peer2_peer_id).await,
         "Peer should be in peers map"
     );
 
@@ -142,7 +141,7 @@ async fn test_connection_lifecycle_with_keepalive() {
     // Test stale connection cleanup
     // Disconnect node2 to simulate connection closure
     debug!("Disconnecting peer to test cleanup...");
-    let _ = node1.disconnect_peer(&peer2_hex).await;
+    let _ = node1.disconnect_peer(&peer2_peer_id).await;
 
     // Wait for disconnect to propagate
     sleep(Duration::from_secs(1)).await;
@@ -226,8 +225,7 @@ async fn test_send_message_validates_connection_state() {
         .expect("First message should succeed");
 
     // Now disconnect to simulate connection closure
-    let peer2_hex = peer2_peer_id.to_hex();
-    let _ = node1.disconnect_peer(&peer2_hex).await;
+    let _ = node1.disconnect_peer(&peer2_peer_id).await;
     sleep(Duration::from_secs(1)).await;
 
     // Verify connection is no longer active

@@ -17,7 +17,7 @@
 //! S/Kademlia provides enhanced security through disjoint path routing, sibling lists,
 //! and cryptographic verification mechanisms to resist various attacks on the DHT.
 
-use crate::dht::{DHTNode, DhtKey, Key};
+use crate::dht::{DHTNode, DhtKey, Key, PeerId};
 use crate::error::{P2PError, P2pResult as Result};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature, ml_dsa_verify};
 use crate::security::ReputationManager;
@@ -216,7 +216,7 @@ pub struct EnhancedDistanceChallenge {
     /// Challenge timestamp
     pub timestamp: SystemTime,
     /// Witness nodes for verification
-    pub witness_nodes: Vec<String>,
+    pub witness_nodes: Vec<PeerId>,
     /// Current challenge round
     pub challenge_round: u32,
     /// Maximum number of rounds
@@ -909,7 +909,7 @@ impl SKademlia {
 
                             // Update reputation for successful query
                             self.reputation_manager.update_reputation(
-                                &node.id.to_string(),
+                                &node.id,
                                 true,
                                 response_time,
                             );
@@ -926,7 +926,7 @@ impl SKademlia {
 
                             // Update reputation for failed query
                             self.reputation_manager.update_reputation(
-                                &node.id.to_string(),
+                                &node.id,
                                 false,
                                 response_time,
                             );
@@ -1007,7 +1007,7 @@ impl SKademlia {
         &mut self,
         target: &String,
         key: &Key,
-        witness_nodes: Vec<String>,
+        witness_nodes: Vec<PeerId>,
     ) -> EnhancedDistanceChallenge {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
@@ -1244,7 +1244,7 @@ impl SKademlia {
         &mut self,
         target_node: &str,
         target_key: &Key,
-        witness_nodes: Vec<String>,
+        witness_nodes: Vec<PeerId>,
         querier: &Q,
     ) -> Result<DistanceConsensus> {
         let mut measurements = Vec::new();
@@ -1252,19 +1252,17 @@ impl SKademlia {
         for witness in &witness_nodes {
             // Request distance measurement from witness node via network call
             let query_start = std::time::Instant::now();
+            let witness_hex = witness.to_hex();
 
             match querier
-                .query_distance_measurement(witness, target_node, target_key)
+                .query_distance_measurement(&witness_hex, target_node, target_key)
                 .await
             {
                 Ok(mut measurement) => {
                     // Update reputation for successful query
                     let response_time = query_start.elapsed();
-                    self.reputation_manager.update_reputation(
-                        &witness.to_string(),
-                        true,
-                        response_time,
-                    );
+                    self.reputation_manager
+                        .update_reputation(witness, true, response_time);
 
                     // Recalculate confidence based on current reputation and response time
                     // (the measurement may have its own confidence, but we weight it by reputation)
@@ -1290,11 +1288,8 @@ impl SKademlia {
                 Err(e) => {
                     // Update reputation for failed query
                     let response_time = query_start.elapsed();
-                    self.reputation_manager.update_reputation(
-                        &witness.to_string(),
-                        false,
-                        response_time,
-                    );
+                    self.reputation_manager
+                        .update_reputation(witness, false, response_time);
 
                     tracing::warn!(
                         witness = %witness,
@@ -1447,7 +1442,7 @@ impl SKademlia {
                 // Get reputation score (trusted nodes get bonus)
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node_id_str)
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.5)
                     * 1.5; // Trusted node bonus
@@ -1479,7 +1474,7 @@ impl SKademlia {
                 // Get reputation score
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node_id_str)
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.5);
 
@@ -1501,10 +1496,10 @@ impl SKademlia {
         // 3. Sort by score (descending) and select top witnesses
         candidate_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let witness_nodes: Vec<String> = candidate_nodes
+        let witness_nodes: Vec<PeerId> = candidate_nodes
             .into_iter()
             .take(witness_count)
-            .map(|(node, _)| hex::encode(node.id.as_bytes()))
+            .map(|(node, _)| node.id.clone())
             .collect();
 
         tracing::debug!(
@@ -1553,9 +1548,7 @@ impl SKademlia {
         for security_bucket in self.security_buckets.values() {
             for trusted_node in &security_bucket.trusted_nodes {
                 // Only use nodes with good reputation as validators
-                if let Some(reputation) = self
-                    .reputation_manager
-                    .get_reputation(&hex::encode(trusted_node.id.as_bytes()))
+                if let Some(reputation) = self.reputation_manager.get_reputation(&trusted_node.id)
                     && reputation.response_rate >= 0.7
                     && reputation.consistency_score >= 0.8
                 {
@@ -1572,7 +1565,7 @@ impl SKademlia {
             let node_id_hex = hex::encode(node.id.as_bytes());
 
             // Check reputation threshold
-            if let Some(reputation) = self.reputation_manager.get_reputation(&node_id_hex)
+            if let Some(reputation) = self.reputation_manager.get_reputation(&node.id)
                 && reputation.response_rate < self.config.min_routing_reputation
             {
                 inconsistencies += 1;
@@ -1722,7 +1715,7 @@ impl SKademlia {
 
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node.id.to_string())
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.0);
 
@@ -2229,7 +2222,7 @@ mod tests {
 
         let target = "test_peer".to_string();
         let key = create_test_key([1u8; 32]);
-        let witness_nodes = vec!["witness1".to_string(), "witness2".to_string()];
+        let witness_nodes = vec![PeerId::random(), PeerId::random()];
 
         let challenge =
             skademlia.create_enhanced_distance_challenge(&target, &key, witness_nodes.clone());

@@ -123,10 +123,16 @@ impl NetworkTestFramework {
         for i in 0..partition_point {
             for j in partition_point..self.nodes.len() {
                 self.nodes[i]
-                    .disconnect_peer(&format!("node_{}", j))
+                    .disconnect_peer(&saorsa_core::network::peer_id_from_hex(&format!(
+                        "node_{}",
+                        j
+                    )))
                     .await?;
                 self.nodes[j]
-                    .disconnect_peer(&format!("node_{}", i))
+                    .disconnect_peer(&saorsa_core::network::peer_id_from_hex(&format!(
+                        "node_{}",
+                        i
+                    )))
                     .await?;
             }
         }

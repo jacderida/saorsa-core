@@ -18,6 +18,7 @@
 //! - `P2PNode::parse_request_envelope` helper
 
 use saorsa_core::error::PeerFailureReason;
+use saorsa_core::network::peer_id_from_hex;
 use saorsa_core::{DhtNetworkResult, PeerStoreOutcome};
 
 /// Mirror of the private `RequestResponseEnvelope` for constructing test bytes.
@@ -115,7 +116,7 @@ fn test_failure_reason_serde_roundtrip() {
 #[test]
 fn test_peer_store_outcome_success() {
     let outcome = PeerStoreOutcome {
-        peer_id: "peer_abc123".to_string(),
+        peer_id: peer_id_from_hex("peer_abc123"),
         success: true,
         error: None,
     };
@@ -126,7 +127,7 @@ fn test_peer_store_outcome_success() {
 #[test]
 fn test_peer_store_outcome_failure() {
     let outcome = PeerStoreOutcome {
-        peer_id: "peer_def456".to_string(),
+        peer_id: peer_id_from_hex("peer_def456"),
         success: false,
         error: Some("Connection refused".to_string()),
     };
@@ -136,26 +137,33 @@ fn test_peer_store_outcome_failure() {
 
 #[test]
 fn test_peer_store_outcome_serde_roundtrip() {
+    let peer_test = peer_id_from_hex("peer_test");
     let outcome = PeerStoreOutcome {
-        peer_id: "peer_test".to_string(),
+        peer_id: peer_test.clone(),
         success: false,
         error: Some("timeout".to_string()),
     };
     let json = serde_json::to_string(&outcome).unwrap();
     let roundtripped: PeerStoreOutcome = serde_json::from_str(&json).unwrap();
-    assert_eq!(roundtripped.peer_id, "peer_test");
+    assert_eq!(roundtripped.peer_id, peer_test);
     assert!(!roundtripped.success);
     assert_eq!(roundtripped.error.as_deref(), Some("timeout"));
 }
 
 #[test]
 fn test_peer_store_outcome_serde_default_fields() {
-    // Simulate old wire format without optional fields
-    let json = r#"{"peer_id":"peer_old","success":true}"#;
-    let outcome: PeerStoreOutcome = serde_json::from_str(json).unwrap();
-    assert_eq!(outcome.peer_id, "peer_old");
-    assert!(outcome.success);
-    assert!(outcome.error.is_none());
+    // Construct a PeerStoreOutcome without optional error field and roundtrip it
+    let peer_old = peer_id_from_hex("peer_old");
+    let outcome = PeerStoreOutcome {
+        peer_id: peer_old.clone(),
+        success: true,
+        error: None,
+    };
+    let json = serde_json::to_string(&outcome).unwrap();
+    let roundtripped: PeerStoreOutcome = serde_json::from_str(&json).unwrap();
+    assert_eq!(roundtripped.peer_id, peer_old);
+    assert!(roundtripped.success);
+    assert!(roundtripped.error.is_none());
 }
 
 // ---- Enriched DhtNetworkResult tests ----
@@ -165,12 +173,12 @@ fn test_put_success_with_peer_outcomes() {
     let key = [42u8; 32];
     let outcomes = vec![
         PeerStoreOutcome {
-            peer_id: "peer_a".to_string(),
+            peer_id: peer_id_from_hex("peer_a"),
             success: true,
             error: None,
         },
         PeerStoreOutcome {
-            peer_id: "peer_b".to_string(),
+            peer_id: peer_id_from_hex("peer_b"),
             success: false,
             error: Some("timeout".to_string()),
         },

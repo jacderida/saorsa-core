@@ -102,7 +102,9 @@ async fn test_peer_info_missing_handling() {
     };
 
     // Request info for non-existent peer
-    let result = node.peer_info("non_existent_peer_id").await;
+    let result = node
+        .peer_info(&saorsa_core::PeerId::from_bytes([0xBBu8; 32]))
+        .await;
     // Should return None, not panic
     assert!(result.is_none());
 }

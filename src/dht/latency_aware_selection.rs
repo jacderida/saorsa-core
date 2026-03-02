@@ -17,6 +17,7 @@
 //! success rates, and geographic proximity for optimal P2P network performance.
 
 use super::geographic_routing::{GeographicRegion, PeerQualityMetrics};
+use crate::PeerId;
 use crate::error::{P2PError, P2pResult as Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -52,7 +53,7 @@ impl Default for LatencySelectionConfig {
 /// Cache entry with LRU tracking
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    peer_id: String,
+    peer_id: PeerId,
     metrics: PeerQualityMetrics,
     last_accessed: Instant,
 }
@@ -61,13 +62,13 @@ struct CacheEntry {
 #[derive(Debug)]
 pub struct PeerMetricsCache {
     /// Cache entries by peer ID
-    entries: HashMap<String, CacheEntry>,
+    entries: HashMap<PeerId, CacheEntry>,
     /// Access order for LRU eviction
-    access_order: VecDeque<String>,
+    access_order: VecDeque<PeerId>,
     /// Maximum cache size
     max_size: usize,
     /// Regional organization of cached peers
-    regional_peers: HashMap<GeographicRegion, Vec<String>>,
+    regional_peers: HashMap<GeographicRegion, Vec<PeerId>>,
 }
 
 impl PeerMetricsCache {
@@ -82,7 +83,7 @@ impl PeerMetricsCache {
     }
 
     /// Add or update a peer in the cache
-    pub fn insert(&mut self, peer_id: String, metrics: PeerQualityMetrics) {
+    pub fn insert(&mut self, peer_id: PeerId, metrics: PeerQualityMetrics) {
         let now = Instant::now();
 
         // Remove from old position if exists
@@ -117,7 +118,7 @@ impl PeerMetricsCache {
     }
 
     /// Get a peer from the cache
-    pub fn get(&mut self, peer_id: &String) -> Option<PeerQualityMetrics> {
+    pub fn get(&mut self, peer_id: &PeerId) -> Option<PeerQualityMetrics> {
         if self.entries.contains_key(peer_id) {
             // Update access order first
             self.remove_from_access_order(peer_id);
@@ -139,7 +140,7 @@ impl PeerMetricsCache {
     pub fn get_regional_peers(
         &self,
         region: GeographicRegion,
-    ) -> Vec<(String, PeerQualityMetrics)> {
+    ) -> Vec<(PeerId, PeerQualityMetrics)> {
         self.regional_peers
             .get(&region)
             .map(|peer_ids| {
@@ -153,7 +154,7 @@ impl PeerMetricsCache {
     }
 
     /// Remove a peer from the cache
-    pub fn remove(&mut self, peer_id: &String) -> bool {
+    pub fn remove(&mut self, peer_id: &PeerId) -> bool {
         if let Some(_entry) = self.entries.remove(peer_id) {
             self.remove_from_access_order(peer_id);
             self.remove_from_regional_index(peer_id);
@@ -166,7 +167,7 @@ impl PeerMetricsCache {
     /// Clean up expired entries
     pub fn cleanup_expired(&mut self, max_age: Duration) {
         let now = Instant::now();
-        let expired_peers: Vec<String> = self
+        let expired_peers: Vec<PeerId> = self
             .entries
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.last_accessed) > max_age)
@@ -204,14 +205,14 @@ impl PeerMetricsCache {
     }
 
     /// Remove peer from access order tracking
-    fn remove_from_access_order(&mut self, peer_id: &String) {
+    fn remove_from_access_order(&mut self, peer_id: &PeerId) {
         if let Some(pos) = self.access_order.iter().position(|id| id == peer_id) {
             self.access_order.remove(pos);
         }
     }
 
     /// Remove peer from regional index
-    fn remove_from_regional_index(&mut self, peer_id: &String) {
+    fn remove_from_regional_index(&mut self, peer_id: &PeerId) {
         for peers in self.regional_peers.values_mut() {
             if let Some(pos) = peers.iter().position(|id| id == peer_id) {
                 peers.remove(pos);
@@ -268,7 +269,7 @@ impl LatencyAwarePeerSelection {
     /// Update metrics for a peer
     pub fn update_peer_metrics(
         &mut self,
-        peer_id: String,
+        peer_id: PeerId,
         metrics: PeerQualityMetrics,
     ) -> Result<()> {
         // Validate metrics quality
@@ -416,7 +417,7 @@ impl LatencyAwarePeerSelection {
     }
 
     /// Remove a peer from selection (e.g., if it becomes unavailable)
-    pub fn remove_peer(&mut self, peer_id: &String) -> bool {
+    pub fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
         self.cache.remove(peer_id)
     }
 
@@ -534,7 +535,7 @@ impl LatencyAwarePeerSelection {
 /// A selected peer with its selection metadata
 #[derive(Debug, Clone)]
 pub struct SelectedPeer {
-    pub peer_id: String,
+    pub peer_id: PeerId,
     pub metrics: PeerQualityMetrics,
     pub region: GeographicRegion,
     pub selection_score: f64,
@@ -574,10 +575,10 @@ mod tests {
     fn test_peer_metrics_cache() {
         let mut cache = PeerMetricsCache::new(3);
 
-        let peer1 = "peer1".to_string();
-        let peer2 = "peer2".to_string();
-        let peer3 = "peer3".to_string();
-        let peer4 = "peer4".to_string();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        let peer3 = PeerId::random();
+        let peer4 = PeerId::random();
 
         let metrics = PeerQualityMetrics::new(GeographicRegion::Europe);
 
@@ -608,11 +609,13 @@ mod tests {
         metrics2.record_request(true);
         metrics2.record_rtt(Duration::from_millis(100));
 
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
         selector
-            .update_peer_metrics("peer1".to_string(), metrics1)
+            .update_peer_metrics(peer1.clone(), metrics1)
             .unwrap();
         selector
-            .update_peer_metrics("peer2".to_string(), metrics2)
+            .update_peer_metrics(peer2.clone(), metrics2)
             .unwrap();
 
         // Select peers - should prefer European peer
@@ -620,7 +623,7 @@ mod tests {
             .select_peers(Some(GeographicRegion::Europe), Some(1))
             .unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].peer_id, "peer1");
+        assert_eq!(selected[0].peer_id, peer1);
         assert_eq!(selected[0].region, GeographicRegion::Europe);
     }
 
@@ -637,10 +640,10 @@ mod tests {
         na_metrics.record_request(true);
 
         selector
-            .update_peer_metrics("eu_peer".to_string(), eu_metrics)
+            .update_peer_metrics(PeerId::random(), eu_metrics)
             .unwrap();
         selector
-            .update_peer_metrics("na_peer".to_string(), na_metrics)
+            .update_peer_metrics(PeerId::random(), na_metrics)
             .unwrap();
 
         // Select cross-region peers

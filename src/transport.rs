@@ -28,7 +28,7 @@ pub mod network_config;
 
 pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, RetryBehavior};
 
-use crate::validation::{Validate, ValidationContext, validate_message_size, validate_peer_id};
+use crate::validation::{Validate, ValidationContext, validate_message_size};
 use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -125,9 +125,6 @@ pub struct TransportMessage {
 
 impl Validate for TransportMessage {
     fn validate(&self, ctx: &ValidationContext) -> Result<()> {
-        // Validate sender peer ID
-        validate_peer_id(&self.sender)?;
-
         // Validate message size
         validate_message_size(self.data.len(), ctx.max_message_size)?;
 

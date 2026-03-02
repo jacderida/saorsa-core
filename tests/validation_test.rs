@@ -23,17 +23,12 @@ use std::time::Duration;
 
 #[test]
 fn test_peer_id_validation() {
-    // Valid peer IDs
-    assert!(validate_peer_id("valid_peer_id_123").is_ok());
-    assert!(validate_peer_id("PEER-ID-WITH-CAPS").is_ok());
-    assert!(validate_peer_id(&format!("peer_with_64_chars_{}", "x".repeat(45))).is_ok());
+    // PeerId is a strongly-typed [u8; 32] — always valid by construction.
+    let peer = saorsa_core::PeerId::from_bytes([0xAA; 32]);
+    assert!(validate_peer_id(&peer).is_ok());
 
-    // Invalid peer IDs
-    assert!(validate_peer_id("short").is_err()); // Too short
-    assert!(validate_peer_id(&"x".repeat(100)).is_err()); // Too long
-    assert!(validate_peer_id("invalid peer id").is_err()); // Contains space
-    assert!(validate_peer_id("peer@id").is_err()); // Invalid character
-    assert!(validate_peer_id("").is_err()); // Empty
+    let zero_peer = saorsa_core::PeerId::from_bytes([0u8; 32]);
+    assert!(validate_peer_id(&zero_peer).is_ok());
 }
 
 #[test]
@@ -170,9 +165,11 @@ fn test_rate_limiter() {
 fn test_network_message_validation() {
     let ctx = ValidationContext::default();
 
+    let test_peer = saorsa_core::PeerId::from_bytes([0xAA; 32]);
+
     // Valid message
     let valid_msg = NetworkMessage {
-        peer_id: "valid_peer_id_123".to_string(),
+        peer_id: test_peer.clone(),
         payload: vec![0u8; 1024],
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -182,18 +179,11 @@ fn test_network_message_validation() {
 
     assert!(valid_msg.validate(&ctx).is_ok());
 
-    // Invalid peer ID
-    let invalid_peer = NetworkMessage {
-        peer_id: "short".to_string(),
-        payload: vec![0u8; 1024],
-        timestamp: valid_msg.timestamp,
-    };
-
-    assert!(invalid_peer.validate(&ctx).is_err());
+    // PeerId is valid by construction, so no "invalid peer ID" test needed.
 
     // Payload too large
     let large_payload = NetworkMessage {
-        peer_id: "valid_peer_id_123".to_string(),
+        peer_id: test_peer.clone(),
         payload: vec![0u8; 20 * 1024 * 1024], // 20MB
         timestamp: valid_msg.timestamp,
     };
@@ -202,7 +192,7 @@ fn test_network_message_validation() {
 
     // Timestamp in future
     let future_msg = NetworkMessage {
-        peer_id: "valid_peer_id_123".to_string(),
+        peer_id: test_peer,
         payload: vec![0u8; 1024],
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -322,19 +312,18 @@ mod fuzzing_tests {
     use quickcheck::TestResult;
 
     quickcheck::quickcheck! {
-        fn fuzz_peer_id_validation(input: String) -> TestResult {
-        // Skip if input could cause issues
-        if input.len() > 1000 {
+        fn fuzz_peer_id_validation(bytes: Vec<u8>) -> TestResult {
+        // PeerId is [u8; 32], so only test with 32-byte inputs
+        if bytes.len() != 32 {
             return TestResult::discard();
         }
 
-        let result = validate_peer_id(&input);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let peer = saorsa_core::PeerId::from_bytes(arr);
 
-        // Should only succeed if it matches our criteria
-        if result.is_ok() {
-            assert!(input.len() >= 16 && input.len() <= 64);
-            assert!(input.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'));
-        }
+        // PeerId is always valid by construction
+        assert!(validate_peer_id(&peer).is_ok());
 
         TestResult::passed()
         }

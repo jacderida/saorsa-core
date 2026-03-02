@@ -85,11 +85,13 @@ use std::time::Duration;
 /// # Usage
 /// ```rust
 /// use saorsa_core::dht::derive_dht_key_from_peer_id;
+/// use saorsa_core::identity::node_identity::PeerId;
 ///
-/// let key = derive_dht_key_from_peer_id("peer-abc123");
+/// let peer = PeerId::random();
+/// let key = derive_dht_key_from_peer_id(&peer);
 /// // Always produces same key for same peer_id, across all nodes
 /// ```
-pub fn derive_dht_key_from_peer_id(peer_id: &str) -> [u8; 32] {
+pub fn derive_dht_key_from_peer_id(peer_id: &PeerId) -> [u8; 32] {
     use blake3::Hasher;
     let mut hasher = Hasher::new();
     hasher.update(peer_id.as_bytes());

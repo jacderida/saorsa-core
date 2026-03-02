@@ -4,6 +4,7 @@
 //! Provides region detection, latency-aware peer selection, and cross-region routing optimization.
 
 use crate::Multiaddr;
+use crate::PeerId;
 use crate::dht::{
     geographic_routing::{GeographicRegion, PeerQualityMetrics},
     geographic_routing_table::{
@@ -29,7 +30,7 @@ pub struct GeographicNetworkIntegration {
     /// Region mapping cache for IP addresses
     region_cache: Arc<RwLock<HashMap<IpAddr, GeographicRegion>>>,
     /// Quality metrics tracking
-    quality_tracker: Arc<RwLock<HashMap<String, PeerQualityMetrics>>>,
+    quality_tracker: Arc<RwLock<HashMap<PeerId, PeerQualityMetrics>>>,
     /// Local node region
     local_region: GeographicRegion,
 }
@@ -172,7 +173,7 @@ impl GeographicNetworkIntegration {
     }
 
     /// Add peer with geographic awareness
-    pub async fn add_peer(&self, peer_id: String, address: Multiaddr) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: PeerId, address: Multiaddr) -> Result<()> {
         let region = self.detect_region(&address).await;
 
         debug!("Adding peer {} in region {:?}", peer_id, region);
@@ -224,7 +225,7 @@ impl GeographicNetworkIntegration {
     /// Update peer quality metrics based on operation results
     pub async fn update_peer_quality(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         success: bool,
         rtt: Option<Duration>,
     ) -> Result<()> {
@@ -246,7 +247,7 @@ impl GeographicNetworkIntegration {
         {
             let mut selector = self.peer_selector.write().await;
             if let Some(updated_metrics) = self.quality_tracker.read().await.get(peer_id) {
-                selector.update_peer_metrics(peer_id.to_string(), updated_metrics.clone())?;
+                selector.update_peer_metrics(peer_id.clone(), updated_metrics.clone())?;
             }
         }
 
@@ -257,7 +258,7 @@ impl GeographicNetworkIntegration {
     pub async fn get_peers_by_region(
         &self,
         region: GeographicRegion,
-    ) -> Result<Vec<(String, PeerQualityMetrics)>> {
+    ) -> Result<Vec<(PeerId, PeerQualityMetrics)>> {
         let routing_table = self.routing_table.read().await;
         Ok(routing_table.get_regional_peers(region))
     }
@@ -315,7 +316,7 @@ impl GeographicNetworkIntegration {
 
             // Clean up stale metrics (older than 24 hours)
             let _now = std::time::Instant::now();
-            let stale_peers: Vec<String> = tracker
+            let stale_peers: Vec<PeerId> = tracker
                 .iter()
                 .filter(|(_, metrics)| metrics.needs_refresh(Duration::from_secs(24 * 3600)))
                 .map(|(peer_id, _)| peer_id.clone())
@@ -404,7 +405,8 @@ mod tests {
             GeographicNetworkIntegration::new(GeographicRegion::NorthAmerica).unwrap();
 
         let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
-        let result = integration.add_peer("test_peer_1".to_string(), addr).await;
+        let peer_id = PeerId::random();
+        let result = integration.add_peer(peer_id, addr).await;
         assert!(result.is_ok());
 
         let stats = integration.get_routing_stats().await.unwrap();
@@ -418,21 +420,17 @@ mod tests {
             GeographicNetworkIntegration::new(GeographicRegion::NorthAmerica).unwrap();
 
         let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
-        integration
-            .add_peer("test_peer_1".to_string(), addr)
-            .await
-            .unwrap();
+        let peer_id = PeerId::random();
+        integration.add_peer(peer_id.clone(), addr).await.unwrap();
 
         // Test successful operation
         let result = integration
-            .update_peer_quality("test_peer_1", true, Some(Duration::from_millis(50)))
+            .update_peer_quality(&peer_id, true, Some(Duration::from_millis(50)))
             .await;
         assert!(result.is_ok());
 
         // Test failed operation
-        let result = integration
-            .update_peer_quality("test_peer_1", false, None)
-            .await;
+        let result = integration.update_peer_quality(&peer_id, false, None).await;
         assert!(result.is_ok());
     }
 }

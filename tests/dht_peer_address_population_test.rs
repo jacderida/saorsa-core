@@ -71,7 +71,7 @@ async fn create_test_dht_config(
     );
 
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
+        .peer_id(saorsa_core::network::peer_id_from_hex(peer_id))
         .listen_port(0) // Random port
         .ipv6(false)
         .build()?;
@@ -92,7 +92,7 @@ async fn create_test_dht_config(
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer_id.to_string(),
+        peer_id: saorsa_core::network::peer_id_from_hex(peer_id),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),
@@ -160,8 +160,8 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     let (manager_a, identity_a) = create_test_manager("address_test_a").await?;
     let (manager_b, identity_b) = create_test_manager("address_test_b").await?;
 
-    let a_node_id = identity_a.peer_id().to_hex();
-    let b_node_id = identity_b.peer_id().to_hex();
+    let a_node_id = identity_a.peer_id().clone();
+    let b_node_id = identity_b.peer_id().clone();
     info!(
         "Created nodes A (node_id={}) and B (node_id={})",
         a_node_id, b_node_id
@@ -412,8 +412,8 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     let (manager_a, _identity_a) = create_test_manager("consistency_a").await?;
     let (manager_b, identity_b) = create_test_manager("consistency_b").await?;
 
-    let b_node_id = identity_b.peer_id().to_hex();
-    info!("Created nodes A and B (B's node_id={})", b_node_id);
+    let b_peer_id = identity_b.peer_id().clone();
+    info!("Created nodes A and B (B's node_id={})", b_peer_id);
 
     // Connect and authenticate bidirectionally
     let addr_b = manager_b
@@ -426,9 +426,9 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     // Query P2P layer for peer B's info (using B's app-level node ID)
     info!(
         "Querying P2P layer for peer B's info (node_id={})...",
-        b_node_id
+        b_peer_id
     );
-    let p2p_peer_info = manager_a.transport().peer_info(&b_node_id).await;
+    let p2p_peer_info = manager_a.transport().peer_info(&b_peer_id).await;
 
     let p2p_addresses = match p2p_peer_info {
         Some(info) => {
@@ -450,7 +450,7 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     // Query DHT layer for peer B's info (using B's app-level node ID)
     info!("Querying DHT layer for peer B's info...");
     let dht_peers = manager_a.get_connected_peers().await;
-    let dht_peer_info = dht_peers.iter().find(|p| p.peer_id == b_node_id);
+    let dht_peer_info = dht_peers.iter().find(|p| p.peer_id == b_peer_id);
 
     let dht_addresses = match dht_peer_info {
         Some(info) => {

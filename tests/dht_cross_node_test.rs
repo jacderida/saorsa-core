@@ -36,8 +36,9 @@ async fn create_test_dht_config(
     peer_id: &str,
     port: u16,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::network::peer_id_from_hex(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
+        .peer_id(peer.clone())
         .listen_port(port)
         .ipv6(false)
         .build()
@@ -59,7 +60,7 @@ async fn create_test_dht_config(
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -196,8 +197,9 @@ async fn test_cross_node_dht_store_retrieve() -> Result<()> {
 async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     // Create DhtNetworkManager (DHT layer)
     // The caller creates a TransportHandle (transport layer) and passes it in
+    let arch_peer = saorsa_core::network::peer_id_from_hex("architecture_test_node");
     let node_config = NodeConfig::builder()
-        .peer_id("architecture_test_node".to_string())
+        .peer_id(arch_peer.clone())
         .listen_port(0)
         .ipv6(false)
         .build()?;
@@ -218,7 +220,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     );
 
     let dht_config = DhtNetworkConfig {
-        peer_id: "architecture_test_node".to_string(),
+        peer_id: arch_peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -266,7 +268,9 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
 async fn test_p2p_node_local_dht_only() -> Result<()> {
     // Create P2PNode (transport layer only)
     let node_config = NodeConfig::builder()
-        .peer_id("local_only_test_node".to_string())
+        .peer_id(saorsa_core::network::peer_id_from_hex(
+            "local_only_test_node",
+        ))
         .listen_port(0)
         .ipv6(false)
         .build()?;

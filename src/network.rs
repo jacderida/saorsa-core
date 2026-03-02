@@ -100,7 +100,7 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Local peer ID for this node
-    pub peer_id: Option<String>,
+    pub peer_id: Option<PeerId>,
 
     /// Addresses to listen on for incoming connections
     pub listen_addrs: Vec<std::net::SocketAddr>,
@@ -283,7 +283,7 @@ impl NodeConfig {
 /// Builder for constructing NodeConfig with fluent API
 #[derive(Debug, Clone, Default)]
 pub struct NodeConfigBuilder {
-    peer_id: Option<String>,
+    peer_id: Option<PeerId>,
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
@@ -298,7 +298,7 @@ pub struct NodeConfigBuilder {
 
 impl NodeConfigBuilder {
     /// Set the peer ID
-    pub fn peer_id(mut self, peer_id: String) -> Self {
+    pub fn peer_id(mut self, peer_id: PeerId) -> Self {
         self.peer_id = Some(peer_id);
         self
     }
@@ -607,7 +607,7 @@ pub enum NetworkEvent {
     /// A new peer has connected
     PeerConnected {
         /// The identifier of the newly connected peer
-        peer_id: String,
+        peer_id: PeerId,
         /// The network addresses where the peer can be reached
         addresses: Vec<String>,
     },
@@ -615,7 +615,7 @@ pub enum NetworkEvent {
     /// A peer has disconnected
     PeerDisconnected {
         /// The identifier of the disconnected peer
-        peer_id: String,
+        peer_id: PeerId,
         /// The reason for the disconnection
         reason: String,
     },
@@ -623,7 +623,7 @@ pub enum NetworkEvent {
     /// A message was received from a peer
     MessageReceived {
         /// The identifier of the sending peer
-        peer_id: String,
+        peer_id: PeerId,
         /// The protocol used for the message
         protocol: String,
         /// The raw message data
@@ -633,7 +633,7 @@ pub enum NetworkEvent {
     /// A connection attempt failed
     ConnectionFailed {
         /// The identifier of the peer (if known)
-        peer_id: Option<String>,
+        peer_id: Option<PeerId>,
         /// The address where connection was attempted
         address: String,
         /// The error message describing the failure
@@ -837,7 +837,7 @@ impl P2PNode {
         let pre_trusted: HashSet<PeerId> = config
             .bootstrap_peers_str
             .iter()
-            .map(|p| PeerId::from_bytes(crate::dht::derive_dht_key_from_peer_id(p)))
+            .map(|p| peer_id_from_hex(p))
             .collect();
         let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
         trust_engine.clone().start_background_updates();
@@ -869,7 +869,7 @@ impl P2PNode {
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
-            peer_id: peer_id.to_hex(),
+            peer_id: peer_id.clone(),
             dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
@@ -977,13 +977,6 @@ impl P2PNode {
     /// ```
     pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
         self.trust_engine.clone()
-    }
-
-    /// Parse a hex-encoded PeerId string into a `PeerId` for trust lookups.
-    ///
-    /// Delegates to the standalone [`peer_id_from_hex`] function.
-    fn peer_id_from_hex(peer_id: &str) -> PeerId {
-        crate::network::peer_id_from_hex(peer_id)
     }
 
     /// Report a successful interaction with a peer
@@ -1100,7 +1093,7 @@ impl P2PNode {
     ///
     /// # Arguments
     ///
-    /// * `peer_id` - The peer ID (as a string) to query
+    /// * `peer_id` - The peer ID to query
     ///
     /// # Example
     ///
@@ -1110,11 +1103,9 @@ impl P2PNode {
     ///     tracing::warn!("Low trust peer: {}", peer_id);
     /// }
     /// ```
-    pub fn peer_trust(&self, peer_id: &str) -> f64 {
+    pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_from_hex(peer_id);
-
-            engine.get_trust(&node_id)
+            engine.get_trust(peer_id)
         } else {
             // Trust engine not initialized - return neutral trust
             DEFAULT_NEUTRAL_TRUST
@@ -1342,7 +1333,7 @@ impl P2PNode {
     }
 
     /// Get peer info
-    pub async fn peer_info(&self, peer_id: &str) -> Option<PeerInfo> {
+    pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
         self.transport.peer_info(peer_id).await
     }
 
@@ -1365,7 +1356,7 @@ impl P2PNode {
     }
 
     /// Check if an authenticated peer is connected (has at least one active channel).
-    pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
+    pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
         self.transport.is_peer_connected(peer_id).await
     }
 
@@ -1396,7 +1387,7 @@ impl P2PNode {
     }
 
     /// Disconnect from a peer
-    pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
+    pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
         self.transport.disconnect_peer(peer_id).await
     }
 
@@ -1447,9 +1438,9 @@ pub fn peer_id_from_hex(peer_id: &str) -> PeerId {
         arr.copy_from_slice(&bytes);
         return PeerId::from_bytes(arr);
     }
-    // Non-hex or wrong length: use canonical derivation
-    let hash = crate::dht::derive_dht_key_from_peer_id(peer_id);
-    PeerId::from_bytes(hash)
+    // Non-hex or wrong length: hash the raw string bytes
+    let hash = blake3::hash(peer_id.as_bytes());
+    PeerId::from_bytes(*hash.as_bytes())
 }
 
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
@@ -1676,7 +1667,7 @@ impl P2PNode {
     }
 
     /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(&self, peer_id: String, addresses: Vec<String>) -> Result<()> {
+    pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.write().await;
             let socket_addresses: Vec<std::net::SocketAddr> = addresses
@@ -1694,7 +1685,7 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
@@ -1779,7 +1770,10 @@ impl P2PNode {
                 if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
                     seen_addresses.insert(socket_addr);
                     let contact = ContactEntry::new(
-                        format!("cli_peer_{}", addr.chars().take(8).collect::<String>()),
+                        peer_id_from_hex(&format!(
+                            "cli_peer_{}",
+                            addr.chars().take(8).collect::<String>()
+                        )),
                         vec![socket_addr],
                     );
                     bootstrap_contacts.push(contact);
@@ -1846,20 +1840,20 @@ impl P2PNode {
         // as a provisional identifier until app-level identity exchange
         // is implemented in the bootstrap handshake.
         let mut successful_connections = 0;
-        let mut connected_channel_ids: Vec<String> = Vec::new();
+        let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
                 match self.connect_peer(&addr.to_string()).await {
                     Ok(channel_id) => {
                         successful_connections += 1;
-                        connected_channel_ids.push(channel_id.clone());
+                        connected_peer_ids.push(peer_id_from_hex(&channel_id));
 
                         // Update bootstrap cache with successful connection
                         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
                             let manager = bootstrap_manager.write().await;
                             let mut updated_contact = contact.clone();
-                            updated_contact.peer_id = channel_id.clone();
+                            updated_contact.peer_id = peer_id_from_hex(&channel_id);
                             updated_contact.update_connection_result(true, Some(100), None); // Assume 100ms latency for now
 
                             if let Err(e) = manager.add_contact(updated_contact).await {
@@ -1905,10 +1899,9 @@ impl P2PNode {
         );
 
         // Perform DHT peer discovery from connected bootstrap peers.
-        // Uses channel IDs which the DHT manager resolves internally.
         match self
             .dht_manager
-            .bootstrap_from_peers(&connected_channel_ids)
+            .bootstrap_from_peers(&connected_peer_ids)
             .await
         {
             Ok(count) => info!("DHT peer discovery found {} peers", count),
@@ -1921,7 +1914,7 @@ impl P2PNode {
         info!(
             "Bootstrap complete: connected to {} peers, initiated {} discovery requests",
             successful_connections,
-            connected_channel_ids.len()
+            connected_peer_ids.len()
         );
 
         Ok(())
@@ -1962,7 +1955,7 @@ impl NodeBuilder {
     }
 
     /// Set the peer ID
-    pub fn with_peer_id(mut self, peer_id: String) -> Self {
+    pub fn with_peer_id(mut self, peer_id: PeerId) -> Self {
         self.config.peer_id = Some(peer_id);
         self
     }
@@ -2122,7 +2115,7 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            peer_id: Some("test_peer_123".to_string()),
+            peer_id: Some(peer_id_from_hex("test_peer_123")),
             listen_addrs: vec![
                 std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
@@ -2283,7 +2276,7 @@ mod tests {
     async fn test_peer_connection() -> Result<()> {
         let config1 = create_test_node_config();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some("test_peer_456".to_string());
+        config2.peer_id = Some(peer_id_from_hex("test_peer_456"));
 
         let node1 = P2PNode::new(config1).await?;
         let node2 = P2PNode::new(config2).await?;
@@ -2302,24 +2295,25 @@ mod tests {
                 ))
             })?;
 
-        // Connect to a real peer (unsigned — no node_identity configured)
-        let peer_id = node1.connect_peer(&node2_addr.to_string()).await?;
+        // Connect to a real peer (unsigned — no node_identity configured).
+        // connect_peer returns a transport-level channel ID (String), not a PeerId.
+        let channel_id = node1.connect_peer(&node2_addr.to_string()).await?;
 
-        // Unauthenticated connections don't appear in connected_peers() (app-level).
-        // Verify transport-level tracking via peer_info / is_peer_connected instead.
-        assert!(node1.is_peer_connected(&peer_id).await);
+        // Unauthenticated connections don't appear in the app-level peer maps.
+        // Verify transport-level tracking via is_connection_active / peers map.
+        assert!(node1.is_connection_active(&channel_id).await);
 
-        // Get peer info (resolves via peers map for channel IDs)
-        let peer_info = node1.peer_info(&peer_id).await;
+        // Get peer info from the transport-level peers map (keyed by channel ID)
+        let peer_info = node1.transport.peer_info_by_channel(&channel_id).await;
         assert!(peer_info.is_some());
-        let info = peer_info.expect("Peer info should exist after adding peer");
-        assert_eq!(info.channel_id, peer_id);
+        let info = peer_info.expect("Peer info should exist after connect");
+        assert_eq!(info.channel_id, channel_id);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.protocols.contains(&"p2p-foundation/1.0".to_string()));
 
-        // Disconnect from peer
-        node1.disconnect_peer(&peer_id).await?;
-        assert!(!node1.is_peer_connected(&peer_id).await);
+        // Disconnect the channel
+        node1.remove_channel(&channel_id).await;
+        assert!(!node1.is_connection_active(&channel_id).await);
 
         node1.stop().await?;
         node2.stop().await?;
@@ -2355,7 +2349,7 @@ mod tests {
 
         let node2_peer_id = identity2.peer_id().clone();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some("test_peer_456".to_string());
+        config2.peer_id = Some(peer_id_from_hex("test_peer_456"));
         config2.listen_addr = ipv4_localhost;
         config2.listen_addrs = vec![ipv4_localhost];
         config2.enable_ipv6 = false;
@@ -2582,8 +2576,9 @@ mod tests {
     #[tokio::test]
     async fn test_node_builder() -> Result<()> {
         // Create a config using the builder but don't actually build a real node
+        let builder_peer_id = peer_id_from_hex("builder_test_peer");
         let builder = P2PNode::builder()
-            .with_peer_id("builder_test_peer".to_string())
+            .with_peer_id(builder_peer_id.clone())
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
             .with_bootstrap_peer("/ip4/127.0.0.1/tcp/9000") // Use a valid port number
@@ -2594,7 +2589,7 @@ mod tests {
 
         // Test the configuration that was built
         let config = builder.config;
-        assert_eq!(config.peer_id, Some("builder_test_peer".to_string()));
+        assert_eq!(config.peer_id, Some(builder_peer_id));
         assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
         assert_eq!(config.bootstrap_peers_str.len(), 1); // Check bootstrap_peers_str instead
         assert!(config.enable_ipv6);
@@ -2646,7 +2641,7 @@ mod tests {
     #[tokio::test]
     async fn test_network_event_variants() {
         // Test that all network event variants can be created
-        let peer_id = "test_peer".to_string();
+        let peer_id = peer_id_from_hex("test_peer");
         let address = "/ip4/127.0.0.1/tcp/9000".to_string();
 
         let _peer_connected = NetworkEvent::PeerConnected {
@@ -2904,6 +2899,7 @@ mod tests {
 
         // Add a peer
         let channel_id = "peer_to_remove".to_string();
+        let channel_peer_id = peer_id_from_hex(&channel_id);
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
@@ -2917,16 +2913,19 @@ mod tests {
         node.transport
             .inject_peer(channel_id.clone(), peer_info)
             .await;
+        node.transport
+            .inject_peer_to_channel(channel_peer_id.clone(), channel_id.clone())
+            .await;
 
         // Verify peer exists
-        assert!(node.is_peer_connected(&channel_id).await);
+        assert!(node.is_peer_connected(&channel_peer_id).await);
 
         // Remove the channel
         let removed = node.remove_channel(&channel_id).await;
         assert!(removed);
 
         // Verify peer no longer exists
-        assert!(!node.is_peer_connected(&channel_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         Ok(())
     }
@@ -2949,9 +2948,10 @@ mod tests {
         let node = P2PNode::new(config).await?;
 
         let channel_id = "test_peer".to_string();
+        let channel_peer_id = peer_id_from_hex(&channel_id);
 
         // Initially not connected
-        assert!(!node.is_peer_connected(&channel_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         // Add peer
         let peer_info = PeerInfo {
@@ -2967,15 +2967,18 @@ mod tests {
         node.transport
             .inject_peer(channel_id.clone(), peer_info)
             .await;
+        node.transport
+            .inject_peer_to_channel(channel_peer_id.clone(), channel_id.clone())
+            .await;
 
         // Now connected
-        assert!(node.is_peer_connected(&channel_id).await);
+        assert!(node.is_peer_connected(&channel_peer_id).await);
 
         // Remove channel
         node.remove_channel(&channel_id).await;
 
         // No longer connected
-        assert!(!node.is_peer_connected(&channel_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         Ok(())
     }

@@ -23,7 +23,7 @@
 use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
-use crate::{P2PError, Result};
+use crate::{P2PError, PeerId, Result};
 use ant_quic::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
@@ -184,7 +184,7 @@ impl BootstrapManager {
     /// Enforces:
     /// 1. Rate limiting (per-subnet temporal limits)
     /// 2. IP diversity (geographic/ASN limits)
-    pub async fn add_peer(&self, peer_id: String, addresses: Vec<SocketAddr>) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: &PeerId, addresses: Vec<SocketAddr>) -> Result<()> {
         if addresses.is_empty() {
             return Err(P2PError::Bootstrap(BootstrapError::InvalidData(
                 "No addresses provided".to_string().into(),
@@ -231,7 +231,7 @@ impl BootstrapManager {
         } // Lock released here before await
 
         // Convert PeerId to ant-quic format and add to cache
-        let ant_peer_id = string_to_ant_peer_id(&peer_id);
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.add_seed(ant_peer_id, addresses).await;
 
         Ok(())
@@ -240,20 +240,20 @@ impl BootstrapManager {
     /// Add a trusted peer bypassing Sybil protection
     ///
     /// Use only for well-known bootstrap nodes or admin-approved peers.
-    pub async fn add_peer_trusted(&self, peer_id: String, addresses: Vec<SocketAddr>) {
-        let ant_peer_id = string_to_ant_peer_id(&peer_id);
+    pub async fn add_peer_trusted(&self, peer_id: &PeerId, addresses: Vec<SocketAddr>) {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.add_seed(ant_peer_id, addresses).await;
     }
 
     /// Record a successful connection
-    pub async fn record_success(&self, peer_id: &str, rtt_ms: u32) {
-        let ant_peer_id = string_to_ant_peer_id(peer_id);
+    pub async fn record_success(&self, peer_id: &PeerId, rtt_ms: u32) {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.record_success(&ant_peer_id, rtt_ms).await;
     }
 
     /// Record a failed connection
-    pub async fn record_failure(&self, peer_id: &str) {
-        let ant_peer_id = string_to_ant_peer_id(peer_id);
+    pub async fn record_failure(&self, peer_id: &PeerId) {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.record_failure(&ant_peer_id).await;
     }
 
@@ -299,22 +299,22 @@ impl BootstrapManager {
     }
 
     /// Update peer capabilities
-    pub async fn update_capabilities(&self, peer_id: &str, capabilities: PeerCapabilities) {
-        let ant_peer_id = string_to_ant_peer_id(peer_id);
+    pub async fn update_capabilities(&self, peer_id: &PeerId, capabilities: PeerCapabilities) {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache
             .update_capabilities(&ant_peer_id, capabilities)
             .await;
     }
 
     /// Check if a peer exists in the cache
-    pub async fn contains(&self, peer_id: &str) -> bool {
-        let ant_peer_id = string_to_ant_peer_id(peer_id);
+    pub async fn contains(&self, peer_id: &PeerId) -> bool {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.contains(&ant_peer_id).await
     }
 
     /// Get a specific peer from the cache
-    pub async fn get_peer(&self, peer_id: &str) -> Option<CachedPeer> {
-        let ant_peer_id = string_to_ant_peer_id(peer_id);
+    pub async fn get_peer(&self, peer_id: &PeerId) -> Option<CachedPeer> {
+        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
         self.cache.get(&ant_peer_id).await
     }
 
@@ -327,12 +327,12 @@ impl BootstrapManager {
     ///
     /// This accepts the old `ContactEntry` type and converts it to the new API.
     pub async fn add_contact(&self, contact: super::ContactEntry) -> Result<()> {
-        self.add_peer(contact.peer_id, contact.addresses).await
+        self.add_peer(&contact.peer_id, contact.addresses).await
     }
 
     /// Add a contact bypassing rate limiting (compatibility method)
     pub async fn add_contact_trusted(&self, contact: super::ContactEntry) {
-        self.add_peer_trusted(contact.peer_id, contact.addresses)
+        self.add_peer_trusted(&contact.peer_id, contact.addresses)
             .await;
     }
 
@@ -341,7 +341,7 @@ impl BootstrapManager {
     /// Maps the old `QualityMetrics` to record_success/record_failure calls.
     pub async fn update_contact_metrics(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         metrics: super::QualityMetrics,
     ) -> Result<()> {
         // Convert QualityMetrics to success/failure recording
@@ -392,10 +392,9 @@ impl BootstrapManager {
         let contacts: Vec<super::ContactEntry> = peers
             .into_iter()
             .map(|cached| {
-                // Convert ant-quic PeerId back to string
-                // Use hex encoding of the first 8 bytes as the peer_id
-                let peer_id_str = hex::encode(&cached.peer_id.0[..8]);
-                super::ContactEntry::new(peer_id_str, cached.addresses.clone())
+                // Convert ant-quic PeerId ([u8; 32]) back to saorsa PeerId
+                let peer_id = PeerId::from_bytes(cached.peer_id.0);
+                super::ContactEntry::new(peer_id, cached.addresses.clone())
             })
             .collect();
         Ok(contacts)
@@ -430,10 +429,11 @@ pub struct BootstrapStats {
     pub untested_peers: usize,
 }
 
-/// Convert saorsa PeerId (String) to ant-quic PeerId ([u8; 32])
-fn string_to_ant_peer_id(peer_id: &str) -> ant_quic::nat_traversal_api::PeerId {
-    let hash = blake3::hash(peer_id.as_bytes());
-    ant_quic::nat_traversal_api::PeerId(*hash.as_bytes())
+/// Convert saorsa `PeerId` to ant-quic `PeerId` ([u8; 32]).
+///
+/// Both types are 32-byte identifiers, so this is a direct copy.
+fn peer_id_to_ant_peer_id(peer_id: &PeerId) -> ant_quic::nat_traversal_api::PeerId {
+    ant_quic::nat_traversal_api::PeerId(peer_id.0)
 }
 
 /// Convert IP address to IPv6 (IPv4 mapped if needed)
@@ -489,11 +489,11 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = "test-peer-1".to_string();
+        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Add peer
-        let result = manager.add_peer(peer_id.clone(), vec![addr]).await;
+        let result = manager.add_peer(&peer_id, vec![addr]).await;
         assert!(result.is_ok());
 
         // Verify it was added
@@ -507,8 +507,8 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = "test-peer-1".to_string();
-        let result = manager.add_peer(peer_id, vec![]).await;
+        let peer_id = PeerId::random();
+        let result = manager.add_peer(&peer_id, vec![]).await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -523,11 +523,11 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = "trusted-peer".to_string();
+        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Trusted add doesn't return Result, always succeeds
-        manager.add_peer_trusted(peer_id.clone(), vec![addr]).await;
+        manager.add_peer_trusted(&peer_id, vec![addr]).await;
 
         assert_eq!(manager.peer_count().await, 1);
         assert!(manager.contains(&peer_id).await);
@@ -539,9 +539,9 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = "test-peer".to_string();
+        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        manager.add_peer_trusted(peer_id.clone(), vec![addr]).await;
+        manager.add_peer_trusted(&peer_id, vec![addr]).await;
 
         // Get initial quality
         let initial_peer = manager.get_peer(&peer_id).await.unwrap();
@@ -566,9 +566,9 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = "test-peer".to_string();
+        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        manager.add_peer_trusted(peer_id.clone(), vec![addr]).await;
+        manager.add_peer_trusted(&peer_id, vec![addr]).await;
 
         // Record successes first to establish baseline
         for _ in 0..3 {
@@ -598,9 +598,9 @@ mod tests {
 
         // Add multiple peers with different quality
         for i in 0..10 {
-            let peer_id = format!("peer-{}", i);
+            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            manager.add_peer_trusted(peer_id.clone(), vec![addr]).await;
+            manager.add_peer_trusted(&peer_id, vec![addr]).await;
 
             // Make some peers better than others
             for _ in 0..i {
@@ -629,9 +629,9 @@ mod tests {
 
         // Add some peers
         for i in 0..5 {
-            let peer_id = format!("peer-{}", i);
+            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            manager.add_peer_trusted(peer_id, vec![addr]).await;
+            manager.add_peer_trusted(&peer_id, vec![addr]).await;
         }
 
         let stats = manager.stats().await;
@@ -654,9 +654,9 @@ mod tests {
                 diversity: IPDiversityConfig::default(),
             };
             let manager = BootstrapManager::with_config(config).await.unwrap();
-            let peer_id = "persistent-peer".to_string();
+            let peer_id = PeerId::random();
             let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            manager.add_peer_trusted(peer_id, vec![addr]).await;
+            manager.add_peer_trusted(&peer_id, vec![addr]).await;
 
             // Verify peer was added
             let count_before = manager.peer_count().await;
@@ -731,11 +731,11 @@ mod tests {
 
         // Add first two peers from same /24 - should succeed
         for i in 0..2 {
-            let peer_id = format!("peer-{}", i);
+            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("192.168.1.{}:{}", 10 + i, 9000 + i)
                 .parse()
                 .unwrap();
-            let result = manager.add_peer(peer_id, vec![addr]).await;
+            let result = manager.add_peer(&peer_id, vec![addr]).await;
             assert!(
                 result.is_ok(),
                 "First 2 peers should be allowed: {:?}",
@@ -744,9 +744,9 @@ mod tests {
         }
 
         // Third peer from same /24 subnet - should fail rate limiting
-        let peer_id = "peer-blocked".to_string();
+        let peer_id = PeerId::random();
         let addr: SocketAddr = "192.168.1.100:9100".parse().unwrap();
-        let result = manager.add_peer(peer_id, vec![addr]).await;
+        let result = manager.add_peer(&peer_id, vec![addr]).await;
         assert!(result.is_err(), "Third peer should be rate limited");
         assert!(matches!(
             result.unwrap_err(),
@@ -755,16 +755,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_peer_id_hashing_deterministic() {
-        // Same peer_id should always produce same ant_peer_id
-        let peer_id = "test-peer-123";
-        let ant_id_1 = string_to_ant_peer_id(peer_id);
-        let ant_id_2 = string_to_ant_peer_id(peer_id);
+    async fn test_peer_id_conversion_deterministic() {
+        // Same PeerId should always produce same ant_peer_id
+        let peer_id = PeerId::random();
+        let ant_id_1 = peer_id_to_ant_peer_id(&peer_id);
+        let ant_id_2 = peer_id_to_ant_peer_id(&peer_id);
         assert_eq!(ant_id_1.0, ant_id_2.0);
 
-        // Different peer_ids should produce different ant_peer_ids
-        let other_id = "other-peer-456";
-        let ant_id_3 = string_to_ant_peer_id(other_id);
+        // Different PeerIds should produce different ant_peer_ids
+        let other_id = PeerId::random();
+        let ant_id_3 = peer_id_to_ant_peer_id(&other_id);
         assert_ne!(ant_id_1.0, ant_id_3.0);
     }
 }
