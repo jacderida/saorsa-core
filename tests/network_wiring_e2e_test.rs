@@ -1847,7 +1847,7 @@ async fn test_zero_stale_threshold() {
     let addr2 = addrs2.first().expect("Need address").to_string();
 
     // Connection might succeed or fail immediately - both are valid
-    let peer2_peer_id = node2.peer_id().clone();
+    let peer2_peer_id = *node2.peer_id();
     match node1.connect_peer(&addr2).await {
         Ok(channel_id) => {
             info!("Connection succeeded with zero threshold");

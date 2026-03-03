@@ -198,7 +198,7 @@ mod eigentrust_tests {
         }
 
         // Add and remove pre-trusted nodes dynamically
-        engine.add_pre_trusted(nodes[2].clone()).await;
+        engine.add_pre_trusted(nodes[2]).await;
         let trust = engine.get_trust_async(&nodes[2]).await;
         assert_eq!(
             trust, 0.9,
@@ -341,7 +341,7 @@ mod eigentrust_tests {
         engine.compute_global_trust().await;
 
         // Create routing strategy
-        let strategy = TrustBasedRoutingStrategy::new(engine.clone(), nodes[0].clone());
+        let strategy = TrustBasedRoutingStrategy::new(engine.clone(), nodes[0]);
 
         // Find path to target
         let path = strategy

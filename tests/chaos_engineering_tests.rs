@@ -460,7 +460,7 @@ impl AdaptiveNode {
 
     async fn connect_to(&self, other: &AdaptiveNode) -> anyhow::Result<()> {
         let mut connections = self.connections.write().await;
-        connections.insert(other.id.clone(), true);
+        connections.insert(other.id, true);
         Ok(())
     }
 
@@ -491,7 +491,7 @@ impl AdaptiveNode {
         for node_a in nodes_a {
             for node_b in nodes_b {
                 let mut connections = node_a.connections.write().await;
-                connections.insert(node_b.id.clone(), false);
+                connections.insert(node_b.id, false);
             }
         }
         Ok(())
@@ -505,7 +505,7 @@ impl AdaptiveNode {
         for node_a in nodes_a {
             for node_b in nodes_b {
                 let mut connections = node_a.connections.write().await;
-                connections.insert(node_b.id.clone(), true);
+                connections.insert(node_b.id, true);
             }
         }
         Ok(())
@@ -564,7 +564,7 @@ impl AdaptiveNode {
 
     async fn establish_trust(&self, other: &AdaptiveNode) -> anyhow::Result<()> {
         let mut trust_scores = self.trust_scores.write().await;
-        trust_scores.insert(other.id.clone(), 0.8); // Initial high trust
+        trust_scores.insert(other.id, 0.8); // Initial high trust
         Ok(())
     }
 
@@ -595,13 +595,13 @@ impl AdaptiveNode {
         {
             let mut trust_scores = self.trust_scores.write().await;
             trust_scores
-                .entry(peer.id.clone())
+                .entry(peer.id)
                 .and_modify(|score| *score = (*score * 0.2).min(0.2))
                 .or_insert(0.2);
         }
 
         let mut connections = self.connections.write().await;
-        connections.insert(peer.id.clone(), false);
+        connections.insert(peer.id, false);
         Ok(())
     }
 
@@ -617,7 +617,7 @@ impl AdaptiveNode {
     }
 
     fn get_id(&self) -> PeerId {
-        self.id.clone()
+        self.id
     }
 
     async fn measure_network_stability(nodes: &[AdaptiveNode]) -> anyhow::Result<f64> {

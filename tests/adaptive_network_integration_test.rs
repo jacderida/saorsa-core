@@ -580,7 +580,7 @@ async fn test_adaptive_gossip_protocol() -> anyhow::Result<()> {
     let trust_provider = Arc::new(MockTrustProvider::new());
 
     // Create gossip instance
-    let local_node = network.get_nodes()[0].clone();
+    let local_node = network.get_nodes()[0];
     let gossip = AdaptiveGossipSub::new(local_node, trust_provider);
 
     // Subscribe to topics
@@ -721,14 +721,14 @@ async fn test_security_monitoring() -> anyhow::Result<()> {
     let bad_node = &test_nodes[1];
     monitor
         .blacklist_node(
-            bad_node.clone(),
+            *bad_node,
             saorsa_core::adaptive::security::BlacklistReason::RateLimitViolation,
         )
         .await;
 
     // Try to validate join from blacklisted node
     let node_descriptor = saorsa_core::adaptive::NodeDescriptor {
-        id: bad_node.clone(),
+        id: *bad_node,
         public_key: MlDsaPublicKey::from_bytes(&[0u8; 1952]).unwrap(),
         addresses: vec!["127.0.0.1:8080".to_string()],
         hyperbolic: None,
@@ -1080,7 +1080,7 @@ async fn test_adaptive_network_resilience() -> anyhow::Result<()> {
     for i in 0..5 {
         let node_idx = rand::random::<usize>() % config.num_nodes;
         let failed_node = &network.get_nodes()[node_idx];
-        failed_nodes.push(failed_node.clone());
+        failed_nodes.push(*failed_node);
 
         println!("  Simulating failure of node {:?}", &failed_node.0[..4]);
 

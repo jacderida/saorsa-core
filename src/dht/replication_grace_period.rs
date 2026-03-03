@@ -171,7 +171,7 @@ mod tests {
         let grace_expires = now + Duration::from_secs(300);
 
         let info = FailedNodeInfo {
-            node_id: node_id.clone(),
+            node_id,
             failed_at: now,
             last_seen_endpoint: Some("127.0.0.1:8080".to_string()),
             failure_reason: NodeFailureReason::NetworkTimeout,

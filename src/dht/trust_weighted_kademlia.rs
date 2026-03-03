@@ -167,7 +167,7 @@ impl TrustWeightedKademlia {
     /// Record interaction outcome for trust computation
     pub async fn record_interaction(&self, peer: PeerId, outcome: Outcome) {
         let mut interactions = self.interactions.write().await;
-        interactions.push_back((peer.clone(), outcome, SystemTime::now()));
+        interactions.push_back((peer, outcome, SystemTime::now()));
 
         // Keep only recent interactions (last 1000)
         while interactions.len() > 1000 {
@@ -191,7 +191,7 @@ impl TrustWeightedKademlia {
         };
 
         let local_trust = trust_matrix
-            .entry(self.local_id.clone())
+            .entry(self.local_id)
             .or_insert_with(HashMap::new);
         let current_trust = local_trust.get(&peer).copied().unwrap_or(0.5);
         let new_trust = (current_trust + trust_delta).clamp(0.0, 1.0);
@@ -206,7 +206,7 @@ impl TrustWeightedKademlia {
         // Initialize with uniform trust
         let all_peers: HashSet<_> = trust_matrix.keys().collect();
         for peer in &all_peers {
-            scores.insert((**peer).clone(), 1.0 / all_peers.len() as f32);
+            scores.insert(**peer, 1.0 / all_peers.len() as f32);
         }
 
         // Power iteration (simplified)
@@ -226,7 +226,7 @@ impl TrustWeightedKademlia {
                 }
 
                 new_scores.insert(
-                    (**peer).clone(),
+                    **peer,
                     if total_weight > 0.0 {
                         score / total_weight
                     } else {
@@ -436,7 +436,7 @@ impl super::Dht for TrustWeightedKademlia {
         providers
             .entry(local_key)
             .or_insert_with(HashSet::new)
-            .insert(self.local_id.clone());
+            .insert(self.local_id);
         Ok(())
     }
 }

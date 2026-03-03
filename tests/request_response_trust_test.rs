@@ -138,7 +138,7 @@ fn test_peer_store_outcome_failure() {
 fn test_peer_store_outcome_serde_roundtrip() {
     let peer_test = saorsa_core::PeerId::from_name("peer_test");
     let outcome = PeerStoreOutcome {
-        peer_id: peer_test.clone(),
+        peer_id: peer_test,
         success: false,
         error: Some("timeout".to_string()),
     };
@@ -154,7 +154,7 @@ fn test_peer_store_outcome_serde_default_fields() {
     // Construct a PeerStoreOutcome without optional error field and roundtrip it
     let peer_old = saorsa_core::PeerId::from_name("peer_old");
     let outcome = PeerStoreOutcome {
-        peer_id: peer_old.clone(),
+        peer_id: peer_old,
         success: true,
         error: None,
     };

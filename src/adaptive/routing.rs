@@ -281,7 +281,7 @@ pub struct KademliaRouting {
 impl KademliaRouting {
     pub fn new(node_id: PeerId) -> Self {
         Self {
-            _node_id: node_id.clone(),
+            _node_id: node_id,
             _routing_table: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -292,7 +292,7 @@ impl RoutingStrategy for KademliaRouting {
     async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Implementation would use the actual Kademlia lookup
         // For now, return a placeholder
-        Ok(vec![target.clone()])
+        Ok(vec![*target])
     }
 
     fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
@@ -346,7 +346,7 @@ impl RoutingStrategy for HyperbolicRouting {
     async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Greedy routing in hyperbolic space
         // For now, return a placeholder
-        Ok(vec![target.clone()])
+        Ok(vec![*target])
     }
 
     fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
@@ -375,7 +375,7 @@ impl TrustRouting {
 impl RoutingStrategy for TrustRouting {
     async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Route through high-trust nodes
-        Ok(vec![target.clone()])
+        Ok(vec![*target])
     }
 
     fn route_score(&self, neighbor: &PeerId, _target: &PeerId) -> f64 {
@@ -410,7 +410,7 @@ impl SOMRouting {
 impl RoutingStrategy for SOMRouting {
     async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Route through similar nodes in SOM space
-        Ok(vec![target.clone()])
+        Ok(vec![*target])
     }
 
     fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
@@ -493,7 +493,7 @@ impl RoutingStrategy for MockRoutingStrategy {
     ) -> std::result::Result<Vec<PeerId>, AdaptiveNetworkError> {
         let mut path = vec![PeerId::from_bytes([0u8; 32])]; // Start node
         if self.nodes.contains(target) {
-            path.push(target.clone());
+            path.push(*target);
         }
         Ok(path)
     }

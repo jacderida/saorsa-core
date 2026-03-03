@@ -70,7 +70,7 @@ fn create_diverse_node_metadata(
         let asn = base_asn + (i / locations.len()) as u32;
         let location = GeographicLocation::new(lat, lon)
             .unwrap_or_else(|_| GeographicLocation::new(0.0, 0.0).unwrap());
-        metadata.insert(node_id.clone(), (location, asn, region));
+        metadata.insert(*node_id, (location, asn, region));
     }
 
     metadata
@@ -86,10 +86,7 @@ fn create_same_region_metadata(
         let lon = -74.0 + (i as f64 * 0.001);
         let location = GeographicLocation::new(lat, lon)
             .unwrap_or_else(|_| GeographicLocation::new(0.0, 0.0).unwrap());
-        metadata.insert(
-            node_id.clone(),
-            (location, 12345, NetworkRegion::NorthAmerica),
-        );
+        metadata.insert(*node_id, (location, 12345, NetworkRegion::NorthAmerica));
     }
     metadata
 }
@@ -150,7 +147,7 @@ fn calculate_trust_distribution(selections: &[Vec<PeerId>]) -> HashMap<PeerId, u
     let mut distribution = HashMap::new();
     for selection in selections {
         for node_id in selection {
-            *distribution.entry(node_id.clone()).or_insert(0) += 1;
+            *distribution.entry(*node_id).or_insert(0) += 1;
         }
     }
     distribution
@@ -882,7 +879,7 @@ async fn test_placement_under_high_churn() {
             .iter()
             .enumerate()
             .filter(|(idx, _)| (idx + i) % 3 != 0)
-            .map(|(_, node)| node.clone())
+            .map(|(_, node)| *node)
             .collect();
 
         if available_nodes.len() >= 8 {
@@ -1016,9 +1013,9 @@ fn test_trust_distribution_calculation() {
     let nodes = create_test_nodes(5);
 
     let selections = vec![
-        vec![nodes[0].clone(), nodes[1].clone()],
-        vec![nodes[1].clone(), nodes[2].clone()],
-        vec![nodes[0].clone(), nodes[2].clone()],
+        vec![nodes[0], nodes[1]],
+        vec![nodes[1], nodes[2]],
+        vec![nodes[0], nodes[2]],
     ];
 
     let distribution = calculate_trust_distribution(&selections);

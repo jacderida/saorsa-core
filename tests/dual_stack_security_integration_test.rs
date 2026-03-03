@@ -290,7 +290,7 @@ fn test_node_age_registration() {
     let verifier = NodeAgeVerifier::new();
 
     let node_id = make_node_id("test-node-1");
-    let record = verifier.register_node(node_id.clone());
+    let record = verifier.register_node(node_id);
 
     // New node should be in New category
     assert_eq!(record.category(), NodeAgeCategory::New);
@@ -333,7 +333,7 @@ fn test_node_age_verification_for_operations() {
 
     // Register a new node
     let new_node = make_node_id("new-node");
-    verifier.register_node(new_node.clone());
+    verifier.register_node(new_node);
 
     // New node should not pass replication check
     let result = verifier.verify_for_operation(&new_node, OperationType::Replication);
@@ -416,7 +416,7 @@ fn test_full_security_pipeline_new_node() {
     // 2. Register node for age tracking
     let age_verifier = NodeAgeVerifier::new();
     let node_id = make_node_id("joining-node");
-    let age_record = age_verifier.register_node(node_id.clone());
+    let age_record = age_verifier.register_node(node_id);
 
     // Node starts as New
     assert_eq!(age_record.category(), NodeAgeCategory::New);
@@ -433,7 +433,7 @@ fn test_full_security_pipeline_new_node() {
     let replicator = CrossNetworkReplicator::new(repl_config);
 
     let node_info = NodeNetworkInfo {
-        node_id: node_id.clone(),
+        node_id,
         ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 100)],
         ipv6_addresses: vec![joining_ip],
         last_seen: SystemTime::now(),

@@ -233,7 +233,7 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
     // Test blacklisting
     security
         .blacklist_node(
-            test_node.id.clone(),
+            test_node.id,
             BlacklistReason::Manual("Test blacklist".to_string()),
         )
         .await;

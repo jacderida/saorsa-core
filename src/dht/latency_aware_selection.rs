@@ -94,22 +94,22 @@ impl PeerMetricsCache {
 
         // Add to cache
         self.entries.insert(
-            peer_id.clone(),
+            peer_id,
             CacheEntry {
-                peer_id: peer_id.clone(),
+                peer_id,
                 metrics: metrics.clone(),
                 last_accessed: now,
             },
         );
 
         // Update access order
-        self.access_order.push_back(peer_id.clone());
+        self.access_order.push_back(peer_id);
 
         // Update regional index
         self.regional_peers
             .entry(metrics.region)
             .or_default()
-            .push(peer_id.clone());
+            .push(peer_id);
 
         // Evict if over capacity
         while self.entries.len() > self.max_size {
@@ -122,7 +122,7 @@ impl PeerMetricsCache {
         if self.entries.contains_key(peer_id) {
             // Update access order first
             self.remove_from_access_order(peer_id);
-            self.access_order.push_back(peer_id.clone());
+            self.access_order.push_back(*peer_id);
 
             // Now update the entry and return the metrics
             if let Some(entry) = self.entries.get_mut(peer_id) {
@@ -147,7 +147,7 @@ impl PeerMetricsCache {
                 peer_ids
                     .iter()
                     .filter_map(|id| self.entries.get(id))
-                    .map(|entry| (entry.peer_id.clone(), entry.metrics.clone()))
+                    .map(|entry| (entry.peer_id, entry.metrics.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -171,7 +171,7 @@ impl PeerMetricsCache {
             .entries
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.last_accessed) > max_age)
-            .map(|(peer_id, _)| peer_id.clone())
+            .map(|(peer_id, _)| *peer_id)
             .collect();
 
         for peer_id in expired_peers {
@@ -582,14 +582,14 @@ mod tests {
 
         let metrics = PeerQualityMetrics::new(GeographicRegion::Europe);
 
-        cache.insert(peer1.clone(), metrics.clone());
-        cache.insert(peer2.clone(), metrics.clone());
-        cache.insert(peer3.clone(), metrics.clone());
+        cache.insert(peer1, metrics.clone());
+        cache.insert(peer2, metrics.clone());
+        cache.insert(peer3, metrics.clone());
 
         assert_eq!(cache.entries.len(), 3);
 
         // This should evict peer1 (LRU)
-        cache.insert(peer4.clone(), metrics);
+        cache.insert(peer4, metrics);
         assert_eq!(cache.entries.len(), 3);
         assert!(!cache.entries.contains_key(&peer1));
         assert!(cache.entries.contains_key(&peer4));
@@ -611,12 +611,8 @@ mod tests {
 
         let peer1 = PeerId::random();
         let peer2 = PeerId::random();
-        selector
-            .update_peer_metrics(peer1.clone(), metrics1)
-            .unwrap();
-        selector
-            .update_peer_metrics(peer2.clone(), metrics2)
-            .unwrap();
+        selector.update_peer_metrics(peer1, metrics1).unwrap();
+        selector.update_peer_metrics(peer2, metrics2).unwrap();
 
         // Select peers - should prefer European peer
         let selected = selector

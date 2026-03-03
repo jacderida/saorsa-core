@@ -39,7 +39,7 @@ async fn test_security_manager_validate_join() -> anyhow::Result<()> {
     let sm = SecurityManager::new(SecurityConfig::default(), &identity);
 
     let desc = NodeDescriptor {
-        id: saorsa_core::peer_record::PeerId::from_public_key(identity.public_key()),
+        id: saorsa_core::identity::node_identity::peer_id_from_public_key(identity.public_key()),
         public_key: identity.public_key().clone(),
         addresses: vec!["127.0.0.1:0".to_string()],
         hyperbolic: None,
@@ -73,7 +73,7 @@ async fn test_adaptive_router_routes_with_registered_strategy() -> anyhow::Resul
     #[async_trait::async_trait]
     impl RoutingStrategy for DirectStrategy {
         async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
-            Ok(vec![target.clone()])
+            Ok(vec![*target])
         }
         fn route_score(&self, _from: &PeerId, _to: &PeerId) -> f64 {
             1.0

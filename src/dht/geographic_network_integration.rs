@@ -181,16 +181,15 @@ impl GeographicNetworkIntegration {
         let quality_metrics = PeerQualityMetrics::new(region);
 
         // Add to routing table
-        self.routing_table.write().await.add_peer(
-            peer_id.clone(),
-            region,
-            quality_metrics.clone(),
-        )?;
+        self.routing_table
+            .write()
+            .await
+            .add_peer(peer_id, region, quality_metrics.clone())?;
 
         // Initialize quality metrics in tracker
         {
             let mut tracker = self.quality_tracker.write().await;
-            tracker.insert(peer_id.clone(), quality_metrics);
+            tracker.insert(peer_id, quality_metrics);
         }
 
         info!(
@@ -247,7 +246,7 @@ impl GeographicNetworkIntegration {
         {
             let mut selector = self.peer_selector.write().await;
             if let Some(updated_metrics) = self.quality_tracker.read().await.get(peer_id) {
-                selector.update_peer_metrics(peer_id.clone(), updated_metrics.clone())?;
+                selector.update_peer_metrics(*peer_id, updated_metrics.clone())?;
             }
         }
 
@@ -319,7 +318,7 @@ impl GeographicNetworkIntegration {
             let stale_peers: Vec<PeerId> = tracker
                 .iter()
                 .filter(|(_, metrics)| metrics.needs_refresh(Duration::from_secs(24 * 3600)))
-                .map(|(peer_id, _)| peer_id.clone())
+                .map(|(peer_id, _)| *peer_id)
                 .collect();
 
             for peer_id in stale_peers {
@@ -421,7 +420,7 @@ mod tests {
 
         let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
         let peer_id = PeerId::random();
-        integration.add_peer(peer_id.clone(), addr).await.unwrap();
+        integration.add_peer(peer_id, addr).await.unwrap();
 
         // Test successful operation
         let result = integration

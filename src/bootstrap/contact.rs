@@ -644,7 +644,7 @@ mod tests {
         let peer_id = PeerId::random();
         let addresses = vec!["127.0.0.1:9000".parse().unwrap()];
 
-        let contact = ContactEntry::new(peer_id.clone(), addresses.clone());
+        let contact = ContactEntry::new(peer_id, addresses.clone());
 
         assert_eq!(contact.peer_id, peer_id);
         assert_eq!(contact.addresses, addresses);

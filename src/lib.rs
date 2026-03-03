@@ -323,7 +323,7 @@ pub use crate::placement::{
 };
 
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
-pub use identity::node_identity::PeerId;
+pub use saorsa_types::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 
 /// Transport channel identifier (e.g. a QUIC connection).
 ///

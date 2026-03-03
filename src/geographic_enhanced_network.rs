@@ -174,7 +174,7 @@ impl GeographicNetworkService {
         }
 
         self.geographic_integration
-            .add_peer(peer_id.clone(), address)
+            .add_peer(peer_id, address)
             .await?;
 
         // Update connection count

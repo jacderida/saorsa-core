@@ -71,7 +71,7 @@ fn key_from_str(s: &str) -> Key {
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer.clone())
+        .peer_id(peer)
         .listen_port(0) // Use 0 for automatic port allocation
         .ipv6(false)
         .build()?;
@@ -470,7 +470,7 @@ async fn test_concurrent_peer_registration() -> Result<()> {
     let mut registration_handles = vec![];
     for manager in &managers {
         let manager_clone = manager.clone();
-        let peer_id = manager.peer_id().clone();
+        let peer_id = *manager.peer_id();
         let addr = match manager.local_addr() {
             Some(a) => a,
             None => {

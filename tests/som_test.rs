@@ -439,7 +439,7 @@ mod node_assignment_tests {
         let features = create_test_features(42);
 
         // Assign node to SOM
-        som.assign_node(node_id.clone(), features);
+        som.assign_node(node_id, features);
 
         // Retrieve nodes for the BMU
         let (bmu_x, bmu_y) = som.find_best_matching_unit(&create_test_features(42));
@@ -475,11 +475,11 @@ mod node_assignment_tests {
         let node_id = create_test_node_id(42);
 
         // First assignment
-        som.assign_node(node_id.clone(), create_test_features(10));
+        som.assign_node(node_id, create_test_features(10));
         let (old_x, old_y) = som.find_best_matching_unit(&create_test_features(10));
 
         // Reassign to different features
-        som.assign_node(node_id.clone(), create_test_features(200));
+        som.assign_node(node_id, create_test_features(200));
         let (new_x, new_y) = som.find_best_matching_unit(&create_test_features(200));
 
         // Check old neuron no longer has the node
@@ -581,7 +581,7 @@ mod grid_sizing_tests {
         for i in 0..20 {
             let node_id = create_test_node_id(i);
             let features = create_test_features(i);
-            som.assign_node(node_id.clone(), features);
+            som.assign_node(node_id, features);
             node_ids.push(node_id);
         }
 
@@ -718,7 +718,7 @@ mod integration_tests {
             all_features.push(features.clone());
 
             let node_id = create_test_node_id(i);
-            all_nodes.push((node_id.clone(), features));
+            all_nodes.push((node_id, features));
         }
 
         // Cluster 2: High storage, moderate latency (storage nodes)
@@ -729,7 +729,7 @@ mod integration_tests {
             all_features.push(features.clone());
 
             let node_id = create_test_node_id(i);
-            all_nodes.push((node_id.clone(), features));
+            all_nodes.push((node_id, features));
         }
 
         // Cluster 3: Balanced features (general nodes)
@@ -738,7 +738,7 @@ mod integration_tests {
             all_features.push(features.clone());
 
             let node_id = create_test_node_id(i);
-            all_nodes.push((node_id.clone(), features));
+            all_nodes.push((node_id, features));
         }
 
         // Train the SOM

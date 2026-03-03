@@ -181,7 +181,7 @@ proptest! {
                 let retrieved = retrieved.unwrap();
                 prop_assert_eq!(retrieved.key, record.key);
                 prop_assert_eq!(retrieved.value, record.value.clone());
-                prop_assert_eq!(retrieved.publisher, record.publisher.clone());
+                prop_assert_eq!(retrieved.publisher, record.publisher);
             }
             Ok(())
         })?;

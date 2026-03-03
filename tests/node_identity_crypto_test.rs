@@ -14,7 +14,7 @@ use rand::{RngCore, thread_rng};
 use saorsa_core::identity::{
     encryption::{decrypt_with_device_password, encrypt_with_device_password},
     four_words::FourWordAddress,
-    node_identity::{NodeIdentity, PeerId},
+    node_identity::{NodeIdentity, PeerId, peer_id_from_public_key},
 };
 use saorsa_core::quantum_crypto::ant_quic_integration::ml_dsa_verify;
 use std::collections::{HashMap, HashSet};
@@ -123,7 +123,7 @@ async fn test_node_identity_cryptography() -> Result<()> {
     let _signing_key = identity.secret_key_bytes();
 
     // Node ID should be derived from public key
-    let expected_node_id = PeerId::from_public_key(public_key);
+    let expected_node_id = peer_id_from_public_key(public_key);
     assert_eq!(
         *node_id, expected_node_id,
         "Node ID should match public key derivation"
@@ -221,23 +221,31 @@ async fn test_node_id_properties() -> Result<()> {
     let bytes = id1.to_bytes();
     assert_eq!(bytes.len(), 32, "Node ID should be 32 bytes");
 
-    // Test Display implementation
+    // Test Display implementation (full 64-char hex)
     let id_string = id1.to_string();
     assert_eq!(
         id_string.len(),
-        16,
-        "Display should show first 8 bytes as hex (16 chars)"
+        64,
+        "Display should show full 32 bytes as hex (64 chars)"
     );
     assert!(
         id_string.chars().all(|c| c.is_ascii_hexdigit()),
         "Display should be valid hex"
     );
 
+    // short_hex() returns compact 16-char representation
+    let short = id1.short_hex();
+    assert_eq!(
+        short.len(),
+        16,
+        "short_hex should show first 8 bytes (16 chars)"
+    );
+
     // Test uniqueness
     let mut node_ids = HashSet::new();
     for seed in 0..1000 {
         let identity_binding = create_test_identity(seed);
-        let id = identity_binding.peer_id().clone();
+        let id = *identity_binding.peer_id();
         assert!(!node_ids.contains(&id), "Node IDs should be unique");
         node_ids.insert(id);
     }
@@ -734,7 +742,7 @@ async fn test_identity_system_integration() -> Result<()> {
         );
 
         println!("    Node {}: {} -> {}", i, identity.peer_id(), addr_string);
-        four_word_registry.insert(addr_string.clone(), identity.peer_id().clone());
+        four_word_registry.insert(addr_string.clone(), *identity.peer_id());
         network_identities.push((identity, four_word_addr));
     }
 
@@ -754,7 +762,7 @@ async fn test_identity_system_integration() -> Result<()> {
             addr
         );
 
-        signatures.push((identity.peer_id().clone(), signature));
+        signatures.push((*identity.peer_id(), signature));
     }
 
     // Phase 3: Cross-verification
@@ -825,7 +833,7 @@ async fn test_identity_system_integration() -> Result<()> {
     // All node IDs should be unique
     let mut node_id_set = HashSet::new();
     for (identity, _) in &network_identities {
-        let node_id = identity.peer_id().clone();
+        let node_id = *identity.peer_id();
         assert!(!node_id_set.contains(&node_id), "Node IDs should be unique");
         node_id_set.insert(node_id);
     }

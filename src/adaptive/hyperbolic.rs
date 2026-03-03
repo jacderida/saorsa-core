@@ -105,7 +105,7 @@ impl HyperbolicSpace {
             .filter_map(|(id, coord)| {
                 let dist = Self::distance(coord, target);
                 if dist + epsilon < my_distance {
-                    Some((id.clone(), dist))
+                    Some((*id, dist))
                 } else {
                     None
                 }
@@ -279,9 +279,9 @@ impl HyperbolicRoutingStrategy {
         };
 
         let mut path = Vec::new();
-        let mut _current = self.local_id.clone();
+        let mut _current = self.local_id;
         let mut visited = std::collections::HashSet::<PeerId>::new();
-        visited.insert(_current.clone());
+        visited.insert(_current);
 
         // Greedy routing with loop detection
         for _ in 0..self.max_hops {
@@ -306,8 +306,8 @@ impl HyperbolicRoutingStrategy {
                         ));
                     }
 
-                    path.push(next.clone());
-                    visited.insert(next.clone());
+                    path.push(next);
+                    visited.insert(next);
                     _current = next;
                 }
                 None => {
@@ -462,7 +462,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut hash);
         let local_id = PeerId::from_bytes(hash);
 
-        let strategy = HyperbolicRoutingStrategy::new(local_id.clone(), space.clone());
+        let strategy = HyperbolicRoutingStrategy::new(local_id, space.clone());
 
         // Add some neighbors with coordinates
         let mut hash1 = [0u8; 32];
@@ -479,19 +479,13 @@ mod tests {
 
         // Set up coordinates
         space
-            .update_neighbor(
-                neighbor1.clone(),
-                HyperbolicCoordinate { r: 0.3, theta: 0.0 },
-            )
+            .update_neighbor(neighbor1, HyperbolicCoordinate { r: 0.3, theta: 0.0 })
             .await;
         space
-            .update_neighbor(
-                neighbor2.clone(),
-                HyperbolicCoordinate { r: 0.7, theta: 1.0 },
-            )
+            .update_neighbor(neighbor2, HyperbolicCoordinate { r: 0.7, theta: 1.0 })
             .await;
         space
-            .update_neighbor(target.clone(), HyperbolicCoordinate { r: 0.8, theta: 1.5 })
+            .update_neighbor(target, HyperbolicCoordinate { r: 0.8, theta: 1.5 })
             .await;
 
         // Try routing to target
@@ -525,7 +519,7 @@ mod tests {
                 theta: (i as f64) * std::f64::consts::PI / 3.0,
             };
 
-            space.update_neighbor(node_id.clone(), coord).await;
+            space.update_neighbor(node_id, coord).await;
             neighbors.push((node_id, coord));
         }
 

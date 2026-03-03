@@ -75,7 +75,7 @@ fn dht_record_benchmarks(c: &mut Criterion) {
 
         b.iter(|| {
             let key: Key = [1u8; 32];
-            let record = Record::new(key, black_box(data.clone()), peer_id.clone());
+            let record = Record::new(key, black_box(data.clone()), peer_id);
             black_box(record);
         });
     });

@@ -438,7 +438,7 @@ impl ChurnHandler {
             topic: "node_departing".to_string(),
             data: postcard::to_stdvec(&node_id)
                 .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?,
-            from: self.node_id.clone(),
+            from: self.node_id,
             seqno: 0, // Will be set by gossip subsystem
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -479,7 +479,7 @@ impl ChurnHandler {
             self.recovery_manager
                 .queue_recovery_with_grace_period(
                     content_hash,
-                    vec![node_id.clone()],
+                    vec![*node_id],
                     RecoveryPriority::Critical,
                     &grace_config,
                 )
@@ -535,7 +535,7 @@ impl ChurnHandler {
             topic: "high_churn_alert".to_string(),
             data: postcard::to_stdvec(&churn_rate)
                 .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?,
-            from: self.node_id.clone(),
+            from: self.node_id,
             seqno: 0, // Will be set by gossip subsystem
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -633,7 +633,7 @@ impl ChurnHandler {
     /// Clone for spawning tasks
     fn clone_for_task(&self) -> Self {
         Self {
-            node_id: self.node_id.clone(),
+            node_id: self.node_id,
             predictor: self.predictor.clone(),
             node_monitor: self.node_monitor.clone(),
             recovery_manager: self.recovery_manager.clone(),
@@ -670,7 +670,7 @@ impl NodeMonitor {
             .get(node_id)
             .cloned()
             .unwrap_or(NodeStatus {
-                node_id: node_id.clone(),
+                node_id: *node_id,
                 last_seen: Instant::now(),
                 last_heartbeat: None,
                 last_gossip: None,
@@ -690,20 +690,18 @@ impl NodeMonitor {
     /// Record heartbeat from node
     pub async fn record_heartbeat(&self, node_id: &PeerId) {
         let now = Instant::now();
-        self.heartbeats.write().await.insert(node_id.clone(), now);
+        self.heartbeats.write().await.insert(*node_id, now);
 
         let mut status_map = self.node_status.write().await;
-        let status = status_map
-            .entry(node_id.clone())
-            .or_insert_with(|| NodeStatus {
-                node_id: node_id.clone(),
-                last_seen: now,
-                last_heartbeat: None,
-                last_gossip: None,
-                status: NodeState::Active,
-                reliability: 1.0,
-                stored_content: HashSet::new(),
-            });
+        let status = status_map.entry(*node_id).or_insert_with(|| NodeStatus {
+            node_id: *node_id,
+            last_seen: now,
+            last_heartbeat: None,
+            last_gossip: None,
+            status: NodeState::Active,
+            reliability: 1.0,
+            stored_content: HashSet::new(),
+        });
         status.last_heartbeat = Some(now);
         status.last_seen = now;
         status.status = NodeState::Active;
@@ -831,7 +829,7 @@ impl RecoveryManager {
             for node_id in &failed_nodes {
                 failure_tracker
                     .record_node_failure(
-                        node_id.clone(),
+                        *node_id,
                         crate::dht::replication_grace_period::NodeFailureReason::NetworkTimeout,
                         config,
                     )
@@ -843,9 +841,9 @@ impl RecoveryManager {
 
             for node_id in &failed_nodes {
                 if failure_tracker.should_start_replication(node_id).await {
-                    immediate_recovery_nodes.push(node_id.clone());
+                    immediate_recovery_nodes.push(*node_id);
                 } else {
-                    delayed_recovery_nodes.push(node_id.clone());
+                    delayed_recovery_nodes.push(*node_id);
                 }
             }
 
@@ -904,7 +902,7 @@ impl RecoveryManager {
 
                 for node_id in &failed_nodes {
                     if failure_tracker.should_start_replication(node_id).await {
-                        nodes_to_recover.push(node_id.clone());
+                        nodes_to_recover.push(*node_id);
                     }
                 }
 
@@ -963,10 +961,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut hash);
         let node_id = PeerId::from_bytes(hash);
 
-        let gossip = Arc::new(AdaptiveGossipSub::new(
-            node_id.clone(),
-            trust_provider.clone(),
-        ));
+        let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
         // Create default ChurnConfig
         let config = ChurnConfig {

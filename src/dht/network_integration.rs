@@ -248,7 +248,7 @@ impl ConnectionPool {
 
         // Create new connection
         let connection = transport.connect(address).await?;
-        let managed = ManagedConnection::new(connection, node_id.clone());
+        let managed = ManagedConnection::new(connection, node_id);
 
         // Store in active connections
         let mut active = self.active_connections.write().await;
@@ -258,7 +258,7 @@ impl ConnectionPool {
                 .iter()
                 .filter(|(_, c)| c.is_idle())
                 .min_by_key(|(_, c)| c.last_used)
-                .map(|(id, _)| id.clone());
+                .map(|(id, _)| *id);
 
             if let Some(id) = to_remove {
                 active.remove(&id);
@@ -267,7 +267,7 @@ impl ConnectionPool {
             }
         }
 
-        active.insert(node_id.clone(), managed);
+        active.insert(node_id, managed);
         // Create a new connection for this request
         transport.connect(address).await
     }
@@ -393,7 +393,7 @@ impl PeerManager {
     pub async fn add_peer(&self, node_info: NodeInfo) {
         let mut peers = self.known_peers.write().await;
         peers.insert(
-            node_info.id.clone(),
+            node_info.id,
             PeerInfo {
                 node_info,
                 last_seen: SystemTime::now(),
@@ -552,7 +552,7 @@ impl NetworkIntegrationLayer {
         // Get connection
         let mut connection = self
             .connection_pool
-            .get_connection(target.clone(), self.transport.as_ref(), &address)
+            .get_connection(*target, self.transport.as_ref(), &address)
             .await?;
 
         // Serialize and send message
@@ -564,9 +564,7 @@ impl NetworkIntegrationLayer {
         let response: DhtResponse = postcard::from_bytes(&response_data)?;
 
         // Release connection
-        self.connection_pool
-            .release_connection(target.clone())
-            .await;
+        self.connection_pool.release_connection(*target).await;
 
         Ok(response)
     }
@@ -637,10 +635,7 @@ impl NetworkIntegrationLayer {
 
         // Send FindNode messages to bootstrap nodes
         let target = DhtKey::new(b"discover");
-        let message = DhtMessage::FindNode {
-            target: target.clone(),
-            count: 20,
-        };
+        let message = DhtMessage::FindNode { target, count: 20 };
 
         let responses = self
             .broadcast_message(
@@ -781,12 +776,12 @@ mod tests {
         let node_id = PeerId::from_bytes([42u8; 32]);
 
         let conn1 = pool
-            .get_connection(node_id.clone(), &transport, "mock://test")
+            .get_connection(node_id, &transport, "mock://test")
             .await?;
 
         assert!(conn1.is_alive());
 
-        pool.release_connection(node_id.clone()).await;
+        pool.release_connection(node_id).await;
 
         Ok(())
     }
@@ -799,19 +794,15 @@ mod tests {
         let message = DhtMessage::Ping {
             timestamp: 0,
             sender_info: NodeInfo {
-                id: node_id.clone(),
+                id: node_id,
                 address: "test".to_string(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             },
         };
 
-        router
-            .queue_message(node_id.clone(), message.clone(), true)
-            .await;
-        router
-            .queue_message(node_id.clone(), message.clone(), false)
-            .await;
+        router.queue_message(node_id, message.clone(), true).await;
+        router.queue_message(node_id, message.clone(), false).await;
 
         let batch = router.get_next_batch().await;
         assert_eq!(batch.len(), 2);
@@ -850,7 +841,7 @@ mod tests {
 
         let target = PeerId::from_bytes([42u8; 32]);
         let peer_info = NodeInfo {
-            id: target.clone(),
+            id: target,
             address: "mock://test".to_string(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),

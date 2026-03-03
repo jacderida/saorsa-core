@@ -86,7 +86,7 @@ impl CloseGroupEvictionTracker {
             reasons: reasons.clone(),
             consensus_count: peer_confirmations,
         };
-        self.evicted_nodes.insert(node_id.clone(), record);
+        self.evicted_nodes.insert(node_id, record);
 
         // Broadcast to network
         let _ = self.eviction_sender.send(CloseGroupEviction {
@@ -139,7 +139,7 @@ impl CloseGroupEvictionTracker {
                     .ok()
                     .is_some_and(|elapsed| elapsed < within)
             })
-            .map(|(id, r)| (id.clone(), r))
+            .map(|(id, r)| (*id, r))
             .collect()
     }
 
@@ -263,7 +263,7 @@ impl SecurityCoordinator {
 
     /// Update trust score for a node
     pub fn update_trust_score(&self, node_id: &PeerId, score: f64) {
-        self.trust_scores.write().insert(node_id.clone(), score);
+        self.trust_scores.write().insert(*node_id, score);
         self.eviction_manager
             .write()
             .update_trust_score(node_id, score);
@@ -271,7 +271,7 @@ impl SecurityCoordinator {
 
     /// Update node geographic region
     pub fn update_node_region(&self, node_id: &PeerId, region: String) {
-        self.node_regions.write().insert(node_id.clone(), region);
+        self.node_regions.write().insert(*node_id, region);
     }
 
     /// Get trust score for a node
@@ -336,7 +336,7 @@ impl SecurityCoordinator {
         let peer_confirmations = (result.confirmation_ratio * 10.0) as usize; // Approximate
 
         self.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            *node_id,
             result.failure_reasons.clone(),
             peer_confirmations,
         );
@@ -364,7 +364,7 @@ impl SecurityCoordinator {
         // Convert PeerId to PeerId (identity::PeerId)
         let temporal_data: Vec<(PeerId, Duration, Instant)> = responses
             .iter()
-            .map(|r| (r.peer_id.clone(), r.response_latency, r.received_at))
+            .map(|r| (r.peer_id, r.response_latency, r.received_at))
             .collect();
 
         // Check for temporal correlation
@@ -514,7 +514,7 @@ impl SecurityCoordinator {
                 for member in &group.members {
                     if !candidates.iter().any(|(id, _)| id == member) {
                         candidates.push((
-                            member.clone(),
+                            *member,
                             EvictionReason::LowTrust("Sybil suspected".to_string()),
                         ));
                     }
@@ -528,7 +528,7 @@ impl SecurityCoordinator {
                 for member in &group.members {
                     if !candidates.iter().any(|(id, _)| id == member) {
                         candidates.push((
-                            member.clone(),
+                            *member,
                             EvictionReason::LowTrust("Collusion suspected".to_string()),
                         ));
                     }
@@ -626,11 +626,11 @@ impl SecurityCoordinator {
             let validation_result = self.validate_node_comprehensive(node_id, responses);
 
             if validation_result.is_valid {
-                valid_nodes.push(node_id.clone());
+                valid_nodes.push(*node_id);
             } else {
                 // Determine eviction reason
                 let reason = self.determine_eviction_reason(&validation_result);
-                eviction_candidates.push((node_id.clone(), reason));
+                eviction_candidates.push((*node_id, reason));
             }
         }
 
@@ -989,7 +989,7 @@ mod tests {
 
         // Record eviction
         coordinator.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            node_id,
             vec![CloseGroupFailure::InsufficientConfirmation],
             5,
         );
@@ -1091,7 +1091,7 @@ mod tests {
 
         // Record eviction
         coordinator.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            node_id,
             vec![CloseGroupFailure::InsufficientConfirmation],
             5,
         );

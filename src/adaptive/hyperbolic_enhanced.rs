@@ -304,9 +304,9 @@ impl EnhancedHyperbolicSpace {
         let my_id = generate_local_node_id(); // Placeholder
 
         viz_data.nodes.insert(
-            my_id.clone(),
+            my_id,
             VisualizationNode {
-                id: my_id.clone(),
+                id: my_id,
                 coordinate: HyperbolicCoordinate {
                     r: my_coord.r(),
                     theta: my_coord.theta(),
@@ -320,9 +320,9 @@ impl EnhancedHyperbolicSpace {
         // Add neighbor nodes
         for (node_id, coord) in neighbors.iter() {
             viz_data.nodes.insert(
-                node_id.clone(),
+                *node_id,
                 VisualizationNode {
-                    id: node_id.clone(),
+                    id: *node_id,
                     coordinate: HyperbolicCoordinate {
                         r: coord.r(),
                         theta: coord.theta(),
@@ -478,7 +478,7 @@ impl EnhancedHyperbolicRoutingStrategy {
 
         let mut path = Vec::new();
         let mut visited = std::collections::HashSet::<PeerId>::new();
-        visited.insert(self.local_id.clone());
+        visited.insert(self.local_id);
 
         let mut total_distance = 0.0;
         let _start_time = std::time::Instant::now();
@@ -502,7 +502,7 @@ impl EnhancedHyperbolicRoutingStrategy {
                         .partial_cmp(&dist_b)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .map(|(id, coord)| (id.clone(), *coord));
+                .map(|(id, coord)| (*id, *coord));
 
             match next_hop {
                 Some((next_id, next_coord)) => {
@@ -516,8 +516,8 @@ impl EnhancedHyperbolicRoutingStrategy {
                         if self.enable_visualization {
                             let mut viz_data = self.space.visualization_data.write().await;
                             viz_data.paths.push(RoutingPath {
-                                source: self.local_id.clone(),
-                                target: target.clone(),
+                                source: self.local_id,
+                                target: *target,
                                 hops: path.clone(),
                                 success: true,
                                 total_distance,
@@ -527,7 +527,7 @@ impl EnhancedHyperbolicRoutingStrategy {
                         return Ok(path);
                     }
 
-                    path.push(next_id.clone());
+                    path.push(next_id);
                     visited.insert(next_id);
                     total_distance +=
                         EnhancedHyperbolicSpace::distance_fixed(&my_coord, &next_coord);
@@ -537,8 +537,8 @@ impl EnhancedHyperbolicRoutingStrategy {
                     if self.enable_visualization {
                         let mut viz_data = self.space.visualization_data.write().await;
                         viz_data.paths.push(RoutingPath {
-                            source: self.local_id.clone(),
-                            target: target.clone(),
+                            source: self.local_id,
+                            target: *target,
                             hops: path.clone(),
                             success: false,
                             total_distance,

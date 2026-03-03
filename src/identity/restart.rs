@@ -267,10 +267,9 @@ pub struct RestartManager {
 impl RestartManager {
     /// Create a new restart manager.
     pub async fn new(config: RestartConfig, identity: NodeIdentity) -> Result<Arc<Self>> {
-        let node_id = identity.peer_id().clone();
+        let node_id = *identity.peer_id();
 
-        let fitness_monitor =
-            Arc::new(FitnessMonitor::new(config.fitness.clone(), node_id.clone()));
+        let fitness_monitor = Arc::new(FitnessMonitor::new(config.fitness.clone(), node_id));
 
         let regeneration_trigger = Arc::new(RegenerationTrigger::new(config.regeneration.clone()));
 
@@ -299,7 +298,7 @@ impl RestartManager {
 
     /// Get the current node ID.
     pub async fn current_peer_id(&self) -> PeerId {
-        self.current_identity.read().await.peer_id().clone()
+        *self.current_identity.read().await.peer_id()
     }
 
     /// Get the fitness monitor.
@@ -392,20 +391,20 @@ impl RestartManager {
             .event_tx
             .send(IdentitySystemEvent::RegenerationTriggered {
                 reason: reason.clone(),
-                old_peer_id: old_peer_id.clone(),
+                old_peer_id,
                 target: target.clone(),
             });
 
         // Record attempt
         self.regeneration_trigger
-            .record_attempt(old_peer_id.clone(), reason);
+            .record_attempt(old_peer_id, reason);
 
         // Generate targeted identity
         let new_identity = self
             .identity_targeter
             .generate_targeted_identity(target.as_ref())?;
 
-        let new_peer_id = new_identity.peer_id().clone();
+        let new_peer_id = *new_identity.peer_id();
 
         // Export the identity data so we can create a copy for the caller
         let identity_data = new_identity.export();
@@ -419,7 +418,7 @@ impl RestartManager {
         // Emit identity changed event (success TBD by network acceptance)
         let _ = self.event_tx.send(IdentitySystemEvent::IdentityChanged {
             old_peer_id,
-            new_peer_id: new_peer_id.clone(),
+            new_peer_id,
             succeeded: true, // Will be updated by record_regeneration_result
         });
 
@@ -435,7 +434,7 @@ impl RestartManager {
     /// Record the result of a regeneration attempt.
     pub async fn record_regeneration_result(&self, new_peer_id: &PeerId, succeeded: bool) {
         self.regeneration_trigger
-            .record_result(new_peer_id.clone(), succeeded);
+            .record_result(*new_peer_id, succeeded);
 
         let mut state = self.persistent_state.write().await;
         if succeeded {
@@ -445,8 +444,7 @@ impl RestartManager {
             state.consecutive_failures += 1;
 
             // Record as rejected for targeting
-            self.identity_targeter
-                .record_rejected_peer_id(new_peer_id.clone());
+            self.identity_targeter.record_rejected_peer_id(*new_peer_id);
         }
     }
 
@@ -853,7 +851,7 @@ mod tests {
     async fn test_regenerate() {
         let config = RestartConfig::default();
         let identity = test_identity();
-        let old_node_id = identity.peer_id().clone();
+        let old_node_id = *identity.peer_id();
         let manager = RestartManager::new(config, identity).await.unwrap();
 
         let new_identity = manager.regenerate(RegenerationReason::Manual).await;

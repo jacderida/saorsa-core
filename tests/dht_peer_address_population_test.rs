@@ -160,8 +160,8 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     let (manager_a, identity_a) = create_test_manager("address_test_a").await?;
     let (manager_b, identity_b) = create_test_manager("address_test_b").await?;
 
-    let a_node_id = identity_a.peer_id().clone();
-    let b_node_id = identity_b.peer_id().clone();
+    let a_node_id = *identity_a.peer_id();
+    let b_node_id = *identity_b.peer_id();
     info!(
         "Created nodes A (node_id={}) and B (node_id={})",
         a_node_id, b_node_id
@@ -412,7 +412,7 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     let (manager_a, _identity_a) = create_test_manager("consistency_a").await?;
     let (manager_b, identity_b) = create_test_manager("consistency_b").await?;
 
-    let b_peer_id = identity_b.peer_id().clone();
+    let b_peer_id = *identity_b.peer_id();
     info!("Created nodes A and B (B's node_id={})", b_peer_id);
 
     // Connect and authenticate bidirectionally

@@ -65,13 +65,13 @@ impl EvictionManager {
 
     /// Record a communication failure for a node
     pub fn record_failure(&mut self, node_id: &PeerId) {
-        let state = self.liveness_states.entry(node_id.clone()).or_default();
+        let state = self.liveness_states.entry(*node_id).or_default();
         state.record_failure();
     }
 
     /// Record a successful communication with a node
     pub fn record_success(&mut self, node_id: &PeerId) {
-        let state = self.liveness_states.entry(node_id.clone()).or_default();
+        let state = self.liveness_states.entry(*node_id).or_default();
         state.record_success();
     }
 
@@ -80,12 +80,12 @@ impl EvictionManager {
     /// This is used when a node fails validation during close group
     /// validation or other explicit eviction scenarios.
     pub fn record_eviction(&mut self, node_id: &PeerId, reason: EvictionReason) {
-        self.marked_for_eviction.insert(node_id.clone(), reason);
+        self.marked_for_eviction.insert(*node_id, reason);
     }
 
     /// Update trust score for a node
     pub fn update_trust_score(&mut self, node_id: &PeerId, score: f64) {
-        self.trust_scores.insert(node_id.clone(), score);
+        self.trust_scores.insert(*node_id, score);
     }
 
     /// Get trust score for a node
@@ -162,7 +162,7 @@ impl EvictionManager {
 
         // Check explicitly marked nodes first (highest priority)
         for (node_id, reason) in &self.marked_for_eviction {
-            candidates.push((node_id.clone(), reason.clone()));
+            candidates.push((*node_id, reason.clone()));
         }
 
         // Check all nodes in liveness states
@@ -172,7 +172,7 @@ impl EvictionManager {
                 continue;
             }
             if let Some(reason) = self.get_eviction_reason(node_id) {
-                candidates.push((node_id.clone(), reason));
+                candidates.push((*node_id, reason));
             }
         }
 
@@ -185,7 +185,7 @@ impl EvictionManager {
                 continue;
             }
             if let Some(reason) = self.get_eviction_reason(node_id) {
-                candidates.push((node_id.clone(), reason));
+                candidates.push((*node_id, reason));
             }
         }
 
@@ -239,7 +239,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.10); // Below threshold
+        trust_scores.insert(node_id, 0.10); // Below threshold
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         assert!(manager.should_evict_for_trust(&node_id));
@@ -253,7 +253,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.50); // Above threshold
+        trust_scores.insert(node_id, 0.50); // Above threshold
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         assert!(!manager.should_evict_for_trust(&node_id));
@@ -301,7 +301,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.05);
+        trust_scores.insert(node_id, 0.05);
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         let reason = manager.get_eviction_reason(&node_id);

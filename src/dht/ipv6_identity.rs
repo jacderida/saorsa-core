@@ -266,7 +266,7 @@ impl IPv6DHTIdentityManager {
 
         // Cache the verified node
         self.verified_nodes
-            .insert(enhanced_node.base_node.id.clone(), enhanced_node.clone());
+            .insert(enhanced_node.base_node.id, enhanced_node.clone());
 
         info!(
             "Enhanced DHT node with IPv6 identity: {}",
@@ -413,7 +413,7 @@ impl IPv6DHTIdentityManager {
         node: &DHTNode,
         ipv6_identity: &IPv6NodeID,
     ) -> Result<IPv6SecurityEvent> {
-        let node_peer_id = node.id.clone();
+        let node_peer_id = node.id;
 
         // Check if node is banned
         if let Some(ban_time) = self.banned_nodes.get(&node_peer_id) {
@@ -435,7 +435,7 @@ impl IPv6DHTIdentityManager {
 
         if !verification_result.is_valid {
             let event = IPv6SecurityEvent::VerificationFailed {
-                peer_id: node_peer_id.clone(),
+                peer_id: node_peer_id,
                 ipv6_addr: ipv6_identity.ipv6_addr,
                 reason: verification_result
                     .error_message
@@ -494,7 +494,7 @@ impl IPv6DHTIdentityManager {
 
     /// Ban a node for security violations
     pub fn ban_node(&mut self, peer_id: &PeerId, reason: &str) {
-        self.banned_nodes.insert(peer_id.clone(), SystemTime::now());
+        self.banned_nodes.insert(*peer_id, SystemTime::now());
         warn!("Banned node {} for: {}", peer_id, reason);
     }
 
@@ -813,7 +813,7 @@ mod tests {
         let ip_analysis = create_test_ip_analysis();
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
 
         // Should now find the verified node
         assert!(manager.get_verified_node(&peer_id).is_some());
@@ -831,7 +831,7 @@ mod tests {
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
         // Add verified node
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
         assert!(manager.get_verified_node(&peer_id).is_some());
 
         // Remove node
@@ -850,7 +850,7 @@ mod tests {
         let ip_analysis = create_test_ip_analysis();
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
 
         let initial_reputation = manager.verified_nodes[&peer_id]
             .ip_analysis
@@ -893,9 +893,7 @@ mod tests {
         manager
             .ip_analysis_cache
             .insert(ipv6_addr, (ip_analysis, SystemTime::now()));
-        manager
-            .banned_nodes
-            .insert(peer_id.clone(), SystemTime::now());
+        manager.banned_nodes.insert(peer_id, SystemTime::now());
 
         // Sleep to let entries expire
         std::thread::sleep(Duration::from_millis(10));
@@ -991,7 +989,7 @@ mod tests {
 
         // Test NodeJoined event
         let joined_event = IPv6SecurityEvent::NodeJoined {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             verification_confidence: 0.9,
         };
@@ -1008,7 +1006,7 @@ mod tests {
 
         // Test VerificationFailed event
         let failed_event = IPv6SecurityEvent::VerificationFailed {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             reason: "Test failure".to_string(),
         };
@@ -1022,7 +1020,7 @@ mod tests {
 
         // Test DiversityViolation event
         let violation_event = IPv6SecurityEvent::DiversityViolation {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             subnet_type: "IPv6 subnet".to_string(),
         };
@@ -1036,7 +1034,7 @@ mod tests {
 
         // Test NodeBanned event
         let banned_event = IPv6SecurityEvent::NodeBanned {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             reason: "Security violation".to_string(),
             ban_duration: Duration::from_secs(3600),

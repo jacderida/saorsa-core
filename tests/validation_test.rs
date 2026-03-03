@@ -169,7 +169,7 @@ fn test_network_message_validation() {
 
     // Valid message
     let valid_msg = NetworkMessage {
-        peer_id: test_peer.clone(),
+        peer_id: test_peer,
         payload: vec![0u8; 1024],
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -183,7 +183,7 @@ fn test_network_message_validation() {
 
     // Payload too large
     let large_payload = NetworkMessage {
-        peer_id: test_peer.clone(),
+        peer_id: test_peer,
         payload: vec![0u8; 20 * 1024 * 1024], // 20MB
         timestamp: valid_msg.timestamp,
     };

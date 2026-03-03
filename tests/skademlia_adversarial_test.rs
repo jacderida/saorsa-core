@@ -203,7 +203,7 @@ async fn test_replay_attack_prevention_via_sequence() {
 
     // Create two broadcasts with same content but different sequence numbers
     let broadcast_1 = SiblingBroadcastBuilder::new()
-        .broadcaster(broadcaster.clone(), position)
+        .broadcaster(broadcaster, position)
         .add_sibling(create_sibling_entry())
         .sequence_number(1)
         .build_and_sign(&secret_key)

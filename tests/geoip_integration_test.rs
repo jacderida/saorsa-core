@@ -50,7 +50,7 @@ async fn test_geoip_rejection_flow() {
         .await
         .expect("Identity exchange timed out");
 
-    let connected_peer_id = node_b.peer_id().clone();
+    let connected_peer_id = *node_b.peer_id();
 
     // 4. Simulate Rejection: Node A sends RejectionMessage to Node B
     let rejection = RejectionMessage {

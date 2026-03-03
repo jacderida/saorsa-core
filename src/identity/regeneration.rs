@@ -586,7 +586,7 @@ impl RegenerationTrigger {
 
         // Update the last attempt
         if let Some(last) = state.attempts.last_mut() {
-            last.complete(new_id.clone(), succeeded);
+            last.complete(new_id, succeeded);
         }
 
         if succeeded {
@@ -874,7 +874,7 @@ mod tests {
 
         let node_id = PeerId([0xAB; 32]);
         trigger.record_attempt(test_peer_id(), RegenerationReason::Manual);
-        trigger.record_result(node_id.clone(), false);
+        trigger.record_result(node_id, false);
 
         assert!(trigger.is_prefix_rejected(&node_id));
 

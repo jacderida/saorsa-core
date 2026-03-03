@@ -471,7 +471,7 @@ impl SecurityManager {
             eclipse_detector,
             integrity_verifier,
             auditor,
-            _identity: identity.peer_id().clone(),
+            _identity: *identity.peer_id(),
         }
     }
 
@@ -482,7 +482,7 @@ impl SecurityManager {
             self.auditor
                 .log_event(
                     SecurityEvent::NodeBlacklisted,
-                    Some(node.id.clone()),
+                    Some(node.id),
                     "Node attempted to join while blacklisted".to_string(),
                     Severity::Warning,
                 )
@@ -495,7 +495,7 @@ impl SecurityManager {
             self.auditor
                 .log_event(
                     SecurityEvent::RateLimitExceeded,
-                    Some(node.id.clone()),
+                    Some(node.id),
                     "Join rate limit exceeded".to_string(),
                     Severity::Warning,
                 )
@@ -525,7 +525,7 @@ impl SecurityManager {
             self.auditor
                 .log_event(
                     SecurityEvent::RateLimitExceeded,
-                    Some(node_id.clone()),
+                    Some(*node_id),
                     "Node request rate limit exceeded".to_string(),
                     Severity::Warning,
                 )
@@ -657,9 +657,7 @@ impl SecurityManager {
 
     /// Blacklist a node
     pub async fn blacklist_node(&self, node_id: PeerId, reason: BlacklistReason) {
-        self.blacklist
-            .add_entry(node_id.clone(), reason.clone())
-            .await;
+        self.blacklist.add_entry(node_id, reason.clone()).await;
 
         self.auditor
             .log_event(
@@ -713,13 +711,13 @@ impl RateLimiter {
             if let Some(oldest_key) = requests
                 .iter()
                 .min_by_key(|(_, window)| window.window_start)
-                .map(|(k, _)| k.clone())
+                .map(|(k, _)| *k)
             {
                 requests.remove(&oldest_key);
             }
         }
 
-        let window = requests.entry(node_id.clone()).or_insert(RequestWindow {
+        let window = requests.entry(*node_id).or_insert(RequestWindow {
             count: 0,
             window_start: now,
         });
@@ -855,14 +853,14 @@ impl BlacklistManager {
             if let Some(oldest) = blacklist
                 .iter()
                 .min_by_key(|(_, entry)| entry.timestamp)
-                .map(|(id, _)| id.clone())
+                .map(|(id, _)| *id)
             {
                 blacklist.remove(&oldest);
             }
         }
 
         blacklist.insert(
-            node_id.clone(),
+            node_id,
             BlacklistEntry {
                 node_id,
                 reason,
@@ -875,13 +873,13 @@ impl BlacklistManager {
     /// Record violation
     pub async fn record_violation(&self, node_id: &PeerId, reason: BlacklistReason) {
         let mut violations = self.violations.write().await;
-        let count = violations.entry(node_id.clone()).or_insert(0);
+        let count = violations.entry(*node_id).or_insert(0);
         *count += 1;
 
         // Auto-blacklist if threshold exceeded
         if *count >= self.config.violation_threshold {
             drop(violations);
-            self.add_entry(node_id.clone(), reason).await;
+            self.add_entry(*node_id, reason).await;
         }
     }
 
@@ -916,7 +914,7 @@ impl BlacklistManager {
             match blacklist.get(&entry.node_id) {
                 Some(existing) if existing.timestamp >= entry.timestamp => continue,
                 _ => {
-                    blacklist.insert(entry.node_id.clone(), entry);
+                    blacklist.insert(entry.node_id, entry);
                 }
             }
         }
@@ -1269,7 +1267,7 @@ mod tests {
         // Add to blacklist
         blacklist
             .add_entry(
-                node_id.clone(),
+                node_id,
                 BlacklistReason::MaliciousBehavior("Test".to_string()),
             )
             .await;
@@ -1383,7 +1381,7 @@ mod tests {
         // Test node join validation
         // Generate a valid ML-DSA key and derive matching PeerId via BLAKE3(pubkey)
         let (ml_pub, _ml_sec) = crate::quantum_crypto::generate_ml_dsa_keypair().unwrap();
-        let derived_id = crate::peer_record::PeerId::from_public_key(&ml_pub);
+        let derived_id = crate::identity::node_identity::peer_id_from_public_key(&ml_pub);
         let node = NodeDescriptor {
             id: derived_id,
             public_key: ml_pub,
@@ -1403,7 +1401,7 @@ mod tests {
 
         // Blacklist the node
         manager
-            .blacklist_node(node.id.clone(), BlacklistReason::Manual("Test".to_string()))
+            .blacklist_node(node.id, BlacklistReason::Manual("Test".to_string()))
             .await;
 
         // Should now fail validation

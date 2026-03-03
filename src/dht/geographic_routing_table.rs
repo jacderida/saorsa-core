@@ -132,7 +132,7 @@ impl GeographicRoutingTable {
     ) -> Result<bool> {
         // Add to regional bucket
         let added = if let Some(bucket) = self.regional_buckets.get_mut(&region) {
-            bucket.add_peer(peer_id.clone(), metrics.clone())
+            bucket.add_peer(peer_id, metrics.clone())
         } else {
             false
         };
@@ -229,7 +229,7 @@ impl GeographicRoutingTable {
                 bucket
                     .peers
                     .iter()
-                    .map(|(peer_id, metrics)| (peer_id.clone(), metrics.clone()))
+                    .map(|(peer_id, metrics)| (*peer_id, metrics.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -330,7 +330,7 @@ impl GeographicRoutingTable {
                 let peers: Vec<_> = bucket
                     .peers
                     .iter()
-                    .map(|(peer_id, metrics)| (peer_id.clone(), metrics.clone()))
+                    .map(|(peer_id, metrics)| (*peer_id, metrics.clone()))
                     .collect();
 
                 (
@@ -369,7 +369,7 @@ impl GeographicRoutingTable {
 
                 // Add peers from state
                 for (peer_id, metrics) in bucket_state.peers {
-                    bucket.add_peer(peer_id.clone(), metrics.clone());
+                    bucket.add_peer(peer_id, metrics.clone());
                     // Also update peer selector
                     self.peer_selector.update_peer_metrics(peer_id, metrics)?;
                 }
@@ -471,7 +471,7 @@ mod tests {
 
         // Add peer
         let added = table
-            .add_peer(peer_id.clone(), GeographicRegion::Europe, metrics)
+            .add_peer(peer_id, GeographicRegion::Europe, metrics)
             .unwrap();
         assert!(added);
 

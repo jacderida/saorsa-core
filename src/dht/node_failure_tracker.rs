@@ -118,7 +118,7 @@ impl NodeFailureTracker for DefaultNodeFailureTracker {
             .unwrap_or(None);
 
         let failure_info = FailedNodeInfo {
-            node_id: node_id.clone(),
+            node_id,
             failed_at: now,
             last_seen_endpoint,
             failure_reason: reason,
@@ -274,7 +274,7 @@ mod tests {
 
         // Record a failure
         let result = tracker
-            .record_node_failure(node_id.clone(), NodeFailureReason::NetworkTimeout, &config)
+            .record_node_failure(node_id, NodeFailureReason::NetworkTimeout, &config)
             .await;
 
         assert!(result.is_ok());
@@ -296,7 +296,7 @@ mod tests {
 
         // Record failure
         tracker
-            .record_node_failure(node_id.clone(), NodeFailureReason::NetworkTimeout, &config)
+            .record_node_failure(node_id, NodeFailureReason::NetworkTimeout, &config)
             .await
             .unwrap();
 
@@ -361,7 +361,7 @@ mod tests {
 
         for node_id in &node_ids {
             tracker
-                .record_node_failure(node_id.clone(), NodeFailureReason::NetworkTimeout, &config)
+                .record_node_failure(*node_id, NodeFailureReason::NetworkTimeout, &config)
                 .await
                 .unwrap();
         }
@@ -370,10 +370,7 @@ mod tests {
         assert_eq!(failed_nodes.len(), 3);
 
         // Verify all node IDs are present
-        let returned_ids: Vec<_> = failed_nodes
-            .iter()
-            .map(|info| info.node_id.clone())
-            .collect();
+        let returned_ids: Vec<_> = failed_nodes.iter().map(|info| info.node_id).collect();
         for node_id in &node_ids {
             assert!(returned_ids.contains(node_id));
         }

@@ -114,7 +114,7 @@ impl EigenTrustEngine {
         let mut initial_cache = HashMap::new();
         // Pre-trusted nodes start with high trust
         for node in &pre_trusted_nodes {
-            initial_cache.insert(node.clone(), 0.9);
+            initial_cache.insert(*node, 0.9);
         }
 
         Self {
@@ -142,7 +142,7 @@ impl EigenTrustEngine {
 
     /// Update local trust based on interaction
     pub async fn update_local_trust(&self, from: &PeerId, to: &PeerId, success: bool) {
-        let key = (from.clone(), to.clone());
+        let key = (*from, *to);
         let new_value = if success { 1.0 } else { 0.0 };
 
         let mut trust_map = self.local_trust.write().await;
@@ -164,7 +164,7 @@ impl EigenTrustEngine {
     /// Update node statistics
     pub async fn update_node_stats(&self, node_id: &PeerId, stats_update: NodeStatisticsUpdate) {
         let mut stats = self.node_stats.write().await;
-        let node_stats = stats.entry(node_id.clone()).or_default();
+        let node_stats = stats.entry(*node_id).or_default();
 
         match stats_update {
             NodeStatisticsUpdate::Uptime(seconds) => node_stats.uptime += seconds,
@@ -217,11 +217,11 @@ impl EigenTrustEngine {
         // Build node set efficiently
         let mut node_set = HashSet::new();
         for ((from, to), _) in local_trust.iter() {
-            node_set.insert(from.clone());
-            node_set.insert(to.clone());
+            node_set.insert(*from);
+            node_set.insert(*to);
         }
         for node in node_stats.keys() {
-            node_set.insert(node.clone());
+            node_set.insert(*node);
         }
 
         if node_set.is_empty() {
@@ -238,7 +238,7 @@ impl EigenTrustEngine {
         // Calculate outgoing sums for normalization
         for ((from, _), data) in local_trust.iter() {
             if data.value > 0.0 {
-                *outgoing_sums.entry(from.clone()).or_insert(0.0) += data.value;
+                *outgoing_sums.entry(*from).or_insert(0.0) += data.value;
             }
         }
 
@@ -257,16 +257,16 @@ impl EigenTrustEngine {
 
             let normalized_value = data.value / sum;
             incoming_edges
-                .entry(to.clone())
+                .entry(*to)
                 .or_default()
-                .push((from.clone(), normalized_value));
+                .push((*from, normalized_value));
         }
 
         // Initialize trust vector uniformly
         let mut trust_vector: HashMap<PeerId, f64> = HashMap::new();
         let initial_trust = 1.0 / n as f64;
         for node in &node_set {
-            trust_vector.insert(node.clone(), initial_trust);
+            trust_vector.insert(*node, initial_trust);
         }
 
         // Pre-compute pre-trusted distribution
@@ -298,7 +298,7 @@ impl EigenTrustEngine {
                 }
 
                 // Apply (1 - alpha) factor for trust propagation
-                new_trust.insert(node.clone(), (1.0 - self.alpha) * trust_sum);
+                new_trust.insert(*node, (1.0 - self.alpha) * trust_sum);
             }
 
             // Add teleportation component (alpha portion)
@@ -306,14 +306,14 @@ impl EigenTrustEngine {
                 // Teleport to pre-trusted nodes only
                 // This ensures pre-trusted nodes always maintain baseline trust
                 for pre_node in pre_trusted.iter() {
-                    let current = new_trust.entry(pre_node.clone()).or_insert(0.0);
+                    let current = new_trust.entry(*pre_node).or_insert(0.0);
                     *current += self.alpha * pre_trust_value;
                 }
             } else {
                 // No pre-trusted nodes - uniform teleportation
                 let uniform_value = self.alpha / n as f64;
                 for node in &node_set {
-                    let current = new_trust.entry(node.clone()).or_insert(0.0);
+                    let current = new_trust.entry(*node).or_insert(0.0);
                     *current += uniform_value;
                 }
             }
@@ -379,8 +379,8 @@ impl EigenTrustEngine {
         let mut trust_cache = self.trust_cache.write().await;
 
         for (node, trust) in &trust_vector {
-            global_trust.insert(node.clone(), *trust);
-            trust_cache.insert(node.clone(), *trust);
+            global_trust.insert(*node, *trust);
+            trust_cache.insert(*node, *trust);
         }
 
         // Update timestamp
@@ -415,7 +415,7 @@ impl EigenTrustEngine {
     /// Add a pre-trusted node
     pub async fn add_pre_trusted(&self, node_id: PeerId) {
         let mut pre_trusted = self.pre_trusted_nodes.write().await;
-        pre_trusted.insert(node_id.clone());
+        pre_trusted.insert(node_id);
 
         // Update cache with high initial trust
         let mut cache = self.trust_cache.write().await;
@@ -450,8 +450,8 @@ impl TrustProvider for EigenTrustEngine {
     fn update_trust(&self, from: &PeerId, to: &PeerId, success: bool) {
         // Spawn a task to handle async update
         let local_trust = self.local_trust.clone();
-        let from = from.clone();
-        let to = to.clone();
+        let from = *from;
+        let to = *to;
 
         tokio::spawn(async move {
             let key = (from, to);
@@ -484,7 +484,7 @@ impl TrustProvider for EigenTrustEngine {
 
     fn remove_node(&self, node: &PeerId) {
         // Schedule removal in background task
-        let node_id = node.clone();
+        let node_id = *node;
         let local_trust = self.local_trust.clone();
         let trust_cache = self.trust_cache.clone();
 
@@ -589,7 +589,7 @@ impl RoutingStrategy for TrustBasedRoutingStrategy {
             .into_iter()
             .take(self.config.max_intermediate_hops)
             .map(|(id, _)| id)
-            .chain(std::iter::once(target.clone()))
+            .chain(std::iter::once(*target))
             .collect();
 
         if path.len() == 1 {
@@ -653,7 +653,7 @@ impl TrustProvider for MockTrustProvider {
         } else {
             (current - 0.1).max(0.0)
         };
-        scores.insert(to.clone(), new_score);
+        scores.insert(*to, new_score);
     }
 
     fn get_global_trust(&self) -> HashMap<PeerId, f64> {
@@ -855,9 +855,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut hash_pre);
         let pre_trusted_id = PeerId::from_bytes(hash_pre);
 
-        let engine = Arc::new(EigenTrustEngine::new(HashSet::from([
-            pre_trusted_id.clone()
-        ])));
+        let engine = Arc::new(EigenTrustEngine::new(HashSet::from([pre_trusted_id])));
 
         // Create some nodes
         let mut hash_local = [0u8; 32];

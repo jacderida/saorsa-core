@@ -308,9 +308,8 @@ impl RetrievalManager {
 
         // Query nodes along the path
         for node in path {
-            if let Ok((content, source_node)) = self
-                .query_node_for_content(node.clone(), *content_hash)
-                .await
+            if let Ok((content, source_node)) =
+                self.query_node_for_content(node, *content_hash).await
             {
                 return Ok(RetrievalResult {
                     content,

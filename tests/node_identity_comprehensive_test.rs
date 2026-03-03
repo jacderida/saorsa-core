@@ -20,6 +20,7 @@
 //! 3. Refactor while keeping tests passing
 
 use proptest::prelude::*;
+use saorsa_core::identity::node_identity::peer_id_from_public_key;
 use saorsa_core::identity::{FourWordAddress, NodeIdentity, PeerId};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -61,7 +62,7 @@ mod identity_generation_tests {
         let public_key = identity.public_key().clone();
 
         // Node ID should be deterministic from public key
-        let node_id = PeerId::from_public_key(&public_key);
+        let node_id = peer_id_from_public_key(&public_key);
         assert_eq!(node_id, *identity.peer_id());
     }
 }

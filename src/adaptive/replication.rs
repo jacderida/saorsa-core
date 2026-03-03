@@ -337,7 +337,7 @@ impl ReplicationManager {
             let mut at_risk_nodes = Vec::new();
             for node in &replica_info.storing_nodes {
                 if self.churn_predictor.should_replicate(node).await {
-                    at_risk_nodes.push(node.clone());
+                    at_risk_nodes.push(*node);
                 }
             }
 
@@ -359,7 +359,7 @@ impl ReplicationManager {
                 // Update storing nodes (in real implementation, would trigger actual replication)
                 for (old_node, new_node) in at_risk_nodes.iter().zip(replacement_nodes.iter()) {
                     replica_info.storing_nodes.remove(old_node);
-                    replica_info.storing_nodes.insert(new_node.clone());
+                    replica_info.storing_nodes.insert(*new_node);
                 }
             }
 
@@ -625,7 +625,7 @@ mod tests {
         // Add content that includes the departed node
         let content_hash = ContentHash([1u8; 32]);
         let mut storing_nodes = HashSet::new();
-        storing_nodes.insert(departed_node.clone());
+        storing_nodes.insert(departed_node);
         storing_nodes.insert(PeerId::from_bytes([2u8; 32]));
         storing_nodes.insert(PeerId::from_bytes([3u8; 32]));
 

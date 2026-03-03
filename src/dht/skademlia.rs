@@ -382,7 +382,7 @@ impl DisjointPathLookup {
         }
 
         if let Some(node) = next_node {
-            self.path_states[path_id].queried.insert(node.id.clone());
+            self.path_states[path_id].queried.insert(node.id);
             return Some(node);
         }
 
@@ -986,8 +986,7 @@ impl SKademlia {
             timestamp: SystemTime::now(),
         };
 
-        self.pending_challenges
-            .insert(target.clone(), challenge.clone());
+        self.pending_challenges.insert(*target, challenge.clone());
         challenge
     }
 
@@ -1016,7 +1015,7 @@ impl SKademlia {
         };
 
         self.pending_challenges.insert(
-            target.clone(),
+            *target,
             DistanceChallenge {
                 challenger: challenge.challenger.clone(),
                 target_key: challenge.target_key,
@@ -1484,7 +1483,7 @@ impl SKademlia {
         let witness_nodes: Vec<PeerId> = candidate_nodes
             .into_iter()
             .take(witness_count)
-            .map(|(node, _)| node.id.clone())
+            .map(|(node, _)| node.id)
             .collect();
 
         tracing::debug!(

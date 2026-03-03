@@ -184,21 +184,14 @@ impl BootstrapManager {
     /// Enforces:
     /// 1. Rate limiting (per-subnet temporal limits)
     /// 2. IP diversity (geographic/ASN limits)
-    pub async fn add_peer(&self, peer_id: &PeerId, addresses: Vec<SocketAddr>) -> Result<()> {
+    pub async fn add_peer(&self, addr: &SocketAddr, addresses: Vec<SocketAddr>) -> Result<()> {
         if addresses.is_empty() {
             return Err(P2PError::Bootstrap(BootstrapError::InvalidData(
                 "No addresses provided".to_string().into(),
             )));
         }
 
-        let ip = addresses
-            .first()
-            .ok_or_else(|| {
-                P2PError::Bootstrap(BootstrapError::InvalidData(
-                    "No addresses provided".to_string().into(),
-                ))
-            })?
-            .ip();
+        let ip = addr.ip();
 
         // Rate limiting check
         self.rate_limiter.check_join_allowed(&ip).map_err(|e| {
@@ -230,9 +223,8 @@ impl BootstrapManager {
             }
         } // Lock released here before await
 
-        // Convert PeerId to ant-quic format and add to cache
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.add_seed(ant_peer_id, addresses).await;
+        // Add to cache keyed by primary address
+        self.cache.add_seed(*addr, addresses).await;
 
         Ok(())
     }
@@ -240,21 +232,18 @@ impl BootstrapManager {
     /// Add a trusted peer bypassing Sybil protection
     ///
     /// Use only for well-known bootstrap nodes or admin-approved peers.
-    pub async fn add_peer_trusted(&self, peer_id: &PeerId, addresses: Vec<SocketAddr>) {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.add_seed(ant_peer_id, addresses).await;
+    pub async fn add_peer_trusted(&self, addr: &SocketAddr, addresses: Vec<SocketAddr>) {
+        self.cache.add_seed(*addr, addresses).await;
     }
 
     /// Record a successful connection
-    pub async fn record_success(&self, peer_id: &PeerId, rtt_ms: u32) {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.record_success(&ant_peer_id, rtt_ms).await;
+    pub async fn record_success(&self, addr: &SocketAddr, rtt_ms: u32) {
+        self.cache.record_success(addr, rtt_ms).await;
     }
 
     /// Record a failed connection
-    pub async fn record_failure(&self, peer_id: &PeerId) {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.record_failure(&ant_peer_id).await;
+    pub async fn record_failure(&self, addr: &SocketAddr) {
+        self.cache.record_failure(addr).await;
     }
 
     /// Select peers for bootstrap using epsilon-greedy strategy
@@ -299,23 +288,18 @@ impl BootstrapManager {
     }
 
     /// Update peer capabilities
-    pub async fn update_capabilities(&self, peer_id: &PeerId, capabilities: PeerCapabilities) {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache
-            .update_capabilities(&ant_peer_id, capabilities)
-            .await;
+    pub async fn update_capabilities(&self, addr: &SocketAddr, capabilities: PeerCapabilities) {
+        self.cache.update_capabilities(addr, capabilities).await;
     }
 
     /// Check if a peer exists in the cache
-    pub async fn contains(&self, peer_id: &PeerId) -> bool {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.contains(&ant_peer_id).await
+    pub async fn contains(&self, addr: &SocketAddr) -> bool {
+        self.cache.contains(addr).await
     }
 
     /// Get a specific peer from the cache
-    pub async fn get_peer(&self, peer_id: &PeerId) -> Option<CachedPeer> {
-        let ant_peer_id = peer_id_to_ant_peer_id(peer_id);
-        self.cache.get(&ant_peer_id).await
+    pub async fn get_peer(&self, addr: &SocketAddr) -> Option<CachedPeer> {
+        self.cache.get(addr).await
     }
 
     // ========================================================================
@@ -326,14 +310,22 @@ impl BootstrapManager {
     /// Add a discovered peer to the cache (compatibility method)
     ///
     /// This accepts the old `ContactEntry` type and converts it to the new API.
+    /// Uses the first address as the primary cache key.
     pub async fn add_contact(&self, contact: super::ContactEntry) -> Result<()> {
-        self.add_peer(&contact.peer_id, contact.addresses).await
+        let primary = contact.addresses.first().copied().ok_or_else(|| {
+            P2PError::Bootstrap(BootstrapError::InvalidData(
+                "No addresses provided".to_string().into(),
+            ))
+        })?;
+        self.add_peer(&primary, contact.addresses).await
     }
 
     /// Add a contact bypassing rate limiting (compatibility method)
     pub async fn add_contact_trusted(&self, contact: super::ContactEntry) {
-        self.add_peer_trusted(&contact.peer_id, contact.addresses)
-            .await;
+        if let Some(primary) = contact.addresses.first() {
+            self.add_peer_trusted(primary, contact.addresses.clone())
+                .await;
+        }
     }
 
     /// Update contact performance metrics (compatibility method)
@@ -341,7 +333,7 @@ impl BootstrapManager {
     /// Maps the old `QualityMetrics` to record_success/record_failure calls.
     pub async fn update_contact_metrics(
         &self,
-        peer_id: &PeerId,
+        addr: &SocketAddr,
         metrics: super::QualityMetrics,
     ) -> Result<()> {
         // Convert QualityMetrics to success/failure recording
@@ -349,9 +341,9 @@ impl BootstrapManager {
         // Otherwise record as failure
         if metrics.success_rate >= 0.5 {
             let rtt_ms = metrics.avg_latency_ms as u32;
-            self.record_success(peer_id, rtt_ms).await;
+            self.record_success(addr, rtt_ms).await;
         } else {
-            self.record_failure(peer_id).await;
+            self.record_failure(addr).await;
         }
         Ok(())
     }
@@ -387,14 +379,16 @@ impl BootstrapManager {
     /// Get bootstrap peers for initial connection (compatibility method)
     ///
     /// Converts ant-quic CachedPeer results to ContactEntry format.
+    /// Uses a zeroed PeerId since ant-quic no longer tracks peer identity.
     pub async fn get_bootstrap_peers(&self, count: usize) -> Result<Vec<super::ContactEntry>> {
         let peers = self.select_peers(count).await;
         let contacts: Vec<super::ContactEntry> = peers
             .into_iter()
             .map(|cached| {
-                // Convert ant-quic PeerId ([u8; 32]) back to saorsa PeerId
-                let peer_id = PeerId::from_bytes(cached.peer_id.0);
-                super::ContactEntry::new(peer_id, cached.addresses.clone())
+                let mut addrs = vec![cached.primary_address];
+                addrs.extend(cached.addresses);
+                // Use a zeroed PeerId — real identity is established after connecting
+                super::ContactEntry::new(PeerId::from_bytes([0u8; 32]), addrs)
             })
             .collect();
         Ok(contacts)
@@ -427,13 +421,6 @@ pub struct BootstrapStats {
     pub average_quality: f64,
     /// Number of untested peers
     pub untested_peers: usize,
-}
-
-/// Convert saorsa `PeerId` to ant-quic `PeerId` ([u8; 32]).
-///
-/// Both types are 32-byte identifiers, so this is a direct copy.
-fn peer_id_to_ant_peer_id(peer_id: &PeerId) -> ant_quic::nat_traversal_api::PeerId {
-    ant_quic::nat_traversal_api::PeerId(peer_id.0)
 }
 
 /// Convert IP address to IPv6 (IPv4 mapped if needed)
@@ -489,16 +476,15 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Add peer
-        let result = manager.add_peer(&peer_id, vec![addr]).await;
+        let result = manager.add_peer(&addr, vec![addr]).await;
         assert!(result.is_ok());
 
         // Verify it was added
         assert_eq!(manager.peer_count().await, 1);
-        assert!(manager.contains(&peer_id).await);
+        assert!(manager.contains(&addr).await);
     }
 
     #[tokio::test]
@@ -507,8 +493,8 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = PeerId::random();
-        let result = manager.add_peer(&peer_id, vec![]).await;
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let result = manager.add_peer(&addr, vec![]).await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -523,14 +509,13 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Trusted add doesn't return Result, always succeeds
-        manager.add_peer_trusted(&peer_id, vec![addr]).await;
+        manager.add_peer_trusted(&addr, vec![addr]).await;
 
         assert_eq!(manager.peer_count().await, 1);
-        assert!(manager.contains(&peer_id).await);
+        assert!(manager.contains(&addr).await);
     }
 
     #[tokio::test]
@@ -539,21 +524,20 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        manager.add_peer_trusted(&peer_id, vec![addr]).await;
+        manager.add_peer_trusted(&addr, vec![addr]).await;
 
         // Get initial quality
-        let initial_peer = manager.get_peer(&peer_id).await.unwrap();
+        let initial_peer = manager.get_peer(&addr).await.unwrap();
         let initial_quality = initial_peer.quality_score;
 
         // Record multiple successes
         for _ in 0..5 {
-            manager.record_success(&peer_id, 50).await;
+            manager.record_success(&addr, 50).await;
         }
 
         // Quality should improve
-        let updated_peer = manager.get_peer(&peer_id).await.unwrap();
+        let updated_peer = manager.get_peer(&addr).await.unwrap();
         assert!(
             updated_peer.quality_score >= initial_quality,
             "Quality should improve after successes"
@@ -566,24 +550,23 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let peer_id = PeerId::random();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        manager.add_peer_trusted(&peer_id, vec![addr]).await;
+        manager.add_peer_trusted(&addr, vec![addr]).await;
 
         // Record successes first to establish baseline
         for _ in 0..3 {
-            manager.record_success(&peer_id, 50).await;
+            manager.record_success(&addr, 50).await;
         }
-        let good_peer = manager.get_peer(&peer_id).await.unwrap();
+        let good_peer = manager.get_peer(&addr).await.unwrap();
         let good_quality = good_peer.quality_score;
 
         // Record failures
         for _ in 0..5 {
-            manager.record_failure(&peer_id).await;
+            manager.record_failure(&addr).await;
         }
 
         // Quality should decrease
-        let bad_peer = manager.get_peer(&peer_id).await.unwrap();
+        let bad_peer = manager.get_peer(&addr).await.unwrap();
         assert!(
             bad_peer.quality_score < good_quality,
             "Quality should decrease after failures"
@@ -598,13 +581,12 @@ mod tests {
 
         // Add multiple peers with different quality
         for i in 0..10 {
-            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            manager.add_peer_trusted(&peer_id, vec![addr]).await;
+            manager.add_peer_trusted(&addr, vec![addr]).await;
 
             // Make some peers better than others
             for _ in 0..i {
-                manager.record_success(&peer_id, 50).await;
+                manager.record_success(&addr, 50).await;
             }
         }
 
@@ -629,9 +611,8 @@ mod tests {
 
         // Add some peers
         for i in 0..5 {
-            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
-            manager.add_peer_trusted(&peer_id, vec![addr]).await;
+            manager.add_peer_trusted(&addr, vec![addr]).await;
         }
 
         let stats = manager.stats().await;
@@ -654,9 +635,8 @@ mod tests {
                 diversity: IPDiversityConfig::default(),
             };
             let manager = BootstrapManager::with_config(config).await.unwrap();
-            let peer_id = PeerId::random();
             let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            manager.add_peer_trusted(&peer_id, vec![addr]).await;
+            manager.add_peer_trusted(&addr, vec![addr]).await;
 
             // Verify peer was added
             let count_before = manager.peer_count().await;
@@ -731,11 +711,10 @@ mod tests {
 
         // Add first two peers from same /24 - should succeed
         for i in 0..2 {
-            let peer_id = PeerId::random();
             let addr: SocketAddr = format!("192.168.1.{}:{}", 10 + i, 9000 + i)
                 .parse()
                 .unwrap();
-            let result = manager.add_peer(&peer_id, vec![addr]).await;
+            let result = manager.add_peer(&addr, vec![addr]).await;
             assert!(
                 result.is_ok(),
                 "First 2 peers should be allowed: {:?}",
@@ -744,27 +723,12 @@ mod tests {
         }
 
         // Third peer from same /24 subnet - should fail rate limiting
-        let peer_id = PeerId::random();
         let addr: SocketAddr = "192.168.1.100:9100".parse().unwrap();
-        let result = manager.add_peer(&peer_id, vec![addr]).await;
+        let result = manager.add_peer(&addr, vec![addr]).await;
         assert!(result.is_err(), "Third peer should be rate limited");
         assert!(matches!(
             result.unwrap_err(),
             P2PError::Bootstrap(BootstrapError::RateLimited(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn test_peer_id_conversion_deterministic() {
-        // Same PeerId should always produce same ant_peer_id
-        let peer_id = PeerId::random();
-        let ant_id_1 = peer_id_to_ant_peer_id(&peer_id);
-        let ant_id_2 = peer_id_to_ant_peer_id(&peer_id);
-        assert_eq!(ant_id_1.0, ant_id_2.0);
-
-        // Different PeerIds should produce different ant_peer_ids
-        let other_id = PeerId::random();
-        let ant_id_3 = peer_id_to_ant_peer_id(&other_id);
-        assert_ne!(ant_id_1.0, ant_id_3.0);
     }
 }

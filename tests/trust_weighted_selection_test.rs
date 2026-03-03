@@ -107,9 +107,7 @@ async fn test_trust_affects_peer_order_in_selection() {
 
     let pre_trusted_id = saorsa_core::PeerId::from_bytes([1u8; 32]);
 
-    let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::from([
-        pre_trusted_id.clone()
-    ])));
+    let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::from([pre_trusted_id])));
 
     // Update trust scores for test nodes
     // Pre-trusted node trusts node 2 with multiple interactions

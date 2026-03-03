@@ -294,7 +294,7 @@ impl SelfOrganizingMap {
         }
 
         // Assign to new position
-        positions.insert(node_id.clone(), (x, y));
+        positions.insert(node_id, (x, y));
         let Ok(mut grid) = self.grid.write() else {
             return;
         };
@@ -434,9 +434,7 @@ impl SelfOrganizingMap {
                 // For simplicity, we'll just find a nearby valid position
                 let new_x = x.min(new_width - 1);
                 let new_y = y.min(new_height - 1);
-                old_grid[new_y][new_x]
-                    .assigned_nodes
-                    .insert(node_id.clone());
+                old_grid[new_y][new_x].assigned_nodes.insert(node_id);
                 if let Ok(mut pos) = self.node_positions.write() {
                     pos.insert(node_id, (new_x, new_y));
                 }

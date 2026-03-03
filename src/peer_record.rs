@@ -30,7 +30,7 @@
 //! - Batch processing support
 
 use crate::error::SecurityError;
-pub use crate::identity::node_identity::PeerId;
+pub use crate::identity::node_identity::{PeerId, peer_id_from_public_key};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use crate::{NetworkAddress, P2PError, Result};
 use blake3::Hash;
@@ -497,10 +497,10 @@ mod tests {
     #[test]
     fn test_user_id_generation() {
         let (_, public_key) = create_test_keypair();
-        let user_id = PeerId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
 
         // Should be deterministic
-        let user_id2 = PeerId::from_public_key(&public_key);
+        let user_id2 = peer_id_from_public_key(&public_key);
         assert_eq!(user_id, user_id2);
     }
 
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn test_dht_record_creation_and_signing() {
         let (secret_key, public_key) = create_test_keypair();
-        let user_id = PeerId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
         let endpoint = create_test_endpoint();
 
         let mut record = PeerDHTRecord::new(
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn test_signature_cache() {
         let (secret_key, public_key) = create_test_keypair();
-        let user_id = PeerId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
         let endpoint = create_test_endpoint();
 
         let mut record = PeerDHTRecord::new(
@@ -581,12 +581,12 @@ mod tests {
     #[test]
     fn test_validation_limits() {
         let (_, public_key) = create_test_keypair();
-        let user_id = PeerId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
 
         // Test name too long
         let long_name = "a".repeat(256);
         let result = PeerDHTRecord::new(
-            user_id.clone(),
+            user_id,
             public_key.clone(),
             1,
             Some(long_name),
@@ -598,7 +598,7 @@ mod tests {
         // Test too many endpoints
         let many_endpoints = vec![create_test_endpoint(); MAX_ENDPOINTS_PER_PEER + 1];
         let result = PeerDHTRecord::new(
-            user_id.clone(),
+            user_id,
             public_key.clone(),
             1,
             Some("test".to_string()),

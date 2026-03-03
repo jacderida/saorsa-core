@@ -422,7 +422,7 @@ impl DhtNetworkManager {
         // Strict mode rejects every unknown node, making it impossible to bootstrap a
         // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
         let dht_instance = DhtCoreEngine::new_with_validation_mode(
-            local_peer_id.clone(),
+            *local_peer_id,
             crate::dht::routing_maintenance::close_group_validator::CloseGroupEnforcementMode::LogOnly,
         )
             .map_err(|e| P2PError::Dht(DhtError::StorageFailed(e.to_string().into())))?;
@@ -525,14 +525,14 @@ impl DhtNetworkManager {
                         return Ok(DhtNetworkResult::GetSuccess {
                             key: *key,
                             value,
-                            source: self.config.peer_id.clone(),
+                            source: self.config.peer_id,
                         });
                     }
 
                     return Ok(DhtNetworkResult::ValueFound {
                         key: *key,
                         value,
-                        source: self.config.peer_id.clone(),
+                        source: self.config.peer_id,
                     });
                 }
                 Ok(None) => {}
@@ -588,7 +588,7 @@ impl DhtNetworkManager {
         trust_engine: Option<Arc<EigenTrustEngine>>,
         mut config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let transport_app_peer_id = transport.peer_id().clone();
+        let transport_app_peer_id = transport.peer_id();
         if config.peer_id == PeerId::from_bytes([0u8; 32]) {
             config.peer_id = transport_app_peer_id;
         } else if config.peer_id != transport_app_peer_id {
@@ -752,11 +752,11 @@ impl DhtNetworkManager {
 
         // Create parallel replication requests
         let replication_futures = closest_nodes.iter().map(|node| {
-            let peer_id = node.peer_id.clone();
+            let peer_id = node.peer_id;
             let op = operation.clone();
             async move {
                 debug!("Sending PUT to peer: {}", peer_id.to_hex());
-                (peer_id.clone(), self.send_dht_request(&peer_id, op).await)
+                (peer_id, self.send_dht_request(&peer_id, op).await)
             }
         });
 
@@ -827,9 +827,9 @@ impl DhtNetworkManager {
 
         let mut replicated_count = 1usize;
         let replication_futures = targets.iter().map(|peer_id| {
-            let peer = peer_id.clone();
+            let peer = *peer_id;
             let op = operation.clone();
-            async move { (peer.clone(), self.send_dht_request(&peer, op).await) }
+            async move { (peer, self.send_dht_request(&peer, op).await) }
         });
 
         let results = futures::future::join_all(replication_futures).await;
@@ -866,7 +866,7 @@ impl DhtNetworkManager {
                 return Ok(DhtNetworkResult::GetSuccess {
                     key: *key,
                     value,
-                    source: self.config.peer_id.clone(),
+                    source: self.config.peer_id,
                 });
             }
             Ok(None) => {
@@ -902,7 +902,7 @@ impl DhtNetworkManager {
         let initial = self.find_closest_nodes_local(key, ALPHA * 2).await;
 
         for node in initial {
-            queued_peer_ids.insert(node.peer_id.clone());
+            queued_peer_ids.insert(node.peer_id);
             candidate_nodes.push_back(node);
         }
 
@@ -958,12 +958,12 @@ impl DhtNetworkManager {
             let query_futures: Vec<_> = batch
                 .iter()
                 .map(|node| {
-                    let peer_id = node.peer_id.clone();
+                    let peer_id = node.peer_id;
                     let address = node.address.clone();
                     let op = DhtNetworkOperation::FindValue { key: *key };
                     async move {
                         self.dial_candidate(&peer_id, &address).await;
-                        (peer_id.clone(), self.send_dht_request(&peer_id, op).await)
+                        (peer_id, self.send_dht_request(&peer_id, op).await)
                     }
                 })
                 .collect();
@@ -972,7 +972,7 @@ impl DhtNetworkManager {
 
             // Process results
             for (peer_id, result) in results {
-                queried_nodes.insert(peer_id.clone());
+                queried_nodes.insert(peer_id);
                 let peer_hex = peer_id.to_hex();
                 info!(
                     "[ITERATIVE LOOKUP] {}: Got result from {}: {:?}",
@@ -1035,7 +1035,7 @@ impl DhtNetworkManager {
                                 );
                                 continue;
                             }
-                            queued_peer_ids.insert(node.peer_id.clone());
+                            queued_peer_ids.insert(node.peer_id);
                             candidate_nodes.push_back(node);
                         }
                     }
@@ -1215,17 +1215,17 @@ impl DhtNetworkManager {
             match dht_guard.find_nodes(&DhtKey::from_bytes(*key), count).await {
                 Ok(nodes) => {
                     for node in nodes {
-                        let id = node.id.clone();
+                        let id = node.id;
                         if self.is_local_peer_id(&id) {
                             continue;
                         }
-                        if seen_peer_ids.insert(id.clone()) {
+                        if seen_peer_ids.insert(id) {
                             all_nodes.push(DHTNode {
                                 peer_id: id,
                                 address: node.address,
                                 distance: None,
                                 reliability: node.capacity.reliability_score,
-                                cached_dht_key: Some(node.id.clone()),
+                                cached_dht_key: Some(node.id),
                             });
                         }
                     }
@@ -1246,7 +1246,7 @@ impl DhtNetworkManager {
                 if self.is_local_peer_id(peer_id) {
                     continue;
                 }
-                if !seen_peer_ids.insert(peer_id.clone()) {
+                if !seen_peer_ids.insert(*peer_id) {
                     continue;
                 }
                 let address = match peer_info.addresses.first() {
@@ -1254,11 +1254,11 @@ impl DhtNetworkManager {
                     None => continue,
                 };
                 all_nodes.push(DHTNode {
-                    peer_id: peer_id.clone(),
+                    peer_id: *peer_id,
                     address,
                     distance: Some(peer_id.as_bytes().to_vec()),
                     reliability: peer_info.reliability_score,
-                    cached_dht_key: Some(peer_id.clone()),
+                    cached_dht_key: Some(*peer_id),
                 });
             }
         }
@@ -1306,7 +1306,7 @@ impl DhtNetworkManager {
         let initial = self.find_closest_nodes_local(key, count).await;
         let mut candidates: VecDeque<DHTNode> = VecDeque::new();
         for node in initial {
-            queued_peer_ids.insert(node.peer_id.clone());
+            queued_peer_ids.insert(node.peer_id);
             candidates.push_back(node);
         }
         let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
@@ -1351,12 +1351,12 @@ impl DhtNetworkManager {
             let query_futures: Vec<_> = batch
                 .iter()
                 .map(|node| {
-                    let peer_id = node.peer_id.clone();
+                    let peer_id = node.peer_id;
                     let address = node.address.clone();
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         self.dial_candidate(&peer_id, &address).await;
-                        (peer_id.clone(), self.send_dht_request(&peer_id, op).await)
+                        (peer_id, self.send_dht_request(&peer_id, op).await)
                     }
                 })
                 .collect();
@@ -1365,7 +1365,7 @@ impl DhtNetworkManager {
 
             let mut found_new_closer = false;
             for (peer_id, result) in results {
-                queried_nodes.insert(peer_id.clone());
+                queried_nodes.insert(peer_id);
 
                 match result {
                     Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
@@ -1403,7 +1403,7 @@ impl DhtNetworkManager {
                                     );
                                     continue;
                                 }
-                                queued_peer_ids.insert(node.peer_id.clone());
+                                queued_peer_ids.insert(node.peer_id);
                                 candidates.push_back(node);
                                 found_new_closer = true;
                             }
@@ -1471,16 +1471,8 @@ impl DhtNetworkManager {
     /// Uses cached DHT keys when available, falls back to the peer ID directly
     /// (which is now the same keyspace).
     fn compare_node_distance(a: &DHTNode, b: &DHTNode, key: &Key) -> std::cmp::Ordering {
-        let a_key = a
-            .cached_dht_key
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| a.peer_id.clone());
-        let b_key = b
-            .cached_dht_key
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| b.peer_id.clone());
+        let a_key = a.cached_dht_key.as_ref().cloned().unwrap_or(a.peer_id);
+        let b_key = b.cached_dht_key.as_ref().cloned().unwrap_or(b.peer_id);
         let target_key = DhtKey::from_bytes(*key);
         a_key
             .distance(&target_key)
@@ -1508,24 +1500,24 @@ impl DhtNetworkManager {
     /// ranking but is never queried over the network.
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
-            peer_id: self.config.peer_id.clone(),
+            peer_id: self.config.peer_id,
             address: self.config.node_config.listen_addr.to_string(),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
-            cached_dht_key: Some(self.config.peer_id.clone()),
+            cached_dht_key: Some(self.config.peer_id),
         }
     }
 
     /// Add the local app-level peer ID to `queried` so that iterative lookups
     /// never send RPCs to the local node.
     fn mark_self_queried(&self, queried: &mut HashSet<PeerId>) {
-        queried.insert(self.config.peer_id.clone());
+        queried.insert(self.config.peer_id);
     }
 
     /// Ensure a DHT node has a cached DHT key available for distance comparisons.
     fn ensure_cached_dht_key(node: &mut DHTNode) {
         if node.cached_dht_key.is_none() {
-            node.cached_dht_key = Some(node.peer_id.clone());
+            node.cached_dht_key = Some(node.peer_id);
         }
     }
 
@@ -1697,8 +1689,8 @@ impl DhtNetworkManager {
 
         let message = DhtNetworkMessage {
             message_id: message_id.clone(),
-            source: self.config.peer_id.clone(),
-            target: Some(peer_id.clone()),
+            source: self.config.peer_id,
+            target: Some(*peer_id),
             message_type: DhtMessageType::Request,
             payload: operation,
             result: None, // Requests don't have results
@@ -1724,12 +1716,12 @@ impl DhtNetworkManager {
 
         // Only track app-level peer IDs. Transport IDs identify communication
         // channels, not peers — multiple peers may share one transport in the future.
-        let contacted_nodes = vec![peer_id.clone()];
+        let contacted_nodes = vec![*peer_id];
 
         // Create operation context for tracking
         let operation_context = DhtOperationContext {
             operation: message.payload.clone(),
-            peer_id: peer_id.clone(),
+            peer_id: *peer_id,
             started_at: Instant::now(),
             timeout: self.config.request_timeout,
             contacted_nodes,
@@ -1810,11 +1802,11 @@ impl DhtNetworkManager {
     async fn canonical_app_peer_id(&self, peer_id: &PeerId) -> Option<PeerId> {
         // Check if this is a known app-level peer ID
         if self.transport.is_known_app_peer_id(peer_id).await {
-            return Some(peer_id.clone());
+            return Some(*peer_id);
         }
         // Fallback: connected transport peer (unsigned connections)
         if self.transport.is_peer_connected(peer_id).await {
-            return Some(peer_id.clone());
+            return Some(*peer_id);
         }
         None
     }
@@ -1953,7 +1945,7 @@ impl DhtNetworkManager {
         );
 
         // Update peer info
-        self.update_peer_info(sender.clone(), &message).await;
+        self.update_peer_info(*sender, &message).await;
 
         match message.message_type {
             DhtMessageType::Request => {
@@ -2038,7 +2030,7 @@ impl DhtNetworkManager {
             DhtNetworkOperation::Ping => {
                 info!("Handling PING request from: {}", message.source);
                 Ok(DhtNetworkResult::PongReceived {
-                    responder: self.config.peer_id.clone(),
+                    responder: self.config.peer_id,
                     latency: Duration::from_millis(0), // Local response
                 })
             }
@@ -2047,11 +2039,11 @@ impl DhtNetworkManager {
                 // Add the joining node to our routing table
                 let dht_key = *message.source.as_bytes();
                 let _node = DHTNode {
-                    peer_id: message.source.clone(),
+                    peer_id: message.source,
                     address: String::new(),
                     distance: Some(dht_key.to_vec()),
                     reliability: 1.0,
-                    cached_dht_key: Some(message.source.clone()),
+                    cached_dht_key: Some(message.source),
                 };
 
                 // Node will be added to routing table through normal DHT operations
@@ -2156,7 +2148,7 @@ impl DhtNetworkManager {
                     message_id
                 );
                 // Send response - if receiver dropped (timeout), log it
-                if tx.send((message.source.clone(), result)).is_err() {
+                if tx.send((message.source, result)).is_err() {
                     warn!(
                         "[STEP 5a FAILED] {}: Response channel closed for msg_id {} (receiver timed out)",
                         self.config.peer_id.to_hex(),
@@ -2217,8 +2209,8 @@ impl DhtNetworkManager {
 
         Ok(DhtNetworkMessage {
             message_id: request.message_id.clone(),
-            source: self.config.peer_id.clone(),
-            target: Some(request.source.clone()),
+            source: self.config.peer_id,
+            target: Some(request.source),
             message_type: DhtMessageType::Response,
             payload,
             result: Some(result),
@@ -2258,17 +2250,15 @@ impl DhtNetworkManager {
         };
 
         let mut peers = self.dht_peers.write().await;
-        let peer_info = peers
-            .entry(app_peer_id.clone())
-            .or_insert_with(|| DhtPeerInfo {
-                peer_id: app_peer_id.clone(),
-                dht_key,
-                addresses: addresses.clone(),
-                last_seen: Instant::now(),
-                is_connected: true,
-                avg_latency: DEFAULT_PEER_LATENCY,
-                reliability_score: INITIAL_PEER_RELIABILITY,
-            });
+        let peer_info = peers.entry(app_peer_id).or_insert_with(|| DhtPeerInfo {
+            peer_id: app_peer_id,
+            dht_key,
+            addresses: addresses.clone(),
+            last_seen: Instant::now(),
+            is_connected: true,
+            avg_latency: DEFAULT_PEER_LATENCY,
+            reliability_score: INITIAL_PEER_RELIABILITY,
+        });
 
         peer_info.last_seen = Instant::now();
         peer_info.is_connected = true;
@@ -2320,7 +2310,7 @@ impl DhtNetworkManager {
         // Track peer and decide whether it should be promoted to routing table.
         let should_add_to_routing = {
             let mut peers = self.dht_peers.write().await;
-            match peers.entry(node_id.clone()) {
+            match peers.entry(node_id) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let peer_info = entry.get_mut();
                     let had_addresses = !peer_info.addresses.is_empty();
@@ -2333,7 +2323,7 @@ impl DhtNetworkManager {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(DhtPeerInfo {
-                        peer_id: node_id.clone(),
+                        peer_id: node_id,
                         dht_key,
                         addresses: addresses.clone(),
                         last_seen: Instant::now(),
@@ -2371,7 +2361,7 @@ impl DhtNetworkManager {
             use crate::dht::core_engine::{NodeCapacity, NodeInfo};
 
             let node_info = NodeInfo {
-                id: node_id.clone(),
+                id: node_id,
                 address: address_str,
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),

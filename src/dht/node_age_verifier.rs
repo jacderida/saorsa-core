@@ -385,7 +385,7 @@ impl NodeAgeVerifier {
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.min_replication_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -397,7 +397,7 @@ impl NodeAgeVerifier {
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.min_critical_ops_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -409,7 +409,7 @@ impl NodeAgeVerifier {
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.veteran_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -559,7 +559,7 @@ mod tests {
         let node_id = create_test_node_id("test_node");
 
         // First registration
-        let record1 = verifier.register_node(node_id.clone());
+        let record1 = verifier.register_node(node_id);
         assert!(record1.is_active);
         assert_eq!(record1.rejoin_count, 0);
 
@@ -574,7 +574,7 @@ mod tests {
         let verifier = NodeAgeVerifier::new();
         let node_id = create_test_node_id("rejoining_node");
 
-        verifier.register_node(node_id.clone());
+        verifier.register_node(node_id);
         verifier.mark_departed(&node_id);
 
         let record = verifier.get_record(&node_id).unwrap();
@@ -591,7 +591,7 @@ mod tests {
         let verifier = NodeAgeVerifier::new();
         let node_id = create_test_node_id("op_test_node");
 
-        verifier.register_node(node_id.clone());
+        verifier.register_node(node_id);
 
         // New node - basic operations should pass
         let result = verifier.verify_for_operation(&node_id, OperationType::BasicRead);
@@ -663,8 +663,8 @@ mod tests {
         let node1 = create_test_node_id("active");
         let node2 = create_test_node_id("inactive");
 
-        verifier.register_node(node1.clone());
-        verifier.register_node(node2.clone());
+        verifier.register_node(node1);
+        verifier.register_node(node2);
         verifier.mark_departed(&node2);
 
         // Clean up records older than 0 seconds (immediate cleanup of inactive)

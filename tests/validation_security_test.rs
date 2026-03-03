@@ -312,7 +312,7 @@ fn test_memory_exhaustion_protection() {
     let memory_attacks = vec![
         // Large message
         NetworkMessage {
-            peer_id: test_peer.clone(),
+            peer_id: test_peer,
             payload: vec![0u8; 100 * 1024 * 1024], // 100MB
             timestamp: 0,
         },

@@ -209,7 +209,7 @@ impl PlacementOrchestrator {
             let asn = 12345 + (i as u32 % 1000);
             let region = NetworkRegion::from_coordinates(&location);
 
-            metadata.insert(node_id.clone(), (location, asn, region));
+            metadata.insert(*node_id, (location, asn, region));
         }
 
         Ok(metadata)
@@ -256,7 +256,7 @@ impl StorageOrchestrator {
 
             let shard_info = ShardInfo {
                 shard_id: shard_id.clone(),
-                node_id: node_id.clone(),
+                node_id: *node_id,
                 data_size: data.len() / decision.selected_nodes.len(),
                 created_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)

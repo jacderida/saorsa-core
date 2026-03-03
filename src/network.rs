@@ -24,7 +24,7 @@ use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
 use crate::NetworkAddress;
-use crate::identity::node_identity::NodeIdentity;
+use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
@@ -808,7 +808,7 @@ impl P2PNode {
         };
 
         // Derive the canonical peer ID from the cryptographic identity.
-        let peer_id = node_identity.peer_id().clone();
+        let peer_id = *node_identity.peer_id();
 
         // Initialize production resource manager if configured
         let resource_manager = config
@@ -869,7 +869,7 @@ impl P2PNode {
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
-            peer_id: peer_id.clone(),
+            peer_id,
             dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
@@ -1511,7 +1511,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
     Some(ParsedMessage {
         event: P2PEvent::Message {
             topic: message.protocol,
-            source: authenticated_node_id.clone(),
+            source: authenticated_node_id,
             data: message.data,
         },
         authenticated_node_id,
@@ -1528,7 +1528,7 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId
     let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
         .map_err(|e| format!("invalid public key: {e:?}"))?;
 
-    let peer_id = PeerId::from_public_key(&pubkey);
+    let peer_id = peer_id_from_public_key(&pubkey);
 
     // Validate that the self-asserted `from` field matches the public key.
     if message.from != peer_id {
@@ -1667,7 +1667,7 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        peer_id: &PeerId,
+        addr: &std::net::SocketAddr,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
@@ -1694,7 +1694,7 @@ impl P2PNode {
             };
 
             manager
-                .update_contact_metrics(peer_id, metrics)
+                .update_contact_metrics(addr, metrics)
                 .await
                 .map_err(|e| protocol_error(format!("Failed to update peer metrics: {e}")))?;
         }
@@ -2329,7 +2329,7 @@ mod tests {
         config1.enable_ipv6 = false;
         config1.node_identity = Some(identity1);
 
-        let node2_peer_id = identity2.peer_id().clone();
+        let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
         config2.peer_id = Some(PeerId::from_name("test_peer_456"));
         config2.listen_addr = ipv4_localhost;
@@ -2524,7 +2524,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_config_access() -> Result<()> {
         let config = create_test_node_config();
-        let expected_peer_id = config.peer_id.clone();
+        let expected_peer_id = config.peer_id;
         let node = P2PNode::new(config).await?;
 
         let node_config = node.config();
@@ -2560,7 +2560,7 @@ mod tests {
         // Create a config using the builder but don't actually build a real node
         let builder_peer_id = PeerId::from_name("builder_test_peer");
         let builder = P2PNode::builder()
-            .with_peer_id(builder_peer_id.clone())
+            .with_peer_id(builder_peer_id)
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
             .with_bootstrap_peer("/ip4/127.0.0.1/tcp/9000") // Use a valid port number
@@ -2627,23 +2627,23 @@ mod tests {
         let address = "/ip4/127.0.0.1/tcp/9000".to_string();
 
         let _peer_connected = NetworkEvent::PeerConnected {
-            peer_id: peer_id.clone(),
+            peer_id,
             addresses: vec![address.clone()],
         };
 
         let _peer_disconnected = NetworkEvent::PeerDisconnected {
-            peer_id: peer_id.clone(),
+            peer_id,
             reason: "test disconnect".to_string(),
         };
 
         let _message_received = NetworkEvent::MessageReceived {
-            peer_id: peer_id.clone(),
+            peer_id,
             protocol: "test-protocol".to_string(),
             data: vec![1, 2, 3],
         };
 
         let _connection_failed = NetworkEvent::ConnectionFailed {
-            peer_id: Some(peer_id.clone()),
+            peer_id: Some(peer_id),
             address: address.clone(),
             error: "connection refused".to_string(),
         };
@@ -2896,7 +2896,7 @@ mod tests {
             .inject_peer(channel_id.clone(), peer_info)
             .await;
         node.transport
-            .inject_peer_to_channel(channel_peer_id.clone(), channel_id.clone())
+            .inject_peer_to_channel(channel_peer_id, channel_id.clone())
             .await;
 
         // Verify peer exists
@@ -2950,7 +2950,7 @@ mod tests {
             .inject_peer(channel_id.clone(), peer_info)
             .await;
         node.transport
-            .inject_peer_to_channel(channel_peer_id.clone(), channel_id.clone())
+            .inject_peer_to_channel(channel_peer_id, channel_id.clone())
             .await;
 
         // Now connected
@@ -3113,7 +3113,7 @@ mod tests {
         let protocol = "test/signed";
         let data: Vec<u8> = vec![10, 20, 30];
         // The `from` field must match the PeerId derived from the public key.
-        let from = identity.peer_id().clone();
+        let from = *identity.peer_id();
         let timestamp = current_timestamp();
 
         // Compute signable bytes the same way create_protocol_message does
@@ -3123,7 +3123,7 @@ mod tests {
         let msg = WireMessage {
             protocol: protocol.to_string(),
             data: data.clone(),
-            from: from.clone(),
+            from,
             timestamp,
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
@@ -3133,7 +3133,7 @@ mod tests {
         let parsed =
             parse_protocol_message(&bytes, "transport-xyz").expect("signed message should parse");
 
-        let expected_peer_id = identity.peer_id().clone();
+        let expected_peer_id = *identity.peer_id();
         assert_eq!(
             parsed.authenticated_node_id.as_ref(),
             Some(&expected_peer_id)
@@ -3156,7 +3156,7 @@ mod tests {
         let identity = NodeIdentity::generate().expect("should generate identity");
         let protocol = "test/bad-sig";
         let data: Vec<u8> = vec![1, 2, 3];
-        let from = identity.peer_id().clone();
+        let from = *identity.peer_id();
         let timestamp = current_timestamp();
 
         // Sign correct signable bytes

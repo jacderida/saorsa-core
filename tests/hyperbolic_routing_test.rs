@@ -161,7 +161,7 @@ async fn test_greedy_routing_decisions() {
             r: 0.1 + (i as f64) * 0.1,
             theta: (i as f64) * std::f64::consts::PI / 5.0,
         };
-        space.update_neighbor(node_id.clone(), coord).await;
+        space.update_neighbor(node_id, coord).await;
         topology.push((node_id, coord));
     }
 
@@ -171,7 +171,7 @@ async fn test_greedy_routing_decisions() {
         theta: 1.5,
     };
     let target_id = generate_test_node_id(100);
-    space.update_neighbor(target_id.clone(), target_coord).await;
+    space.update_neighbor(target_id, target_coord).await;
 
     // Greedy routing should find path
     let next_hop = space.greedy_route(&target_coord).await;
@@ -233,11 +233,11 @@ async fn test_routing_loop_detection() {
 
     // Set coordinates that might cause oscillation
     space
-        .update_neighbor(node1.clone(), HyperbolicCoordinate { r: 0.5, theta: 0.0 })
+        .update_neighbor(node1, HyperbolicCoordinate { r: 0.5, theta: 0.0 })
         .await;
     space
         .update_neighbor(
-            node2.clone(),
+            node2,
             HyperbolicCoordinate {
                 r: 0.5,
                 theta: std::f64::consts::PI,
@@ -246,7 +246,7 @@ async fn test_routing_loop_detection() {
         .await;
     space
         .update_neighbor(
-            target.clone(),
+            target,
             HyperbolicCoordinate {
                 r: 0.9,
                 theta: std::f64::consts::PI / 2.0,
@@ -349,7 +349,7 @@ mod simulation_tests {
         for i in 0..5 {
             let node_id = generate_test_node_id(i);
             let space = Arc::new(HyperbolicSpace::new());
-            nodes.push(node_id.clone());
+            nodes.push(node_id);
             spaces.insert(node_id, space);
         }
 
@@ -370,15 +370,13 @@ mod simulation_tests {
                     theta: (i as f64) * 2.0 * std::f64::consts::PI / 50.0,
                 };
 
-                new_space.update_neighbor(target.clone(), coord).await;
+                new_space.update_neighbor(*target, coord).await;
                 if let Some(target_space) = spaces.get(target) {
-                    target_space
-                        .update_neighbor(new_node_id.clone(), coord)
-                        .await;
+                    target_space.update_neighbor(new_node_id, coord).await;
                 }
             }
 
-            nodes.push(new_node_id.clone());
+            nodes.push(new_node_id);
             spaces.insert(new_node_id, new_space);
         }
 
@@ -395,8 +393,7 @@ mod simulation_tests {
                 let target = &nodes[target_idx];
 
                 if let Some(source_space) = spaces.get(source) {
-                    let strategy =
-                        HyperbolicRoutingStrategy::new(source.clone(), source_space.clone());
+                    let strategy = HyperbolicRoutingStrategy::new(*source, source_space.clone());
 
                     total_attempts += 1;
                     if strategy.find_path(target).await.is_ok() {
@@ -482,7 +479,7 @@ mod simulation_tests {
                                     (grid_spaces.get(&(x1, y1)), grid_spaces.get(&(x2, y2)))
                             {
                                 let strategy = HyperbolicRoutingStrategy::new(
-                                    source_id.clone(),
+                                    *source_id,
                                     source_space.clone(),
                                 );
 

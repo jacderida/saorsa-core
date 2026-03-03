@@ -378,9 +378,7 @@ impl AdaptiveDHT {
             Some(coord) => coord,
             None => {
                 let coord = Self::derive_hyperbolic_coordinate(node_id);
-                self.hyperbolic_space
-                    .update_neighbor(node_id.clone(), coord)
-                    .await;
+                self.hyperbolic_space.update_neighbor(*node_id, coord).await;
                 coord
             }
         };
@@ -390,7 +388,7 @@ impl AdaptiveDHT {
             None => {
                 let coord = Self::derive_hyperbolic_coordinate(target_id);
                 self.hyperbolic_space
-                    .update_neighbor(target_id.clone(), coord)
+                    .update_neighbor(*target_id, coord)
                     .await;
                 coord
             }
@@ -602,7 +600,7 @@ impl AdaptiveDHT {
                 Ok(nodes
                     .into_iter()
                     .map(|node| CandidateNode {
-                        peer_id: node.id.clone(),
+                        peer_id: node.id,
                         address: node.address,
                         reliability: node.capacity.reliability_score,
                     })
@@ -673,8 +671,7 @@ impl AdaptiveDHT {
                         .await
                         .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
                 } else {
-                    let targets: Vec<crate::PeerId> =
-                        selected.iter().map(|c| c.peer_id.clone()).collect();
+                    let targets: Vec<crate::PeerId> = selected.iter().map(|c| c.peer_id).collect();
                     manager
                         .put_with_targets(key, value, &targets)
                         .await
@@ -733,7 +730,7 @@ impl AdaptiveDHT {
                 for candidate in selected {
                     let op = DhtNetworkOperation::Get { key };
                     let manager = Arc::clone(manager);
-                    let peer_id = candidate.peer_id.clone();
+                    let peer_id = candidate.peer_id;
                     attempted_hops += 1;
                     futures.push(async move {
                         let result = manager.send_request(&peer_id, op).await;
@@ -820,9 +817,9 @@ impl AdaptiveDHT {
         let nodes = selected
             .into_iter()
             .map(|candidate| {
-                let node_id = candidate.peer_id.clone();
+                let node_id = candidate.peer_id;
                 NodeDescriptor {
-                    id: node_id.clone(),
+                    id: node_id,
                     public_key: public_key.clone(),
                     addresses: candidate
                         .address
@@ -923,7 +920,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let trust_provider = Arc::new(MockTrustProvider);
         let router = Arc::new(AdaptiveRouter::new_with_id(
-            identity.peer_id().clone(),
+            *identity.peer_id(),
             trust_provider.clone(),
         ));
 

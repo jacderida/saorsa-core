@@ -773,7 +773,7 @@ mod tests {
         let os_sig = OsSignature::current();
 
         let node_ad = NodeAd::new(
-            node_id.clone(),
+            node_id,
             vec![addr],
             caps,
             NatType::None,
@@ -798,7 +798,7 @@ mod tests {
         // No addresses
         assert!(
             NodeAd::new(
-                node_id.clone(),
+                node_id,
                 vec![],
                 caps.clone(),
                 NatType::None,

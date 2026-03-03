@@ -995,9 +995,7 @@ impl ChurnPredictor {
 
         // Update feature history
         let mut history = self.feature_history.write().await;
-        let entry = history
-            .entry(node_id.clone())
-            .or_insert(FeatureHistory::new());
+        let entry = history.entry(*node_id).or_insert(FeatureHistory::new());
 
         // Add or update session with new features
         if entry.sessions.is_empty() || entry.sessions.last().map(|s| s.1.is_some()).unwrap_or(true)
@@ -1190,7 +1188,7 @@ impl ChurnPredictor {
 
         // Cache the prediction
         let mut cache = self.prediction_cache.write().await;
-        cache.insert(node_id.clone(), prediction.clone());
+        cache.insert(*node_id, prediction.clone());
         prediction
     }
 
@@ -1267,15 +1265,13 @@ impl ChurnPredictor {
         features: NodeFeatures,
     ) -> anyhow::Result<()> {
         let mut history = self.feature_history.write().await;
-        let node_history = history
-            .entry(node_id.clone())
-            .or_insert_with(|| FeatureHistory {
-                node_id: node_id.clone(),
-                snapshots: Vec::new(),
-                sessions: vec![(std::time::Instant::now(), None)],
-                total_uptime: 0,
-                total_downtime: 0,
-            });
+        let node_history = history.entry(*node_id).or_insert_with(|| FeatureHistory {
+            node_id: *node_id,
+            snapshots: Vec::new(),
+            sessions: vec![(std::time::Instant::now(), None)],
+            total_uptime: 0,
+            total_downtime: 0,
+        });
 
         // Add snapshot
         node_history
@@ -1299,15 +1295,13 @@ impl ChurnPredictor {
     /// Record node connection event
     pub async fn record_node_event(&self, node_id: &PeerId, event: NodeEvent) -> Result<()> {
         let mut history = self.feature_history.write().await;
-        let node_history = history
-            .entry(node_id.clone())
-            .or_insert_with(|| FeatureHistory {
-                node_id: node_id.clone(),
-                snapshots: Vec::new(),
-                sessions: Vec::new(),
-                total_uptime: 0,
-                total_downtime: 0,
-            });
+        let node_history = history.entry(*node_id).or_insert_with(|| FeatureHistory {
+            node_id: *node_id,
+            snapshots: Vec::new(),
+            sessions: Vec::new(),
+            total_uptime: 0,
+            total_downtime: 0,
+        });
 
         match event {
             NodeEvent::Connected => {
@@ -1342,7 +1336,7 @@ impl ChurnPredictor {
         actual_churn_24h: bool,
     ) -> anyhow::Result<()> {
         let example = TrainingExample {
-            node_id: node_id.clone(),
+            node_id: *node_id,
             features,
             timestamp: std::time::Instant::now(),
             actual_churn_1h,

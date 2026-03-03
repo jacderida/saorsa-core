@@ -55,20 +55,18 @@ async fn test_trust_weighted_routing() {
     let node2 = random_node_id();
     let node3 = random_node_id();
 
-    let dht = TrustWeightedKademlia::new(node1.clone());
+    let dht = TrustWeightedKademlia::new(node1);
 
     // Record good interactions with node2
     for _ in 0..5 {
-        dht.record_interaction(node2.clone(), Outcome::Ok).await;
+        dht.record_interaction(node2, Outcome::Ok).await;
     }
 
     // Record bad interactions with node3
     for _ in 0..3 {
-        dht.record_interaction(node3.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(node3, Outcome::Timeout).await;
     }
-    dht.record_interaction(node3.clone(), Outcome::BadData)
-        .await;
+    dht.record_interaction(node3, Outcome::BadData).await;
 
     // Run EigenTrust computation
     dht.eigen_trust_epoch().await;
@@ -81,7 +79,7 @@ async fn test_trust_weighted_routing() {
 #[tokio::test]
 async fn test_capacity_signaling() {
     let local_peer = random_node_id();
-    let mut capacity_manager = CapacityManager::new(local_peer.clone(), 10_000_000_000);
+    let mut capacity_manager = CapacityManager::new(local_peer, 10_000_000_000);
 
     // Update local capacity
     capacity_manager.update_local_capacity(8_000_000_000).await;
@@ -93,7 +91,7 @@ async fn test_capacity_signaling() {
 
     capacity_manager
         .receive_gossip(saorsa_core::dht::CapacityGossip {
-            peer: peer1.clone(),
+            peer: peer1,
             free_bytes: 5_000_000_000,
             total_bytes: 10_000_000_000,
             epoch: 1,
@@ -102,7 +100,7 @@ async fn test_capacity_signaling() {
 
     capacity_manager
         .receive_gossip(saorsa_core::dht::CapacityGossip {
-            peer: peer2.clone(),
+            peer: peer2,
             free_bytes: 1_000_000_000,
             total_bytes: 5_000_000_000,
             epoch: 1,
@@ -184,7 +182,7 @@ async fn test_lookup_under_churn() {
     // Create initial network of nodes
     for _ in 0..20 {
         let node_id = random_node_id();
-        let dht = TrustWeightedKademlia::new(node_id.clone());
+        let dht = TrustWeightedKademlia::new(node_id);
         nodes.push((node_id, dht));
     }
 
@@ -437,7 +435,7 @@ async fn test_trust_weighted_find_closest_nodes() {
     use saorsa_core::dht::trust_weighted_kademlia::Outcome;
 
     let local_id = random_node_id();
-    let dht = TrustWeightedKademlia::new(local_id.clone());
+    let dht = TrustWeightedKademlia::new(local_id);
 
     // Create two nodes that could be at similar distances
     let node1_id = random_node_id();
@@ -445,16 +443,14 @@ async fn test_trust_weighted_find_closest_nodes() {
 
     // Record high trust for node1
     for _ in 0..10 {
-        dht.record_interaction(node1_id.clone(), Outcome::Ok).await;
+        dht.record_interaction(node1_id, Outcome::Ok).await;
     }
 
     // Record low trust for node2
     for _ in 0..5 {
-        dht.record_interaction(node2_id.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(node2_id, Outcome::Timeout).await;
     }
-    dht.record_interaction(node2_id.clone(), Outcome::BadData)
-        .await;
+    dht.record_interaction(node2_id, Outcome::BadData).await;
 
     // Run EigenTrust computation
     dht.eigen_trust_epoch().await;
@@ -501,7 +497,7 @@ async fn test_distance_magnitude_bucketing() {
 #[tokio::test]
 async fn test_find_closest_self_lookup() {
     let node_id = random_node_id();
-    let _dht = TrustWeightedKademlia::new(node_id.clone());
+    let _dht = TrustWeightedKademlia::new(node_id);
 
     // Test self-distance
     let self_distance = node_id.xor_distance(&node_id);
@@ -534,17 +530,15 @@ async fn test_distance_overrides_trust() {
 
     // Give far node maximum trust
     for _ in 0..100 {
-        dht.record_interaction(far_node.clone(), Outcome::Ok).await;
+        dht.record_interaction(far_node, Outcome::Ok).await;
     }
 
     // Give close node minimum trust
     for _ in 0..50 {
-        dht.record_interaction(close_node.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(close_node, Outcome::Timeout).await;
     }
     for _ in 0..50 {
-        dht.record_interaction(close_node.clone(), Outcome::BadData)
-            .await;
+        dht.record_interaction(close_node, Outcome::BadData).await;
     }
 
     dht.eigen_trust_epoch().await;
@@ -578,7 +572,7 @@ async fn test_find_closest_nodes_performance() {
         // Vary trust scores
         let outcomes = i % 3;
         for _ in 0..outcomes {
-            dht.record_interaction(peer.clone(), Outcome::Ok).await;
+            dht.record_interaction(peer, Outcome::Ok).await;
         }
     }
 

@@ -39,7 +39,7 @@ impl NetworkSimulation {
 
         for i in 0..num_nodes {
             let identity = NodeIdentity::generate().unwrap();
-            let user_id = identity.peer_id().clone();
+            let user_id = *identity.peer_id();
 
             let config = NetworkConfig {
                 bootstrap_nodes: bootstrap_nodes.clone(),

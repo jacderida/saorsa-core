@@ -73,7 +73,7 @@ fn test_signing_and_verification() {
 #[test]
 fn test_persistence() {
     let identity = NodeIdentity::generate().unwrap();
-    let original_id = identity.peer_id().clone();
+    let original_id = *identity.peer_id();
 
     // Export to data
     let data = identity.export();

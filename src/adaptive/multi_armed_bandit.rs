@@ -208,7 +208,7 @@ impl MultiArmedBandit {
             // Random exploration
             let strategy =
                 available_strategies[rand::random::<usize>() % available_strategies.len()];
-            let route_id = RouteId::new(destination.clone(), strategy);
+            let route_id = RouteId::new(*destination, strategy);
 
             let stats = statistics
                 .entry((route_id.clone(), content_type))
@@ -235,7 +235,7 @@ impl MultiArmedBandit {
         let mut best_stats = RouteStatistics::default();
 
         for strategy in available_strategies {
-            let route_id = RouteId::new(destination.clone(), *strategy);
+            let route_id = RouteId::new(*destination, *strategy);
             let key = (route_id.clone(), content_type);
 
             let stats = statistics.entry(key).or_default();
@@ -686,7 +686,7 @@ mod tests {
 
         // Simulate Kademlia being better (80% success rate)
         for _ in 0..100 {
-            let route_id = RouteId::new(destination.clone(), StrategyChoice::Kademlia);
+            let route_id = RouteId::new(destination, StrategyChoice::Kademlia);
             let success = rand::random::<f64>() < 0.8;
             let outcome = Outcome {
                 success,
@@ -700,7 +700,7 @@ mod tests {
 
         // Simulate Hyperbolic being worse (30% success rate)
         for _ in 0..100 {
-            let route_id = RouteId::new(destination.clone(), StrategyChoice::Hyperbolic);
+            let route_id = RouteId::new(destination, StrategyChoice::Hyperbolic);
             let success = rand::random::<f64>() < 0.3;
             let outcome = Outcome {
                 success,

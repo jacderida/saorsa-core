@@ -25,174 +25,46 @@
 
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
-use blake3;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::cmp::Ordering;
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
 
 // Import PQC types from ant_quic via quantum_crypto module
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 
-// No four-word address tied to identity; addressing is handled elsewhere.
+// Re-export canonical PeerId from saorsa-types.
+pub use saorsa_types::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 
-/// Length of a PeerId in bytes (BLAKE3 output).
-pub const PEER_ID_BYTE_LEN: usize = 32;
-
-/// Peer ID derived from public key (256-bit).
+/// Create a [`PeerId`] from an ML-DSA public key.
 ///
-/// The canonical peer identity in the Saorsa network. Computed as the
-/// BLAKE3 hash of the node's ML-DSA-65 public key.
+/// This is a standalone function because it depends on `MlDsaPublicKey`
+/// from `saorsa-pqc`, which `saorsa-types` does not (and should not)
+/// depend on.
+pub fn peer_id_from_public_key(public_key: &MlDsaPublicKey) -> PeerId {
+    let hash = blake3::hash(public_key.as_bytes());
+    PeerId(*hash.as_bytes())
+}
+
+/// ML-DSA-65 public key length in bytes.
+const ML_DSA_PUB_KEY_LEN: usize = 1952;
+
+/// Create a [`PeerId`] from raw ML-DSA public key bytes.
 ///
-/// Serializes as a hex string (64 characters) in all formats to maintain
-/// wire compatibility with the existing postcard-based `WireMessage` protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
-
-impl Serialize for PeerId {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_hex())
-    }
-}
-
-impl<'de> Deserialize<'de> for PeerId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        PeerId::from_hex(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-impl PeerId {
-    /// Create from ML-DSA public key
-    pub fn from_public_key(public_key: &MlDsaPublicKey) -> Self {
-        let hash = blake3::hash(public_key.as_bytes());
-        Self(*hash.as_bytes())
+/// # Errors
+///
+/// Returns an error if the byte slice is not exactly 1952 bytes or
+/// cannot be parsed as a valid ML-DSA-65 public key.
+pub fn peer_id_from_public_key_bytes(bytes: &[u8]) -> Result<PeerId> {
+    if bytes.len() != ML_DSA_PUB_KEY_LEN {
+        return Err(P2PError::Identity(IdentityError::InvalidFormat(
+            "Invalid ML-DSA public key length".to_string().into(),
+        )));
     }
 
-    /// Convert to bytes
-    pub fn to_bytes(&self) -> &[u8; PEER_ID_BYTE_LEN] {
-        &self.0
-    }
+    let public_key = MlDsaPublicKey::from_bytes(bytes).map_err(|e| {
+        IdentityError::InvalidFormat(format!("Invalid ML-DSA public key: {:?}", e).into())
+    })?;
 
-    /// Backward-compatible byte accessor.
-    pub fn as_bytes(&self) -> &[u8; PEER_ID_BYTE_LEN] {
-        self.to_bytes()
-    }
-
-    /// XOR distance to another peer ID (for Kademlia)
-    pub fn xor_distance(&self, other: &PeerId) -> [u8; PEER_ID_BYTE_LEN] {
-        let mut distance = [0u8; PEER_ID_BYTE_LEN];
-        for (i, out) in distance.iter_mut().enumerate() {
-            *out = self.0[i] ^ other.0[i];
-        }
-        distance
-    }
-
-    /// Create from public key bytes
-    pub fn from_public_key_bytes(bytes: &[u8]) -> Result<Self> {
-        // ML-DSA-65 public key is 1952 bytes
-        if bytes.len() != 1952 {
-            return Err(P2PError::Identity(IdentityError::InvalidFormat(
-                "Invalid ML-DSA public key length".to_string().into(),
-            )));
-        }
-
-        // Create ML-DSA public key from bytes
-        let public_key = MlDsaPublicKey::from_bytes(bytes).map_err(|e| {
-            IdentityError::InvalidFormat(format!("Invalid ML-DSA public key: {:?}", e).into())
-        })?;
-
-        Ok(PeerId::from_public_key(&public_key))
-    }
-
-    /// Create from a hex-encoded string (64 hex characters → 32 bytes).
-    pub fn from_hex(hex_str: &str) -> Result<Self> {
-        let bytes = hex::decode(hex_str).map_err(|e| {
-            P2PError::Identity(IdentityError::InvalidFormat(
-                format!("Invalid hex for PeerId: {e}").into(),
-            ))
-        })?;
-        if bytes.len() != PEER_ID_BYTE_LEN {
-            return Err(P2PError::Identity(IdentityError::InvalidFormat(
-                format!(
-                    "PeerId hex must be 64 characters ({PEER_ID_BYTE_LEN} bytes), got {} characters ({} bytes)",
-                    hex_str.len(),
-                    bytes.len()
-                )
-                .into(),
-            )));
-        }
-        let mut id = [0u8; PEER_ID_BYTE_LEN];
-        id.copy_from_slice(&bytes);
-        Ok(Self(id))
-    }
-
-    /// Encode this PeerId as a lowercase hex string (64 characters).
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Construct from raw bytes
-    pub fn from_bytes(bytes: [u8; PEER_ID_BYTE_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Create a deterministic PeerId by blake3-hashing an arbitrary name.
-    ///
-    /// Use this for synthetic identifiers (e.g. CLI peer placeholders, test
-    /// peers) where you don't have a real hex-encoded peer ID.
-    pub fn from_name(name: &str) -> Self {
-        let hash = blake3::hash(name.as_bytes());
-        Self(*hash.as_bytes())
-    }
-
-    /// Create a random peer identifier (primarily for tests/simulation).
-    pub fn random() -> Self {
-        Self(rand::random())
-    }
-
-    /// BLAKE3 hash constructor — produces a deterministic PeerId from arbitrary data.
-    ///
-    /// Equivalent to the former `DhtKey::new()`. Use this when you need a
-    /// content-addressed identifier (e.g. hashing a test label into a key).
-    pub fn new(data: &[u8]) -> Self {
-        let hash = blake3::hash(data);
-        Self(*hash.as_bytes())
-    }
-
-    /// XOR distance to another peer (Kademlia metric).
-    ///
-    /// Alias for [`xor_distance`](Self::xor_distance) — provided so that
-    /// code using the `DhtKey` type alias can call `.distance()` unchanged.
-    pub fn distance(&self, other: &PeerId) -> [u8; PEER_ID_BYTE_LEN] {
-        self.xor_distance(other)
-    }
-}
-
-impl fmt::Display for PeerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
-    }
-}
-
-impl Ord for PeerId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl PartialOrd for PeerId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl FromStr for PeerId {
-    type Err = P2PError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        Self::from_hex(s)
-    }
+    Ok(peer_id_from_public_key(&public_key))
 }
 
 /// Public node identity information (without secret keys) - safe to clone
@@ -250,7 +122,7 @@ impl NodeIdentity {
                 ))
             })?;
 
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -297,7 +169,7 @@ impl NodeIdentity {
                     ))
                 })?;
 
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -350,7 +222,7 @@ impl NodeIdentity {
     pub fn to_public(&self) -> PublicNodeIdentity {
         PublicNodeIdentity {
             public_key: self.public_key.clone(),
-            peer_id: self.peer_id.clone(),
+            peer_id: self.peer_id,
         }
     }
 }
@@ -449,7 +321,7 @@ impl NodeIdentity {
             ))
         })?;
 
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
             &secret_key,
@@ -472,13 +344,13 @@ mod tests {
     fn test_peer_id_generation() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         // Should be 32 bytes
         assert_eq!(peer_id.to_bytes().len(), 32);
 
         // Should be deterministic
-        let peer_id2 = PeerId::from_public_key(&public_key);
+        let peer_id2 = peer_id_from_public_key(&public_key);
         assert_eq!(peer_id, peer_id2);
     }
 

@@ -278,7 +278,7 @@ impl DataStore {
             last_accessed: SystemTime::now(),
         };
 
-        self.data.insert(key.clone(), value);
+        self.data.insert(key, value);
         self.metadata.insert(key, metadata);
     }
 
@@ -363,7 +363,7 @@ impl LoadBalancer {
                 if load.is_nan() {
                     None
                 } else {
-                    Some((node.id.clone(), load))
+                    Some((node.id, load))
                 }
             })
             .collect();
@@ -520,7 +520,7 @@ impl DhtCoreEngine {
         )));
 
         let mut bucket_refresh_manager = BucketRefreshManager::new_with_validation(
-            node_id.clone(),
+            node_id,
             CloseGroupValidatorConfig::default(),
         );
         // Link validator to refresh manager
@@ -540,7 +540,7 @@ impl DhtCoreEngine {
             Arc::new(RwLock::new(GeographicDiversityEnforcer::new(50)));
 
         Ok(Self {
-            node_id: node_id.clone(),
+            node_id,
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
             data_store: Arc::new(RwLock::new(DataStore::new())),
             replication_manager: Arc::new(RwLock::new(ReplicationManager::new(K))),
@@ -751,10 +751,8 @@ impl DhtCoreEngine {
                                             reason = ?reason,
                                             "Node failed validation during refresh"
                                         );
-                                        evict_list.push((
-                                            node_id.clone(),
-                                            EvictionReason::CloseGroupRejection,
-                                        ));
+                                        evict_list
+                                            .push((*node_id, EvictionReason::CloseGroupRejection));
                                     }
                                 }
                                 drop(validator);
@@ -855,10 +853,10 @@ impl DhtCoreEngine {
         if selected_nodes.contains(&self.node_id) || selected_nodes.is_empty() {
             let mut store = self.data_store.write().await;
             // Avoid unnecessary clone of value: key is cloned for ownership, value is consumed by this branch
-            store.put(key.clone(), value);
+            store.put(*key, value);
             // Return early since we've consumed value
             return Ok(StoreReceipt {
-                key: key.clone(),
+                key: *key,
                 stored_at: selected_nodes,
                 timestamp: SystemTime::now(),
                 success: true,
@@ -866,7 +864,7 @@ impl DhtCoreEngine {
         }
 
         Ok(StoreReceipt {
-            key: key.clone(),
+            key: *key,
             stored_at: selected_nodes,
             timestamp: SystemTime::now(),
             success: true,
@@ -963,7 +961,7 @@ impl DhtCoreEngine {
 
         // Create the DHT message
         let message = DhtMessage::Retrieve {
-            key: key.clone(),
+            key: *key,
             consistency: ConsistencyLevel::One,
         };
 
@@ -1082,12 +1080,9 @@ impl DhtCoreEngine {
                         },
                     };
                 }
-                self.data_store
-                    .write()
-                    .await
-                    .put(key.clone(), value.clone());
+                self.data_store.write().await.put(*key, value.clone());
                 DhtResponse::StoreAck {
-                    replicas: vec![self.node_id.clone()],
+                    replicas: vec![self.node_id],
                 }
             }
             DhtMessage::FindNode { ref target, count } => {

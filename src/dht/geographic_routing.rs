@@ -317,7 +317,7 @@ impl RegionalBucket {
                     .partial_cmp(&b.get_reliability_score())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(id, metrics)| (id.clone(), metrics.get_reliability_score()));
+            .map(|(id, metrics)| (*id, metrics.get_reliability_score()));
 
         if let Some((worst_peer_id, worst_score)) = worst_peer
             && new_metrics.get_reliability_score() > worst_score
@@ -340,7 +340,7 @@ impl RegionalBucket {
         let mut peer_list: Vec<_> = self
             .peers
             .iter()
-            .map(|(id, metrics)| (id.clone(), metrics.clone()))
+            .map(|(id, metrics)| (*id, metrics.clone()))
             .collect();
 
         // Sort by reliability score (descending)
@@ -360,7 +360,7 @@ impl RegionalBucket {
             .peers
             .iter()
             .filter(|(_, metrics)| metrics.needs_refresh(max_peer_age))
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
 
         for peer_id in stale_peers {

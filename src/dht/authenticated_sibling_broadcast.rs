@@ -280,11 +280,7 @@ impl SiblingBroadcastValidator {
         }
 
         // Check for duplicate entries
-        let unique_siblings: HashSet<_> = broadcast
-            .siblings
-            .iter()
-            .map(|s| s.node.id.clone())
-            .collect();
+        let unique_siblings: HashSet<_> = broadcast.siblings.iter().map(|s| s.node.id).collect();
         if unique_siblings.len() != broadcast.siblings.len() {
             failures.push(BroadcastValidationFailure::DuplicateEntries);
             is_valid = false;
@@ -307,11 +303,8 @@ impl SiblingBroadcastValidator {
         }
 
         // Calculate overlap with local siblings
-        let broadcast_peer_ids: HashSet<PeerId> = broadcast
-            .siblings
-            .iter()
-            .map(|s| s.node.id.clone())
-            .collect();
+        let broadcast_peer_ids: HashSet<PeerId> =
+            broadcast.siblings.iter().map(|s| s.node.id).collect();
 
         let overlap_count = self
             .local_siblings
@@ -333,7 +326,7 @@ impl SiblingBroadcastValidator {
 
         // Track this broadcast
         self.recent_broadcasts.push_back((
-            broadcast.broadcaster.clone(),
+            broadcast.broadcaster,
             broadcast.sequence_number,
             broadcast.timestamp,
         ));
@@ -639,7 +632,7 @@ mod tests {
         let peer1 = random_peer_id();
         let peer2 = random_peer_id();
 
-        let siblings: HashSet<_> = [peer1.clone(), peer2.clone()].into_iter().collect();
+        let siblings: HashSet<_> = [peer1, peer2].into_iter().collect();
         validator.update_local_siblings(siblings);
 
         assert_eq!(validator.local_siblings.len(), 2);
@@ -651,7 +644,7 @@ mod tests {
         let mut validator = SiblingBroadcastValidator::with_defaults(position);
 
         let peer = random_peer_id();
-        validator.add_local_sibling(peer.clone());
+        validator.add_local_sibling(peer);
         assert!(validator.local_siblings.contains(&peer));
 
         validator.remove_local_sibling(&peer);
@@ -862,7 +855,7 @@ mod tests {
         };
 
         let broadcast = SiblingBroadcastBuilder::new()
-            .broadcaster(broadcaster.clone(), position)
+            .broadcaster(broadcaster, position)
             .add_sibling(sibling)
             .sequence_number(42)
             .build()
@@ -883,7 +876,7 @@ mod tests {
         // First broadcast with seq 1
         validator
             .recent_broadcasts
-            .push_back((peer.clone(), 1, SystemTime::now()));
+            .push_back((peer, 1, SystemTime::now()));
 
         // Seq 2 should be valid
         assert!(validator.is_valid_sequence(&peer, 2));
@@ -963,7 +956,7 @@ mod tests {
         };
 
         let broadcast = SiblingBroadcastBuilder::new()
-            .broadcaster(broadcaster.clone(), position)
+            .broadcaster(broadcaster, position)
             .add_sibling(sibling)
             .sequence_number(1)
             .build_and_sign(&secret_key)
@@ -1191,7 +1184,7 @@ mod tests {
         };
 
         let broadcast = AuthenticatedSiblingBroadcast {
-            broadcaster: broadcaster.clone(),
+            broadcaster,
             broadcaster_position: position,
             siblings: vec![sibling.clone()],
             timestamp,

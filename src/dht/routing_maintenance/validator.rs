@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn test_witness_response_confirming() {
         let witness_id = PeerId::random();
-        let response = WitnessResponse::confirming(witness_id.clone());
+        let response = WitnessResponse::confirming(witness_id);
 
         assert!(response.confirms_valid);
         assert!(response.failure_reason.is_none());
@@ -342,8 +342,7 @@ mod tests {
     #[test]
     fn test_witness_response_denying() {
         let witness_id = PeerId::random();
-        let response =
-            WitnessResponse::denying(witness_id.clone(), ValidationFailure::MarkedMalicious);
+        let response = WitnessResponse::denying(witness_id, ValidationFailure::MarkedMalicious);
 
         assert!(!response.confirms_valid);
         assert_eq!(

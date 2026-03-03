@@ -387,7 +387,7 @@ mod tests {
 
         // Generate identity
         let identity = NodeIdentity::generate().expect("Should generate identity in test");
-        let original_id = identity.peer_id().clone();
+        let original_id = *identity.peer_id();
 
         // Save
         save_identity(&identity, &identity_path).expect("Should save identity in test");

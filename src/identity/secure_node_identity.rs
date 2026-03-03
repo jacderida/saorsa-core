@@ -21,7 +21,7 @@
 //! This module provides enhanced security features for the NodeIdentity
 //! including secure key handling with automatic zeroization.
 
-use super::node_identity::{IdentityData, PeerId};
+use super::node_identity::{IdentityData, PeerId, peer_id_from_public_key};
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
 use ant_quic::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
@@ -54,7 +54,7 @@ impl SecureNodeIdentity {
             })?;
 
         // Derive peer ID from public key
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         Ok(Self {
             secret_key,
@@ -78,7 +78,7 @@ impl SecureNodeIdentity {
             })?;
 
         // Derive peer ID from public key
-        let peer_id = PeerId::from_public_key(&public_key);
+        let peer_id = peer_id_from_public_key(&public_key);
 
         Ok(Self {
             secret_key,

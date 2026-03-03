@@ -401,7 +401,7 @@ impl NetworkCoordinator {
 
         // Create trust provider for components that need it
         let mut pre_trusted = HashSet::new();
-        pre_trusted.insert(identity.peer_id().clone());
+        pre_trusted.insert(*identity.peer_id());
         let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
 
         // Initialize routing components
@@ -443,7 +443,7 @@ impl NetworkCoordinator {
 
         // Initialize gossip
         let gossip = Arc::new(AdaptiveGossipSub::new(
-            identity.peer_id().clone(),
+            *identity.peer_id(),
             trust_engine.clone(),
         ));
 
@@ -501,7 +501,7 @@ impl NetworkCoordinator {
         // Initialize churn handler
         let churn_config = ChurnConfig::default();
         let churn_handler = Arc::new(ChurnHandler::new(
-            identity.peer_id().clone(),
+            *identity.peer_id(),
             churn_predictor.clone(),
             trust_engine.clone(),
             replication.clone(),
@@ -935,7 +935,7 @@ impl NetworkCoordinator {
     /// Public accessor for basic node information used by tests/examples
     pub async fn get_node_info(&self) -> Result<NodeDescriptor> {
         Ok(NodeDescriptor {
-            id: self.network.identity.peer_id().clone(),
+            id: *self.network.identity.peer_id(),
             public_key: self.network.identity.public_key().clone(),
             addresses: vec![],
             hyperbolic: None,
@@ -1012,21 +1012,21 @@ impl NetworkCoordinator {
         let paths = vec![
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::Kademlia,
                 },
                 kademlia_path,
             ),
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::Hyperbolic,
                 },
                 hyperbolic_path,
             ),
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::TrustPath,
                 },
                 trust_path,
@@ -1156,7 +1156,7 @@ mod tests {
             Ok(Ok(coordinator)) => {
                 let message = NetworkMessage {
                     id: "test-123".to_string(),
-                    sender: coordinator.network.identity.peer_id().clone(),
+                    sender: *coordinator.network.identity.peer_id(),
                     content: vec![1, 2, 3],
                     msg_type: ContentType::DHTLookup,
                     timestamp: 0,

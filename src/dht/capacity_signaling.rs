@@ -139,7 +139,7 @@ impl CapacityManager {
             return;
         }
 
-        peer_capacities.insert(gossip.peer.clone(), gossip);
+        peer_capacities.insert(gossip.peer, gossip);
         drop(peer_capacities);
 
         // Update histogram
@@ -187,7 +187,7 @@ impl CapacityManager {
         candidates
             .into_iter()
             .take(required_count)
-            .map(|gossip| gossip.peer.clone())
+            .map(|gossip| gossip.peer)
             .collect()
     }
 
@@ -231,12 +231,12 @@ mod tests {
         let peer2 = PeerId::from_bytes([2u8; 32]);
         let peer3 = PeerId::from_bytes([3u8; 32]);
 
-        let manager = CapacityManager::new(peer1.clone(), 10_000_000_000); // 10GB
+        let manager = CapacityManager::new(peer1, 10_000_000_000); // 10GB
 
         // Add peer capacities
         manager
             .receive_gossip(CapacityGossip {
-                peer: peer2.clone(),
+                peer: peer2,
                 free_bytes: 5_000_000_000, // 5GB
                 total_bytes: 10_000_000_000,
                 epoch: 1,
@@ -245,7 +245,7 @@ mod tests {
 
         manager
             .receive_gossip(CapacityGossip {
-                peer: peer3.clone(),
+                peer: peer3,
                 free_bytes: 1_000_000_000, // 1GB
                 total_bytes: 5_000_000_000,
                 epoch: 1,

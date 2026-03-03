@@ -340,7 +340,7 @@ impl ChurnDetector {
                 match event {
                     ChurnEvent::PeerJoined(node_id) => {
                         joins += 1;
-                        _node_join_times.insert(node_id.clone(), *time);
+                        _node_join_times.insert(*node_id, *time);
                     }
                     ChurnEvent::PeerLeft(_) => leaves += 1,
                 }
@@ -465,7 +465,7 @@ impl AdaptiveGossipSub {
             let msg = ControlMessage::Graft {
                 topic: topic.to_string(),
             };
-            tx.send((peer.clone(), msg))
+            tx.send((*peer, msg))
                 .await
                 .map_err(|_| AdaptiveNetworkError::Other("Failed to send GRAFT".to_string()))?;
         }
@@ -480,7 +480,7 @@ impl AdaptiveGossipSub {
                 topic: topic.to_string(),
                 backoff,
             };
-            tx.send((peer.clone(), msg))
+            tx.send((*peer, msg))
                 .await
                 .map_err(|_| AdaptiveNetworkError::Other("Failed to send PRUNE".to_string()))?;
         }
@@ -500,7 +500,7 @@ impl AdaptiveGossipSub {
                 topic: topic.to_string(),
                 message_ids,
             };
-            tx.send((peer.clone(), msg))
+            tx.send((*peer, msg))
                 .await
                 .map_err(|_| AdaptiveNetworkError::Other("Failed to send IHAVE".to_string()))?;
         }
@@ -512,7 +512,7 @@ impl AdaptiveGossipSub {
         let control_tx = self.control_tx.read().await;
         if let Some(tx) = control_tx.as_ref() {
             let msg = ControlMessage::IWant { message_ids };
-            tx.send((peer.clone(), msg))
+            tx.send((*peer, msg))
                 .await
                 .map_err(|_| AdaptiveNetworkError::Other("Failed to send IWANT".to_string()))?;
         }
@@ -540,7 +540,7 @@ impl AdaptiveGossipSub {
                     if let Some(score) = scores.get(peer)
                         && score.score() < params.graylist_threshold
                     {
-                        peers_to_remove.push(peer.clone());
+                        peers_to_remove.push(*peer);
                     }
                 }
             }
@@ -563,7 +563,7 @@ impl AdaptiveGossipSub {
                 // Add high-scoring peers if below target
                 while topic_mesh.len() < target_size {
                     if let Some(peer) = self.select_peer_for_mesh(&topic, topic_mesh).await {
-                        topic_mesh.insert(peer.clone());
+                        topic_mesh.insert(peer);
                         let _ = self.send_graft(&peer, &topic).await;
 
                         // Record peer joining mesh
@@ -622,11 +622,11 @@ impl AdaptiveGossipSub {
         let mut candidates: Vec<_> = scores
             .iter()
             .filter(|(peer_id, _)| !current_mesh.contains(peer_id))
-            .map(|(peer_id, score)| (peer_id.clone(), score.score()))
+            .map(|(peer_id, score)| (*peer_id, score.score()))
             .collect();
 
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.first().map(|(peer, _)| peer.clone())
+        candidates.first().map(|(peer, _)| *peer)
     }
 
     /// Update peer scores
@@ -698,7 +698,7 @@ impl AdaptiveGossipSub {
                     };
 
                     if score > 0.0 {
-                        topic_mesh.insert(from.clone());
+                        topic_mesh.insert(*from);
                     } else {
                         // Send PRUNE back if we don't want them
                         let _ = self.send_prune(from, &topic, Duration::from_secs(60)).await;
@@ -1087,7 +1087,7 @@ mod tests {
         let message = GossipMessage {
             topic: "test-topic".to_string(),
             data: vec![1, 2, 3, 4],
-            from: from_peer.clone(),
+            from: from_peer,
             seqno: 1,
             timestamp: 12345,
         };

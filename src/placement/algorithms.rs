@@ -158,7 +158,7 @@ impl WeightedSampler {
         // Ensure weight is finite and positive
         if !weight.is_finite() || weight <= 0.0 {
             return Err(PlacementError::InvalidWeight {
-                node_id: node_id.clone(),
+                node_id: *node_id,
                 weight,
                 reason: "Computed weight is not finite or positive".to_string(),
             });
@@ -197,7 +197,7 @@ impl WeightedSampler {
             .map(|(node_id, weight)| {
                 if *weight <= 0.0 {
                     return Err(PlacementError::InvalidWeight {
-                        node_id: node_id.clone(),
+                        node_id: *node_id,
                         weight: *weight,
                         reason: "Weight must be positive".to_string(),
                     });
@@ -209,7 +209,7 @@ impl WeightedSampler {
                 // Calculate weighted key: k_i = u^(1/w_i)
                 let key = u.powf(1.0 / weight);
 
-                Ok((key, node_id.clone()))
+                Ok((key, *node_id))
             })
             .collect::<PlacementResult<Vec<_>>>()?;
 
@@ -309,7 +309,7 @@ impl DiversityEnforcer {
                     if distance < self.min_geographic_distance / 2.0 {
                         return Err(PlacementError::DiversityViolation {
                             constraint: "geographic_distance".to_string(),
-                            nodes: vec![node_a.clone(), node_b.clone()],
+                            nodes: vec![*node_a, *node_b],
                             details: format!(
                                 "Distance {} km < minimum {} km",
                                 distance,
@@ -334,7 +334,7 @@ impl DiversityEnforcer {
                     nodes: selection
                         .iter()
                         .filter(|(_, _, _, r)| *r == region)
-                        .map(|(node_id, _, _, _)| node_id.clone())
+                        .map(|(node_id, _, _, _)| *node_id)
                         .collect(),
                     details: format!(
                         "Region {:?} has {} nodes > maximum {}",
@@ -357,7 +357,7 @@ impl DiversityEnforcer {
                     nodes: selection
                         .iter()
                         .filter(|(_, _, a, _)| *a == asn)
-                        .map(|(node_id, _, _, _)| node_id.clone())
+                        .map(|(node_id, _, _, _)| *node_id)
                         .collect(),
                     details: format!(
                         "ASN {} has {} nodes > maximum {}",
@@ -413,7 +413,7 @@ impl WeightedPlacementStrategy {
             // Get node metadata for diversity calculation
             let (location, asn, region) = node_metadata
                 .get(node_id)
-                .ok_or_else(|| PlacementError::NodeMetadataNotFound(node_id.clone()))?;
+                .ok_or(PlacementError::NodeMetadataNotFound(*node_id))?;
 
             // Calculate diversity factor
             let diversity_factor = self.diversity_enforcer.calculate_diversity_factor(
@@ -436,7 +436,7 @@ impl WeightedPlacementStrategy {
                 self.config.optimization_weights.capacity_weight,
             )?;
 
-            weights.push((node_id.clone(), weight));
+            weights.push((*node_id, weight));
         }
 
         // Sort by weight for better selection
@@ -498,20 +498,17 @@ impl PlacementStrategy for WeightedPlacementStrategy {
 
             // Sample one node using weighted selection
             let selected = self.sampler.sample_nodes(&weights, 1)?;
-            let selected_node = selected
-                .first()
-                .ok_or(PlacementError::InsufficientNodes {
-                    required: 1,
-                    available: 0,
-                })?
-                .clone();
+            let selected_node = *selected.first().ok_or(PlacementError::InsufficientNodes {
+                required: 1,
+                available: 0,
+            })?;
 
             // Add to selection with metadata
             let (location, asn, region) = node_metadata
                 .get(&selected_node)
-                .ok_or_else(|| PlacementError::NodeMetadataNotFound(selected_node.clone()))?;
+                .ok_or(PlacementError::NodeMetadataNotFound(selected_node))?;
 
-            selected_nodes.push((selected_node.clone(), *location, *asn, *region));
+            selected_nodes.push((selected_node, *location, *asn, *region));
 
             // Remove from candidates
             remaining_candidates.remove(&selected_node);

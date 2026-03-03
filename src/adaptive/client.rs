@@ -391,10 +391,7 @@ impl Client {
 
         // Create gossip protocol
         let node_id = PeerId::from_bytes([0u8; 32]); // Temporary node ID
-        let gossip = Arc::new(AdaptiveGossipSub::new(
-            node_id.clone(),
-            trust_provider.clone(),
-        ));
+        let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
         // Create storage
         let storage_config = match config.profile {
@@ -434,7 +431,7 @@ impl Client {
         ));
 
         let churn = Arc::new(ChurnHandler::new(
-            node_id.clone(),
+            node_id,
             churn_predictor,
             trust_provider.clone(),
             replication.clone(),
@@ -668,7 +665,7 @@ impl AdaptiveP2PClient for Client {
         let gossip_msg = GossipMessage {
             topic: topic.to_string(),
             data: message,
-            from: self.components.node_id.clone(),
+            from: self.components.node_id,
             seqno: 0, // TODO: Track sequence numbers
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -822,10 +819,7 @@ mod tests {
         let _som = som;
 
         let node_id = PeerId::from_bytes([0u8; 32]);
-        let gossip = Arc::new(AdaptiveGossipSub::new(
-            node_id.clone(),
-            trust_provider.clone(),
-        ));
+        let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
         // Create storage with minimal config
         let storage_config = StorageConfig {
@@ -852,7 +846,7 @@ mod tests {
         ));
 
         let churn = Arc::new(ChurnHandler::new(
-            node_id.clone(),
+            node_id,
             churn_predictor,
             trust_provider.clone(),
             replication.clone(),

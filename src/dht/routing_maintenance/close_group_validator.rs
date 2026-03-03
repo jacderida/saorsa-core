@@ -534,7 +534,7 @@ impl CloseGroupValidator {
         node_trust_score: Option<f64>,
     ) -> CloseGroupValidationResult {
         let start = Instant::now();
-        let mut result = CloseGroupValidationResult::new(node_id.clone());
+        let mut result = CloseGroupValidationResult::new(*node_id);
 
         // Check if we have enough responses
         if responses.len() < self.config.min_peers_to_query {
@@ -696,7 +696,7 @@ impl CloseGroupValidator {
         if let Some(entry) = history.get_mut(&node_id) {
             entry.update(members);
         } else {
-            history.insert(node_id.clone(), CloseGroupHistory::new(node_id, members));
+            history.insert(node_id, CloseGroupHistory::new(node_id, members));
         }
     }
 
@@ -706,7 +706,7 @@ impl CloseGroupValidator {
         let history = self.close_group_history.read();
         history
             .iter()
-            .map(|(node_id, hist)| (node_id.clone(), hist.removed_nodes()))
+            .map(|(node_id, hist)| (*node_id, hist.removed_nodes()))
             .filter(|(_, removed)| !removed.is_empty())
             .collect()
     }
@@ -740,7 +740,7 @@ impl CloseGroupValidator {
     /// Cache a validation result
     pub fn cache_result(&self, result: CloseGroupValidationResult) {
         let mut cache = self.validation_cache.write();
-        cache.insert(result.node_id.clone(), result);
+        cache.insert(result.node_id, result);
     }
 
     /// Clear expired cache entries
@@ -761,7 +761,7 @@ impl CloseGroupValidator {
         &self,
         result: &CloseGroupValidationResult,
     ) -> NodeValidationResult {
-        let mut node_result = NodeValidationResult::new(result.node_id.clone());
+        let mut node_result = NodeValidationResult::new(result.node_id);
 
         // Map confirmation ratio to witness counts
         // This is an approximation for compatibility
@@ -984,14 +984,14 @@ mod tests {
         let node_id = PeerId::random();
 
         let initial_members: HashSet<_> = (0..5).map(|_| PeerId::random()).collect();
-        validator.update_close_group_history(node_id.clone(), initial_members.clone());
+        validator.update_close_group_history(node_id, initial_members.clone());
 
         // Simulate some members changing
         let mut new_members: HashSet<_> = initial_members.iter().take(3).cloned().collect();
         new_members.insert(PeerId::random());
         new_members.insert(PeerId::random());
 
-        validator.update_close_group_history(node_id.clone(), new_members);
+        validator.update_close_group_history(node_id, new_members);
 
         let removed = validator.detect_removed_nodes();
         assert!(!removed.is_empty());
@@ -1030,7 +1030,7 @@ mod tests {
         let validator = CloseGroupValidator::with_defaults();
         let node_id = PeerId::random();
 
-        let mut result = CloseGroupValidationResult::new(node_id.clone());
+        let mut result = CloseGroupValidationResult::new(node_id);
         result.is_valid = true;
         result.weighted_confirmation = 0.85;
 
@@ -1157,7 +1157,7 @@ mod tests {
         let node_id = PeerId::random();
 
         // Cache a valid result
-        let mut valid_result = CloseGroupValidationResult::new(node_id.clone());
+        let mut valid_result = CloseGroupValidationResult::new(node_id);
         valid_result.is_valid = true;
         validator.cache_result(valid_result);
 
@@ -1166,7 +1166,7 @@ mod tests {
 
         // Cache an invalid result for a different node
         let invalid_node = PeerId::random();
-        let mut invalid_result = CloseGroupValidationResult::new(invalid_node.clone());
+        let mut invalid_result = CloseGroupValidationResult::new(invalid_node);
         invalid_result.is_valid = false;
         validator.cache_result(invalid_result);
 
@@ -1181,7 +1181,7 @@ mod tests {
         let node_id = PeerId::random();
 
         // Cache an invalid result
-        let mut invalid_result = CloseGroupValidationResult::new(node_id.clone());
+        let mut invalid_result = CloseGroupValidationResult::new(node_id);
         invalid_result.is_valid = false;
         validator.cache_result(invalid_result);
 

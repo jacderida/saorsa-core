@@ -526,7 +526,7 @@ impl BucketRefreshManager {
 
                 // Perform validation
                 let result = validator_read.validate_membership(node_id, responses, trust_score);
-                (node_id.clone(), result)
+                (*node_id, result)
             })
             .collect();
         drop(validator_read);

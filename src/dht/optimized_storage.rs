@@ -448,7 +448,7 @@ mod tests {
             let hash = blake3::hash(format!("key_{}", i).as_bytes());
             let key = *hash.as_bytes();
             let value = format!("value_{}", i).into_bytes();
-            let record = Record::new(key, value, publisher.clone());
+            let record = Record::new(key, value, publisher);
             storage.store(record).await.unwrap();
         }
 

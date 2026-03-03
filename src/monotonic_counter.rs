@@ -234,9 +234,7 @@ impl MonotonicCounterSystem {
                     "write lock failed".to_string().into(),
                 ))
             })?;
-            let peer_counter = counters
-                .entry(user_id.clone())
-                .or_insert_with(PeerCounter::new);
+            let peer_counter = counters.entry(*user_id).or_insert_with(PeerCounter::new);
 
             // Validate the sequence number
             let result =
@@ -315,7 +313,7 @@ impl MonotonicCounterSystem {
 
             for request in requests {
                 let peer_counter = counters
-                    .entry(request.user_id.clone())
+                    .entry(request.user_id)
                     .or_insert_with(PeerCounter::new);
 
                 let validation_result = self.validate_sequence_internal(
@@ -615,13 +613,13 @@ mod tests {
 
         let requests = vec![
             BatchUpdateRequest {
-                user_id: user_id1.clone(),
+                user_id: user_id1,
                 sequence: 1,
                 message_hash,
                 timestamp: current_timestamp(),
             },
             BatchUpdateRequest {
-                user_id: user_id2.clone(),
+                user_id: user_id2,
                 sequence: 1,
                 message_hash,
                 timestamp: current_timestamp(),

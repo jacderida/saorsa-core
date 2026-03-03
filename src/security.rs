@@ -1255,19 +1255,19 @@ impl ReputationManager {
 
     /// Update reputation based on interaction
     pub fn update_reputation(&mut self, peer_id: &PeerId, success: bool, response_time: Duration) {
-        let reputation =
-            self.reputations
-                .entry(peer_id.clone())
-                .or_insert_with(|| NodeReputation {
-                    peer_id: peer_id.clone(),
-                    response_rate: 0.5,
-                    response_time: Duration::from_millis(500),
-                    consistency_score: 0.5,
-                    uptime_estimate: Duration::from_secs(0),
-                    routing_accuracy: 0.5,
-                    last_seen: SystemTime::now(),
-                    interaction_count: 0,
-                });
+        let reputation = self
+            .reputations
+            .entry(*peer_id)
+            .or_insert_with(|| NodeReputation {
+                peer_id: *peer_id,
+                response_rate: 0.5,
+                response_time: Duration::from_millis(500),
+                consistency_score: 0.5,
+                uptime_estimate: Duration::from_secs(0),
+                routing_accuracy: 0.5,
+                last_seen: SystemTime::now(),
+                interaction_count: 0,
+            });
 
         // Use higher learning rate for faster convergence in tests
         let alpha = 0.3; // Increased from 0.1 for better test convergence
@@ -1934,7 +1934,7 @@ mod tests {
     fn test_node_reputation_structure() {
         let peer_id = PeerId::random();
         let reputation = NodeReputation {
-            peer_id: peer_id.clone(),
+            peer_id,
             response_rate: 0.85,
             response_time: Duration::from_millis(150),
             consistency_score: 0.9,

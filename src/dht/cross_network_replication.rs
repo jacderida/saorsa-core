@@ -195,29 +195,23 @@ impl CrossNetworkReplicator {
 
     /// Register a node with its network capabilities
     pub fn register_node(&self, info: NodeNetworkInfo) {
-        let node_id = info.node_id.clone();
+        let node_id = info.node_id;
 
         // Update node info
-        self.nodes.write().insert(node_id.clone(), info.clone());
+        self.nodes.write().insert(node_id, info.clone());
 
         // Update family indexes
         let mut by_family = self.nodes_by_family.write();
         if info.supports_ipv4() {
-            by_family
-                .entry(IpFamily::IPv4)
-                .or_default()
-                .insert(node_id.clone());
+            by_family.entry(IpFamily::IPv4).or_default().insert(node_id);
         }
         if info.supports_ipv6() {
-            by_family
-                .entry(IpFamily::IPv6)
-                .or_default()
-                .insert(node_id.clone());
+            by_family.entry(IpFamily::IPv6).or_default().insert(node_id);
         }
 
         // Update dual-stack index
         if info.is_dual_stack() {
-            self.dual_stack_nodes.write().insert(node_id.clone());
+            self.dual_stack_nodes.write().insert(node_id);
             debug!("Registered dual-stack node: {:?}", node_id);
         }
     }
@@ -249,7 +243,7 @@ impl CrossNetworkReplicator {
             let mut ds_candidates: Vec<_> = dual_stack
                 .iter()
                 .filter(|n| !excluded.contains(n))
-                .filter_map(|n| nodes.get(n).map(|info| (n.clone(), info.trust_score)))
+                .filter_map(|n| nodes.get(n).map(|info| (*n, info.trust_score)))
                 .collect();
 
             // Sort by trust score descending
@@ -260,7 +254,7 @@ impl CrossNetworkReplicator {
                 .iter()
                 .take(self.config.min_replicas_per_family)
             {
-                selection.add_node(node_id.clone(), vec![IpFamily::IPv4, IpFamily::IPv6]);
+                selection.add_node(*node_id, vec![IpFamily::IPv4, IpFamily::IPv6]);
             }
         }
 
@@ -276,14 +270,14 @@ impl CrossNetworkReplicator {
                     .iter()
                     .filter(|n| !excluded.contains(n))
                     .filter(|n| !selection.contains(n))
-                    .filter_map(|n| nodes.get(n).map(|info| (n.clone(), info.trust_score)))
+                    .filter_map(|n| nodes.get(n).map(|info| (*n, info.trust_score)))
                     .collect();
 
                 candidates
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 for (node_id, _) in candidates.iter().take(needed) {
-                    selection.add_node(node_id.clone(), vec![family]);
+                    selection.add_node(*node_id, vec![family]);
                 }
             }
         }
@@ -298,14 +292,14 @@ impl CrossNetworkReplicator {
                 .iter()
                 .filter(|(n, _)| !excluded.contains(n))
                 .filter(|(n, _)| !selection.contains(n))
-                .map(|(n, info)| (n.clone(), info.trust_score, info.supported_families()))
+                .map(|(n, info)| (*n, info.trust_score, info.supported_families()))
                 .collect();
 
             let mut sorted: Vec<_> = all_candidates;
             sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             for (node_id, _, families) in sorted.iter().take(remaining) {
-                selection.add_node(node_id.clone(), families.clone());
+                selection.add_node(*node_id, families.clone());
             }
         }
 
@@ -326,7 +320,7 @@ impl CrossNetworkReplicator {
                 .replicas_by_family
                 .entry(*family)
                 .or_default()
-                .push(node_id.clone());
+                .push(*node_id);
         }
 
         // Calculate missing replicas
@@ -362,7 +356,7 @@ impl CrossNetworkReplicator {
                 .iter()
                 .take(*missing_count)
             {
-                targets.push((node_id.clone(), *family));
+                targets.push((*node_id, *family));
             }
         }
 
@@ -452,7 +446,7 @@ impl ReplicaSelection {
         self.nodes
             .iter()
             .filter(|(_, families)| families.contains(&family))
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -606,10 +600,10 @@ mod tests {
 
         // Good replication - 2 per family
         let replicas = vec![
-            (node1.clone(), IpFamily::IPv4),
-            (node2.clone(), IpFamily::IPv4),
-            (node3.clone(), IpFamily::IPv6),
-            (node4.clone(), IpFamily::IPv6),
+            (node1, IpFamily::IPv4),
+            (node2, IpFamily::IPv4),
+            (node3, IpFamily::IPv6),
+            (node4, IpFamily::IPv6),
         ];
 
         let status = replicator.check_replication_health(&key, &replicas);
@@ -617,10 +611,7 @@ mod tests {
         assert!(status.missing_replicas.is_empty());
 
         // Poor replication - missing IPv6
-        let poor_replicas = vec![
-            (node1.clone(), IpFamily::IPv4),
-            (node2.clone(), IpFamily::IPv4),
-        ];
+        let poor_replicas = vec![(node1, IpFamily::IPv4), (node2, IpFamily::IPv4)];
 
         let poor_status = replicator.check_replication_health(&key, &poor_replicas);
         assert!(!poor_status.is_healthy);
@@ -659,7 +650,7 @@ mod tests {
         let replicator = CrossNetworkReplicator::new(CrossNetworkReplicationConfig::default());
 
         let node = create_test_node("test", true, true, 0.9);
-        let node_id = node.node_id.clone();
+        let node_id = node.node_id;
 
         replicator.register_node(node);
         assert_eq!(replicator.get_diversity_stats().total_nodes, 1);

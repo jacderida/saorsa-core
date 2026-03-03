@@ -47,7 +47,7 @@ mod gossipsub_tests {
 
         async fn set_trust(&self, node: &PeerId, trust: f64) {
             let mut scores = self.trust_scores.write().await;
-            scores.insert(node.clone(), trust);
+            scores.insert(*node, trust);
         }
     }
 
@@ -92,7 +92,7 @@ mod gossipsub_tests {
         GossipMessage {
             topic: topic.to_string(),
             data,
-            from: from.clone(),
+            from: *from,
             seqno: 1,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -168,7 +168,7 @@ mod gossipsub_tests {
     async fn test_message_publishing() {
         let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
-        let gossipsub = AdaptiveGossipSub::new(local_id.clone(), trust_provider);
+        let gossipsub = AdaptiveGossipSub::new(local_id, trust_provider);
 
         let topic = "propagation_topic";
 
@@ -240,7 +240,7 @@ mod gossipsub_tests {
     async fn test_topic_prioritization() {
         let local_id = PeerId::from_bytes([1u8; 32]);
         let trust_provider = Arc::new(MockTrustProvider::new());
-        let gossipsub = AdaptiveGossipSub::new(local_id.clone(), trust_provider);
+        let gossipsub = AdaptiveGossipSub::new(local_id, trust_provider);
 
         // Define topic priorities
         gossipsub
