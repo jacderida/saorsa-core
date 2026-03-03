@@ -294,12 +294,6 @@ pub struct DhtNetworkManager {
     maintenance_scheduler: Arc<RwLock<MaintenanceScheduler>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
-    /// Cached local DHT key to avoid repeated BLAKE3 hashing
-    /// PERF-001: Eliminates redundant computation in message handlers
-    local_dht_key: DhtKey,
-    /// Hex-encoded local DHT key, cached to avoid repeated allocation in
-    /// `is_local_peer_id` which runs in hot loops.
-    local_dht_key_hex: String,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the maintenance task so it can be joined on stop
@@ -423,8 +417,7 @@ enum LookupRequestKind {
 }
 
 impl DhtNetworkManager {
-    fn init_dht_core(local_peer_id: &PeerId) -> Result<(Arc<RwLock<DhtCoreEngine>>, DhtKey)> {
-        let dht_key = crate::dht::derive_dht_key_from_peer_id(local_peer_id);
+    fn init_dht_core(local_peer_id: &PeerId) -> Result<Arc<RwLock<DhtCoreEngine>>> {
         // Use LogOnly mode so nodes can join the routing table without prior validation.
         // Strict mode rejects every unknown node, making it impossible to bootstrap a
         // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
@@ -434,8 +427,7 @@ impl DhtNetworkManager {
         )
             .map_err(|e| P2PError::Dht(DhtError::StorageFailed(e.to_string().into())))?;
         dht_instance.start_maintenance_tasks();
-        let dht = Arc::new(RwLock::new(dht_instance));
-        Ok((dht, DhtKey::from_bytes(dht_key)))
+        Ok(Arc::new(RwLock::new(dht_instance)))
     }
 
     fn new_from_components(
@@ -443,7 +435,7 @@ impl DhtNetworkManager {
         trust_engine: Option<Arc<EigenTrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let (dht, local_dht_key) = Self::init_dht_core(&config.peer_id)?;
+        let dht = Self::init_dht_core(&config.peer_id)?;
 
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
         let maintenance_config = MaintenanceConfig::from(&config.dht_config);
@@ -454,8 +446,6 @@ impl DhtNetworkManager {
                 .max_concurrent_operations
                 .max(MIN_CONCURRENT_OPERATIONS),
         ));
-
-        let local_dht_key_hex = hex::encode(local_dht_key.as_bytes());
 
         Ok(Self {
             dht,
@@ -468,8 +458,6 @@ impl DhtNetworkManager {
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             maintenance_scheduler,
             message_handler_semaphore,
-            local_dht_key,
-            local_dht_key_hex,
             shutdown: CancellationToken::new(),
             maintenance_handle: Arc::new(RwLock::new(None)),
             event_handler_handle: Arc::new(RwLock::new(None)),
@@ -651,7 +639,7 @@ impl DhtNetworkManager {
     /// then dials any newly-discovered candidates. Returns the total number
     /// of new peers discovered.
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
-        let key = *self.local_dht_key.as_bytes();
+        let key = *self.config.peer_id.as_bytes();
         let mut discovered = 0;
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
@@ -1237,7 +1225,7 @@ impl DhtNetworkManager {
                                 address: node.address,
                                 distance: None,
                                 reliability: node.capacity.reliability_score,
-                                cached_dht_key: Some(DhtKey::from_bytes(*node.id.as_bytes())),
+                                cached_dht_key: Some(node.id.clone()),
                             });
                         }
                     }
@@ -1268,9 +1256,9 @@ impl DhtNetworkManager {
                 all_nodes.push(DHTNode {
                     peer_id: peer_id.clone(),
                     address,
-                    distance: Some(peer_info.dht_key.to_vec()),
+                    distance: Some(peer_id.as_bytes().to_vec()),
                     reliability: peer_info.reliability_score,
-                    cached_dht_key: Some(DhtKey::from_bytes(peer_info.dht_key)),
+                    cached_dht_key: Some(peer_id.clone()),
                 });
             }
         }
@@ -1478,44 +1466,25 @@ impl DhtNetworkManager {
         Ok(best_nodes)
     }
 
-    /// Compare two nodes by their XOR distance to a target key
+    /// Compare two nodes by their XOR distance to a target key.
     ///
-    /// PERF-001: Uses cached DHT keys to avoid repeated BLAKE3 hashing.
-    /// Falls back to parse_peer_id_to_key only if cached key is missing.
-    ///
-    /// If a peer ID cannot be decoded, it is placed at the end (treated as maximum distance).
-    /// This prevents malformed peer IDs from being incorrectly treated as close to the target.
+    /// Uses cached DHT keys when available, falls back to the peer ID directly
+    /// (which is now the same keyspace).
     fn compare_node_distance(a: &DHTNode, b: &DHTNode, key: &Key) -> std::cmp::Ordering {
-        // Use cached keys if available, fallback to parsing if not
-        let a_fallback;
-        let a_key_ref = match a.cached_dht_key.as_ref() {
-            Some(k) => Some(k),
-            None => {
-                a_fallback = Self::parse_peer_id_to_key(&a.peer_id);
-                a_fallback.as_ref()
-            }
-        };
-        let b_fallback;
-        let b_key_ref = match b.cached_dht_key.as_ref() {
-            Some(k) => Some(k),
-            None => {
-                b_fallback = Self::parse_peer_id_to_key(&b.peer_id);
-                b_fallback.as_ref()
-            }
-        };
-
-        match (a_key_ref, b_key_ref) {
-            (Some(a_key), Some(b_key)) => {
-                let target_key = DhtKey::from_bytes(*key);
-                a_key
-                    .distance(&target_key)
-                    .cmp(&b_key.distance(&target_key))
-            }
-            // Invalid peer IDs sort to the end
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+        let a_key = a
+            .cached_dht_key
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| a.peer_id.clone());
+        let b_key = b
+            .cached_dht_key
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| b.peer_id.clone());
+        let target_key = DhtKey::from_bytes(*key);
+        a_key
+            .distance(&target_key)
+            .cmp(&b_key.distance(&target_key))
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -1543,7 +1512,7 @@ impl DhtNetworkManager {
             address: self.config.node_config.listen_addr.to_string(),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
-            cached_dht_key: Some(self.local_dht_key.clone()),
+            cached_dht_key: Some(self.config.peer_id.clone()),
         }
     }
 
@@ -1555,30 +1524,9 @@ impl DhtNetworkManager {
 
     /// Ensure a DHT node has a cached DHT key available for distance comparisons.
     fn ensure_cached_dht_key(node: &mut DHTNode) {
-        if node.cached_dht_key.is_some() {
-            return;
+        if node.cached_dht_key.is_none() {
+            node.cached_dht_key = Some(node.peer_id.clone());
         }
-
-        if let Some(distance) = node.distance.as_ref()
-            && distance.len() == 32
-        {
-            let mut key_bytes = [0u8; 32];
-            key_bytes.copy_from_slice(&distance[..32]);
-            node.cached_dht_key = Some(DhtKey::from_bytes(key_bytes));
-            return;
-        }
-
-        node.cached_dht_key = Self::parse_peer_id_to_key(&node.peer_id);
-    }
-
-    /// Parse a PeerId to a DhtKey for distance comparisons.
-    ///
-    /// Uses the canonical `derive_dht_key_from_peer_id()` to ensure consistent
-    /// DHT positioning across all nodes in the network.
-    fn parse_peer_id_to_key(peer_id: &PeerId) -> Option<DhtKey> {
-        Some(DhtKey::from_bytes(crate::dht::derive_dht_key_from_peer_id(
-            peer_id,
-        )))
     }
 
     /// Convert peer addresses reported by the transport into multiaddresses the DHT understands.
@@ -1849,11 +1797,8 @@ impl DhtNetworkManager {
     }
 
     /// Check whether `peer_id` refers to this node.
-    ///
-    /// Compares against both the app-level peer ID and the DHT key
-    /// (BLAKE3 of the peer ID) to handle both identity spaces.
     fn is_local_peer_id(&self, peer_id: &PeerId) -> bool {
-        *peer_id == self.config.peer_id || peer_id.to_hex() == self.local_dht_key_hex
+        *peer_id == self.config.peer_id
     }
 
     /// Resolve any peer identifier to a canonical app-level peer ID.
@@ -2100,13 +2045,13 @@ impl DhtNetworkManager {
             DhtNetworkOperation::Join => {
                 info!("Handling JOIN request from: {}", message.source);
                 // Add the joining node to our routing table
-                let dht_key = crate::dht::derive_dht_key_from_peer_id(&message.source);
+                let dht_key = *message.source.as_bytes();
                 let _node = DHTNode {
                     peer_id: message.source.clone(),
                     address: String::new(),
                     distance: Some(dht_key.to_vec()),
                     reliability: 1.0,
-                    cached_dht_key: Some(DhtKey::from_bytes(dht_key)),
+                    cached_dht_key: Some(message.source.clone()),
                 };
 
                 // Node will be added to routing table through normal DHT operations
@@ -2299,7 +2244,7 @@ impl DhtNetworkManager {
             );
             return;
         };
-        let dht_key = crate::dht::derive_dht_key_from_peer_id(&app_peer_id);
+        let dht_key = *app_peer_id.as_bytes();
 
         // peer_info() resolves app-level IDs internally via peer_to_channel
         let addresses = if let Some(info) = self.transport.peer_info(&app_peer_id).await {
@@ -2362,7 +2307,7 @@ impl DhtNetworkManager {
     async fn handle_peer_connected(&self, node_id: PeerId) {
         let app_peer_id_hex = node_id.to_hex();
         info!("DHT peer connected: app_id={}", app_peer_id_hex);
-        let dht_key = crate::dht::derive_dht_key_from_peer_id(&node_id);
+        let dht_key = *node_id.as_bytes();
 
         // peer_info() resolves app-level IDs internally via peer_to_channel
         let addresses = if let Some(info) = self.transport.peer_info(&node_id).await {
@@ -2426,7 +2371,7 @@ impl DhtNetworkManager {
             use crate::dht::core_engine::{NodeCapacity, NodeInfo};
 
             let node_info = NodeInfo {
-                id: PeerId::from_bytes(dht_key),
+                id: node_id.clone(),
                 address: address_str,
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),

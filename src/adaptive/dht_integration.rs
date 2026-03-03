@@ -267,7 +267,7 @@ impl AdaptiveDHT {
         dependencies: AdaptiveDhtDependencies,
     ) -> Result<Self> {
         let local_key = Self::node_id_to_key(&dependencies.identity.peer_id().clone());
-        let node_id = crate::dht::core_engine::peer_id_from_key(DhtKey::from_bytes(local_key));
+        let node_id = PeerId::from_bytes(local_key);
         let base_dht = Arc::new(RwLock::new(
             DHT::new(node_id).map_err(|e| AdaptiveNetworkError::Other(e.to_string()))?,
         ));

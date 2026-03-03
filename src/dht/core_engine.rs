@@ -28,53 +28,13 @@ use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// DHT key type (256-bit)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DhtKey([u8; 32]);
-
-impl DhtKey {
-    pub fn new(data: &[u8]) -> Self {
-        let hash = blake3::hash(data);
-        Self(*hash.as_bytes())
-    }
-
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Generate a random DhtKey (useful for testing and key generation)
-    #[must_use]
-    pub fn random() -> Self {
-        let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-        Self(bytes)
-    }
-
-    /// XOR distance metric for Kademlia
-    pub fn distance(&self, other: &DhtKey) -> [u8; 32] {
-        let mut result = [0u8; 32];
-        for (i, out) in result.iter_mut().enumerate() {
-            *out = self.0[i] ^ other.0[i];
-        }
-        result
-    }
-}
-
-/// Convert DHT key to DHT peer identifier (same 32-byte space).
-#[must_use]
-pub fn peer_id_from_key(key: DhtKey) -> PeerId {
-    PeerId::from_bytes(*key.as_bytes())
-}
-
-/// Convert DHT peer identifier to DHT key.
-#[must_use]
-pub fn dht_key_from_peer_id(peer_id: &PeerId) -> DhtKey {
-    DhtKey::from_bytes(*peer_id.to_bytes())
-}
+/// DHT key type — now a direct alias for [`PeerId`].
+///
+/// Both types are `[u8; 32]` wrappers with identity conversions between them.
+/// Using a single type eliminates keyspace mismatch bugs where BLAKE3-hashing
+/// a PeerId into a second "DHT key" space caused nodes to land in wrong
+/// Kademlia buckets.
+pub type DhtKey = PeerId;
 
 #[inline]
 fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {

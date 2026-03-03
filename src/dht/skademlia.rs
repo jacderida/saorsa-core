@@ -1786,9 +1786,7 @@ mod tests {
 
     fn create_test_dht_node(peer_id: &str, _distance_bytes: [u8; 32]) -> NodeInfo {
         NodeInfo {
-            id: crate::dht::core_engine::peer_id_from_key(crate::dht::core_engine::DhtKey::new(
-                &[42u8; 32],
-            )),
+            id: PeerId::new(&[42u8; 32]),
             address: peer_id.to_string(),
             last_seen: std::time::SystemTime::now(),
             capacity: NodeCapacity::default(),

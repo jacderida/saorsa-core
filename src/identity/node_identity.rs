@@ -150,6 +150,23 @@ impl PeerId {
     pub fn random() -> Self {
         Self(rand::random())
     }
+
+    /// BLAKE3 hash constructor — produces a deterministic PeerId from arbitrary data.
+    ///
+    /// Equivalent to the former `DhtKey::new()`. Use this when you need a
+    /// content-addressed identifier (e.g. hashing a test label into a key).
+    pub fn new(data: &[u8]) -> Self {
+        let hash = blake3::hash(data);
+        Self(*hash.as_bytes())
+    }
+
+    /// XOR distance to another peer (Kademlia metric).
+    ///
+    /// Alias for [`xor_distance`](Self::xor_distance) — provided so that
+    /// code using the `DhtKey` type alias can call `.distance()` unchanged.
+    pub fn distance(&self, other: &PeerId) -> [u8; PEER_ID_BYTE_LEN] {
+        self.xor_distance(other)
+    }
 }
 
 impl fmt::Display for PeerId {
