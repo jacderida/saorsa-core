@@ -60,7 +60,6 @@ fn create_test_node_config() -> NodeConfig {
             }),
         ],
         bootstrap_peers: vec![],
-        bootstrap_peers_str: vec![],
         node_identity: Some(identity),
         ..Default::default()
     }
@@ -87,7 +86,6 @@ fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConf
             }),
         ],
         bootstrap_peers: vec![],
-        bootstrap_peers_str: vec![],
         stale_peer_threshold: threshold,
         node_identity: Some(identity),
         ..Default::default()

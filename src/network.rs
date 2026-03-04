@@ -96,6 +96,9 @@ const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
+/// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -108,11 +111,8 @@ pub struct NodeConfig {
     /// Primary listen address (for compatibility)
     pub listen_addr: std::net::SocketAddr,
 
-    /// Bootstrap peers to connect to on startup (legacy)
+    /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<std::net::SocketAddr>,
-
-    /// Bootstrap peers as strings (for integration tests)
-    pub bootstrap_peers_str: Vec<String>,
 
     /// Enable IPv6 support
     pub enable_ipv6: bool,
@@ -252,8 +252,12 @@ impl NodeConfig {
             peer_id: None,
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
-            bootstrap_peers: Vec::new(),
-            bootstrap_peers_str: config.network.bootstrap_nodes.clone(),
+            bootstrap_peers: config
+                .network
+                .bootstrap_nodes
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -315,7 +319,7 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Add a bootstrap peer
+    /// Add a bootstrap peer.
     pub fn bootstrap_peer(mut self, addr: std::net::SocketAddr) -> Self {
         self.bootstrap_peers.push(addr);
         self
@@ -387,7 +391,6 @@ impl NodeConfigBuilder {
             listen_addrs: build_listen_addrs(port, ipv6_enabled),
             listen_addr,
             bootstrap_peers: self.bootstrap_peers.clone(),
-            bootstrap_peers_str: self.bootstrap_peers.iter().map(|a| a.to_string()).collect(),
             enable_ipv6: ipv6_enabled,
             connection_timeout: self
                 .connection_timeout
@@ -428,7 +431,6 @@ impl Default for NodeConfig {
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: Vec::new(),
-            bootstrap_peers_str: Vec::new(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -450,21 +452,16 @@ impl NodeConfig {
     /// Create NodeConfig from Config
     pub fn from_config(config: &Config) -> Result<Self> {
         let listen_addr = config.listen_socket_addr()?;
-        let bootstrap_addrs = config.bootstrap_addrs()?;
 
         let mut node_config = Self {
             peer_id: None,
             listen_addrs: vec![listen_addr],
             listen_addr,
-            bootstrap_peers: bootstrap_addrs
-                .iter()
-                .map(|addr| addr.socket_addr())
-                .collect(),
-            bootstrap_peers_str: config
+            bootstrap_peers: config
                 .network
                 .bootstrap_nodes
                 .iter()
-                .map(|addr| addr.to_string())
+                .filter_map(|s| s.parse().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
 
@@ -833,12 +830,10 @@ impl P2PNode {
             }
         };
 
-        // Initialize EigenTrust engine for reputation management
-        let pre_trusted: HashSet<PeerId> = config
-            .bootstrap_peers_str
-            .iter()
-            .map(|p| PeerId::from_name(p))
-            .collect();
+        // Initialize EigenTrust engine for reputation management.
+        // The pre-trusted set starts empty — real PeerIds are learned
+        // via identity exchange after connecting to bootstrap peers.
+        let pre_trusted: HashSet<PeerId> = HashSet::new();
         let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
         trust_engine.clone().start_background_updates();
         let trust_engine = Some(trust_engine);
@@ -1731,37 +1726,18 @@ impl P2PNode {
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
-        // CLI-provided bootstrap peers take priority - always include them first
-        let cli_bootstrap_peers = if !self.config.bootstrap_peers_str.is_empty() {
-            self.config.bootstrap_peers_str.clone()
-        } else {
-            // Convert Multiaddr to strings
-            self.config
-                .bootstrap_peers
-                .iter()
-                .map(|addr| addr.to_string())
-                .collect::<Vec<_>>()
-        };
-
-        if !cli_bootstrap_peers.is_empty() {
+        // Configured bootstrap peers take priority — always include them first.
+        if !self.config.bootstrap_peers.is_empty() {
             info!(
-                "Using {} CLI-provided bootstrap peers (priority)",
-                cli_bootstrap_peers.len()
+                "Using {} configured bootstrap peers (priority)",
+                self.config.bootstrap_peers.len()
             );
-            for addr in &cli_bootstrap_peers {
-                if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
-                    seen_addresses.insert(socket_addr);
-                    let contact = ContactEntry::new(
-                        PeerId::from_name(&format!(
-                            "cli_peer_{}",
-                            addr.chars().take(8).collect::<String>()
-                        )),
-                        vec![socket_addr],
-                    );
-                    bootstrap_contacts.push(contact);
-                } else {
-                    warn!("Invalid bootstrap address format: {}", addr);
-                }
+            for socket_addr in &self.config.bootstrap_peers {
+                seen_addresses.insert(*socket_addr);
+                // Use a zero sentinel PeerId — the real identity comes
+                // from wait_for_peer_identity() after connecting.
+                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![*socket_addr]);
+                bootstrap_contacts.push(contact);
             }
         }
 
@@ -1816,11 +1792,9 @@ impl P2PNode {
             return Ok(());
         }
 
-        // Connect to bootstrap peers and perform peer discovery.
-        // `connect_peer` returns a transport-level channel ID, not an
-        // app-level PeerId.  We store channel IDs in the bootstrap cache
-        // as a provisional identifier until app-level identity exchange
-        // is implemented in the bootstrap handshake.
+        // Connect to bootstrap peers, wait for identity exchange, then
+        // perform DHT peer discovery using the real cryptographic PeerIds.
+        let identity_timeout = Duration::from_secs(BOOTSTRAP_IDENTITY_TIMEOUT_SECS);
         let mut successful_connections = 0;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
@@ -1828,21 +1802,37 @@ impl P2PNode {
             for addr in &contact.addresses {
                 match self.connect_peer(&addr.to_string()).await {
                     Ok(channel_id) => {
-                        successful_connections += 1;
-                        connected_peer_ids.push(PeerId::from_hex(&channel_id)?);
+                        // Wait for the remote peer's signed identity announce
+                        // so we get a real cryptographic PeerId.
+                        match self
+                            .transport
+                            .wait_for_peer_identity(&channel_id, identity_timeout)
+                            .await
+                        {
+                            Ok(real_peer_id) => {
+                                successful_connections += 1;
+                                connected_peer_ids.push(real_peer_id);
 
-                        // Update bootstrap cache with successful connection
-                        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.write().await;
-                            let mut updated_contact = contact.clone();
-                            updated_contact.peer_id = PeerId::from_hex(&channel_id)?;
-                            updated_contact.update_connection_result(true, Some(100), None); // Assume 100ms latency for now
+                                // Update bootstrap cache with successful connection
+                                if let Some(ref bootstrap_manager) = self.bootstrap_manager {
+                                    let manager = bootstrap_manager.write().await;
+                                    let mut updated_contact = contact.clone();
+                                    updated_contact.peer_id = real_peer_id;
+                                    updated_contact.update_connection_result(true, Some(100), None);
 
-                            if let Err(e) = manager.add_contact(updated_contact).await {
-                                warn!("Failed to update bootstrap cache: {}", e);
+                                    if let Err(e) = manager.add_contact(updated_contact).await {
+                                        warn!("Failed to update bootstrap cache: {}", e);
+                                    }
+                                }
+                                break; // Successfully connected, move to next contact
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Timeout waiting for identity from bootstrap peer {}: {}",
+                                    addr, e
+                                );
                             }
                         }
-                        break; // Successfully connected, move to next contact
                     }
                     Err(e) => {
                         warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
@@ -1952,10 +1942,9 @@ impl NodeBuilder {
 
     /// Add a bootstrap peer
     pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse() {
-            self.config.bootstrap_peers.push(multiaddr);
+        if let Ok(socket_addr) = addr.parse() {
+            self.config.bootstrap_peers.push(socket_addr);
         }
-        self.config.bootstrap_peers_str.push(addr.to_string());
         self
     }
 
@@ -2107,7 +2096,6 @@ mod tests {
                 0,
             ),
             bootstrap_peers: vec![],
-            bootstrap_peers_str: vec![],
             enable_ipv6: true,
 
             connection_timeout: Duration::from_secs(2),
@@ -2563,7 +2551,7 @@ mod tests {
             .with_peer_id(builder_peer_id)
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
-            .with_bootstrap_peer("/ip4/127.0.0.1/tcp/9000") // Use a valid port number
+            .with_bootstrap_peer("127.0.0.1:9000")
             .with_ipv6(true)
             .with_connection_timeout(Duration::from_secs(15))
             .with_max_connections(200)
@@ -2573,7 +2561,7 @@ mod tests {
         let config = builder.config;
         assert_eq!(config.peer_id, Some(builder_peer_id));
         assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
-        assert_eq!(config.bootstrap_peers_str.len(), 1); // Check bootstrap_peers_str instead
+        assert_eq!(config.bootstrap_peers.len(), 1);
         assert!(config.enable_ipv6);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.max_connections, 200);
