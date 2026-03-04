@@ -26,7 +26,7 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReaso
 use crate::NetworkAddress;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature};
+use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -155,7 +155,7 @@ pub struct NodeConfig {
 
     /// Optional override for the maximum application-layer message size.
     ///
-    /// When `None`, the underlying ant-quic default is used.
+    /// When `None`, the underlying saorsa-transport default is used.
     #[serde(default)]
     pub max_message_size: Option<usize>,
 
@@ -363,7 +363,7 @@ impl NodeConfigBuilder {
 
     /// Set maximum application-layer message size in bytes.
     ///
-    /// If this method is not called, ant-quic's built-in default is used.
+    /// If this method is not called, saorsa-transport's built-in default is used.
     pub fn max_message_size(mut self, max_message_size: usize) -> Self {
         self.max_message_size = Some(max_message_size);
         self
@@ -766,7 +766,7 @@ pub struct P2PNode {
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
 ///
-/// ant-quic correctly rejects "unspecified" addresses (0.0.0.0 and [::]) for remote connections
+/// saorsa-transport correctly rejects "unspecified" addresses (0.0.0.0 and [::]) for remote connections
 /// because you cannot connect TO an unspecified address - these are only valid for BINDING.
 ///
 /// This function converts wildcard addresses to appropriate loopback addresses for local connections:
@@ -1742,7 +1742,7 @@ impl P2PNode {
         }
 
         // Supplement with cached bootstrap peers (after CLI peers)
-        // Use QUIC-specific peer selection since we're using ant-quic transport
+        // Use QUIC-specific peer selection since we're using saorsa-transport transport
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
             match manager
@@ -1970,7 +1970,7 @@ impl NodeBuilder {
 
     /// Set maximum application-layer message size in bytes.
     ///
-    /// If this method is not called, ant-quic's built-in default is used.
+    /// If this method is not called, saorsa-transport's built-in default is used.
     pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
         self.config.max_message_size = Some(max_message_size);
         self
@@ -2294,7 +2294,7 @@ mod tests {
     // TODO(windows): Investigate QUIC connection issues on Windows CI
     // This test consistently fails on Windows GitHub Actions runners with
     // "All connect attempts failed" even with IPv4-only config, long delays,
-    // and multiple retry attempts. The underlying ant-quic library may have
+    // and multiple retry attempts. The underlying saorsa-transport library may have
     // issues on Windows that need investigation.
     // See: https://github.com/dirvine/saorsa-core/issues/TBD
     #[cfg_attr(target_os = "windows", ignore)]

@@ -18,7 +18,7 @@
 //! large-scale Sybil attacks while maintaining network openness.
 
 use crate::PeerId;
-use crate::quantum_crypto::ant_quic_integration::{
+use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, ml_dsa_sign, ml_dsa_verify,
 };
 use anyhow::{Result, anyhow};

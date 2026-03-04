@@ -24,8 +24,8 @@
 use super::node_identity::{IdentityData, PeerId, peer_id_from_public_key};
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
-use ant_quic::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use rand::rngs::OsRng;
+use saorsa_transport::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 
 /// Enhanced node identity with secure key management
 // Note: ML-DSA keys have secure memory handling
@@ -96,9 +96,9 @@ impl SecureNodeIdentity {
     }
 
     /// Import from identity data with validation
-    /// Note: Currently not implemented due to ant-quic API limitations
+    /// Note: Currently not implemented due to saorsa-transport API limitations
     pub fn import(_data: &IdentityData) -> Result<Self> {
-        // TODO: Implement when ant-quic provides key import functionality
+        // TODO: Implement when saorsa-transport provides key import functionality
         Err(P2PError::Identity(IdentityError::InvalidFormat(
             "Import from persisted data not yet implemented"
                 .to_string()

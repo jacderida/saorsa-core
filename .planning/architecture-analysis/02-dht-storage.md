@@ -320,7 +320,7 @@ pub struct Record {
 
 **Strengths**:
 - ✅ **Privacy-preserving DHT**: Headless nodes store encrypted blobs they cannot decrypt
-- ✅ **Double encryption**: E2E (ChaCha20Poly1305) + Transport (ant-quic ML-KEM-768)
+- ✅ **Double encryption**: E2E (ChaCha20Poly1305) + Transport (saorsa-transport ML-KEM-768)
 - ✅ **Symmetric AEAD**: Fast encryption with authenticated encryption
 - ✅ **Untrusted nodes**: DHT nodes don't need to be trusted
 
@@ -342,7 +342,7 @@ The 5 critical questions were:
 
 **Decision impact**:
 - **DHT storage = YES** → Application-layer encryption REQUIRED
-- Cannot rely on transport-only encryption (ant-quic)
+- Cannot rely on transport-only encryption (saorsa-transport)
 - DHT nodes are untrusted third parties
 - Must maintain E2E encryption even when stored
 

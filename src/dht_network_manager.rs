@@ -953,7 +953,7 @@ impl DhtNetworkManager {
 
             // Query batch in parallel using FindValue operation
             // For each node, ensure we're connected before querying
-            // ant-quic multiplexes streams on a single socket, so issuing ALPHA
+            // saorsa-transport multiplexes streams on a single socket, so issuing ALPHA
             // parallel queries here does not consume extra listening ports.
             let query_futures: Vec<_> = batch
                 .iter()
@@ -1346,7 +1346,7 @@ impl DhtNetworkManager {
             );
 
             // Query nodes in parallel
-            // ant-quic connection multiplexing lets us keep a single transport socket
+            // saorsa-transport connection multiplexing lets us keep a single transport socket
             // while still querying multiple peers concurrently.
             let query_futures: Vec<_> = batch
                 .iter()
@@ -1813,7 +1813,7 @@ impl DhtNetworkManager {
 
     /// Attempt to connect to a candidate peer with a timeout derived from the node config.
     ///
-    /// All iterative lookups share the same ant-quic connection pool, so reusing the node's
+    /// All iterative lookups share the same saorsa-transport connection pool, so reusing the node's
     /// connection timeout keeps behavior consistent with the transport while still letting
     /// us parallelize lookups safely.
     async fn dial_candidate(&self, peer_id: &PeerId, address: &str) {

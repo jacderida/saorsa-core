@@ -12,11 +12,11 @@
 
 **Answer**: **2 encryption layers**
 
-1. **Transport Layer**: ant-quic ML-KEM-768 (in-transit encryption)
+1. **Transport Layer**: saorsa-transport ML-KEM-768 (in-transit encryption)
 2. **Application Layer**: ChaCha20Poly1305 (end-to-end encryption)
 
 **Evidence**:
-- Transport: `src/transport/ant_quic_adapter.rs` (ant-quic integration)
+- Transport: `src/transport/saorsa_transport_adapter.rs` (saorsa-transport integration)
 - Application: `src/messaging/encryption.rs:44-74` (ChaCha20Poly1305)
 
 ---
@@ -46,10 +46,10 @@
 
 ## Question 3: Which layer uses ML-KEM-768?
 
-**Answer**: **Transport Layer (ant-quic QUIC encryption)**
+**Answer**: **Transport Layer (saorsa-transport QUIC encryption)**
 
 **Implementation**:
-- ant-quic library (external dependency)
+- saorsa-transport library (external dependency)
 - ML-KEM-768: Post-quantum key encapsulation
 - ML-DSA-65: Post-quantum signatures (optional)
 
@@ -76,7 +76,7 @@
    - Required for: Relay nodes (untrusted intermediaries)
    - Provides: End-to-end confidentiality
 
-2. **Transport Layer (ant-quic ML-KEM-768)**:
+2. **Transport Layer (saorsa-transport ML-KEM-768)**:
    - Required for: In-transit protection
    - Required for: NAT traversal, firewall bypass
    - Provides: Transport confidentiality, forward secrecy
@@ -104,7 +104,7 @@
 **Cannot remove Transport Layer because**:
 1. Network-level protection required
 2. NAT traversal depends on QUIC
-3. ant-quic provides connection management
+3. saorsa-transport provides connection management
 
 **Conclusion**: Current architecture requires both encryption layers.
 
@@ -135,7 +135,7 @@
 │        │                                                    │
 │        ▼                                                    │
 │  Layer 1: Transport Encryption (QUIC)                       │
-│  ├─ Algorithm: ant-quic ML-KEM-768                          │
+│  ├─ Algorithm: saorsa-transport ML-KEM-768                          │
 │  ├─ Overhead: ~16 bytes per message (amortized)             │
 │  └─ Protection: Sender → Relay → Recipient                  │
 │                                                             │
@@ -152,7 +152,7 @@
 |-------|----------|---------|
 | Application metadata | ~84-92 bytes | Message ID, channel ID, sender, nonce, key_id |
 | ChaCha20Poly1305 | +28 bytes | Nonce (12B) + Auth tag (16B) |
-| ant-quic ML-KEM-768 | +16 bytes | Amortized transport overhead |
+| saorsa-transport ML-KEM-768 | +16 bytes | Amortized transport overhead |
 | **Total** | **~128-136 bytes** | **Per message** |
 
 **From baseline measurements** (`.planning/baseline-measurements.md`):
@@ -169,7 +169,7 @@
 
 ## Security Properties by Layer
 
-### Layer 1: Transport (ant-quic ML-KEM-768)
+### Layer 1: Transport (saorsa-transport ML-KEM-768)
 
 **Provides**:
 - ✅ Confidentiality: In-transit encryption
@@ -233,7 +233,7 @@
 |---------|------|---------|----------|
 | ChaCha20Poly1305 encryption | encryption.rs | 44-74 | `encrypt_message()` |
 | EncryptedMessage structure | types.rs | 362-369 | Metadata + ciphertext |
-| ant-quic integration | ant_quic_adapter.rs | - | ML-KEM-768 transport |
+| saorsa-transport integration | saorsa_transport_adapter.rs | - | ML-KEM-768 transport |
 | DHT storage | transport.rs | 95 | Stores EncryptedMessage |
 | Overhead measurements | baseline-measurements.md | - | 128-136 bytes per message |
 
@@ -242,7 +242,7 @@
 ## Summary
 
 **Encryption Layers in Saorsa**:
-- **2 layers**: Transport (ant-quic) + Application (ChaCha20Poly1305)
+- **2 layers**: Transport (saorsa-transport) + Application (ChaCha20Poly1305)
 - **Total overhead**: ~128-136 bytes per message
 - **Redundancy**: NONE - layers serve different purposes
 - **Can remove**: NO - both layers required for security

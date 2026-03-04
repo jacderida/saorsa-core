@@ -598,7 +598,7 @@ mod tests {
     use super::*;
     use crate::PeerId;
     use crate::dht::NodeCapacity;
-    use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
     use crate::security::{IPAnalysis, IPv4NodeID};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;

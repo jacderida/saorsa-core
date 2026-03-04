@@ -95,14 +95,15 @@ impl SignatureVerifier {
         })?;
 
         // Use the quantum_crypto module for ML-DSA verification
-        let public_key = crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey::from_bytes(
-            &public_key_bytes,
-        )
-        .map_err(|e| {
-            UpgradeError::SignatureVerification(format!("invalid public key: {:?}", e).into())
-        })?;
+        let public_key =
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey::from_bytes(
+                &public_key_bytes,
+            )
+            .map_err(|e| {
+                UpgradeError::SignatureVerification(format!("invalid public key: {:?}", e).into())
+            })?;
 
-        let sig = crate::quantum_crypto::ant_quic_integration::MlDsaSignature::from_bytes(
+        let sig = crate::quantum_crypto::saorsa_transport_integration::MlDsaSignature::from_bytes(
             &signature_bytes,
         )
         .map_err(|e| {

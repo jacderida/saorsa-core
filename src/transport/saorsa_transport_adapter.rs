@@ -1,15 +1,15 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// Adapter for ant-quic integration
+// Adapter for saorsa-transport integration
 
 //! Ant-QUIC Transport Adapter
 //!
-//! This module provides a clean interface to ant-quic's peer-to-peer networking
+//! This module provides a clean interface to saorsa-transport's peer-to-peer networking
 //! with advanced NAT traversal and post-quantum cryptography.
 //!
 //! ## Architecture
 //!
-//! Uses ant-quic's LinkTransport trait abstraction:
+//! Uses saorsa-transport's LinkTransport trait abstraction:
 //! - `P2pLinkTransport` for real network communication
 //! - `MockTransport` for testing overlay logic
 //! - All communication uses `SocketAddr` for connection addressing
@@ -22,13 +22,13 @@
 //! - `SAORSA_DHT_PROTOCOL` ("saorsa-dht/1.0.0") for DHT operations
 //! - Custom protocols can be registered for different services
 //!
-//! **IMPORTANT**: Protocol-based filtering in `accept()` is not yet implemented in ant-quic.
+//! **IMPORTANT**: Protocol-based filtering in `accept()` is not yet implemented in saorsa-transport.
 //! The `accept()` method accepts all incoming connections regardless of protocol.
 //! Applications must validate the protocol on received connections.
 //!
 //! ## Quality-Based Peer Selection
 //!
-//! The adapter tracks peer quality scores from ant-quic's `Capabilities.quality_score()`
+//! The adapter tracks peer quality scores from saorsa-transport's `Capabilities.quality_score()`
 //! (range 0.0 to 1.0, where higher is better). Methods available:
 //! - `get_peer_quality(addr)` - Get quality for a specific peer
 //! - `get_peers_by_quality()` - Get all peers sorted by quality (descending)
@@ -46,7 +46,7 @@
 //! ## Metrics Integration
 //!
 //! When saorsa-core is compiled with the `metrics` feature, this adapter
-//! automatically enables ant-quic's prometheus metrics collection.
+//! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoEnforcementMode, GeoRejectionError, GeographicConfig};
 use crate::telemetry::StreamClass;
@@ -60,13 +60,15 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-// Import ant-quic types using the new LinkTransport API (0.14+)
-use ant_quic::{LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId};
+// Import saorsa-transport types using the new LinkTransport API (0.14+)
+use saorsa_transport::{
+    LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId,
+};
 
 // Import saorsa-transport types for SharedTransport integration
-use ant_quic::SharedTransport;
-use ant_quic::link_transport::StreamType;
 use futures::StreamExt;
+use saorsa_transport::SharedTransport;
+use saorsa_transport::link_transport::StreamType;
 
 /// Protocol identifier for saorsa DHT overlay
 ///
@@ -74,7 +76,7 @@ use futures::StreamExt;
 /// over the QUIC transport. Other protocols can be registered for different services.
 pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
 
-/// Connection lifecycle events from ant-quic
+/// Connection lifecycle events from saorsa-transport
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Connection successfully established
@@ -94,9 +96,9 @@ pub enum ConnectionEvent {
     },
 }
 
-/// Native ant-quic network node using LinkTransport abstraction
+/// Native saorsa-transport network node using LinkTransport abstraction
 ///
-/// This provides a clean interface to ant-quic's peer-to-peer networking
+/// This provides a clean interface to saorsa-transport's peer-to-peer networking
 /// with advanced NAT traversal and post-quantum cryptography.
 ///
 /// Generic over the transport type to allow testing with MockTransport.
@@ -117,7 +119,7 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
     geo_config: Option<GeographicConfig>,
     /// Peer region tracking for geographic diversity
     peer_regions: Arc<RwLock<HashMap<String, usize>>>,
-    /// Peer quality scores from ant-quic Capabilities, keyed by SocketAddr
+    /// Peer quality scores from saorsa-transport Capabilities, keyed by SocketAddr
     peer_quality: Arc<RwLock<HashMap<SocketAddr, f32>>>,
     /// Shared transport for protocol multiplexing
     shared_transport: Arc<SharedTransport<T>>,
@@ -130,7 +132,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 /// Maximum application-layer message size (1 MiB).
 ///
 /// This tunes both the QUIC stream receive window and the per-stream
-/// read buffer inside `ant-quic`.
+/// read buffer inside `saorsa-transport`.
 pub const MAX_MESSAGE_SIZE: usize = P2pConfig::DEFAULT_MAX_MESSAGE_SIZE;
 
 impl P2PNetworkNode<P2pLinkTransport> {
@@ -142,7 +144,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with a specific connection limit and
     /// optional message-size override.
     ///
-    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
+    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
     pub async fn new_with_max_connections(
         bind_addr: SocketAddr,
         max_connections: usize,
@@ -185,7 +187,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node from NetworkConfig with an optional
     /// message-size override.
     ///
-    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
+    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
     pub async fn from_network_config(
         bind_addr: SocketAddr,
         net_config: &crate::transport::NetworkConfig,
@@ -266,9 +268,9 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Spawn a background task that continuously receives messages from the
     /// QUIC endpoint and forwards them into the provided channel.
     ///
-    /// Uses ant-quic v0.20's channel-based `recv()` which is fully
+    /// Uses saorsa-transport v0.20's channel-based `recv()` which is fully
     /// event-driven — no polling or timeout parameter. Per-connection
-    /// reader tasks inside ant-quic feed a shared mpsc channel, so
+    /// reader tasks inside saorsa-transport feed a shared mpsc channel, so
     /// `recv()` wakes instantly when data arrives on any peer's QUIC
     /// stream. The task exits when the shutdown signal is set, the
     /// channel is closed, or the endpoint shuts down.
@@ -341,7 +343,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
                     () = shutdown_clone.cancelled() => break,
                     recv = link_events.recv() => match recv {
                     Ok(LinkEvent::PeerConnected { addr, public_key, caps }) => {
-                        // Capture quality score from ant-quic Capabilities
+                        // Capture quality score from saorsa-transport Capabilities
                         let quality = caps.quality_score();
                         {
                             let mut quality_map = peer_quality_for_task.write().await;
@@ -418,7 +420,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         dht_engine: Arc<RwLock<crate::dht::core_engine::DhtCoreEngine>>,
     ) -> Result<()> {
         use crate::transport::dht_handler::DhtStreamHandler;
-        use ant_quic::link_transport::ProtocolHandlerExt;
+        use saorsa_transport::link_transport::ProtocolHandlerExt;
 
         let handler = DhtStreamHandler::new(dht_engine);
         self.shared_transport
@@ -500,7 +502,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// down. A `None` return is terminal — the caller should exit its
     /// accept loop.
     ///
-    /// **NOTE**: Protocol-based filtering is not yet implemented in ant-quic's `accept()` method.
+    /// **NOTE**: Protocol-based filtering is not yet implemented in saorsa-transport's `accept()` method.
     /// This method accepts connections for ANY protocol, not just `SAORSA_DHT_PROTOCOL`.
     /// Applications must validate that incoming connections are using the expected protocol.
     pub async fn accept_connection(&self) -> Option<SocketAddr> {
@@ -620,7 +622,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Check if a peer is authenticated (always true with PQC auth)
     pub async fn is_authenticated(&self, _addr: &SocketAddr) -> bool {
-        // With ant-quic 0.14+, all connections are PQC authenticated
+        // With saorsa-transport 0.14+, all connections are PQC authenticated
         true
     }
 
@@ -755,7 +757,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Get the quality score for a specific peer (0.0 to 1.0)
     ///
     /// Returns None if the peer is not connected or quality score is not available.
-    /// Quality scores come from ant-quic's Capabilities.quality_score() method.
+    /// Quality scores come from saorsa-transport's Capabilities.quality_score() method.
     pub async fn get_peer_quality(&self, addr: &SocketAddr) -> Option<f32> {
         let quality_map = self.peer_quality.read().await;
         quality_map.get(addr).copied()

@@ -123,7 +123,7 @@ Bincode vs JSON - 8 KB: JSON=10240 bytes, Bincode=5120 bytes, ratio=0.50x
 - ✅ Reject oversized before deserialization
 - ✅ Version field in 64-byte header
 - ✅ Backward compatibility planning
-- ✅ Frame size enforcement in ant-quic handlers
+- ✅ Frame size enforcement in saorsa-transport handlers
 
 ---
 

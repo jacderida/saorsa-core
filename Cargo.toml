@@ -5,7 +5,7 @@ name = "saorsa-core"
 # 0.10.5: replica planner helper for storage orchestration
 # 0.11.0: remove feature gates — adaptive/trust/placement always compiled
 # 0.11.1: fix Kademlia protocol violations in iterative lookups
-# 0.12.0: configurable max_message_size, bump ant-quic to 0.22.0
+# 0.12.0: configurable max_message_size, bump saorsa-transport to 0.22.0
 # 0.12.1: patch release
 version = "0.12.1"
 edition = "2024"
@@ -58,7 +58,7 @@ statrs = "0.18"
 # Cryptography - Primary source of truth: saorsa-pqc 0.4.0
 saorsa-pqc = "0.4.0"
 # Classical crypto for backward compatibility only
-# Classical crypto removed from production; PQC-only via saorsa-pqc and ant-quic
+# Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
 # Password hashing
 argon2 = "0.5"
 # Random number generation
@@ -76,7 +76,7 @@ flate2 = "1.1"
 once_cell = "1.21"
 
 # Networking
-ant-quic = { path = "../ant-quic" }
+saorsa-transport = { path = "../saorsa-transport" }
 
 four-word-networking = { version = "2.6" }
 

@@ -17,7 +17,7 @@
 //!
 //! [`PeerId`] is a 256-bit identifier computed as the BLAKE3 hash of a node's
 //! ML-DSA-65 public key. It is the single source of truth used across all
-//! Saorsa crates (`saorsa-core`, `ant-quic`, etc.).
+//! Saorsa crates (`saorsa-core`, `saorsa-transport`, etc.).
 
 use std::cmp::Ordering;
 use std::fmt;

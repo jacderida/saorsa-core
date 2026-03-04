@@ -310,7 +310,7 @@ async fn test_peer_discovery_under_load() -> Result<()> {
 ///
 /// NOTE: This test is ignored because it relies on timing-sensitive failure
 /// detection that varies based on:
-/// - ant-quic idle timeout configuration
+/// - saorsa-transport idle timeout configuration
 /// - System load during test execution
 /// - Keepalive task timing
 ///
@@ -334,7 +334,7 @@ async fn test_connection_failure_recovery() -> Result<()> {
 
     // Wait for failure detection.
     //
-    // ant-quic uses an idle timeout (and this crate uses a keepalive task), so peer removal is not
+    // saorsa-transport uses an idle timeout (and this crate uses a keepalive task), so peer removal is not
     // guaranteed to be instantaneous. Poll for convergence instead of assuming a fixed delay.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {

@@ -101,7 +101,7 @@ performance_monitor.clone()  // Arc::clone would be faster for Arc types
 | `too_many_arguments` | 1 | `network.rs:1832` | LOW |
 | `many_single_char_names` | 1 | `adaptive/beta_distribution.rs:143` | LOW |
 | `collapsible_if` | 1 | `address.rs:164` | LOW |
-| `unused_unit` | 1 | `quantum_crypto/ant_quic_integration.rs:93` | LOW |
+| `unused_unit` | 1 | `quantum_crypto/saorsa_transport_integration.rs:93` | LOW |
 
 #### High Priority Issues
 
@@ -138,7 +138,7 @@ performance_monitor.clone()  // Arc::clone would be faster for Arc types
 | **Windows-Specific** | 2 | `network.rs:2977,3081` - platform-specific investigation |
 | **Bandwidth Tracking** | 2 | `coordinator.rs:789`, `client.rs:737` - monitoring gaps |
 | **Sequence Numbers** | 2 | `client.rs:670` - protocol tracking |
-| **Key Import** | 1 | `secure_node_identity.rs:101` - waiting on ant-quic |
+| **Key Import** | 1 | `secure_node_identity.rs:101` - waiting on saorsa-transport |
 | **DHT Optimization** | 1 | `trust_weighted_kademlia.rs:389` - proof generation |
 
 #### Key Findings

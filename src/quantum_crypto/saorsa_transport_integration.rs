@@ -7,16 +7,16 @@
 // For AGPL-3.0 license, see LICENSE-AGPL-3.0
 // For commercial licensing, contact: david@saorsalabs.com
 
-//! Integration with ant-quic's post-quantum cryptography
+//! Integration with saorsa-transport's post-quantum cryptography
 //!
-//! This module provides integration with ant-quic 0.8.1's post-quantum
+//! This module provides integration with saorsa-transport 0.8.1's post-quantum
 //! cryptography features, making them available to saorsa-core applications.
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
 
 #[cfg(debug_assertions)]
-use ant_quic::crypto::pqc::types::ML_DSA_65_SIGNATURE_SIZE;
+use saorsa_transport::crypto::pqc::types::ML_DSA_65_SIGNATURE_SIZE;
 
 #[cfg(debug_assertions)]
 use blake3::{Hasher, hash};
@@ -27,12 +27,12 @@ use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use std::sync::Mutex;
 
-// Re-export ant-quic PQC module and types for applications
-pub use ant_quic::crypto::pqc;
+// Re-export saorsa-transport PQC module and types for applications
+pub use saorsa_transport::crypto::pqc;
 
-// Re-export key ant-quic PQC types from types module
-// Note: ant-quic 0.14+ is pure PQC only (no hybrid mode)
-pub use ant_quic::crypto::pqc::types::{
+// Re-export key saorsa-transport PQC types from types module
+// Note: saorsa-transport 0.14+ is pure PQC only (no hybrid mode)
+pub use saorsa_transport::crypto::pqc::types::{
     MlDsaPublicKey,
     MlDsaSecretKey,
     MlDsaSignature,
@@ -46,7 +46,7 @@ pub use ant_quic::crypto::pqc::types::{
 };
 
 // Re-export config types and algorithm implementations
-pub use ant_quic::crypto::pqc::{
+pub use saorsa_transport::crypto::pqc::{
     MlDsa65,
     MlKem768,
     // Additional enums and types
@@ -60,7 +60,7 @@ pub use ant_quic::crypto::pqc::{
 };
 
 // Re-export PQC traits for advanced users
-pub use ant_quic::crypto::pqc::{MlDsaOperations, MlKemOperations, PqcProvider};
+pub use saorsa_transport::crypto::pqc::{MlDsaOperations, MlKemOperations, PqcProvider};
 
 static ML_DSA: Lazy<MlDsa65> = Lazy::new(MlDsa65::new);
 
@@ -96,7 +96,7 @@ pub fn register_debug_ml_dsa_keypair(_secret_key: &MlDsaSecretKey, _public_key: 
 }
 
 /// Create a default PQC configuration with quantum-resistant algorithms enabled
-/// Note: ant-quic 0.14+ is pure PQC - no hybrid mode available
+/// Note: saorsa-transport 0.14+ is pure PQC - no hybrid mode available
 pub fn create_default_pqc_config() -> Result<PqcConfig> {
     let config = PqcConfigBuilder::new()
         .build()
@@ -106,7 +106,7 @@ pub fn create_default_pqc_config() -> Result<PqcConfig> {
 }
 
 /// Create a PQC-only configuration (no classical algorithms)
-/// Note: This is now the only mode in ant-quic 0.14+ (pure PQC)
+/// Note: This is now the only mode in saorsa-transport 0.14+ (pure PQC)
 pub fn create_pqc_only_config() -> Result<PqcConfig> {
     let config = PqcConfigBuilder::new()
         .build()
@@ -115,7 +115,7 @@ pub fn create_pqc_only_config() -> Result<PqcConfig> {
     Ok(config)
 }
 
-/// Generate ML-DSA-65 key pair using ant-quic's implementation
+/// Generate ML-DSA-65 key pair using saorsa-transport's implementation
 pub fn generate_ml_dsa_keypair() -> Result<(MlDsaPublicKey, MlDsaSecretKey)> {
     let (public_key, secret_key) = ML_DSA
         .generate_keypair()
@@ -124,7 +124,7 @@ pub fn generate_ml_dsa_keypair() -> Result<(MlDsaPublicKey, MlDsaSecretKey)> {
     Ok((public_key, secret_key))
 }
 
-/// Generate ML-KEM-768 key pair using ant-quic's implementation
+/// Generate ML-KEM-768 key pair using saorsa-transport's implementation
 pub fn generate_ml_kem_keypair() -> Result<(MlKemPublicKey, MlKemSecretKey)> {
     let (public_key, secret_key) = ML_KEM
         .generate_keypair()
@@ -132,7 +132,7 @@ pub fn generate_ml_kem_keypair() -> Result<(MlKemPublicKey, MlKemSecretKey)> {
     Ok((public_key, secret_key))
 }
 
-/// Sign a message using ML-DSA-65 with ant-quic's implementation
+/// Sign a message using ML-DSA-65 with saorsa-transport's implementation
 #[cfg(not(debug_assertions))]
 pub fn ml_dsa_sign(secret_key: &MlDsaSecretKey, message: &[u8]) -> Result<MlDsaSignature> {
     ML_DSA
@@ -163,7 +163,7 @@ pub fn ml_dsa_sign(secret_key: &MlDsaSecretKey, message: &[u8]) -> Result<MlDsaS
         .map_err(|e| anyhow::anyhow!("Failed to build debug ML-DSA signature: {}", e))
 }
 
-/// Verify a signature using ML-DSA-65 with ant-quic's implementation
+/// Verify a signature using ML-DSA-65 with saorsa-transport's implementation
 #[cfg(not(debug_assertions))]
 pub fn ml_dsa_verify(
     public_key: &MlDsaPublicKey,
@@ -209,7 +209,7 @@ pub fn ml_dsa_verify(
     Ok(signature_bytes[64..] == expected_tail[..])
 }
 
-/// Encapsulate a shared secret using ML-KEM-768 with ant-quic's implementation
+/// Encapsulate a shared secret using ML-KEM-768 with saorsa-transport's implementation
 pub fn ml_kem_encapsulate(
     public_key: &MlKemPublicKey,
 ) -> Result<(MlKemCiphertext, PqcSharedSecret)> {
@@ -218,7 +218,7 @@ pub fn ml_kem_encapsulate(
         .map_err(|e| anyhow::anyhow!("Failed to encapsulate with ML-KEM: {}", e))
 }
 
-/// Decapsulate a shared secret using ML-KEM-768 with ant-quic's implementation
+/// Decapsulate a shared secret using ML-KEM-768 with saorsa-transport's implementation
 pub fn ml_kem_decapsulate(
     secret_key: &MlKemSecretKey,
     ciphertext: &MlKemCiphertext,

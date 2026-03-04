@@ -17,7 +17,7 @@ use saorsa_core::{
         trust::MockTrustProvider,
     },
     identity::NodeIdentity,
-    quantum_crypto::ant_quic_integration::MlDsaPublicKey,
+    quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
 };
 use std::{
     collections::HashMap,

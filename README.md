@@ -22,22 +22,22 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | ADR | Title | Description |
 |-----|-------|-------------|
 | [ADR-001](docs/adr/ADR-001-multi-layer-architecture.md) | Multi-Layer P2P Architecture | Layered design separating transport, DHT, identity, and application concerns |
-| [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using ant-quic for QUIC transport, NAT traversal, and bootstrap cache |
+| [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
 | [ADR-003](docs/adr/ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
 | [ADR-004](docs/adr/ADR-004-four-word-addresses.md) | Four-Word Addresses | Human-readable addressing via word encoding |
 | [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | EigenTrust Reputation | Iterative trust computation for Sybil resistance |
 | [ADR-007](docs/adr/ADR-007-adaptive-networking.md) | Adaptive Networking | Machine learning for dynamic routing optimization |
-| [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Delegating bootstrap to ant-quic with Sybil protection |
+| [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Delegating bootstrap to saorsa-transport with Sybil protection |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
 | [ADR-011](docs/adr/ADR-011-geographic-placement.md) | Geographic Placement | Region-aware storage for regulatory compliance |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
 
 ## Features
 
-- **P2P NAT Traversal**: True peer-to-peer connectivity with automatic NAT traversal (ant-quic 0.21.x)
+- **P2P NAT Traversal**: True peer-to-peer connectivity with automatic NAT traversal (saorsa-transport 0.21.x)
 - **DHT (Distributed Hash Table)**: Peer phonebook and routing with adaptive scoring and geographic awareness
 - **Placement System**: Intelligent shard placement with EigenTrust integration
-- **QUIC Transport**: High-performance networking with ant-quic
+- **QUIC Transport**: High-performance networking with saorsa-transport
 - **Four-Word Endpoints**: Human‑readable network endpoints via `four-word-networking` (IPv4+port encodes to 4 words; decoding returns both IP and port; IPv6 word count decided by the crate).
 - **Post-Quantum Cryptography**: Future-ready cryptographic algorithms
 - **Geographic Routing**: Location-aware networking
@@ -108,7 +108,7 @@ tokio::spawn(async move {
 
 ### Core Components
 
-1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (ant-quic 0.21.x)
+1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.21.x)
 2. **DHT**: S/Kademlia-based peer phonebook with adaptive routing and geographic awareness
 3. **Placement System**: Intelligent shard placement with weighted selection algorithms
 4. **Identity**: Post‑quantum cryptographic identities with ML‑DSA‑65 signatures (no PoW; no embedded four‑word address)
@@ -144,7 +144,7 @@ Placement Engine → DHT + Geographic Routing
     ↓              ↓
     ↓         Audit & Repair
     ↓              ↓
-QUIC Transport (ant-quic)
+QUIC Transport (saorsa-transport)
     ↓
 Internet
 ```
@@ -229,7 +229,7 @@ let config = NetworkConfig {
 - `h2_greedy` - Hyperbolic greedy routing helpers in API
 - `test-utils` - Test utilities including mock DHT for integration tests
 
-Note: DHT, ant-quic QUIC transport, and post-quantum cryptography are always enabled. Four-word networking is a core feature.
+Note: DHT, saorsa-transport QUIC transport, and post-quantum cryptography are always enabled. Four-word networking is a core feature.
 
 ## Performance
 
@@ -387,7 +387,7 @@ For commercial licensing, contact: david@saorsalabs.com
 - `tracing` - Logging
 
 ### Networking
-- `ant-quic` (0.21.x) - QUIC transport with P2P NAT traversal
+- `saorsa-transport` (0.21.x) - QUIC transport with P2P NAT traversal
 - `four-word-networking` - Human-readable addresses
 
 ### Cryptography

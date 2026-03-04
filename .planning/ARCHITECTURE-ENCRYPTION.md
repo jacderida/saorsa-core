@@ -10,9 +10,9 @@
 
 Phase 1 baseline measurements identified redundant encryption:
 - **Application layer**: ChaCha20Poly1305 (classical, 28B overhead per message)
-- **Transport layer**: ant-quic ML-KEM-768 (post-quantum, 16B overhead per packet)
+- **Transport layer**: saorsa-transport ML-KEM-768 (post-quantum, 16B overhead per packet)
 
-**Proposal**: Remove application-layer encryption, rely exclusively on ant-quic's PQC
+**Proposal**: Remove application-layer encryption, rely exclusively on saorsa-transport's PQC
 
 ---
 
@@ -23,7 +23,7 @@ Phase 1 baseline measurements identified redundant encryption:
 > headless nodes/DHT—transport crypto only protects in-transit hops, not at-rest data or
 > offline verification."
 
-**Valid Point**: Transport encryption (ant-quic) only protects data **in transit**, not:
+**Valid Point**: Transport encryption (saorsa-transport) only protects data **in transit**, not:
 - Messages stored in DHT
 - Messages relayed through headless nodes
 - Offline message queues
@@ -41,7 +41,7 @@ Phase 1 baseline measurements identified redundant encryption:
 - Real-time synchronous communication
 
 **Encryption Approach**:
-- ✅ **ant-quic ML-KEM-768 ONLY**
+- ✅ **saorsa-transport ML-KEM-768 ONLY**
 - Provides: Post-quantum E2E encryption, integrity, replay protection
 - Overhead: 16 bytes per packet (AES-GCM tag)
 - Security: End-to-end between connected peers
@@ -58,7 +58,7 @@ Phase 1 baseline measurements identified redundant encryption:
 - No direct P2P connection during storage
 
 **Encryption Approach**:
-- ❌ **ant-quic protection ENDS at storage boundary**
+- ❌ **saorsa-transport protection ENDS at storage boundary**
 - ✅ **REQUIRES message-level encryption**:
   - Encrypt with recipient's public key (ML-KEM-768 encapsulation)
   - Sign with sender's private key (ML-DSA-65 signature)
@@ -81,7 +81,7 @@ Phase 1 baseline measurements identified redundant encryption:
 - Intermediate nodes should NOT see message content
 
 **Encryption Approach**:
-- ❌ **ant-quic protects hop-by-hop, NOT end-to-end in multi-hop**
+- ❌ **saorsa-transport protects hop-by-hop, NOT end-to-end in multi-hop**
 - ✅ **REQUIRES onion routing OR message-level encryption**:
   - Option A: Onion routing (layer encryption per hop)
   - Option B: Single message-level encryption (simpler)
@@ -145,7 +145,7 @@ Phase 1 baseline measurements identified redundant encryption:
 **Keep**:
 - ✅ **Message-level ML-DSA-65 signatures** (for integrity + non-repudiation)
 - ✅ **Message-level ML-KEM-768 encryption** (for DHT storage + offline delivery)
-- ✅ **Transport-level ant-quic ML-KEM-768** (for in-transit protection)
+- ✅ **Transport-level saorsa-transport ML-KEM-768** (for in-transit protection)
 
 **Remove**:
 - ❌ **ChaCha20Poly1305** (classical, weaker than ML-KEM-768)
@@ -158,7 +158,7 @@ Phase 1 baseline measurements identified redundant encryption:
 RichMessage
   → Bincode
     → ML-DSA-65 signature (for integrity)
-      → ant-quic ML-KEM-768 (transport)
+      → saorsa-transport ML-KEM-768 (transport)
         → Wire
 ```
 
@@ -170,7 +170,7 @@ RichMessage
   → Bincode
     → ML-KEM-768 encrypt (with recipient public key)
       → ML-DSA-65 sign (with sender private key)
-        → ant-quic ML-KEM-768 (transport to DHT node)
+        → saorsa-transport ML-KEM-768 (transport to DHT node)
           → Wire → DHT Storage
 ```
 
@@ -180,26 +180,26 @@ RichMessage
 
 ## Performance Impact Re-Analysis
 
-### Current Architecture (ChaCha20 + ant-quic)
+### Current Architecture (ChaCha20 + saorsa-transport)
 ```
-Overhead per message: 28B (ChaCha20) + 16B (ant-quic) = 44B
+Overhead per message: 28B (ChaCha20) + 16B (saorsa-transport) = 44B
 Encryption operations: 2 (ChaCha20 + ML-KEM-768)
 Key exchange: Separate + QUIC handshake
 ```
 
-### Revised Architecture (ML-KEM-768 message + ant-quic transport)
+### Revised Architecture (ML-KEM-768 message + saorsa-transport transport)
 
 **Direct P2P (Synchronous)**:
 ```
-Overhead per message: 3,300B (ML-DSA-65 sig) + 16B (ant-quic) = 3,316B
-Encryption operations: 1 (ML-KEM-768 via ant-quic)
+Overhead per message: 3,300B (ML-DSA-65 sig) + 16B (saorsa-transport) = 3,316B
+Encryption operations: 1 (ML-KEM-768 via saorsa-transport)
 Signing operations: 1 (ML-DSA-65 for integrity)
 ```
 
 **DHT Storage / Offline**:
 ```
-Overhead per message: 1,088B (ML-KEM-768 ciphertext) + 3,300B (ML-DSA-65 sig) + 16B (ant-quic) = 4,404B
-Encryption operations: 2 (ML-KEM-768 message + ant-quic transport)
+Overhead per message: 1,088B (ML-KEM-768 ciphertext) + 3,300B (ML-DSA-65 sig) + 16B (saorsa-transport) = 4,404B
+Encryption operations: 2 (ML-KEM-768 message + saorsa-transport transport)
 Signing operations: 1 (ML-DSA-65)
 ```
 
@@ -222,14 +222,14 @@ Signing operations: 1 (ML-DSA-65)
 ### Message Classification
 
 **Type A: Ephemeral Direct Messages** (e.g., real-time chat)
-- Transport encryption only (ant-quic ML-KEM-768)
+- Transport encryption only (saorsa-transport ML-KEM-768)
 - Optional: ML-DSA-65 signature for integrity
 - Overhead: 16B (or 3,316B with signature)
 
 **Type B: Stored/Relayed Messages** (e.g., offline messages, DHT data)
 - Message-level ML-KEM-768 encryption
 - Mandatory ML-DSA-65 signature
-- Transport encryption (ant-quic)
+- Transport encryption (saorsa-transport)
 - Overhead: 4,404B
 
 ### Implementation Strategy
@@ -243,8 +243,8 @@ Signing operations: 1 (ML-DSA-65)
    ```
 
 2. **Conditional encryption**:
-   - Ephemeral: ant-quic transport only
-   - Persistent: ML-KEM-768 + ML-DSA-65 + ant-quic
+   - Ephemeral: saorsa-transport transport only
+   - Persistent: ML-KEM-768 + ML-DSA-65 + saorsa-transport
 
 3. **Default to Persistent** for safety:
    - All messages encrypted by default
@@ -282,13 +282,13 @@ Signing operations: 1 (ML-DSA-65)
 
 **Codex's concern is VALID and IMPORTANT**:
 - Removing ALL application-layer encryption is unsafe for stored/relayed messages
-- Transport-only encryption (ant-quic) is insufficient for DHT storage
+- Transport-only encryption (saorsa-transport) is insufficient for DHT storage
 
 **Revised Proposal**:
 - Remove **classical** encryption (ChaCha20)
 - Keep/add **post-quantum** message-level encryption (ML-KEM-768) for non-ephemeral messages
 - Keep **post-quantum** signatures (ML-DSA-65) for integrity
-- Use **ant-quic ML-KEM-768** for transport
+- Use **saorsa-transport ML-KEM-768** for transport
 
 **Net Result**:
 - Stronger security (all PQC, no classical crypto)

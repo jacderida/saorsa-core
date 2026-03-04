@@ -4,12 +4,12 @@
 //! Integration test proving the P2P messaging connection lifecycle issue is fixed
 //!
 //! This test validates the fix for the issue documented in P2P_MESSAGING_STATUS_2025-10-02_FINAL.md
-//! where P2PNode's peers map didn't track when ant-quic connections closed, leading to
+//! where P2PNode's peers map didn't track when saorsa-transport connections closed, leading to
 //! "send_to_peer failed on both stacks" errors after 30-second idle timeout.
 //!
 //! The fix implements:
-//! - Connection lifecycle tracking via ant-quic events
-//! - Active connections HashSet synchronized with ant-quic state
+//! - Connection lifecycle tracking via saorsa-transport events
+//! - Active connections HashSet synchronized with saorsa-transport state
 //! - Keepalive messages every 15 seconds to prevent 30-second idle timeout
 //! - Automatic stale connection cleanup
 
@@ -20,7 +20,7 @@ use tracing::{debug, info};
 
 /// Test that demonstrates the connection lifecycle tracking prevents the original issue
 ///
-/// Original issue: After 30 seconds of inactivity, ant-quic closes the connection due to
+/// Original issue: After 30 seconds of inactivity, saorsa-transport closes the connection due to
 /// max_idle_timeout, but P2PNode's peers map still contains the peer entry. Attempts to
 /// send messages fail with "send_to_peer failed on both stacks".
 ///
@@ -31,7 +31,7 @@ use tracing::{debug, info};
 /// 4. MessageTransport can retry with a fresh connection
 ///
 /// TODO: Investigate why QUIC-level keepalive (configured at 5s interval) doesn't
-/// prevent the 30-second idle timeout. The ant-quic transport has keep_alive_interval
+/// prevent the 30-second idle timeout. The saorsa-transport transport has keep_alive_interval
 /// set, but connections still timeout. This may be a timing issue with how events are
 /// polled, or the keepalive mechanism may not be working as expected.
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     debug!("Initial message sent successfully");
 
-    // Wait for 40 seconds - longer than ant-quic's 30-second max_idle_timeout
+    // Wait for 40 seconds - longer than saorsa-transport's 30-second max_idle_timeout
     // The keepalive task should prevent the connection from timing out
     info!("Waiting 40 seconds to test keepalive prevents timeout...");
     sleep(Duration::from_secs(40)).await;
@@ -162,7 +162,7 @@ async fn test_connection_lifecycle_with_keepalive() {
 /// Test that P2PNode's send_message validates connection state before sending
 ///
 /// This test verifies that even if a peer entry exists in the peers map,
-/// send_message will check if the ant-quic connection is actually active
+/// send_message will check if the saorsa-transport connection is actually active
 /// and fail gracefully with ConnectionClosed error if not.
 #[tokio::test]
 #[ignore = "Connection state tracking needs investigation - disconnect not propagating synchronously"]

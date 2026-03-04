@@ -130,7 +130,7 @@
 - ✓ src/messaging/transport.rs - Queue structure, processing, cleanup verified
 - ✓ src/messaging/key_exchange.rs - DHT integration verified
 - ✓ src/network.rs - Protocol wrapper verified
-- ✓ src/transport/ant_quic_adapter.rs - QUIC transmission verified
+- ✓ src/transport/saorsa_transport_adapter.rs - QUIC transmission verified
 
 ---
 

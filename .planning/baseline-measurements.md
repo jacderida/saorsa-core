@@ -155,7 +155,7 @@ RichMessage (8KB)
 ```
 RichMessage (8KB)
   → Bincode (8.5KB)
-    → ant-quic PQC encryption (9KB, includes ML-KEM-768 overhead)
+    → saorsa-transport PQC encryption (9KB, includes ML-KEM-768 overhead)
       → Binary frame header (9KB + 64B = 9.064KB)
         → Wire (9.064KB)
 ```
@@ -191,7 +191,7 @@ Based on bincode vs JSON benchmarks from other projects:
 - Overhead: Nonce (12B) + Tag (16B) = 28 bytes per message
 - Purpose: E2E encryption
 
-**Transport-layer encryption** (ant-quic):
+**Transport-layer encryption** (saorsa-transport):
 - Uses: ML-KEM-768 (post-quantum)
 - Key size: 768-bit encapsulation
 - Overhead: ~1KB PQC handshake (amortized over connection)
@@ -200,17 +200,17 @@ Based on bincode vs JSON benchmarks from other projects:
 ### Problem
 
 Both layers provide **confidentiality and integrity**. Application-layer encryption is redundant because:
-1. ant-quic already provides E2E encryption (QUIC connection is peer-to-peer)
+1. saorsa-transport already provides E2E encryption (QUIC connection is peer-to-peer)
 2. ML-KEM-768 is **post-quantum secure** (ChaCha20 is not)
 3. Double encryption adds overhead without security benefit
-4. ant-quic handles key exchange, replay protection, and integrity checking
+4. saorsa-transport handles key exchange, replay protection, and integrity checking
 
 ### Security Threat Model Analysis
 
 **CRITICAL**: The following threat model analysis must be considered before removing application-layer encryption:
 
 #### When Transport-Only Encryption is SUFFICIENT:
-- ✅ **Direct peer-to-peer communication**: Sender → ant-quic stream → Recipient (both online, connected)
+- ✅ **Direct peer-to-peer communication**: Sender → saorsa-transport stream → Recipient (both online, connected)
 - ✅ **Live messaging**: Messages only exist in-transit, never stored
 - ✅ **No relay/intermediaries**: No headless nodes, DHT storage, or message forwarding
 - ✅ **No offline delivery**: Messages never sit in queues or storage
@@ -239,8 +239,8 @@ Both layers provide **confidentiality and integrity**. Application-layer encrypt
 ### Solution
 
 **Remove application-layer encryption** entirely:
-- ✅ Use ant-quic's ML-KEM-768 for encryption
-- ✅ Use ant-quic's ML-DSA-65 for signatures (via saorsa-pqc)
+- ✅ Use saorsa-transport's ML-KEM-768 for encryption
+- ✅ Use saorsa-transport's ML-DSA-65 for signatures (via saorsa-pqc)
 - ✅ Simplify message types (no EncryptedMessage wrapper needed)
 - ✅ Binary encoding directly over QUIC stream
 
@@ -251,17 +251,17 @@ Both layers provide **confidentiality and integrity**. Application-layer encrypt
 ### Phase 4: Remove Redundant Encryption
 
 1. **Eliminate `EncryptedMessage` type**
-   - No longer needed with ant-quic transport encryption
+   - No longer needed with saorsa-transport transport encryption
    - Reduces message nesting by one layer
 
-2. **Use ant-quic PQC exclusively**
+2. **Use saorsa-transport PQC exclusively**
    - ML-KEM-768 for key encapsulation (encryption)
    - ML-DSA-65 for digital signatures (via saorsa-pqc)
    - Post-quantum secure end-to-end
 
 3. **Simplify message flow**
    ```
-   RichMessage → Bincode → Binary frame → ant-quic (encrypted) → Wire
+   RichMessage → Bincode → Binary frame → saorsa-transport (encrypted) → Wire
    ```
 
 ### Phase 5: Binary Encoding Migration
@@ -283,10 +283,10 @@ Both layers provide **confidentiality and integrity**. Application-layer encrypt
      - Version field in 64-byte header (1 byte reserved)
      - Support version negotiation on connection setup
      - Allow backward compatibility or graceful rejection of incompatible versions
-   - **SECURITY**: Enforce frame size limits in ant-quic stream handlers
+   - **SECURITY**: Enforce frame size limits in saorsa-transport stream handlers
 
 3. **Stream multiplexing via QUIC**
-   - ant-quic handles connection management
+   - saorsa-transport handles connection management
    - Multiple concurrent streams per connection
    - Built-in flow control and congestion control
 
@@ -303,11 +303,11 @@ Both layers provide **confidentiality and integrity**. Application-layer encrypt
 
 ---
 
-## Task 5: ant-quic Transport PQC Overhead Analysis
+## Task 5: saorsa-transport Transport PQC Overhead Analysis
 
 ### Overview
 
-ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
+saorsa-transport (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
 - **ML-KEM-768**: Key encapsulation mechanism (encryption)
 - **ML-DSA-65**: Digital signature algorithm (authentication)
 
@@ -341,7 +341,7 @@ ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
 - Security: Classical (not post-quantum resistant)
 - Coverage: Application data only
 
-**Transport-layer** (ant-quic ML-KEM-768):
+**Transport-layer** (saorsa-transport ML-KEM-768):
 - Per-message overhead: 16 bytes (AES-GCM tag)
 - Key exchange: Integrated QUIC handshake
 - Security: Post-quantum resistant
@@ -351,21 +351,21 @@ ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
 
 1. **Redundant Security**: Both provide confidentiality + integrity
 2. **Weaker Chain**: ChaCha20 is NOT post-quantum resistant
-3. **Extra Overhead**: 28B per message (ChaCha20) + 16B per packet (ant-quic) = 44B total
+3. **Extra Overhead**: 28B per message (ChaCha20) + 16B per packet (saorsa-transport) = 44B total
 4. **Performance Cost**: Double encryption CPU overhead
 
-### ant-quic vs Application-layer: Feature Comparison
+### saorsa-transport vs Application-layer: Feature Comparison
 
-| Feature | ant-quic (ML-KEM-768) | App-layer (ChaCha20) | Winner |
+| Feature | saorsa-transport (ML-KEM-768) | App-layer (ChaCha20) | Winner |
 |---------|----------------------|---------------------|---------|
 | **Confidentiality** | ✅ AES-256-GCM | ✅ ChaCha20 | Tie |
 | **Integrity** | ✅ GCM auth tag | ✅ Poly1305 MAC | Tie |
-| **Post-quantum** | ✅ ML-KEM-768 | ❌ Classical | **ant-quic** |
-| **Key exchange** | ✅ Integrated | ❌ Separate protocol | **ant-quic** |
-| **Replay protection** | ✅ QUIC packet numbers | ❌ Application must handle | **ant-quic** |
-| **Per-message overhead** | 16 bytes | 28 bytes | **ant-quic** |
-| **Connection overhead** | 2,272 bytes (one-time) | N/A | ant-quic |
-| **Performance** | Hardware AES-NI | Software ChaCha20 | **ant-quic** (on x86) |
+| **Post-quantum** | ✅ ML-KEM-768 | ❌ Classical | **saorsa-transport** |
+| **Key exchange** | ✅ Integrated | ❌ Separate protocol | **saorsa-transport** |
+| **Replay protection** | ✅ QUIC packet numbers | ❌ Application must handle | **saorsa-transport** |
+| **Per-message overhead** | 16 bytes | 28 bytes | **saorsa-transport** |
+| **Connection overhead** | 2,272 bytes (one-time) | N/A | saorsa-transport |
+| **Performance** | Hardware AES-NI | Software ChaCha20 | **saorsa-transport** (on x86) |
 
 ### Conclusion: Application Encryption is Redundant
 
@@ -381,7 +381,7 @@ ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
 **If above conditions are met**, remove application-layer encryption because:
 1. **Performance**: Lower overhead (16B vs 28B per message)
 2. **Simplicity**: One encryption layer vs two, simpler code
-3. **Security (within scope)**: ant-quic's post-quantum ML-KEM-768 is stronger than ChaCha20
+3. **Security (within scope)**: saorsa-transport's post-quantum ML-KEM-768 is stronger than ChaCha20
 4. **Standards**: QUIC is IETF-standardized, well-audited
 
 **Downsides IF ANY CONDITION IS FALSE**:
@@ -392,7 +392,7 @@ ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
 - ❌ No forward secrecy for archived/historical messages
 - ❌ Transport-layer key compromise exposes ALL messages on connection
 
-**Conditional removal SAFE**: ant-quic provides transport-level encryption, adequate for direct P2P sessions, but NOT sufficient for storage, relay, or offline scenarios
+**Conditional removal SAFE**: saorsa-transport provides transport-level encryption, adequate for direct P2P sessions, but NOT sufficient for storage, relay, or offline scenarios
 
 ### Measured Impact on Our Use Case
 
@@ -404,7 +404,7 @@ ant-quic (v0.10+) provides post-quantum cryptography via saorsa-pqc, using:
   Total: 44 bytes per message
 ```
 
-**Target overhead** (ant-quic only):
+**Target overhead** (saorsa-transport only):
 ```
 8KB message:
   Transport ML-KEM-768: 16 bytes (packet overhead)
@@ -422,7 +422,7 @@ Raw payload: 8,192 bytes
 + EncryptedMessage JSON + ChaCha20: ~3,072 bytes (1.6x)
 + ProtocolWrapper JSON: ~4,096 bytes (1.88x)
 + Application ChaCha20 overhead: 28 bytes
-+ ant-quic packet overhead: 16 bytes
++ saorsa-transport packet overhead: 16 bytes
 = Total wire size: ~17,452 bytes (2.13x bloat)
 ```
 
@@ -431,7 +431,7 @@ Raw payload: 8,192 bytes
 Raw payload: 8,192 bytes
 + Bincode overhead: ~200 bytes (1.024x)
 + Binary frame header: 64 bytes
-+ ant-quic packet overhead: 16 bytes
++ saorsa-transport packet overhead: 16 bytes
 = Total wire size: ~8,472 bytes (1.034x bloat)
 ```
 
@@ -479,7 +479,7 @@ Based on JSON structure and Base64 encoding overhead, the cumulative size growth
 └─────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────┐
-│  Wire: 20,037 bytes + 16 bytes (ant-quic GCM tag)       │
+│  Wire: 20,037 bytes + 16 bytes (saorsa-transport GCM tag)       │
 │  = Total: 20,053 bytes on wire                          │
 │  **Total overhead: 8,192 → 20,053 (2.45x bloat)**       │
 └─────────────────────────────────────────────────────────┘
@@ -493,7 +493,7 @@ Based on JSON structure and Base64 encoding overhead, the cumulative size growth
 | **+ Layer 1 (RichMessage JSON)** | 10,240 B | 81,920 B | 327,680 B | 1.25x |
 | **+ Layer 2 (EncryptedMessage JSON)** | 14,653 B | 116,907 B | 466,432 B | 1.79x |
 | **+ Layer 3 (ProtocolWrapper JSON)** | 20,037 B | 159,477 B | 636,032 B | 2.45x |
-| **+ ant-quic overhead** | 20,053 B | 159,493 B | 636,048 B | 2.45x |
+| **+ saorsa-transport overhead** | 20,053 B | 159,493 B | 636,048 B | 2.45x |
 
 **Key Insight**: Size overhead is **exponential** due to nested Base64 encoding
 
@@ -504,7 +504,7 @@ Based on JSON structure and Base64 encoding overhead, the cumulative size growth
 Layer 1: +2,048 B  (25% overhead)  - JSON structure
 Layer 2: +4,413 B  (43% overhead)  - Base64(Layer1) + envelope
 Layer 3: +5,384 B  (37% overhead)  - Base64(Layer2) + envelope
-ant-quic: +16 B    (0.08% overhead) - AES-GCM tag
+saorsa-transport: +16 B    (0.08% overhead) - AES-GCM tag
 
 Total added: 11,861 B (145% overhead)
 ```
@@ -715,7 +715,7 @@ The current message encoding pipeline suffers from **triple JSON encoding** with
 
 2. **Redundant Encryption**:
    - Application: ChaCha20Poly1305 (classical, not PQ-resistant)
-   - Transport: ML-KEM-768 via ant-quic (post-quantum)
+   - Transport: ML-KEM-768 via saorsa-transport (post-quantum)
    - Both provide confidentiality + integrity (redundant)
 
 3. **JSON Performance Limitations**:
@@ -730,7 +730,7 @@ The current message encoding pipeline suffers from **triple JSON encoding** with
 RichMessage
   → bincode (binary serialization)
     → Binary frame header (64 bytes)
-      → ant-quic (ML-KEM-768 encryption)
+      → saorsa-transport (ML-KEM-768 encryption)
         → Wire
 ```
 
@@ -738,7 +738,7 @@ RichMessage
 1. Remove `EncryptedMessage` type (no longer needed)
 2. Replace JSON with bincode throughout
 3. Simple binary framing (fixed 64-byte header)
-4. Single encryption layer (ant-quic ML-KEM-768)
+4. Single encryption layer (saorsa-transport ML-KEM-768)
 
 ### Expected Improvements
 
@@ -757,7 +757,7 @@ RichMessage
 
 **Low Risk**:
 - ✅ bincode is production-proven (used by Servo, Parity, etc.)
-- ✅ ant-quic provides proven ML-KEM-768 implementation
+- ✅ saorsa-transport provides proven ML-KEM-768 implementation
 - ✅ Breaking change acceptable (user-confirmed)
 - ✅ No backward compatibility needed
 
@@ -772,7 +772,7 @@ RichMessage
 1. **Phase 4**: Remove redundant application encryption
    - Simplifies types
    - Reduces testing surface
-   - Proves ant-quic sufficiency
+   - Proves saorsa-transport sufficiency
 
 2. **Phase 5**: Migrate to bincode
    - Replace JSON serialization calls
@@ -800,7 +800,7 @@ RichMessage
 - ✅ Task 2: RichMessage encoding measured
 - ✅ Task 3: EncryptedMessage encoding measured
 - ✅ Task 4: Protocol wrapper encoding measured
-- ✅ Task 5: ant-quic transport overhead analyzed (ML-KEM-768 characteristics)
+- ✅ Task 5: saorsa-transport transport overhead analyzed (ML-KEM-768 characteristics)
 - ✅ Task 6: Create size overhead visualization (charts/graphs)
 - ✅ Task 7: Benchmark serialization performance (JSON vs bincode comparison)
 - ✅ Task 8: Consolidate findings into final baseline report

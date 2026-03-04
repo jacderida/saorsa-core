@@ -83,7 +83,7 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("5. Keepalive task (spawned in background)");
     info!("");
     info!("These components fix the issue from P2P_MESSAGING_STATUS_2025-10-02_FINAL.md");
-    info!("where P2PNode's peers map didn't track when ant-quic connections closed.");
+    info!("where P2PNode's peers map didn't track when saorsa-transport connections closed.");
 }
 
 /// Test that demonstrates the keepalive task is spawned
@@ -114,11 +114,11 @@ async fn test_keepalive_task_initialized() {
     _node.start().await.expect("Failed to start node");
 
     // The keepalive task is spawned in P2PNode::new() and runs in the background
-    // It sends keepalive messages every 15 seconds to prevent the 30-second ant-quic timeout
+    // It sends keepalive messages every 15 seconds to prevent the 30-second saorsa-transport timeout
 
     info!("✓ P2PNode initialized successfully");
     info!("✓ Keepalive task spawned (runs every 15 seconds)");
-    info!("✓ This prevents ant-quic's 30-second max_idle_timeout");
+    info!("✓ This prevents saorsa-transport's 30-second max_idle_timeout");
 
     info!("=== Keepalive task initialization test passed! ===");
 }

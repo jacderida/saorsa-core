@@ -379,7 +379,7 @@ impl SiblingBroadcastValidator {
         broadcast: &AuthenticatedSiblingBroadcast,
         public_key_bytes: &[u8],
     ) -> bool {
-        use crate::quantum_crypto::ant_quic_integration::{
+        use crate::quantum_crypto::saorsa_transport_integration::{
             MlDsaPublicKey, MlDsaSignature, ml_dsa_verify,
         };
 
@@ -565,9 +565,9 @@ impl SiblingBroadcastBuilder {
     /// - Signing fails
     pub fn build_and_sign(
         self,
-        secret_key: &crate::quantum_crypto::ant_quic_integration::MlDsaSecretKey,
+        secret_key: &crate::quantum_crypto::saorsa_transport_integration::MlDsaSecretKey,
     ) -> Result<AuthenticatedSiblingBroadcast, &'static str> {
-        use crate::quantum_crypto::ant_quic_integration::ml_dsa_sign;
+        use crate::quantum_crypto::saorsa_transport_integration::ml_dsa_sign;
 
         // Build the unsigned broadcast
         let mut broadcast = self.build()?;
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_build_and_sign_creates_valid_signature() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let broadcaster = random_peer_id();
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_wrong_key() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         // Generate two different keypairs
         let (_public_key1, secret_key1) = generate_ml_dsa_keypair().unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_tampered_data() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let broadcaster = random_peer_id();
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_empty_signature() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, _secret_key) = generate_ml_dsa_keypair().unwrap();
 
@@ -1063,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_invalid_public_key() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (_public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
 
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_validate_broadcast_with_signature_success() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let position = random_key();
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_validate_broadcast_with_signature_rejects_invalid() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (_public_key1, secret_key1) = generate_ml_dsa_keypair().unwrap();
         let (public_key2, _secret_key2) = generate_ml_dsa_keypair().unwrap();

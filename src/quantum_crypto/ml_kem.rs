@@ -19,20 +19,21 @@ use super::{QuantumCryptoError, Result};
 use crate::quantum_crypto::types::*;
 // use ml_kem::{MlKem768, EncapsulatePair, DecapsulatePair}; // Temporarily disabled
 
-/// Generate ML-KEM keypair using ant-quic's implementation
+/// Generate ML-KEM keypair using saorsa-transport's implementation
 pub fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    use crate::quantum_crypto::ant_quic_integration;
+    use crate::quantum_crypto::saorsa_transport_integration;
 
-    ant_quic_integration::generate_ml_kem_keypair()
+    saorsa_transport_integration::generate_ml_kem_keypair()
         .map_err(|e| QuantumCryptoError::KeyGenerationError(e.to_string()))
 }
 
 /// Encapsulate a shared secret using ML-KEM public key
 pub fn encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, SharedSecret)> {
-    use crate::quantum_crypto::ant_quic_integration;
+    use crate::quantum_crypto::saorsa_transport_integration;
 
-    let (ciphertext, shared_secret_bytes) = ant_quic_integration::ml_kem_encapsulate(public_key)
-        .map_err(|e| QuantumCryptoError::MlKemError(e.to_string()))?;
+    let (ciphertext, shared_secret_bytes) =
+        saorsa_transport_integration::ml_kem_encapsulate(public_key)
+            .map_err(|e| QuantumCryptoError::MlKemError(e.to_string()))?;
 
     // Convert raw bytes to our SharedSecret type
     let shared_secret =
@@ -45,10 +46,11 @@ pub fn encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, SharedSecret)> {
 
 /// Decapsulate shared secret using ML-KEM private key
 pub fn decapsulate(private_key: &[u8], ciphertext: &[u8]) -> Result<SharedSecret> {
-    use crate::quantum_crypto::ant_quic_integration;
+    use crate::quantum_crypto::saorsa_transport_integration;
 
-    let shared_secret_bytes = ant_quic_integration::ml_kem_decapsulate(private_key, ciphertext)
-        .map_err(|e| QuantumCryptoError::MlKemError(e.to_string()))?;
+    let shared_secret_bytes =
+        saorsa_transport_integration::ml_kem_decapsulate(private_key, ciphertext)
+            .map_err(|e| QuantumCryptoError::MlKemError(e.to_string()))?;
 
     // Convert raw bytes to our SharedSecret type
     let shared_secret =

@@ -188,7 +188,7 @@ pub struct NetworkMessage {
 pub struct NodeDescriptor {
     pub id: PeerId,
     // PQC-only: ML-DSA public key
-    pub public_key: crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey,
+    pub public_key: crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
     pub addresses: Vec<String>,
     pub hyperbolic: Option<HyperbolicCoordinate>,
     pub som_position: Option<[f64; 4]>,

@@ -70,7 +70,7 @@ fn create_sibling_entry() -> SignedSiblingEntry {
 
 #[tokio::test]
 async fn test_invalid_signature_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, _secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -93,7 +93,7 @@ async fn test_invalid_signature_rejection() {
 
 #[tokio::test]
 async fn test_valid_signature_acceptance() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -113,7 +113,7 @@ async fn test_valid_signature_acceptance() {
 
 #[tokio::test]
 async fn test_tampered_siblings_detection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -139,7 +139,7 @@ async fn test_tampered_siblings_detection() {
 
 #[tokio::test]
 async fn test_tampered_broadcaster_detection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -165,7 +165,7 @@ async fn test_tampered_broadcaster_detection() {
 
 #[tokio::test]
 async fn test_tampered_sequence_number_detection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -195,7 +195,7 @@ async fn test_tampered_sequence_number_detection() {
 
 #[tokio::test]
 async fn test_replay_attack_prevention_via_sequence() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (_pk, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
     let broadcaster = random_peer_id();
@@ -242,7 +242,7 @@ async fn test_sequence_validation_rejects_replay() {
 
 #[tokio::test]
 async fn test_different_broadcasters_produce_different_signatures() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     // Two different keypairs for different broadcasters
     let (_pk1, secret_key1) = generate_ml_dsa_keypair().expect("Should generate keypair 1");
@@ -373,7 +373,7 @@ fn test_sybil_node_id_proximity_detection() {
 
 #[tokio::test]
 async fn test_wrong_public_key_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     // Generate two different keypairs
     let (_pk1, secret_key1) = generate_ml_dsa_keypair().expect("Should generate keypair 1");
@@ -398,7 +398,7 @@ async fn test_wrong_public_key_rejection() {
 
 #[tokio::test]
 async fn test_truncated_public_key_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -419,7 +419,7 @@ async fn test_truncated_public_key_rejection() {
 
 #[tokio::test]
 async fn test_empty_public_key_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (_pk, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -442,7 +442,7 @@ async fn test_empty_public_key_rejection() {
 
 #[tokio::test]
 async fn test_truncated_signature_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -463,7 +463,7 @@ async fn test_truncated_signature_rejection() {
 
 #[tokio::test]
 async fn test_empty_signature_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, _sk) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -484,7 +484,7 @@ async fn test_empty_signature_rejection() {
 
 #[tokio::test]
 async fn test_bit_flipped_signature_rejection() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().expect("Should generate keypair");
 
@@ -626,7 +626,7 @@ fn test_missing_membership_proof_rejection() {
 
 #[test]
 fn test_validate_broadcast_with_signature_integration() {
-    use saorsa_core::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use saorsa_core::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
     let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
     let position = random_key();

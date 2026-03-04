@@ -13,12 +13,12 @@
 
 //! Transport Layer
 //!
-//! This module provides native ant-quic integration for the P2P Foundation.
+//! This module provides native saorsa-transport integration for the P2P Foundation.
 //!
-//! Use `ant_quic_adapter::P2PNetworkNode` directly for all networking needs.
+//! Use `saorsa_transport_adapter::P2PNetworkNode` directly for all networking needs.
 
-// Native ant-quic integration with advanced NAT traversal and PQC support
-pub mod ant_quic_adapter;
+// Native saorsa-transport integration with advanced NAT traversal and PQC support
+pub mod saorsa_transport_adapter;
 
 // DHT protocol handler for SharedTransport integration
 pub mod dht_handler;

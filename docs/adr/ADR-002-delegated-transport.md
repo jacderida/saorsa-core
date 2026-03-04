@@ -1,4 +1,4 @@
-# ADR-002: Delegated Transport via ant-quic
+# ADR-002: Delegated Transport via saorsa-transport
 
 ## Status
 
@@ -20,7 +20,7 @@ Building these from scratch would require:
 - Extensive testing across diverse network conditions
 - Security audits for cryptographic implementations
 
-The MaidSafe ecosystem has developed `ant-quic`, a battle-tested QUIC implementation with:
+The MaidSafe ecosystem has developed `saorsa-transport`, a battle-tested QUIC implementation with:
 - Native NAT traversal (path validation, hole punching)
 - Post-quantum cryptography integration
 - Bootstrap cache management
@@ -28,7 +28,7 @@ The MaidSafe ecosystem has developed `ant-quic`, a battle-tested QUIC implementa
 
 ## Decision
 
-We **delegate all transport-layer concerns to ant-quic**, treating it as our transport foundation. Saorsa-core focuses on higher-level P2P semantics while ant-quic handles:
+We **delegate all transport-layer concerns to saorsa-transport**, treating it as our transport foundation. Saorsa-core focuses on higher-level P2P semantics while saorsa-transport handles:
 
 ### Delegated Responsibilities
 
@@ -46,7 +46,7 @@ We **delegate all transport-layer concerns to ant-quic**, treating it as our tra
 │                              ▼                                    │
 │  ┌──────────────────────────────────────────────────────────────┐│
 │  │                 Thin Adapter Layer                            ││
-│  │  • AntQuicAdapter (src/transport/ant_quic_adapter.rs)         ││
+│  │  • AntQuicAdapter (src/transport/saorsa_transport_adapter.rs)         ││
 │  │  • BootstrapManager wrapper (src/bootstrap/manager.rs)        ││
 │  │  • Connection event translation                               ││
 │  └──────────────────────────────────────────────────────────────┘│
@@ -54,7 +54,7 @@ We **delegate all transport-layer concerns to ant-quic**, treating it as our tra
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                         ant-quic                                  │
+│                         saorsa-transport                                  │
 │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐  │
 │  │ QUIC Streams   │  │ NAT Traversal  │  │ Bootstrap Cache    │  │
 │  │ • Bidirectional│  │ • Path Valid.  │  │ • Peer discovery   │  │
@@ -71,10 +71,10 @@ We **delegate all transport-layer concerns to ant-quic**, treating it as our tra
 
 ### Integration Pattern
 
-The adapter layer translates between saorsa-core abstractions and ant-quic primitives:
+The adapter layer translates between saorsa-core abstractions and saorsa-transport primitives:
 
 ```rust
-// src/transport/ant_quic_adapter.rs
+// src/transport/saorsa_transport_adapter.rs
 pub struct AntQuicAdapter {
     endpoint: Endpoint,
     connections: ConnectionPool,
@@ -84,7 +84,7 @@ pub struct AntQuicAdapter {
 impl AntQuicAdapter {
     /// Connect to a peer, handling NAT traversal automatically
     pub async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
-        // ant-quic handles:
+        // saorsa-transport handles:
         // - Path validation for NAT traversal
         // - TLS handshake with PQC
         // - Connection pooling
@@ -103,12 +103,12 @@ impl AntQuicAdapter {
 
 ### Bootstrap Cache Delegation
 
-The `BootstrapManager` wraps ant-quic's cache while adding Sybil protection:
+The `BootstrapManager` wraps saorsa-transport's cache while adding Sybil protection:
 
 ```rust
 // src/bootstrap/manager.rs
 pub struct BootstrapManager {
-    cache: Arc<AntBootstrapCache>,      // Delegated to ant-quic
+    cache: Arc<AntBootstrapCache>,      // Delegated to saorsa-transport
     rate_limiter: JoinRateLimiter,       // Saorsa Sybil protection
     diversity_enforcer: IPDiversityEnforcer, // Saorsa Sybil protection
 }
@@ -120,7 +120,7 @@ impl BootstrapManager {
         self.rate_limiter.check_rate(addr.ip())?;
         self.diversity_enforcer.check_diversity(addr.ip())?;
 
-        // Delegate storage to ant-quic
+        // Delegate storage to saorsa-transport
         self.cache.add_contact(addr.into()).await
     }
 }
@@ -128,9 +128,9 @@ impl BootstrapManager {
 
 ### Version Compatibility
 
-We track ant-quic versions explicitly and test against specific releases:
+We track saorsa-transport versions explicitly and test against specific releases:
 
-| saorsa-core | ant-quic | Features |
+| saorsa-core | saorsa-transport | Features |
 |-------------|----------|----------|
 | 0.11.x      | 0.21.x   | Full PQC, placement system, threshold crypto |
 | 0.10.x      | 0.20.x   | Full PQC, unified config |
@@ -142,7 +142,7 @@ We track ant-quic versions explicitly and test against specific releases:
 ### Positive
 
 1. **Reduced maintenance**: Transport bugs fixed upstream benefit us automatically
-2. **Battle-tested code**: ant-quic is used in production MaidSafe networks
+2. **Battle-tested code**: saorsa-transport is used in production MaidSafe networks
 3. **NAT traversal**: Complex hole-punching logic provided out-of-box
 4. **PQC integration**: Post-quantum TLS without cryptographic expertise
 5. **Focus**: We concentrate on P2P semantics, not transport mechanics
@@ -150,15 +150,15 @@ We track ant-quic versions explicitly and test against specific releases:
 
 ### Negative
 
-1. **Version coupling**: ant-quic upgrades may require adapter changes
-2. **Feature constraints**: Limited to ant-quic's capabilities
-3. **Debugging complexity**: Transport issues require ant-quic knowledge
+1. **Version coupling**: saorsa-transport upgrades may require adapter changes
+2. **Feature constraints**: Limited to saorsa-transport's capabilities
+3. **Debugging complexity**: Transport issues require saorsa-transport knowledge
 4. **Build dependency**: Larger dependency tree
 
 ### Neutral
 
-1. **API stability**: ant-quic follows semver; breaking changes are versioned
-2. **Testing**: Integration tests must use real ant-quic (no mocks for transport)
+1. **API stability**: saorsa-transport follows semver; breaking changes are versioned
+2. **Testing**: Integration tests must use real saorsa-transport (no mocks for transport)
 
 ## Alternatives Considered
 
@@ -204,9 +204,9 @@ Use WebRTC for browser compatibility.
 
 ## Migration Notes
 
-When upgrading ant-quic versions:
+When upgrading saorsa-transport versions:
 
-1. Review ant-quic CHANGELOG for breaking changes
+1. Review saorsa-transport CHANGELOG for breaking changes
 2. Update adapter layer for API changes
 3. Test NAT traversal scenarios
 4. Verify bootstrap cache compatibility
@@ -214,8 +214,8 @@ When upgrading ant-quic versions:
 
 ## References
 
-- [ant-quic Repository](https://github.com/maidsafe/ant-quic)
-- [ant-quic ADRs](../../../ant-quic/docs/adr/)
+- [saorsa-transport Repository](https://github.com/maidsafe/saorsa-transport)
+- [saorsa-transport ADRs](../../../saorsa-transport/docs/adr/)
 - [QUIC RFC 9000](https://www.rfc-editor.org/rfc/rfc9000)
 - [Quinn QUIC Implementation](https://github.com/quinn-rs/quinn)
 - [ADR-008: Bootstrap Cache Delegation](./ADR-008-bootstrap-delegation.md)

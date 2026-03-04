@@ -129,7 +129,7 @@ trust_engine
 The system combines distributed hash table (DHT) storage with machine learning for optimal routing:
 
 #### 1. Transport Layer (`src/transport/`)
-- **Primary**: `ant-quic` (0.8+) for QUIC transport with NAT traversal
+- **Primary**: `saorsa-transport` (0.8+) for QUIC transport with NAT traversal
 - **Security**: Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
 
 #### 2. Adaptive Network Layer (`src/adaptive/`)
@@ -163,7 +163,7 @@ Advanced storage orchestration with EigenTrust integration:
 - `saorsa-webrtc` (0.1.2): WebRTC with pluggable signaling
 - `saorsa-pqc` (0.3.12): Post-quantum cryptography
 - `four-word-networking` (2.6+): Human-readable addresses (IPv4+port encodes to 4 words)
-- `ant-quic` (0.10+): QUIC transport with NAT traversal and PQC
+- `saorsa-transport` (0.10+): QUIC transport with NAT traversal and PQC
 
 ### Feature Flags
 ```toml
@@ -185,7 +185,7 @@ cargo test --test api_implementation_tests       # Clean API implementation
 cargo test --test storage_tests                  # Storage strategies & replication
 
 # Core functionality  
-cargo test --test ant_quic_integration_test      # QUIC transport
+cargo test --test saorsa_transport_integration_test      # QUIC transport
 cargo test --test dht_core_operations_test        # DHT operations
 cargo test --test adaptive_components_test        # Adaptive networking
 
@@ -273,7 +273,7 @@ saorsa-core is a library used by multiple applications. Each application uses a 
 
 | Service | UDP Port Range | Default | Description |
 |---------|----------------|---------|-------------|
-| ant-quic | 9000-9999 | 9000 | QUIC transport layer |
+| saorsa-transport | 9000-9999 | 9000 | QUIC transport layer |
 | **saorsa-node** | **10000-10999** | **10000** | Core P2P network nodes (primary user of saorsa-core) |
 | communitas | 11000-11999 | 11000 | Collaboration platform nodes |
 
@@ -293,7 +293,7 @@ cargo run --bin saorsa-node -- --listen 0.0.0.0:10001  # Second instance OK
 ssh root@saorsa-2.saorsalabs.com "systemctl restart saorsa-node-bootstrap"
 
 # ❌ WRONG - Would disrupt other networks
-ssh root@saorsa-2.saorsalabs.com "pkill -f ':9'"    # NEVER - matches ant-quic ports
+ssh root@saorsa-2.saorsalabs.com "pkill -f ':9'"    # NEVER - matches saorsa-transport ports
 ssh root@saorsa-2.saorsalabs.com "pkill -f ':11'"   # NEVER - matches communitas ports
 ```
 

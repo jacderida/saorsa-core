@@ -592,7 +592,7 @@ impl IPv6DHTNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
     use crate::security::{IPAnalysis, IPv6NodeID};
     use std::net::Ipv6Addr;
     use std::str::FromStr;

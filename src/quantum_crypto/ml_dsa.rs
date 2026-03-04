@@ -18,31 +18,31 @@
 use super::{QuantumCryptoError, Result};
 use crate::quantum_crypto::types::*;
 // use ml_dsa::{MlDsa65, SigningKey, VerificationKey, Signature}; // Temporarily disabled
-// use rand::rngs::OsRng; // No longer needed with ant-quic integration
+// use rand::rngs::OsRng; // No longer needed with saorsa-transport integration
 
-/// Generate ML-DSA keypair using ant-quic's implementation
+/// Generate ML-DSA keypair using saorsa-transport's implementation
 pub fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    use crate::quantum_crypto::ant_quic_integration;
-    
-    ant_quic_integration::generate_ml_dsa_keypair()
+    use crate::quantum_crypto::saorsa_transport_integration;
+
+    saorsa_transport_integration::generate_ml_dsa_keypair()
         .map_err(|e| QuantumCryptoError::KeyGenerationError(e.to_string()))
 }
 
-/// Sign a message with ML-DSA private key using ant-quic's implementation
+/// Sign a message with ML-DSA private key using saorsa-transport's implementation
 pub fn sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
-    use crate::quantum_crypto::ant_quic_integration;
-    
-    ant_quic_integration::ml_dsa_sign(private_key, message)
+    use crate::quantum_crypto::saorsa_transport_integration;
+
+    saorsa_transport_integration::ml_dsa_sign(private_key, message)
         .map_err(|e| QuantumCryptoError::MlDsaError(e.to_string()))
 }
 
-/// Verify ML-DSA signature using ant-quic's implementation
+/// Verify ML-DSA signature using saorsa-transport's implementation
 pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
-    use crate::quantum_crypto::ant_quic_integration;
-    
-    let is_valid = ant_quic_integration::ml_dsa_verify(public_key, message, signature)
+    use crate::quantum_crypto::saorsa_transport_integration;
+
+    let is_valid = saorsa_transport_integration::ml_dsa_verify(public_key, message, signature)
         .map_err(|e| QuantumCryptoError::MlDsaError(e.to_string()))?;
-    
+
     if is_valid {
         Ok(())
     } else {

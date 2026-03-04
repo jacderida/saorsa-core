@@ -94,18 +94,18 @@
 
 ---
 
-## Task 5: Measure ant-quic Transport Overhead
+## Task 5: Measure saorsa-transport Transport Overhead
 
-**Files**: `benches/encoding_baseline.rs`, `src/transport/ant_quic_adapter.rs:1-80`
+**Files**: `benches/encoding_baseline.rs`, `src/transport/saorsa_transport_adapter.rs:1-80`
 
-**Goal**: Measure ant-quic's PQC encryption overhead (ML-KEM-768)
+**Goal**: Measure saorsa-transport's PQC encryption overhead (ML-KEM-768)
 
 **Test Setup**:
-- Send protocol-wrapped JSON through ant-quic
+- Send protocol-wrapped JSON through saorsa-transport
 - Measure final wire format size
 
 **Measurements**:
-- ant-quic encryption overhead (~1KB PQC)
+- saorsa-transport encryption overhead (~1KB PQC)
 - Total wire size
 - Comparison: app ChaCha20 vs transport ML-KEM
 
@@ -131,7 +131,7 @@
 | + RichMessage JSON     | 12KB     | 80KB     | 300KB    |
 | + EncryptedMessage JSON| 15KB     | 96KB     | 350KB    |
 | + Protocol Wrapper JSON| 18KB     | 110KB    | 380KB    |
-| + ant-quic PQC         | 19KB     | 111KB    | 381KB    |
+| + saorsa-transport PQC         | 19KB     | 111KB    | 381KB    |
 
 **Verification**: Criterion HTML report with charts
 

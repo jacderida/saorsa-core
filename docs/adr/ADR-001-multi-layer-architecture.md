@@ -57,7 +57,7 @@ We adopt a **multi-layer architecture** with clearly defined boundaries and inte
 ├─────────────────────────────────┼───────────────────────────────┤
 │                     Transport Layer                              │
 │  ┌─────────────────────────────┴─────────────────────────────┐  │
-│  │                    ant-quic (QUIC + PQC)                   │  │
+│  │                    saorsa-transport (QUIC + PQC)                   │  │
 │  │  ┌────────────┐  ┌────────────────┐  ┌─────────────────┐   │  │
 │  │  │ Connection │  │ NAT Traversal  │  │ Bootstrap Cache │   │  │
 │  │  └────────────┘  └────────────────┘  └─────────────────┘   │  │
@@ -72,7 +72,7 @@ We adopt a **multi-layer architecture** with clearly defined boundaries and inte
 
 ### Layer Responsibilities
 
-#### 1. Transport Layer (`src/transport/`, delegated to ant-quic)
+#### 1. Transport Layer (`src/transport/`, delegated to saorsa-transport)
 
 Handles all network I/O:
 - QUIC connection management with connection pooling

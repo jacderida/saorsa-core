@@ -30,7 +30,7 @@ use crate::network::{
 };
 use crate::production::{ProductionConfig, ResourceManager};
 use crate::security::GeoProvider;
-use crate::transport::ant_quic_adapter::{ConnectionEvent, DualStackNetworkNode};
+use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
 use std::collections::{HashMap, HashSet};
@@ -92,7 +92,7 @@ pub struct TransportConfig {
     pub event_channel_capacity: usize,
     /// Optional override for the maximum application-layer message size.
     ///
-    /// When `None`, ant-quic's built-in default is used. Set this to tune
+    /// When `None`, saorsa-transport's built-in default is used. Set this to tune
     /// the QUIC stream receive window and the
     /// per-stream read buffer for larger or smaller payloads.
     pub max_message_size: Option<usize>,
@@ -151,7 +151,7 @@ impl TransportHandle {
     pub async fn new(config: TransportConfig) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
 
-        // Initialize dual-stack ant-quic nodes
+        // Initialize dual-stack saorsa-transport nodes
         let (v6_opt, v4_opt) = {
             let port = config.listen_addr.port();
             let ip = config.listen_addr.ip();
@@ -1194,7 +1194,7 @@ impl TransportHandle {
 impl TransportHandle {
     /// Start network listeners on the dual-stack transport.
     pub async fn start_network_listeners(&self) -> Result<()> {
-        info!("Starting dual-stack listeners (ant-quic)...");
+        info!("Starting dual-stack listeners (saorsa-transport)...");
         let addrs = self.dual_node.local_addrs().await.map_err(|e| {
             P2PError::Transport(crate::error::TransportError::SetupFailed(
                 format!("Failed to get local addresses: {}", e).into(),
@@ -1478,11 +1478,13 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
-    /// Connection lifecycle monitor — processes ant-quic connection events.
+    /// Connection lifecycle monitor — processes saorsa-transport connection events.
     #[allow(clippy::too_many_arguments)]
     async fn connection_lifecycle_monitor_with_rx(
         dual_node: Arc<DualStackNetworkNode>,
-        mut event_rx: broadcast::Receiver<crate::transport::ant_quic_adapter::ConnectionEvent>,
+        mut event_rx: broadcast::Receiver<
+            crate::transport::saorsa_transport_adapter::ConnectionEvent,
+        >,
         active_connections: Arc<RwLock<HashSet<String>>>,
         peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         event_tx: broadcast::Sender<P2PEvent>,

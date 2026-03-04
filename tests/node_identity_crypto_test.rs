@@ -16,7 +16,7 @@ use saorsa_core::identity::{
     four_words::FourWordAddress,
     node_identity::{NodeIdentity, PeerId, peer_id_from_public_key},
 };
-use saorsa_core::quantum_crypto::ant_quic_integration::ml_dsa_verify;
+use saorsa_core::quantum_crypto::saorsa_transport_integration::ml_dsa_verify;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 

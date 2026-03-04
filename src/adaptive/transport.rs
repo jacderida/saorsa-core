@@ -252,7 +252,7 @@ impl AsyncWrite for TcpTransportConnection {
 }
 
 /// QUIC transport placeholder
-/// NOTE: The project uses `ant-quic` for QUIC. This placeholder remains only
+/// NOTE: The project uses `saorsa-transport` for QUIC. This placeholder remains only
 /// for interface completeness in the adaptive layer and should not import or
 /// reference `quinn` anywhere.
 pub struct QuicTransport {

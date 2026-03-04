@@ -13,12 +13,12 @@
 
 //! Cryptographic identity system for the adaptive P2P network
 //!
-//! Implements PQC identity using ML-DSA-65 via ant-quic integration.
+//! Implements PQC identity using ML-DSA-65 via saorsa-transport integration.
 
-use crate::PeerId;
 use super::*;
+use crate::PeerId;
 use crate::identity::node_identity as pqc_identity;
-use crate::quantum_crypto::ant_quic_integration::MlDsaSignature;
+use crate::quantum_crypto::saorsa_transport_integration::MlDsaSignature;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 

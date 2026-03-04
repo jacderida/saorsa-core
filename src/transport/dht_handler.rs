@@ -9,7 +9,7 @@
 
 //! DHT Protocol Handler for SharedTransport
 //!
-//! This module implements the `ProtocolHandler` trait from ant-quic
+//! This module implements the `ProtocolHandler` trait from saorsa-transport
 //! for routing DHT-related streams to the appropriate handlers.
 //!
 //! ## Stream Types Handled
@@ -21,9 +21,9 @@
 //! | DhtWitness | 0x12 | (removed) |
 //! | DhtReplication | 0x13 | Background replication traffic |
 
-use ant_quic::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
 use async_trait::async_trait;
 use bytes::Bytes;
+use saorsa_transport::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -361,7 +361,7 @@ pub enum DhtStreamType {
 }
 
 impl DhtStreamType {
-    /// Convert to the ant-quic StreamType.
+    /// Convert to the saorsa-transport StreamType.
     pub fn to_stream_type(self) -> StreamType {
         match self {
             Self::Query => StreamType::DhtQuery,

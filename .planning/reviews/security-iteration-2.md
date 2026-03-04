@@ -36,7 +36,7 @@ The fixes transform the baseline analysis from a potentially dangerous oversimpl
   - When application-layer encryption is REQUIRED (6 conditions)
 - ✅ **Saorsa network context explicitly addressed** with 5 key questions
 - ✅ **Decision gate added**: "REQUIRED BEFORE PHASE 4: Explicitly document which threat model Saorsa operates under"
-- ✅ **Conditional safety statement**: "Conditional removal SAFE: ant-quic provides transport-level encryption, adequate for direct P2P sessions, but NOT sufficient for storage, relay, or offline scenarios"
+- ✅ **Conditional safety statement**: "Conditional removal SAFE: saorsa-transport provides transport-level encryption, adequate for direct P2P sessions, but NOT sufficient for storage, relay, or offline scenarios"
 
 **Quality of Fix**: EXCELLENT
 - Threat model is comprehensive and actionable
@@ -74,7 +74,7 @@ Beyond the critical security issue, two additional security considerations were 
 - ✅ Maximum message size limits documented (10MB example)
 - ✅ Rejection before deserialization (prevents memory exhaustion)
 - ✅ Specific bincode API: `bincode::config::standard().with_limit::<10_485_760>()`
-- ✅ Frame size enforcement in ant-quic handlers
+- ✅ Frame size enforcement in saorsa-transport handlers
 
 **Impact**: Protects against malicious oversized message attacks at deserialization boundary.
 
@@ -159,7 +159,7 @@ All critical security risks from Iteration 1 have been eliminated through compre
 ### For Phase 5 (Binary Encoding Migration)
 1. ✅ **Implement size limits** - use documented 10MB example as starting point
 2. ✅ **Implement versioning** - include protocol version in 64-byte header
-3. ✅ **Enforce frame limits** - validate in ant-quic stream handlers
+3. ✅ **Enforce frame limits** - validate in saorsa-transport stream handlers
 
 ---
 

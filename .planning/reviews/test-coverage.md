@@ -55,7 +55,7 @@ Saorsa-core has comprehensive test coverage across unit and integration tests. T
 4. **Transport Layer** (`src/transport/`)
    - QUIC adapter with post-quantum cryptography
    - Network configuration (dual-stack, port binding, timeouts)
-   - NAT traversal via ant-quic integration
+   - NAT traversal via saorsa-transport integration
    - DHT handler for stream type mapping
    - Connection quality metrics
 

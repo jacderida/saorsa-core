@@ -31,7 +31,9 @@
 
 use crate::error::SecurityError;
 pub use crate::identity::node_identity::{PeerId, peer_id_from_public_key};
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
+use crate::quantum_crypto::saorsa_transport_integration::{
+    MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
+};
 use crate::{NetworkAddress, P2PError, Result};
 use blake3::Hash;
 use serde::{Deserialize, Serialize};

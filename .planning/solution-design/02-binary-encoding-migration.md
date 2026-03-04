@@ -28,7 +28,7 @@ Message Creation → Encryption → Transport
    ↓
 5. serde_json::to_vec(encrypted_message) → JSON bytes  [SERIALIZATION #2]
    ↓
-6. ant-quic transport wrapping → JSON bytes  [SERIALIZATION #3]
+6. saorsa-transport transport wrapping → JSON bytes  [SERIALIZATION #3]
 ```
 
 ### Overhead Analysis
@@ -74,7 +74,7 @@ Message Creation → Encryption → Transport
 - **Size**: ~84-92 bytes metadata + ciphertext
 
 **Point #3: Transport Layer Wrapping**
-- **File**: `src/messaging/transport.rs` (ant-quic integration)
+- **File**: `src/messaging/transport.rs` (saorsa-transport integration)
 - **Purpose**: QUIC packet framing
 - **Size**: Minimal (protocol overhead)
 

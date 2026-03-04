@@ -17,7 +17,7 @@
 use anyhow::Result;
 use saorsa_core::PeerId;
 use saorsa_core::adaptive::*;
-use saorsa_core::quantum_crypto::ant_quic_integration::MlDsaPublicKey;
+use saorsa_core::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey;
 use std::time::Duration;
 
 #[tokio::main]

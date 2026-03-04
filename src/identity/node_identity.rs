@@ -28,8 +28,10 @@ use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// Import PQC types from ant_quic via quantum_crypto module
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
+// Import PQC types from saorsa_transport via quantum_crypto module
+use crate::quantum_crypto::saorsa_transport_integration::{
+    MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
+};
 
 // Re-export canonical PeerId from the peer_id module.
 pub use super::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
@@ -114,7 +116,7 @@ impl fmt::Debug for NodeIdentity {
 impl NodeIdentity {
     /// Generate new identity
     pub fn generate() -> Result<Self> {
-        // Generate ML-DSA-65 key pair (ant-quic integration)
+        // Generate ML-DSA-65 key pair (saorsa-transport integration)
         let (public_key, secret_key) =
             crate::quantum_crypto::generate_ml_dsa_keypair().map_err(|e| {
                 P2PError::Identity(IdentityError::InvalidFormat(
@@ -124,7 +126,7 @@ impl NodeIdentity {
 
         let peer_id = peer_id_from_public_key(&public_key);
 
-        crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
+        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
             &secret_key,
             &public_key,
         );
@@ -155,23 +157,27 @@ impl NodeIdentity {
 
         // Construct keys from bytes; these constructors accept byte slices in our integration
         let public_key =
-            crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey::from_bytes(pub_bytes)
-                .map_err(|e| {
-                    P2PError::Identity(IdentityError::InvalidFormat(
-                        format!("Invalid ML-DSA public key bytes: {e}").into(),
-                    ))
-                })?;
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey::from_bytes(
+                pub_bytes,
+            )
+            .map_err(|e| {
+                P2PError::Identity(IdentityError::InvalidFormat(
+                    format!("Invalid ML-DSA public key bytes: {e}").into(),
+                ))
+            })?;
         let secret_key =
-            crate::quantum_crypto::ant_quic_integration::MlDsaSecretKey::from_bytes(sec_bytes)
-                .map_err(|e| {
-                    P2PError::Identity(IdentityError::InvalidFormat(
-                        format!("Invalid ML-DSA secret key bytes: {e}").into(),
-                    ))
-                })?;
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaSecretKey::from_bytes(
+                sec_bytes,
+            )
+            .map_err(|e| {
+                P2PError::Identity(IdentityError::InvalidFormat(
+                    format!("Invalid ML-DSA secret key bytes: {e}").into(),
+                ))
+            })?;
 
         let peer_id = peer_id_from_public_key(&public_key);
 
-        crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
+        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
             &secret_key,
             &public_key,
         );
@@ -229,7 +235,7 @@ impl NodeIdentity {
 
 impl NodeIdentity {
     /// Create an identity from an existing secret key
-    /// Note: Currently not supported as ant-quic doesn't provide public key derivation from secret key
+    /// Note: Currently not supported as saorsa-transport doesn't provide public key derivation from secret key
     /// This would require storing both keys together
     pub fn from_secret_key(_secret_key: MlDsaSecretKey) -> Result<Self> {
         Err(P2PError::Identity(IdentityError::InvalidFormat(
@@ -304,26 +310,28 @@ impl NodeIdentity {
     /// Import identity from persisted data
     pub fn import(data: &IdentityData) -> Result<Self> {
         // Reconstruct keys from bytes
-        let secret_key = crate::quantum_crypto::ant_quic_integration::MlDsaSecretKey::from_bytes(
-            &data.secret_key,
-        )
-        .map_err(|e| {
-            P2PError::Identity(IdentityError::InvalidFormat(
-                format!("Invalid ML-DSA secret key: {e}").into(),
-            ))
-        })?;
-        let public_key = crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey::from_bytes(
-            &data.public_key,
-        )
-        .map_err(|e| {
-            P2PError::Identity(IdentityError::InvalidFormat(
-                format!("Invalid ML-DSA public key: {e}").into(),
-            ))
-        })?;
+        let secret_key =
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaSecretKey::from_bytes(
+                &data.secret_key,
+            )
+            .map_err(|e| {
+                P2PError::Identity(IdentityError::InvalidFormat(
+                    format!("Invalid ML-DSA secret key: {e}").into(),
+                ))
+            })?;
+        let public_key =
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey::from_bytes(
+                &data.public_key,
+            )
+            .map_err(|e| {
+                P2PError::Identity(IdentityError::InvalidFormat(
+                    format!("Invalid ML-DSA public key: {e}").into(),
+                ))
+            })?;
 
         let peer_id = peer_id_from_public_key(&public_key);
 
-        crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
+        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
             &secret_key,
             &public_key,
         );

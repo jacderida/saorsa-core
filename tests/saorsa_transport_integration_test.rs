@@ -1,10 +1,10 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// Integration tests for native ant-quic integration
+// Integration tests for native saorsa-transport integration
 
-// Integration tests for native ant-quic integration
+// Integration tests for native saorsa-transport integration
 
-use saorsa_core::transport::ant_quic_adapter::P2PNetworkNode;
+use saorsa_core::transport::saorsa_transport_adapter::P2PNetworkNode;
 use std::net::SocketAddr;
 use tokio::time::{Duration, timeout};
 
@@ -27,12 +27,9 @@ async fn test_p2p_network_node_creation() {
             assert!(local_addr.port() > 0, "Should have assigned a port");
         }
 
-        // Verify we have a peer ID
-        let peer_id = node.our_peer_id();
-        assert!(
-            !format!("{:?}", peer_id).is_empty(),
-            "Should have a peer ID"
-        );
+        // Verify we have a public key (identity)
+        let public_key = node.our_public_key();
+        assert!(!public_key.is_empty(), "Should have a public key");
     }
 }
 
@@ -58,7 +55,7 @@ async fn test_peer_to_peer_connection() {
     let connect_result = timeout(Duration::from_secs(5), node2.connect_to_peer(addr1)).await;
 
     if let Ok(inner_result) = connect_result {
-        // Connection might succeed if ant-quic is fully functional
+        // Connection might succeed if saorsa-transport is fully functional
         let peer_id = inner_result.unwrap();
         assert!(
             !format!("{:?}", peer_id).is_empty(),
@@ -69,7 +66,7 @@ async fn test_peer_to_peer_connection() {
         let peers = node2.get_connected_peers().await;
         assert!(!peers.is_empty(), "Should have at least one connected peer");
     } else {
-        // Connection might timeout if ant-quic needs more setup
+        // Connection might timeout if saorsa-transport needs more setup
         // This is expected in a basic test environment
         println!(
             "Connection timed out (expected in test environment without full NAT traversal setup)"
@@ -79,7 +76,7 @@ async fn test_peer_to_peer_connection() {
 
 #[tokio::test]
 async fn test_p2p_data_transfer() {
-    // This test would require a full ant-quic setup with proper NAT traversal
+    // This test would require a full saorsa-transport setup with proper NAT traversal
     // For now, we just verify the node compiles and basic operations work
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -103,17 +100,19 @@ async fn test_p2p_peer_authentication() {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let node = P2PNetworkNode::new(bind_addr).await.unwrap();
 
-    // Get our own peer ID
-    let peer_id = node.our_peer_id();
+    // Get our own public key
+    let public_key = node.our_public_key();
+    assert!(!public_key.is_empty(), "Should have a public key");
 
-    // Check if we're authenticated (should be false for a non-existent connection)
-    let is_auth = node.is_authenticated(&peer_id).await;
-    // The result depends on ant-quic's internal implementation
+    // Check if we're authenticated for our own local address
+    let local_addr = node.local_address();
+    let is_auth = node.is_authenticated(&local_addr).await;
+    // The result depends on saorsa-transport's internal implementation
     println!("Self authentication status: {}", is_auth);
 }
 
 #[test]
-fn test_ant_quic_feature_enabled() {
-    // ant-quic is now always enabled (no feature flags)
+fn test_saorsa_transport_feature_enabled() {
+    // saorsa-transport is now always enabled (no feature flags)
     // Test passes by default
 }

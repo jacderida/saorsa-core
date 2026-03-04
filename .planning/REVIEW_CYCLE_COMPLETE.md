@@ -106,7 +106,7 @@ Per CLAUDE.md: **"DO NOT STOP during review"**
 **Implications for Phase 2**:
 - ✅ Question 1 of 5 answered: DHT storage = YES (encrypted)
 - ✅ Application-layer encryption REQUIRED (cannot remove)
-- ✅ Cannot rely on transport-only encryption (ant-quic)
+- ✅ Cannot rely on transport-only encryption (saorsa-transport)
 - ✅ Must maintain ChaCha20Poly1305 before DHT storage
 
 **Remaining Tasks**:

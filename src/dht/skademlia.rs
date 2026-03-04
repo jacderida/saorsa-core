@@ -19,7 +19,9 @@
 
 use crate::dht::{DHTNode, DhtKey, Key, PeerId};
 use crate::error::{P2PError, P2pResult as Result};
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature, ml_dsa_verify};
+use crate::quantum_crypto::saorsa_transport_integration::{
+    MlDsaPublicKey, MlDsaSignature, ml_dsa_verify,
+};
 use crate::security::ReputationManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};

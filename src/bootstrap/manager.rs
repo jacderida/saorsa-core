@@ -13,21 +13,21 @@
 
 //! Simplified Bootstrap Manager
 //!
-//! Thin wrapper around ant-quic's BootstrapCache that adds:
+//! Thin wrapper around saorsa-transport's BootstrapCache that adds:
 //! - IP diversity enforcement (Sybil protection)
 //! - Rate limiting (temporal Sybil protection)
 //! - Four-word address encoding
 //!
-//! All core caching functionality is delegated to ant-quic.
+//! All core caching functionality is delegated to saorsa-transport.
 
 use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
 use crate::{P2PError, PeerId, Result};
-use ant_quic::bootstrap_cache::{
+use parking_lot::Mutex;
+use saorsa_transport::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -107,10 +107,10 @@ impl Default for BootstrapConfig {
     }
 }
 
-/// Simplified bootstrap manager wrapping ant-quic's cache
+/// Simplified bootstrap manager wrapping saorsa-transport's cache
 ///
 /// Provides Sybil protection via rate limiting and IP diversity enforcement
-/// while delegating core caching to ant-quic's proven implementation.
+/// while delegating core caching to saorsa-transport's proven implementation.
 pub struct BootstrapManager {
     cache: Arc<AntBootstrapCache>,
     rate_limiter: JoinRateLimiter,
@@ -167,7 +167,7 @@ impl BootstrapManager {
         Self::with_config(config).await
     }
 
-    /// Start background maintenance tasks (delegated to ant-quic)
+    /// Start background maintenance tasks (delegated to saorsa-transport)
     pub fn start_maintenance(&mut self) -> Result<()> {
         if self.maintenance_handle.is_some() {
             return Ok(()); // Already started
@@ -358,11 +358,11 @@ impl BootstrapManager {
             high_quality_contacts: stats.relay_peers + stats.coordinator_peers,
             verified_contacts: stats.total_peers - stats.untested_peers,
             average_quality_score: stats.average_quality,
-            cache_hit_rate: 0.0, // ant-quic doesn't track this
+            cache_hit_rate: 0.0, // saorsa-transport doesn't track this
             last_cleanup: chrono::Utc::now(),
             last_merge: chrono::Utc::now(),
             // QUIC-specific fields
-            iroh_contacts: stats.total_peers, // All peers are QUIC-capable via ant-quic
+            iroh_contacts: stats.total_peers, // All peers are QUIC-capable via saorsa-transport
             nat_traversal_contacts: stats.coordinator_peers,
             avg_iroh_setup_time_ms: 0.0,
             preferred_iroh_connection_type: None,
@@ -378,8 +378,8 @@ impl BootstrapManager {
 
     /// Get bootstrap peers for initial connection (compatibility method)
     ///
-    /// Converts ant-quic CachedPeer results to ContactEntry format.
-    /// Uses a zeroed PeerId since ant-quic no longer tracks peer identity.
+    /// Converts saorsa-transport CachedPeer results to ContactEntry format.
+    /// Uses a zeroed PeerId since saorsa-transport no longer tracks peer identity.
     pub async fn get_bootstrap_peers(&self, count: usize) -> Result<Vec<super::ContactEntry>> {
         let peers = self.select_peers(count).await;
         let contacts: Vec<super::ContactEntry> = peers
@@ -396,7 +396,7 @@ impl BootstrapManager {
 
     /// Get QUIC-capable bootstrap peers (compatibility method)
     pub async fn get_quic_bootstrap_peers(&self, count: usize) -> Result<Vec<super::ContactEntry>> {
-        // For now, just return regular peers since ant-quic handles QUIC natively
+        // For now, just return regular peers since saorsa-transport handles QUIC natively
         self.get_bootstrap_peers(count).await
     }
 }
@@ -661,15 +661,17 @@ mod tests {
             let manager = BootstrapManager::with_config(config).await.unwrap();
             let count = manager.peer_count().await;
 
-            // ant-quic may use different persistence mechanics
+            // saorsa-transport may use different persistence mechanics
             // If persistence isn't working, this is informative
             if count == 0 {
-                // This might be expected if ant-quic doesn't persist immediately
+                // This might be expected if saorsa-transport doesn't persist immediately
                 // or uses a different persistence model
-                eprintln!("Note: ant-quic BootstrapCache may have different persistence behavior");
+                eprintln!(
+                    "Note: saorsa-transport BootstrapCache may have different persistence behavior"
+                );
             }
             // For now, we just verify the cache can be reopened without error
-            // The actual persistence behavior depends on ant-quic implementation
+            // The actual persistence behavior depends on saorsa-transport implementation
         }
     }
 

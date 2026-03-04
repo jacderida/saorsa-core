@@ -69,19 +69,19 @@ pub struct SessionId(pub [u8; 32]);
 /// Contains all cryptographic material needed for secure quantum-resistant
 /// communication including post-quantum signatures and key exchange.
 ///
-/// NOTE: This now uses ant-quic PQC types exclusively
+/// NOTE: This now uses saorsa-transport PQC types exclusively
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantumPeerIdentity {
     /// Unique identifier for the peer
     pub peer_id: PeerId,
 
     /// ML-DSA (FIPS 204) public key for post-quantum digital signatures
-    /// Use ant-quic::crypto::pqc::types::MlDsaPublicKey
-    pub ml_dsa_public_key: Vec<u8>, // Serialized ant-quic MlDsaPublicKey
+    /// Use saorsa-transport::crypto::pqc::types::MlDsaPublicKey
+    pub ml_dsa_public_key: Vec<u8>, // Serialized saorsa-transport MlDsaPublicKey
 
     /// ML-KEM (FIPS 203) public key for quantum-safe key exchange  
-    /// Use ant-quic::crypto::pqc::types::MlKemPublicKey
-    pub ml_kem_public_key: Vec<u8>, // Serialized ant-quic MlKemPublicKey
+    /// Use saorsa-transport::crypto::pqc::types::MlKemPublicKey
+    pub ml_kem_public_key: Vec<u8>, // Serialized saorsa-transport MlKemPublicKey
 
     /// Optional FROST public key for threshold operations
     pub frost_public_key: Option<FrostPublicKey>,
@@ -93,7 +93,7 @@ pub struct QuantumPeerIdentity {
     pub created_at: SystemTime,
 }
 
-// NOTE: ML-DSA and ML-KEM types removed - use ant-quic types exclusively
+// NOTE: ML-DSA and ML-KEM types removed - use saorsa-transport types exclusively
 // These were: MlDsaPublicKey, MlDsaPrivateKey, MlKemPublicKey, MlKemPrivateKey
 // Access these via: use saorsa_core::{MlDsaPublicKey, MlDsaSecretKey, MlKemPublicKey, MlKemSecretKey};
 
@@ -163,15 +163,15 @@ impl fmt::Debug for Ed25519PrivateKey {
     }
 }
 
-// NOTE: MlDsaSignature removed - use ant-quic::crypto::pqc::types::MlDsaSignature
+// NOTE: MlDsaSignature removed - use saorsa-transport::crypto::pqc::types::MlDsaSignature
 
 /// FROST signature
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrostSignature(pub Vec<u8>);
 
-// NOTE: MlKemCiphertext removed - use ant-quic::crypto::pqc::types::MlKemCiphertext
+// NOTE: MlKemCiphertext removed - use saorsa-transport::crypto::pqc::types::MlKemCiphertext
 
-// NOTE: SharedSecret removed - use ant-quic::crypto::pqc::types::SharedSecret
+// NOTE: SharedSecret removed - use saorsa-transport::crypto::pqc::types::SharedSecret
 
 /// Quantum-safe secure session
 #[derive(Debug)]
@@ -234,8 +234,8 @@ pub enum KeyPurpose {
     KeyWrapping,
 }
 
-// NOTE: PublicKeySet and PrivateKeySet removed to avoid conflicts with ant-quic
-// Use ant-quic PQC types directly: MlDsaPublicKey, MlDsaSecretKey, MlKemPublicKey, MlKemSecretKey
+// NOTE: PublicKeySet and PrivateKeySet removed to avoid conflicts with saorsa-transport
+// Use saorsa-transport PQC types directly: MlDsaPublicKey, MlDsaSecretKey, MlKemPublicKey, MlKemSecretKey
 // For classical keys, use Ed25519PublicKey, Ed25519PrivateKey from this module
 // For threshold keys, use FrostPublicKey, FrostKeyShare from this module
 
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_sensitive_debug() -> Result<(), Box<dyn std::error::Error>> {
-        // Test with Ed25519PrivateKey since ML-DSA types are now from ant-quic
+        // Test with Ed25519PrivateKey since ML-DSA types are now from saorsa-transport
         let private_key = Ed25519PrivateKey([0x42; 64]);
         let debug_str: String = format!("{:?}", private_key);
         assert!(!debug_str.contains("0x42"));

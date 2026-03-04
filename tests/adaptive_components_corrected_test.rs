@@ -13,7 +13,7 @@ use saorsa_core::adaptive::{
     security::{BlacklistReason, SecurityConfig, SecurityError, SecurityManager},
 };
 use saorsa_core::adaptive::{storage::ReplicationConfig, trust::MockTrustProvider};
-use saorsa_core::quantum_crypto::ant_quic_integration::MlDsaPublicKey;
+use saorsa_core::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey;
 use std::{
     collections::HashMap,
     sync::Arc,

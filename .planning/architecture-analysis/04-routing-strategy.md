@@ -2,45 +2,45 @@
 
 ## Overview
 
-**Answer to Critical Question 3**: **Direct P2P delivery with automatic relay via ant-quic when needed. Routing uses S/Kademlia (SKad).**
+**Answer to Critical Question 3**: **Direct P2P delivery with automatic relay via saorsa-transport when needed. Routing uses S/Kademlia (SKad).**
 
 **Architectural Notes**:
 - All nodes are headless in this repository
-- ant-quic provides automatic relay when direct connection fails
+- saorsa-transport provides automatic relay when direct connection fails
 - S/Kademlia routing for DHT operations
 
 ---
 
 ## Question 1: Are messages routed through intermediate nodes (multi-hop)?
 
-**Answer**: **NO (direct delivery preferred)** - Messages attempt direct P2P delivery first, with automatic ant-quic relay as fallback.
+**Answer**: **NO (direct delivery preferred)** - Messages attempt direct P2P delivery first, with automatic saorsa-transport relay as fallback.
 
 **Evidence**:
 - Direct delivery attempt: `src/messaging/transport.rs:78` (`try_direct_delivery()`)
-- ant-quic relay: Built into transport layer (automatic when direct fails)
+- saorsa-transport relay: Built into transport layer (automatic when direct fails)
 - No multi-hop application-layer routing
 
 **Behavior**:
 1. **First attempt**: Direct P2P connection to recipient
-2. **If direct fails**: ant-quic automatically handles relay/NAT traversal
+2. **If direct fails**: saorsa-transport automatically handles relay/NAT traversal
 3. **No multi-hop routing**: Application doesn't route through intermediate peers
 
 ---
 
 ## Question 2: Do headless devices act as message relays?
 
-**Answer**: **YES (all nodes are headless in this repo)** - ant-quic layer provides relay functionality.
+**Answer**: **YES (all nodes are headless in this repo)** - saorsa-transport layer provides relay functionality.
 
 **Clarification**:
 - All nodes in saorsa-core are headless nodes
-- Relay functionality provided by ant-quic transport layer
+- Relay functionality provided by saorsa-transport transport layer
 - Application layer (saorsa-core) uses direct delivery
-- Transport layer (ant-quic) handles relay when needed
+- Transport layer (saorsa-transport) handles relay when needed
 
 **Evidence**:
 - Device types: All nodes use headless configuration
-- Relay: ant-quic transport layer (not application layer)
-- NAT traversal: ant-quic handles automatically
+- Relay: saorsa-transport transport layer (not application layer)
+- NAT traversal: saorsa-transport handles automatically
 
 ---
 
@@ -50,7 +50,7 @@
 
 **Message Delivery**:
 - ✅ Direct P2P: `src/messaging/transport.rs:78` (try_direct_delivery)
-- ✅ ant-quic relay: Automatic fallback for NAT/firewall traversal
+- ✅ saorsa-transport relay: Automatic fallback for NAT/firewall traversal
 
 **Peer Discovery & DHT Operations**:
 - ✅ S/Kademlia (SKad): DHT routing protocol
@@ -66,7 +66,7 @@
 
 ## Question 4: What is the delivery path for a typical message?
 
-**Answer**: **Direct P2P with ant-quic relay fallback**
+**Answer**: **Direct P2P with saorsa-transport relay fallback**
 
 **Delivery Flow**:
 
@@ -90,8 +90,8 @@
    └─> Message delivered via QUIC
    └─> End
 
-5b. Direct Failure → ant-quic Relay
-   └─> ant-quic automatically selects relay nodes
+5b. Direct Failure → saorsa-transport Relay
+   └─> saorsa-transport automatically selects relay nodes
    └─> NAT traversal, firewall bypass
    └─> Message delivered via relay
    └─> End
@@ -138,10 +138,10 @@
 ### Impact on Encryption Strategy
 
 **Direct P2P delivery**:
-- ✅ Transport-layer encryption (ant-quic ML-KEM-768) protects in-transit
+- ✅ Transport-layer encryption (saorsa-transport ML-KEM-768) protects in-transit
 - ✅ Application-layer encryption (ChaCha20Poly1305) still REQUIRED for DHT storage
 
-**ant-quic relay**:
+**saorsa-transport relay**:
 - ✅ Relay nodes see encrypted QUIC traffic (cannot decrypt)
 - ✅ Application-layer encryption provides E2E protection through relay
 - ✅ No change to encryption requirements
@@ -162,7 +162,7 @@
 **Our approach (direct + relay)**:
 - ✅ Simpler: Direct when possible, relay when needed
 - ✅ Faster: No unnecessary hops
-- ✅ Transparent: ant-quic handles relay automatically
+- ✅ Transparent: saorsa-transport handles relay automatically
 - ✅ Secure: E2E encryption protects through relay
 
 ---
@@ -184,7 +184,7 @@
 
 **Routing Strategy in Saorsa**:
 - **Message delivery**: Direct P2P (no multi-hop at application layer)
-- **Relay**: Automatic via ant-quic when direct fails
+- **Relay**: Automatic via saorsa-transport when direct fails
 - **DHT operations**: Adaptive routing (S/Kademlia, Hyperbolic, Trust-weighted)
 - **Routing selection**: Multi-Armed Bandit with Thompson Sampling (ADR-007)
 - **Peer discovery**: Kademlia XOR distance + Hyperbolic greedy routing
@@ -199,11 +199,11 @@ Direct P2P delivery does NOT eliminate need for application-layer encryption. Me
 
 **Are messages routed through intermediate nodes (multi-hop)?**
 
-**Answer**: **NO (direct P2P)** - Application layer uses direct delivery. When direct connection fails, ant-quic transport layer provides automatic relay (not multi-hop routing).
+**Answer**: **NO (direct P2P)** - Application layer uses direct delivery. When direct connection fails, saorsa-transport transport layer provides automatic relay (not multi-hop routing).
 
 **Clarification**:
 - ✅ Direct P2P preferred
-- ✅ ant-quic relay as fallback (transparent to application)
+- ✅ saorsa-transport relay as fallback (transparent to application)
 - ❌ No multi-hop application-layer routing
 - ✅ S/Kademlia routing for DHT operations (peer discovery)
 

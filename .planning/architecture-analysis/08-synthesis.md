@@ -62,12 +62,12 @@
 
 **Evidence**:
 - Direct delivery: `src/messaging/transport.rs:78` (`try_direct_delivery()`)
-- ant-quic relay: Automatic when direct fails
+- saorsa-transport relay: Automatic when direct fails
 - DHT routing: S/Kademlia + Hyperbolic for peer discovery
 
 **Clarification**:
 - Application layer: Direct P2P only
-- Transport layer: ant-quic handles relay transparently
+- Transport layer: saorsa-transport handles relay transparently
 - DHT operations: S/Kademlia routing with K=8 replication
 
 **Implications**:
@@ -109,10 +109,10 @@
 **Evidence**:
 - Ephemeral keys: `src/messaging/encryption.rs:230-260` (ML-KEM-768)
 - Deterministic fallback: `src/messaging/encryption.rs:57-63` (BLAKE3)
-- ant-quic: ML-KEM-768 provides transport forward secrecy
+- saorsa-transport: ML-KEM-768 provides transport forward secrecy
 
 **Current state**:
-- ✅ Transport layer: Forward secrecy guaranteed (ant-quic)
+- ✅ Transport layer: Forward secrecy guaranteed (saorsa-transport)
 - ⚠️ Application layer: Conditional (ephemeral preferred, deterministic fallback)
 - ❌ Deterministic keys: NO forward secrecy (all channel history vulnerable)
 
@@ -137,7 +137,7 @@
 **Current flow**:
 1. RichMessage → ChaCha20Poly1305 encryption → EncryptedMessage
 2. EncryptedMessage → DHT storage (1-hour TTL)
-3. EncryptedMessage → ant-quic ML-KEM-768 → Direct delivery
+3. EncryptedMessage → saorsa-transport ML-KEM-768 → Direct delivery
 
 **Recommendation**: ✅ **KEEP BOTH ENCRYPTION LAYERS**
 
@@ -168,8 +168,8 @@
 
 **Current flow**:
 1. RichMessage → ChaCha20Poly1305 encryption → EncryptedMessage
-2. EncryptedMessage → ant-quic ML-KEM-768 → Relay node
-3. Relay node → ant-quic ML-KEM-768 → Recipient
+2. EncryptedMessage → saorsa-transport ML-KEM-768 → Relay node
+3. Relay node → saorsa-transport ML-KEM-768 → Recipient
 
 **Recommendation**: ✅ **KEEP BOTH ENCRYPTION LAYERS**
 
@@ -201,13 +201,13 @@
    - Cannot be removed without privacy compromise
 
 2. **Relay Delivery Requirement** (Q3 → NO multi-hop, but relay):
-   - ant-quic automatic relay for NAT traversal
+   - saorsa-transport automatic relay for NAT traversal
    - Relay nodes are untrusted
    - Application-layer encryption REQUIRED through relay
 
 3. **Transport Security Requirement**:
    - Network-level protection needed
-   - ant-quic ML-KEM-768 provides forward secrecy
+   - saorsa-transport ML-KEM-768 provides forward secrecy
    - Cannot be removed without in-transit exposure
 
 4. **No Redundancy** (Task 7 finding):
@@ -230,7 +230,7 @@
 
 | Threat | Current Protection | Status |
 |--------|-------------------|--------|
-| **Network Observers** | ant-quic ML-KEM-768 | ✅ PROTECTED |
+| **Network Observers** | saorsa-transport ML-KEM-768 | ✅ PROTECTED |
 | **DHT Nodes** | ChaCha20Poly1305 E2E | ✅ PROTECTED |
 | **Relay Nodes** | ChaCha20Poly1305 E2E | ✅ PROTECTED |
 | **Retroactive Decryption** | Ephemeral keys (when used) | ⚠️ GAPS (deterministic fallback) |
@@ -310,7 +310,7 @@ let key = match ephemeral_exchange {
 **Decision**: No changes to encryption architecture
 
 **Layers to maintain**:
-- ✅ Transport: ant-quic ML-KEM-768 (in-transit)
+- ✅ Transport: saorsa-transport ML-KEM-768 (in-transit)
 - ✅ Application: ChaCha20Poly1305 (E2E)
 
 **Rationale**: Both layers necessary for current architecture

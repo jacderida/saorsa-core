@@ -248,7 +248,7 @@ pub use threshold::{
     GroupMetadata, ParticipantInfo, ThresholdGroup, ThresholdGroupManager, ThresholdSignature,
 };
 
-// Post-quantum cryptography exports (using ant-quic types exclusively)
+// Post-quantum cryptography exports (using saorsa-transport types exclusively)
 pub use quantum_crypto::{
     CryptoCapabilities,
     KemAlgorithm,
@@ -270,7 +270,7 @@ pub use quantum_crypto::{
     // Algorithm implementations
     MlDsa65,
     MlDsaOperations,
-    // Use ant-quic types for better trait implementations
+    // Use saorsa-transport types for better trait implementations
     MlDsaPublicKey as AntMlDsaPublicKey,
     MlDsaSecretKey as AntMlDsaSecretKey,
     MlDsaSignature as AntMlDsaSignature,

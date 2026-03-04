@@ -24,7 +24,7 @@
 //! 6. Update Manager Lifecycle
 //! 7. Security Scenarios
 
-use saorsa_core::quantum_crypto::ant_quic_integration::{
+use saorsa_core::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
 };
 use saorsa_core::quantum_crypto::{generate_ml_dsa_keypair, ml_dsa_sign, ml_dsa_verify};
