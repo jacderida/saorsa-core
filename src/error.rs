@@ -187,8 +187,8 @@ pub enum P2PError {
     Trust(Cow<'static, str>),
 }
 
-impl From<saorsa_types::PeerIdParseError> for P2PError {
-    fn from(err: saorsa_types::PeerIdParseError) -> Self {
+impl From<crate::identity::peer_id::PeerIdParseError> for P2PError {
+    fn from(err: crate::identity::peer_id::PeerIdParseError) -> Self {
         P2PError::Identity(IdentityError::InvalidPeerId(Cow::Owned(err.to_string())))
     }
 }

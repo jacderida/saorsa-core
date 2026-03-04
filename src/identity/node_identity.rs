@@ -31,8 +31,8 @@ use std::fmt;
 // Import PQC types from ant_quic via quantum_crypto module
 use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 
-// Re-export canonical PeerId from saorsa-types.
-pub use saorsa_types::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
+// Re-export canonical PeerId from the peer_id module.
+pub use super::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 
 /// Create a [`PeerId`] from an ML-DSA public key.
 ///

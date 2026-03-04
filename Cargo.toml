@@ -78,8 +78,6 @@ once_cell = "1.21"
 # Networking
 ant-quic = { path = "../ant-quic" }
 
-# Shared types for the Saorsa P2P network ecosystem
-saorsa-types = { path = "../saorsa-types" }
 four-word-networking = { version = "2.6" }
 
 # Core-specific dependencies
