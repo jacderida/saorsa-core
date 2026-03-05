@@ -504,8 +504,15 @@ impl TransportHandle {
     /// identity exchange failed, so no [`PeerId`] is available for
     /// [`disconnect_peer`].
     pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
-        if let Ok(addr) = channel_id.parse::<SocketAddr>() {
-            self.dual_node.disconnect_peer_by_addr(&addr).await;
+        match channel_id.parse::<SocketAddr>() {
+            Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
+            Err(e) => {
+                warn!(
+                    channel = %channel_id,
+                    error = %e,
+                    "Failed to parse channel ID as SocketAddr — QUIC connection will not be closed",
+                );
+            }
         }
         self.active_connections.write().await.remove(channel_id);
         self.remove_channel_mappings(channel_id).await;
@@ -701,8 +708,16 @@ impl TransportHandle {
 
         // Close QUIC connections for channels with no remaining peers.
         for channel_id in &orphaned_channels {
-            if let Ok(addr) = channel_id.parse::<SocketAddr>() {
-                self.dual_node.disconnect_peer_by_addr(&addr).await;
+            match channel_id.parse::<SocketAddr>() {
+                Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
+                Err(e) => {
+                    warn!(
+                        peer = %peer_id,
+                        channel = %channel_id,
+                        error = %e,
+                        "Failed to parse channel ID as SocketAddr — QUIC connection will not be closed",
+                    );
+                }
             }
             self.active_connections.write().await.remove(channel_id);
             if let Some(mut peer_info) = self.peers.write().await.remove(channel_id) {
