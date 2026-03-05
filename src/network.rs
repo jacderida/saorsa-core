@@ -102,9 +102,6 @@ const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Local peer ID for this node
-    pub peer_id: Option<PeerId>,
-
     /// Addresses to listen on for incoming connections
     pub listen_addrs: Vec<std::net::SocketAddr>,
 
@@ -249,7 +246,6 @@ impl NodeConfig {
         let listen_addr = config.listen_socket_addr()?;
 
         Ok(Self {
-            peer_id: None,
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: config
@@ -287,7 +283,6 @@ impl NodeConfig {
 /// Builder for constructing NodeConfig with fluent API
 #[derive(Debug, Clone, Default)]
 pub struct NodeConfigBuilder {
-    peer_id: Option<PeerId>,
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
@@ -301,12 +296,6 @@ pub struct NodeConfigBuilder {
 }
 
 impl NodeConfigBuilder {
-    /// Set the peer ID
-    pub fn peer_id(mut self, peer_id: PeerId) -> Self {
-        self.peer_id = Some(peer_id);
-        self
-    }
-
     /// Set the listen port
     pub fn listen_port(mut self, port: u16) -> Self {
         self.listen_port = Some(port);
@@ -387,7 +376,6 @@ impl NodeConfigBuilder {
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
 
         Ok(NodeConfig {
-            peer_id: self.peer_id,
             listen_addrs: build_listen_addrs(port, ipv6_enabled),
             listen_addr,
             bootstrap_peers: self.bootstrap_peers.clone(),
@@ -427,7 +415,6 @@ impl Default for NodeConfig {
         });
 
         Self {
-            peer_id: None,
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: Vec::new(),
@@ -454,7 +441,6 @@ impl NodeConfig {
         let listen_addr = config.listen_socket_addr()?;
 
         let mut node_config = Self {
-            peer_id: None,
             listen_addrs: vec![listen_addr],
             listen_addr,
             bootstrap_peers: config
@@ -1927,12 +1913,6 @@ impl NodeBuilder {
         }
     }
 
-    /// Set the peer ID
-    pub fn with_peer_id(mut self, peer_id: PeerId) -> Self {
-        self.config.peer_id = Some(peer_id);
-        self
-    }
-
     /// Add a listen address
     pub fn listen_on(mut self, addr: &str) -> Self {
         if let Ok(multiaddr) = addr.parse() {
@@ -2087,7 +2067,6 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            peer_id: Some(PeerId::from_name("test_peer_123")),
             listen_addrs: vec![
                 std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
@@ -2121,7 +2100,6 @@ mod tests {
     async fn test_node_config_default() {
         let config = NodeConfig::default();
 
-        assert!(config.peer_id.is_none());
         assert_eq!(config.listen_addrs.len(), 2);
         assert!(config.enable_ipv6);
         assert_eq!(config.max_connections, 10000); // Fixed: matches actual default
@@ -2198,26 +2176,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_node_creation_without_peer_id() -> Result<()> {
-        let mut config = create_test_node_config();
-        config.peer_id = None;
-
-        let node = P2PNode::new(config).await?;
-
-        // Should have generated a cryptographic peer ID (64-char hex BLAKE3 of public key)
-        assert_eq!(node.peer_id().to_hex().len(), 64);
-        assert!(
-            node.peer_id()
-                .to_hex()
-                .chars()
-                .all(|c| c.is_ascii_hexdigit())
-        );
-        assert!(!node.is_running());
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_node_lifecycle() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
@@ -2246,8 +2204,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_connection() -> Result<()> {
         let config1 = create_test_node_config();
-        let mut config2 = create_test_node_config();
-        config2.peer_id = Some(PeerId::from_name("test_peer_456"));
+        let config2 = create_test_node_config();
 
         let node1 = P2PNode::new(config1).await?;
         let node2 = P2PNode::new(config2).await?;
@@ -2320,7 +2277,6 @@ mod tests {
 
         let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some(PeerId::from_name("test_peer_456"));
         config2.listen_addr = ipv4_localhost;
         config2.listen_addrs = vec![ipv4_localhost];
         config2.enable_ipv6 = false;
@@ -2513,11 +2469,9 @@ mod tests {
     #[tokio::test]
     async fn test_node_config_access() -> Result<()> {
         let config = create_test_node_config();
-        let expected_peer_id = config.peer_id;
         let node = P2PNode::new(config).await?;
 
         let node_config = node.config();
-        assert_eq!(node_config.peer_id, expected_peer_id);
         assert_eq!(node_config.max_connections, 100);
         // MCP removed
 
@@ -2547,9 +2501,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_builder() -> Result<()> {
         // Create a config using the builder but don't actually build a real node
-        let builder_peer_id = PeerId::from_name("builder_test_peer");
         let builder = P2PNode::builder()
-            .with_peer_id(builder_peer_id)
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
             .with_bootstrap_peer("127.0.0.1:9000")
@@ -2560,7 +2512,6 @@ mod tests {
 
         // Test the configuration that was built
         let config = builder.config;
-        assert_eq!(config.peer_id, Some(builder_peer_id));
         assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
         assert_eq!(config.bootstrap_peers.len(), 1);
         assert!(config.enable_ipv6);
@@ -2673,7 +2624,6 @@ mod tests {
         let serialized = serde_json::to_string(&config)?;
         let deserialized: NodeConfig = serde_json::from_str(&serialized)?;
 
-        assert_eq!(config.peer_id, deserialized.peer_id);
         assert_eq!(config.listen_addrs, deserialized.listen_addrs);
         assert_eq!(config.enable_ipv6, deserialized.enable_ipv6);
 
