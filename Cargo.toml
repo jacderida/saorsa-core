@@ -5,7 +5,7 @@ name = "saorsa-core"
 # 0.10.5: replica planner helper for storage orchestration
 # 0.11.0: remove feature gates — adaptive/trust/placement always compiled
 # 0.11.1: fix Kademlia protocol violations in iterative lookups
-# 0.12.0: configurable max_message_size, bump ant-quic to 0.22.0
+# 0.12.0: configurable max_message_size, bump saorsa-transport to 0.22.0
 # 0.12.1: patch release
 version = "0.12.1"
 edition = "2024"
@@ -38,13 +38,10 @@ test-utils = []
 # Core async and serialization
 tokio = { version = "1.49", features = ["full"] }
 
-# Pin time crate to compatible version
-time = { version = "0.3.39", features = ["serde", "parsing", "formatting"] }
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-big-array = "0.5"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -61,22 +58,16 @@ statrs = "0.18"
 # Cryptography - Primary source of truth: saorsa-pqc 0.4.0
 saorsa-pqc = "0.4.0"
 # Classical crypto for backward compatibility only
-# Classical crypto removed from production; PQC-only via saorsa-pqc and ant-quic
+# Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
 # Password hashing
 argon2 = "0.5"
 # Random number generation
 rand = "0.8"
 rand_core = "0.6"
-rand_chacha = "0.3"
-# Memory protection
-zeroize = { version = "1.8", features = ["derive"] }
 # Constant-time operations for cryptographic security
 subtle = "2.6"
-# Pin to fix stdsimd compilation error on newer Rust nightly (CVE-fix in 4.1.1+)
-curve25519-dalek = "4.1.3"
 # TODO: Remove once fully migrated to saorsa-pqc - keeping temporarily for compatibility
 blake3 = "1.6"
-hmac = "0.12"
 hkdf = "0.12"
 
 # Performance optimization
@@ -85,11 +76,11 @@ flate2 = "1.1"
 once_cell = "1.21"
 
 # Networking
-ant-quic = { version = "0.22.0" }
+saorsa-transport = "0.23.0"
+
 four-word-networking = { version = "2.6" }
 
 # Core-specific dependencies
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6.0"
 fastrand = "2.3"
 
@@ -104,7 +95,6 @@ prometheus = { version = "0.14", optional = true, default-features = false }
 # Configuration
 toml = "0.8"
 regex = "1.11"
-lazy_static = "1.5"
 log = "0.4"
 
 tokio-stream = "0.1"
@@ -125,15 +115,13 @@ rusqlite = { version = "0.37", features = ["chrono", "serde_json", "uuid", "bund
 # Exact pin required: >=0.5.1 doesn't override transitive resolution under -Z minimal-versions
 wyz = "=0.5.1"
 
-
-# CLI dependencies (needed for identity CLI types used in tests)
 clap = { version = "4.5", features = ["derive"] }
-sha2 = "0.10"
 
 [build-dependencies]
 # No build dependencies currently required
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.17"
 pretty_assertions = "1.4"
 serial_test = "3.3"

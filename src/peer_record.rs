@@ -30,7 +30,10 @@
 //! - Batch processing support
 
 use crate::error::SecurityError;
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
+pub use crate::identity::node_identity::{PeerId, peer_id_from_public_key};
+use crate::quantum_crypto::saorsa_transport_integration::{
+    MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
+};
 use crate::{NetworkAddress, P2PError, Result};
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
@@ -50,38 +53,6 @@ pub const MAX_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 /// Default TTL for DHT records (5 minutes)
 pub const DEFAULT_TTL_SECONDS: u32 = 5 * 60;
-
-/// Unique identifier for a user in the P2P network
-/// Generated from public key hash to ensure uniqueness and prevent collisions
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserId {
-    /// BLAKE3 hash of the user's public key
-    pub hash: [u8; 32],
-}
-
-impl UserId {
-    /// Create a new UserId from a public key
-    pub fn from_public_key(public_key: &MlDsaPublicKey) -> Self {
-        let hash = blake3::hash(public_key.as_bytes());
-        Self { hash: hash.into() }
-    }
-
-    /// Create a UserId from raw bytes
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self { hash: bytes }
-    }
-
-    /// Get the raw bytes of this UserId
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.hash
-    }
-}
-
-impl fmt::Display for UserId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.hash[..8]))
-    }
-}
 
 /// Unique identifier for a peer endpoint/device
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -116,8 +87,8 @@ impl fmt::Display for EndpointId {
     }
 }
 
-/// Node identifier for coordinator nodes
-pub type NodeId = String;
+/// Identifier for coordinator nodes
+pub type CoordinatorId = String;
 
 /// NAT type classification based on IETF draft-seemann-quic-nat-traversal
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -184,7 +155,7 @@ pub struct PeerEndpoint {
     pub nat_type: NatType,
 
     /// Coordinator nodes this peer is connected to
-    pub coordinator_nodes: Vec<NodeId>,
+    pub coordinator_nodes: Vec<CoordinatorId>,
 
     /// Optional device/client information
     pub device_info: Option<String>,
@@ -199,7 +170,7 @@ impl PeerEndpoint {
         endpoint_id: EndpointId,
         external_address: NetworkAddress,
         nat_type: NatType,
-        coordinator_nodes: Vec<NodeId>,
+        coordinator_nodes: Vec<CoordinatorId>,
         device_info: Option<String>,
     ) -> Self {
         Self {
@@ -231,7 +202,7 @@ pub struct PeerDHTRecord {
     pub version: u8,
 
     /// Unique user identifier
-    pub user_id: UserId,
+    pub user_id: PeerId,
 
     /// User's public key for signature verification
     pub public_key: MlDsaPublicKey,
@@ -261,7 +232,7 @@ impl PeerDHTRecord {
 
     /// Create a new unsigned DHT record
     pub fn new(
-        user_id: UserId,
+        user_id: PeerId,
         public_key: MlDsaPublicKey,
         sequence_number: u64,
         name: Option<String>,
@@ -350,7 +321,7 @@ impl PeerDHTRecord {
         message.push(self.version);
 
         // User ID
-        message.extend_from_slice(&self.user_id.hash);
+        message.extend_from_slice(self.user_id.to_bytes());
 
         // Public key
         message.extend_from_slice(self.public_key.as_bytes());
@@ -436,7 +407,7 @@ impl PeerDHTRecord {
     /// Get a hash of this record for deduplication
     pub fn content_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.user_id.hash);
+        hasher.update(self.user_id.to_bytes());
         hasher.update(&self.sequence_number.to_be_bytes());
         hasher.update(&self.timestamp.to_be_bytes());
         hasher.finalize()
@@ -528,10 +499,10 @@ mod tests {
     #[test]
     fn test_user_id_generation() {
         let (_, public_key) = create_test_keypair();
-        let user_id = UserId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
 
         // Should be deterministic
-        let user_id2 = UserId::from_public_key(&public_key);
+        let user_id2 = peer_id_from_public_key(&public_key);
         assert_eq!(user_id, user_id2);
     }
 
@@ -558,7 +529,7 @@ mod tests {
     #[test]
     fn test_dht_record_creation_and_signing() {
         let (secret_key, public_key) = create_test_keypair();
-        let user_id = UserId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
         let endpoint = create_test_endpoint();
 
         let mut record = PeerDHTRecord::new(
@@ -585,7 +556,7 @@ mod tests {
     #[test]
     fn test_signature_cache() {
         let (secret_key, public_key) = create_test_keypair();
-        let user_id = UserId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
         let endpoint = create_test_endpoint();
 
         let mut record = PeerDHTRecord::new(
@@ -612,12 +583,12 @@ mod tests {
     #[test]
     fn test_validation_limits() {
         let (_, public_key) = create_test_keypair();
-        let user_id = UserId::from_public_key(&public_key);
+        let user_id = peer_id_from_public_key(&public_key);
 
         // Test name too long
         let long_name = "a".repeat(256);
         let result = PeerDHTRecord::new(
-            user_id.clone(),
+            user_id,
             public_key.clone(),
             1,
             Some(long_name),
@@ -629,7 +600,7 @@ mod tests {
         // Test too many endpoints
         let many_endpoints = vec![create_test_endpoint(); MAX_ENDPOINTS_PER_PEER + 1];
         let result = PeerDHTRecord::new(
-            user_id.clone(),
+            user_id,
             public_key.clone(),
             1,
             Some("test".to_string()),

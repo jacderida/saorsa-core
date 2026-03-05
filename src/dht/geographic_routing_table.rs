@@ -132,7 +132,7 @@ impl GeographicRoutingTable {
     ) -> Result<bool> {
         // Add to regional bucket
         let added = if let Some(bucket) = self.regional_buckets.get_mut(&region) {
-            bucket.add_peer(peer_id.clone(), metrics.clone())
+            bucket.add_peer(peer_id, metrics.clone())
         } else {
             false
         };
@@ -229,7 +229,7 @@ impl GeographicRoutingTable {
                 bucket
                     .peers
                     .iter()
-                    .map(|(peer_id, metrics)| (peer_id.clone(), metrics.clone()))
+                    .map(|(peer_id, metrics)| (*peer_id, metrics.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -330,7 +330,7 @@ impl GeographicRoutingTable {
                 let peers: Vec<_> = bucket
                     .peers
                     .iter()
-                    .map(|(peer_id, metrics)| (peer_id.clone(), metrics.clone()))
+                    .map(|(peer_id, metrics)| (*peer_id, metrics.clone()))
                     .collect();
 
                 (
@@ -369,7 +369,7 @@ impl GeographicRoutingTable {
 
                 // Add peers from state
                 for (peer_id, metrics) in bucket_state.peers {
-                    bucket.add_peer(peer_id.clone(), metrics.clone());
+                    bucket.add_peer(peer_id, metrics.clone());
                     // Also update peer selector
                     self.peer_selector.update_peer_metrics(peer_id, metrics)?;
                 }
@@ -466,12 +466,12 @@ mod tests {
         let config = GeographicRoutingConfig::default();
         let mut table = GeographicRoutingTable::new(GeographicRegion::Europe, config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
         let metrics = PeerQualityMetrics::new(GeographicRegion::Europe);
 
         // Add peer
         let added = table
-            .add_peer(peer_id.clone(), GeographicRegion::Europe, metrics)
+            .add_peer(peer_id, GeographicRegion::Europe, metrics)
             .unwrap();
         assert!(added);
 
@@ -505,14 +505,10 @@ mod tests {
         na_metrics.record_rtt(Duration::from_millis(100));
 
         table
-            .add_peer("eu_peer".to_string(), GeographicRegion::Europe, eu_metrics)
+            .add_peer(PeerId::random(), GeographicRegion::Europe, eu_metrics)
             .unwrap();
         table
-            .add_peer(
-                "na_peer".to_string(),
-                GeographicRegion::NorthAmerica,
-                na_metrics,
-            )
+            .add_peer(PeerId::random(), GeographicRegion::NorthAmerica, na_metrics)
             .unwrap();
 
         // Test cross-region selection
@@ -539,7 +535,7 @@ mod tests {
         // Test concurrent operations
         let added = {
             let mut table_guard = table.write().await;
-            table_guard.add_peer("test_peer".to_string(), GeographicRegion::Europe, metrics)
+            table_guard.add_peer(PeerId::random(), GeographicRegion::Europe, metrics)
         };
         assert!(added.is_ok());
 

@@ -286,14 +286,14 @@ impl SybilDetector {
 
     /// Extract ID prefix (first 4 bytes)
     fn id_prefix(peer_id: &PeerId) -> [u8; 4] {
-        let bytes = &peer_id.0;
+        let bytes = peer_id.as_bytes();
         [bytes[0], bytes[1], bytes[2], bytes[3]]
     }
 
     /// Record a peer joining the network
     pub fn record_join(&mut self, peer_id: PeerId, ip_addr: Option<IpAddr>) {
         let now = Instant::now();
-        self.known_peers.insert(peer_id.clone());
+        self.known_peers.insert(peer_id);
 
         // Track subnet joins
         if let Some(ip) = &ip_addr {
@@ -310,7 +310,7 @@ impl SybilDetector {
             }
 
             joins.push_back(JoinRecord {
-                peer_id: peer_id.clone(),
+                peer_id,
                 ip_addr,
                 joined_at: now,
             });
@@ -321,7 +321,7 @@ impl SybilDetector {
         self.id_prefix_map
             .entry(prefix)
             .or_default()
-            .insert(peer_id.clone());
+            .insert(peer_id);
 
         // Initialize behavior profile
         self.behavior_profiles.entry(peer_id).or_default();
@@ -365,7 +365,7 @@ impl SybilDetector {
 
         for (subnet, joins) in &self.subnet_joins {
             if joins.len() >= self.config.subnet_burst_threshold {
-                let peers: Vec<PeerId> = joins.iter().map(|j| j.peer_id.clone()).collect();
+                let peers: Vec<PeerId> = joins.iter().map(|j| j.peer_id).collect();
 
                 if let (Some(first), Some(last)) = (joins.front(), joins.back()) {
                     let window = last.joined_at.duration_since(first.joined_at);
@@ -412,7 +412,7 @@ impl SybilDetector {
                     .filter(|&s| s >= self.config.behavioral_similarity_threshold)
                 {
                     evidence.push(SybilEvidence::BehavioralClustering {
-                        peers: vec![peer_a.clone(), peer_b.clone()],
+                        peers: vec![*peer_a, *peer_b],
                         similarity,
                         pattern: "Response pattern similarity".to_string(),
                     });
@@ -487,7 +487,7 @@ impl SybilDetector {
                 .filter(|&r| r > self.config.resource_asymmetry_threshold)
             {
                 evidence.push(SybilEvidence::ResourceAsymmetry {
-                    peer: peer_id.clone(),
+                    peer: *peer_id,
                     claimed: profile.claimed_bandwidth.unwrap_or(0),
                     measured: profile.measured_bandwidth.unwrap_or(0),
                     ratio,
@@ -520,9 +520,7 @@ impl SybilDetector {
                 SybilEvidence::BehavioralClustering { peers, .. } => {
                     peers.iter().cloned().collect()
                 }
-                SybilEvidence::ResourceAsymmetry { peer, .. } => {
-                    [peer.clone()].into_iter().collect()
-                }
+                SybilEvidence::ResourceAsymmetry { peer, .. } => [*peer].into_iter().collect(),
             };
 
             // Find existing group that overlaps
@@ -618,7 +616,7 @@ mod tests {
     fn random_peer_id() -> PeerId {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill(&mut bytes);
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     fn peer_with_prefix(prefix: [u8; 4]) -> PeerId {
@@ -628,7 +626,7 @@ mod tests {
         bytes[1] = prefix[1];
         bytes[2] = prefix[2];
         bytes[3] = prefix[3];
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     #[test]
@@ -675,7 +673,7 @@ mod tests {
         let peer = random_peer_id();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
 
-        detector.record_join(peer.clone(), Some(ip));
+        detector.record_join(peer, Some(ip));
 
         assert!(detector.known_peers.contains(&peer));
         assert!(detector.behavior_profiles.contains_key(&peer));
@@ -739,7 +737,7 @@ mod tests {
         });
 
         let peer = random_peer_id();
-        detector.record_join(peer.clone(), None);
+        detector.record_join(peer, None);
 
         detector.record_claimed_resources(&peer, 1_000_000_000, 1_000_000_000_000);
         detector.record_measured_bandwidth(&peer, 100_000_000);
@@ -756,11 +754,11 @@ mod tests {
     fn test_sybil_group_creation() {
         let peer_a = random_peer_id();
         let peer_b = random_peer_id();
-        let members: HashSet<_> = [peer_a.clone(), peer_b.clone()].into_iter().collect();
+        let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
 
         let evidence = vec![SybilEvidence::IdPrefixClustering {
             prefix: [0xAB, 0xCD, 0xEF, 0x12],
-            peers: vec![peer_a.clone(), peer_b.clone()],
+            peers: vec![peer_a, peer_b],
         }];
 
         let group = SybilGroup::new(members, evidence);
@@ -778,12 +776,12 @@ mod tests {
         let peer_c = random_peer_id();
 
         // Create a suspected group
-        let members: HashSet<_> = [peer_a.clone(), peer_b.clone()].into_iter().collect();
+        let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
         let group = SybilGroup::new(
             members,
             vec![SybilEvidence::IdPrefixClustering {
                 prefix: [0xAB, 0xCD, 0xEF, 0x12],
-                peers: vec![peer_a.clone(), peer_b.clone()],
+                peers: vec![peer_a, peer_b],
             }],
         );
         detector.suspected_groups.push(group);
@@ -799,7 +797,7 @@ mod tests {
         let peer = random_peer_id();
         let other = random_peer_id();
 
-        let members: HashSet<_> = [peer.clone(), other].into_iter().collect();
+        let members: HashSet<_> = [peer, other].into_iter().collect();
         let mut group = SybilGroup::new(members, vec![]);
         group.confidence = 0.8;
         detector.suspected_groups.push(group);
@@ -845,8 +843,8 @@ mod tests {
         // Add a Sybil group with 2 members
         let peer_a = random_peer_id();
         let peer_b = random_peer_id();
-        detector.known_peers.insert(peer_a.clone());
-        detector.known_peers.insert(peer_b.clone());
+        detector.known_peers.insert(peer_a);
+        detector.known_peers.insert(peer_b);
 
         let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
         let group = SybilGroup::new(members, vec![]);
@@ -861,7 +859,7 @@ mod tests {
         let mut detector = SybilDetector::with_defaults();
         let peer = random_peer_id();
 
-        detector.record_join(peer.clone(), None);
+        detector.record_join(peer, None);
         assert!(detector.known_peers.contains(&peer));
 
         detector.record_leave(&peer);

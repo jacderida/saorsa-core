@@ -168,7 +168,7 @@ src/adaptive/dht_integration.rs:815:        let public_key = self.identity.publi
 src/adaptive/dht_integration.rs:823:                    public_key: public_key.clone(),
 src/adaptive/dht_integration.rs:815:        let public_key = self.identity.public_key().clone();
 src/adaptive/dht_integration.rs:823:                    public_key: public_key.clone(),
-src/adaptive/mod.rs:191:    pub public_key: crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey,
+src/adaptive/mod.rs:191:    pub public_key: crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
 src/adaptive/identity.rs:96:    pub fn public_key(&self) -> &[u8] {
 src/adaptive/identity.rs:97:        self.inner.public_key().as_bytes()
 src/adaptive/identity.rs:137:    pub public_key: Vec<u8>,
@@ -179,7 +179,7 @@ src/adaptive/identity.rs:199:        assert!(signed.verify(&identity.public_key(
 src/adaptive/identity.rs:203:        assert!(!signed.verify(&other_identity.public_key()).unwrap());
 src/adaptive/identity.rs:222:            identity.public_key().to_bytes(),
 src/adaptive/identity.rs:223:            restored.public_key().to_bytes()
-src/adaptive/mod.rs:191:    pub public_key: crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey,
+src/adaptive/mod.rs:191:    pub public_key: crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
 src/adaptive/identity.rs:96:    pub fn public_key(&self) -> &[u8] {
 src/adaptive/identity.rs:97:        self.inner.public_key().as_bytes()
 src/adaptive/identity.rs:137:    pub public_key: Vec<u8>,
@@ -526,8 +526,8 @@ index 523f1b7..e8c0ae0 100644
 +//! | DhtWitness | 0x12 | (removed) |
  //! | DhtReplication | 0x13 | Background replication traffic |
  
- use ant_quic::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
- use ant_quic::nat_traversal_api::PeerId;
+ use saorsa_transport::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
+ use saorsa_transport::nat_traversal_api::PeerId;
  use async_trait::async_trait;
 @@ -30,26 +30,25 @@ use std::sync::Arc;
  use tokio::sync::RwLock;
@@ -693,8 +693,8 @@ exec
 
 use serde::{Deserialize, Serialize};
 
-// Import ant-quic NAT config type (unified config in 0.14+)
-use ant_quic::NatConfig;
+// Import saorsa-transport NAT config type (unified config in 0.14+)
+use saorsa_transport::NatConfig;
 
 /// Configuration for network port binding
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,7 +739,7 @@ index 3f89140..b2808bb 100644
 --- a/src/transport.rs
 +++ b/src/transport.rs
 @@ -21,10 +21,15 @@
- pub mod ant_quic_adapter;
+ pub mod saorsa_transport_adapter;
  
  // DHT protocol handler for SharedTransport integration
  pub mod dht_handler;
@@ -1352,11 +1352,11 @@ thinking
 
 I found a pre-existing mismatch where `store` uses a DHT key derived from input key but returns a content hash based on key+value, while `retrieve` expects the content hash as the DHT key—this inconsistency can cause retrieval failures unless the key is the content hash itself. The recent code change to use raw keys if 32 bytes alters behavior but does not fix the fundamental mismatch, indicating the bug is longstanding rather than newly introduced.
 exec
-/bin/zsh -lc 'git diff -U5 src/transport/ant_quic_adapter.rs' in /Users/davidirvine/Desktop/Devel/projects/saorsa-core succeeded in 26ms:
-diff --git a/src/transport/ant_quic_adapter.rs b/src/transport/ant_quic_adapter.rs
+/bin/zsh -lc 'git diff -U5 src/transport/saorsa_transport_adapter.rs' in /Users/davidirvine/Desktop/Devel/projects/saorsa-core succeeded in 26ms:
+diff --git a/src/transport/saorsa_transport_adapter.rs b/src/transport/saorsa_transport_adapter.rs
 index c94b0ec..79172ca 100644
---- a/src/transport/ant_quic_adapter.rs
-+++ b/src/transport/ant_quic_adapter.rs
+--- a/src/transport/saorsa_transport_adapter.rs
++++ b/src/transport/saorsa_transport_adapter.rs
 @@ -172,11 +172,11 @@ impl P2PNetworkNode<P2pLinkTransport> {
      }
  

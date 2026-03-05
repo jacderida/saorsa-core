@@ -43,7 +43,7 @@ pub struct BackupMetadata {
     /// Platform identifier.
     pub platform: String,
 
-    /// SHA-256 checksum of the backup.
+    /// BLAKE3 checksum of the backup.
     pub checksum: String,
 
     /// Size in bytes.

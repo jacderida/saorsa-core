@@ -37,8 +37,9 @@
 //! - Graceful fallback when trust engine unavailable
 //! - Never panics - all operations return safe defaults
 
-use crate::adaptive::{NodeId as AdaptiveNodeId, TrustProvider};
-use crate::dht::core_engine::{DhtKey, NodeId, NodeInfo};
+use crate::PeerId;
+use crate::adaptive::TrustProvider;
+use crate::dht::core_engine::{DhtKey, NodeInfo};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -229,15 +230,9 @@ impl<T: TrustProvider> TrustAwarePeerSelector<T> {
         distance_score * trust_factor
     }
 
-    /// Get trust score for a DHT node ID
-    ///
-    /// Converts between the DHT NodeId and adaptive NodeId types.
-    fn get_trust_for_node(&self, node_id: &NodeId) -> f64 {
-        // Convert DHT NodeId to adaptive NodeId
-        let adaptive_id = AdaptiveNodeId {
-            hash: *node_id.as_bytes(),
-        };
-        self.trust_provider.get_trust(&adaptive_id)
+    /// Get trust score for a DHT node ID.
+    fn get_trust_for_node(&self, node_id: &PeerId) -> f64 {
+        self.trust_provider.get_trust(node_id)
     }
 
     /// Get the current configuration
@@ -255,7 +250,7 @@ impl<T: TrustProvider> TrustAwarePeerSelector<T> {
 ///
 /// Returns the distance as a u128 (using first 16 bytes for comparison).
 /// This is sufficient for relative ordering since XOR distance is metric.
-fn xor_distance(key: &DhtKey, node_id: &NodeId) -> u128 {
+fn xor_distance(key: &DhtKey, node_id: &PeerId) -> u128 {
     let key_bytes = key.as_bytes();
     let node_bytes = node_id.as_bytes();
 
@@ -266,18 +261,6 @@ fn xor_distance(key: &DhtKey, node_id: &NodeId) -> u128 {
     distance
 }
 
-/// Convert DHT NodeId to adaptive NodeId for trust lookups
-pub fn dht_node_to_adaptive_id(node_id: &NodeId) -> AdaptiveNodeId {
-    AdaptiveNodeId {
-        hash: *node_id.as_bytes(),
-    }
-}
-
-/// Convert adaptive NodeId to DHT NodeId
-pub fn adaptive_id_to_dht_node(adaptive_id: &AdaptiveNodeId) -> NodeId {
-    NodeId::from_bytes(adaptive_id.hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +269,7 @@ mod tests {
 
     fn make_node(id_byte: u8) -> NodeInfo {
         NodeInfo {
-            id: NodeId::from_bytes([id_byte; 32]),
+            id: PeerId::from_bytes([id_byte; 32]),
             address: format!("127.0.0.1:{}", 9000 + id_byte as u16),
             last_seen: SystemTime::now(),
             capacity: crate::dht::core_engine::NodeCapacity::default(),
@@ -296,8 +279,8 @@ mod tests {
     #[test]
     fn test_xor_distance() {
         let key = DhtKey::from_bytes([0u8; 32]);
-        let node_same = NodeId::from_bytes([0u8; 32]);
-        let node_far = NodeId::from_bytes([255u8; 32]);
+        let node_same = PeerId::from_bytes([0u8; 32]);
+        let node_far = PeerId::from_bytes([255u8; 32]);
 
         assert_eq!(xor_distance(&key, &node_same), 0);
         assert!(xor_distance(&key, &node_far) > 0);
@@ -374,15 +357,6 @@ mod tests {
         let result = selector.select_peers(&key, &candidates, 3);
 
         assert_eq!(result.len(), 3);
-    }
-
-    #[test]
-    fn test_node_id_conversion() {
-        let dht_id = NodeId::from_bytes([42u8; 32]);
-        let adaptive_id = dht_node_to_adaptive_id(&dht_id);
-        let converted_back = adaptive_id_to_dht_node(&adaptive_id);
-
-        assert_eq!(dht_id.as_bytes(), converted_back.as_bytes());
     }
 
     #[test]

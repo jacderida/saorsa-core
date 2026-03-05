@@ -16,6 +16,7 @@
 //! Provides region-based routing optimization for improved P2P network performance
 //! across different geographic areas with latency and reliability considerations.
 
+use crate::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -268,7 +269,7 @@ pub struct RegionalBucket {
     /// The region this bucket represents
     pub region: GeographicRegion,
     /// Peers in this region with their quality metrics
-    pub peers: HashMap<String, PeerQualityMetrics>,
+    pub peers: HashMap<PeerId, PeerQualityMetrics>,
     /// Maximum peers per bucket
     pub max_peers: usize,
     /// Last maintenance timestamp
@@ -287,7 +288,7 @@ impl RegionalBucket {
     }
 
     /// Add or update a peer in this bucket
-    pub fn add_peer(&mut self, peer_id: String, mut metrics: PeerQualityMetrics) -> bool {
+    pub fn add_peer(&mut self, peer_id: PeerId, mut metrics: PeerQualityMetrics) -> bool {
         // Ensure the metrics region matches this bucket
         metrics.region = self.region;
 
@@ -306,7 +307,7 @@ impl RegionalBucket {
     }
 
     /// Try to replace a poor-performing peer with a new one
-    fn try_replace_peer(&mut self, new_peer_id: String, new_metrics: PeerQualityMetrics) -> bool {
+    fn try_replace_peer(&mut self, new_peer_id: PeerId, new_metrics: PeerQualityMetrics) -> bool {
         // Find the peer with the lowest reliability score
         let worst_peer = self
             .peers
@@ -316,7 +317,7 @@ impl RegionalBucket {
                     .partial_cmp(&b.get_reliability_score())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(id, metrics)| (id.clone(), metrics.get_reliability_score()));
+            .map(|(id, metrics)| (*id, metrics.get_reliability_score()));
 
         if let Some((worst_peer_id, worst_score)) = worst_peer
             && new_metrics.get_reliability_score() > worst_score
@@ -330,16 +331,16 @@ impl RegionalBucket {
     }
 
     /// Remove a peer from this bucket
-    pub fn remove_peer(&mut self, peer_id: &str) -> bool {
+    pub fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
         self.peers.remove(peer_id).is_some()
     }
 
     /// Get the best peers from this bucket
-    pub fn get_best_peers(&self, count: usize) -> Vec<(String, PeerQualityMetrics)> {
+    pub fn get_best_peers(&self, count: usize) -> Vec<(PeerId, PeerQualityMetrics)> {
         let mut peer_list: Vec<_> = self
             .peers
             .iter()
-            .map(|(id, metrics)| (id.clone(), metrics.clone()))
+            .map(|(id, metrics)| (*id, metrics.clone()))
             .collect();
 
         // Sort by reliability score (descending)
@@ -355,11 +356,11 @@ impl RegionalBucket {
     /// Perform maintenance on this bucket
     pub fn maintenance(&mut self, max_peer_age: Duration) {
         // Remove stale peers
-        let stale_peers: Vec<String> = self
+        let stale_peers: Vec<PeerId> = self
             .peers
             .iter()
             .filter(|(_, metrics)| metrics.needs_refresh(max_peer_age))
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
 
         for peer_id in stale_peers {
@@ -451,8 +452,8 @@ mod tests {
         let metrics1 = PeerQualityMetrics::new(GeographicRegion::Europe);
         let metrics2 = PeerQualityMetrics::new(GeographicRegion::Europe);
 
-        assert!(bucket.add_peer("peer1".to_string(), metrics1));
-        assert!(bucket.add_peer("peer2".to_string(), metrics2));
+        assert!(bucket.add_peer(PeerId::random(), metrics1));
+        assert!(bucket.add_peer(PeerId::random(), metrics2));
         assert_eq!(bucket.peers.len(), 2);
 
         let best_peers = bucket.get_best_peers(1);

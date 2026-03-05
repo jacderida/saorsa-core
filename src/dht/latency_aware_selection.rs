@@ -94,22 +94,22 @@ impl PeerMetricsCache {
 
         // Add to cache
         self.entries.insert(
-            peer_id.clone(),
+            peer_id,
             CacheEntry {
-                peer_id: peer_id.clone(),
+                peer_id,
                 metrics: metrics.clone(),
                 last_accessed: now,
             },
         );
 
         // Update access order
-        self.access_order.push_back(peer_id.clone());
+        self.access_order.push_back(peer_id);
 
         // Update regional index
         self.regional_peers
             .entry(metrics.region)
             .or_default()
-            .push(peer_id.clone());
+            .push(peer_id);
 
         // Evict if over capacity
         while self.entries.len() > self.max_size {
@@ -122,7 +122,7 @@ impl PeerMetricsCache {
         if self.entries.contains_key(peer_id) {
             // Update access order first
             self.remove_from_access_order(peer_id);
-            self.access_order.push_back(peer_id.clone());
+            self.access_order.push_back(*peer_id);
 
             // Now update the entry and return the metrics
             if let Some(entry) = self.entries.get_mut(peer_id) {
@@ -147,7 +147,7 @@ impl PeerMetricsCache {
                 peer_ids
                     .iter()
                     .filter_map(|id| self.entries.get(id))
-                    .map(|entry| (entry.peer_id.clone(), entry.metrics.clone()))
+                    .map(|entry| (entry.peer_id, entry.metrics.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -171,7 +171,7 @@ impl PeerMetricsCache {
             .entries
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.last_accessed) > max_age)
-            .map(|(peer_id, _)| peer_id.clone())
+            .map(|(peer_id, _)| *peer_id)
             .collect();
 
         for peer_id in expired_peers {
@@ -575,21 +575,21 @@ mod tests {
     fn test_peer_metrics_cache() {
         let mut cache = PeerMetricsCache::new(3);
 
-        let peer1 = "peer1".to_string();
-        let peer2 = "peer2".to_string();
-        let peer3 = "peer3".to_string();
-        let peer4 = "peer4".to_string();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        let peer3 = PeerId::random();
+        let peer4 = PeerId::random();
 
         let metrics = PeerQualityMetrics::new(GeographicRegion::Europe);
 
-        cache.insert(peer1.clone(), metrics.clone());
-        cache.insert(peer2.clone(), metrics.clone());
-        cache.insert(peer3.clone(), metrics.clone());
+        cache.insert(peer1, metrics.clone());
+        cache.insert(peer2, metrics.clone());
+        cache.insert(peer3, metrics.clone());
 
         assert_eq!(cache.entries.len(), 3);
 
         // This should evict peer1 (LRU)
-        cache.insert(peer4.clone(), metrics);
+        cache.insert(peer4, metrics);
         assert_eq!(cache.entries.len(), 3);
         assert!(!cache.entries.contains_key(&peer1));
         assert!(cache.entries.contains_key(&peer4));
@@ -609,19 +609,17 @@ mod tests {
         metrics2.record_request(true);
         metrics2.record_rtt(Duration::from_millis(100));
 
-        selector
-            .update_peer_metrics("peer1".to_string(), metrics1)
-            .unwrap();
-        selector
-            .update_peer_metrics("peer2".to_string(), metrics2)
-            .unwrap();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        selector.update_peer_metrics(peer1, metrics1).unwrap();
+        selector.update_peer_metrics(peer2, metrics2).unwrap();
 
         // Select peers - should prefer European peer
         let selected = selector
             .select_peers(Some(GeographicRegion::Europe), Some(1))
             .unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].peer_id, "peer1");
+        assert_eq!(selected[0].peer_id, peer1);
         assert_eq!(selected[0].region, GeographicRegion::Europe);
     }
 
@@ -638,10 +636,10 @@ mod tests {
         na_metrics.record_request(true);
 
         selector
-            .update_peer_metrics("eu_peer".to_string(), eu_metrics)
+            .update_peer_metrics(PeerId::random(), eu_metrics)
             .unwrap();
         selector
-            .update_peer_metrics("na_peer".to_string(), na_metrics)
+            .update_peer_metrics(PeerId::random(), na_metrics)
             .unwrap();
 
         // Select cross-region peers

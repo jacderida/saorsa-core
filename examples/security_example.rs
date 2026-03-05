@@ -15,15 +15,16 @@
 //! Example of using the security module in the adaptive P2P network
 
 use anyhow::Result;
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::*;
-use saorsa_core::quantum_crypto::ant_quic_integration::MlDsaPublicKey;
+use saorsa_core::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Create a node identity
     let identity = NodeIdentity::generate()?;
-    println!("Generated node identity: {:?}", identity.node_id());
+    println!("Generated node identity: {:?}", identity.peer_id());
 
     // Configure security settings
     let mut security_config = SecurityConfig::default();
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
 
     // Example: Validate a node join request
     let new_node = NodeDescriptor {
-        id: NodeId { hash: [1u8; 32] },
+        id: PeerId::from_bytes([1u8; 32]),
         public_key: MlDsaPublicKey::from_bytes(&[0u8; 1952]).unwrap(),
         addresses: vec!["192.168.1.10:8000".to_string()],
         hyperbolic: None,
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
     }
 
     // Example: Check rate limits
-    let peer_id = NodeId { hash: [2u8; 32] };
+    let peer_id = PeerId::from_bytes([2u8; 32]);
     for i in 0..12 {
         if security_manager
             .check_rate_limit(&peer_id, None)
@@ -84,11 +85,11 @@ async fn main() -> Result<()> {
 
     // Example: Check for eclipse attacks
     let routing_table = vec![
-        NodeId { hash: [10u8; 32] },
-        NodeId { hash: [20u8; 32] },
-        NodeId { hash: [30u8; 32] },
-        NodeId { hash: [40u8; 32] },
-        NodeId { hash: [50u8; 32] },
+        PeerId::from_bytes([10u8; 32]),
+        PeerId::from_bytes([20u8; 32]),
+        PeerId::from_bytes([30u8; 32]),
+        PeerId::from_bytes([40u8; 32]),
+        PeerId::from_bytes([50u8; 32]),
     ];
 
     match security_manager.detect_eclipse_attack(&routing_table).await {

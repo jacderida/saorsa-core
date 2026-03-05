@@ -67,7 +67,7 @@ We adopt **pure post-quantum cryptography** without classical fallbacks:
 4. **Reduced Attack Surface**: Fewer algorithms = fewer potential vulnerabilities
 5. **Performance**: Avoid hybrid overhead
 
-### Implementation via saorsa-pqc and ant-quic
+### Implementation via saorsa-pqc and saorsa-transport
 
 Post-quantum cryptography is provided by two sources:
 
@@ -89,12 +89,12 @@ let (ciphertext, shared_secret) = MlKem768::encapsulate(&kem_pk)?;
 let decapsulated = MlKem768::decapsulate(&kem_sk, &ciphertext)?;
 ```
 
-#### 2. ant-quic (Transport Layer)
+#### 2. saorsa-transport (Transport Layer)
 
-Transport-level PQC is handled by ant-quic's TLS integration:
+Transport-level PQC is handled by saorsa-transport's TLS integration:
 
 ```rust
-// ant-quic configures PQC automatically
+// saorsa-transport configures PQC automatically
 let config = QuicConfig {
     pqc_enabled: true,  // Default: true
     // ML-KEM-768 for key exchange

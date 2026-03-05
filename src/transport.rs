@@ -13,12 +13,12 @@
 
 //! Transport Layer
 //!
-//! This module provides native ant-quic integration for the P2P Foundation.
+//! This module provides native saorsa-transport integration for the P2P Foundation.
 //!
-//! Use `ant_quic_adapter::P2PNetworkNode` directly for all networking needs.
+//! Use `saorsa_transport_adapter::P2PNetworkNode` directly for all networking needs.
 
-// Native ant-quic integration with advanced NAT traversal and PQC support
-pub mod ant_quic_adapter;
+// Native saorsa-transport integration with advanced NAT traversal and PQC support
+pub mod saorsa_transport_adapter;
 
 // DHT protocol handler for SharedTransport integration
 pub mod dht_handler;
@@ -28,8 +28,8 @@ pub mod network_config;
 
 pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, RetryBehavior};
 
-use crate::validation::{Validate, ValidationContext, validate_message_size, validate_peer_id};
-use crate::{P2PError, PeerId, Result};
+use crate::validation::{Validate, ValidationContext, validate_message_size};
+use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -114,7 +114,7 @@ pub struct ConnectionPoolStats {
 #[derive(Debug, Clone)]
 pub struct TransportMessage {
     /// Sender peer ID
-    pub sender: PeerId,
+    pub sender: crate::PeerId,
     /// Message data
     pub data: Vec<u8>,
     /// Protocol identifier
@@ -125,9 +125,6 @@ pub struct TransportMessage {
 
 impl Validate for TransportMessage {
     fn validate(&self, ctx: &ValidationContext) -> Result<()> {
-        // Validate sender peer ID
-        validate_peer_id(&self.sender)?;
-
         // Validate message size
         validate_message_size(self.data.len(), ctx.max_message_size)?;
 
@@ -261,13 +258,13 @@ mod tests {
     #[test]
     fn test_transport_message_structure() {
         let message = TransportMessage {
-            sender: "test_peer".to_string(),
+            sender: crate::PeerId::from_name("test_peer"),
             data: vec![1, 2, 3, 4],
             protocol: "/p2p/test/1.0.0".to_string(),
             received_at: Instant::now(),
         };
 
-        assert_eq!(message.sender, "test_peer");
+        assert_eq!(message.sender, crate::PeerId::from_name("test_peer"));
         assert_eq!(message.data, vec![1, 2, 3, 4]);
         assert_eq!(message.protocol, "/p2p/test/1.0.0");
     }

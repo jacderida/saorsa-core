@@ -17,13 +17,10 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
-use crate::dht::DhtNodeId;
+use crate::PeerId;
 use crate::dht::collusion_detector::{CollusionDetector, CollusionDetectorConfig};
 use crate::dht::metrics::security_metrics::SecurityMetricsCollector;
 use crate::dht::sybil_detector::{SybilDetector, SybilDetectorConfig};
-// PeerId from trust_weighted_dht is the identity::NodeId
-use crate::dht::trust_weighted_dht::PeerId;
-use crate::identity::node_identity::NodeId as IdentityNodeId;
 
 use super::close_group_validator::{
     AttackIndicators, CloseGroupFailure, CloseGroupResponse, CloseGroupValidationResult,
@@ -32,23 +29,11 @@ use super::close_group_validator::{
 use super::config::MaintenanceConfig;
 use super::eviction::{EvictionManager, EvictionReason};
 
-/// Convert DhtNodeId (core_engine::NodeId) to PeerId (identity::NodeId)
-#[inline]
-fn dht_to_identity_id(dht_id: &DhtNodeId) -> PeerId {
-    IdentityNodeId::from_bytes(*dht_id.as_bytes())
-}
-
-/// Convert PeerId (identity::NodeId) to DhtNodeId (core_engine::NodeId)
-#[inline]
-fn identity_to_dht_id(identity_id: &PeerId) -> DhtNodeId {
-    DhtNodeId::from_bytes(*identity_id.to_bytes())
-}
-
 /// Event when a node is evicted from close group
 #[derive(Debug, Clone)]
 pub struct CloseGroupEviction {
     /// The evicted node ID
-    pub node_id: DhtNodeId,
+    pub node_id: PeerId,
     /// Reasons for eviction
     pub reasons: Vec<CloseGroupFailure>,
     /// When the eviction was detected
@@ -71,7 +56,7 @@ pub struct EvictionRecord {
 /// Tracks nodes that have been evicted from close groups
 pub struct CloseGroupEvictionTracker {
     /// Nodes evicted with reasons and timestamps
-    evicted_nodes: HashMap<DhtNodeId, EvictionRecord>,
+    evicted_nodes: HashMap<PeerId, EvictionRecord>,
     /// Broadcast channel for eviction events
     eviction_sender: broadcast::Sender<CloseGroupEviction>,
     /// Maximum age to keep eviction records
@@ -92,7 +77,7 @@ impl CloseGroupEvictionTracker {
     /// Record an eviction
     pub fn record_eviction(
         &mut self,
-        node_id: DhtNodeId,
+        node_id: PeerId,
         reasons: Vec<CloseGroupFailure>,
         peer_confirmations: usize,
     ) {
@@ -101,7 +86,7 @@ impl CloseGroupEvictionTracker {
             reasons: reasons.clone(),
             consensus_count: peer_confirmations,
         };
-        self.evicted_nodes.insert(node_id.clone(), record);
+        self.evicted_nodes.insert(node_id, record);
 
         // Broadcast to network
         let _ = self.eviction_sender.send(CloseGroupEviction {
@@ -114,7 +99,7 @@ impl CloseGroupEvictionTracker {
 
     /// Check if a node was recently evicted
     #[must_use]
-    pub fn was_evicted(&self, node_id: &DhtNodeId, within: Duration) -> bool {
+    pub fn was_evicted(&self, node_id: &PeerId, within: Duration) -> bool {
         self.evicted_nodes
             .get(node_id)
             .and_then(|r| r.evicted_at.elapsed().ok())
@@ -123,7 +108,7 @@ impl CloseGroupEvictionTracker {
 
     /// Get eviction record for a node
     #[must_use]
-    pub fn get_eviction_record(&self, node_id: &DhtNodeId) -> Option<&EvictionRecord> {
+    pub fn get_eviction_record(&self, node_id: &PeerId) -> Option<&EvictionRecord> {
         self.evicted_nodes.get(node_id)
     }
 
@@ -145,7 +130,7 @@ impl CloseGroupEvictionTracker {
 
     /// Get all recently evicted nodes
     #[must_use]
-    pub fn get_recently_evicted(&self, within: Duration) -> Vec<(DhtNodeId, &EvictionRecord)> {
+    pub fn get_recently_evicted(&self, within: Duration) -> Vec<(PeerId, &EvictionRecord)> {
         self.evicted_nodes
             .iter()
             .filter(|(_, r)| {
@@ -154,7 +139,7 @@ impl CloseGroupEvictionTracker {
                     .ok()
                     .is_some_and(|elapsed| elapsed < within)
             })
-            .map(|(id, r)| (id.clone(), r))
+            .map(|(id, r)| (*id, r))
             .collect()
     }
 
@@ -227,9 +212,9 @@ pub struct SecurityCoordinator {
     /// Metrics collector
     metrics: Arc<SecurityMetricsCollector>,
     /// Trust scores (from EigenTrust)
-    trust_scores: Arc<RwLock<HashMap<DhtNodeId, f64>>>,
+    trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
     /// Node geographic regions
-    node_regions: Arc<RwLock<HashMap<DhtNodeId, String>>>,
+    node_regions: Arc<RwLock<HashMap<PeerId, String>>>,
     /// Last analysis time
     last_analysis: RwLock<Instant>,
 }
@@ -277,21 +262,21 @@ impl SecurityCoordinator {
     }
 
     /// Update trust score for a node
-    pub fn update_trust_score(&self, node_id: &DhtNodeId, score: f64) {
-        self.trust_scores.write().insert(node_id.clone(), score);
+    pub fn update_trust_score(&self, node_id: &PeerId, score: f64) {
+        self.trust_scores.write().insert(*node_id, score);
         self.eviction_manager
             .write()
             .update_trust_score(node_id, score);
     }
 
     /// Update node geographic region
-    pub fn update_node_region(&self, node_id: &DhtNodeId, region: String) {
-        self.node_regions.write().insert(node_id.clone(), region);
+    pub fn update_node_region(&self, node_id: &PeerId, region: String) {
+        self.node_regions.write().insert(*node_id, region);
     }
 
     /// Get trust score for a node
     #[must_use]
-    pub fn get_trust_score(&self, node_id: &DhtNodeId) -> Option<f64> {
+    pub fn get_trust_score(&self, node_id: &PeerId) -> Option<f64> {
         self.trust_scores.read().get(node_id).copied()
     }
 
@@ -306,12 +291,12 @@ impl SecurityCoordinator {
     }
 
     /// Record a communication success
-    pub fn record_success(&self, node_id: &DhtNodeId) {
+    pub fn record_success(&self, node_id: &PeerId) {
         self.eviction_manager.write().record_success(node_id);
     }
 
     /// Record a communication failure
-    pub fn record_failure(&self, node_id: &DhtNodeId) {
+    pub fn record_failure(&self, node_id: &PeerId) {
         self.eviction_manager.write().record_failure(node_id);
     }
 
@@ -320,7 +305,7 @@ impl SecurityCoordinator {
     /// This is the core function that should be called during routing table refresh.
     pub fn validate_close_group_membership(
         &self,
-        node_id: &DhtNodeId,
+        node_id: &PeerId,
         responses: &[CloseGroupResponse],
     ) -> CloseGroupValidationResult {
         let trust_score = self.get_trust_score(node_id);
@@ -346,12 +331,12 @@ impl SecurityCoordinator {
     }
 
     /// Handle a validation failure
-    fn handle_validation_failure(&self, node_id: &DhtNodeId, result: &CloseGroupValidationResult) {
+    fn handle_validation_failure(&self, node_id: &PeerId, result: &CloseGroupValidationResult) {
         // Record eviction in tracker
         let peer_confirmations = (result.confirmation_ratio * 10.0) as usize; // Approximate
 
         self.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            *node_id,
             result.failure_reasons.clone(),
             peer_confirmations,
         );
@@ -376,16 +361,10 @@ impl SecurityCoordinator {
     /// Check for collusion patterns in responses
     fn check_response_collusion(&self, responses: &[CloseGroupResponse]) {
         // Build temporal data for collusion check
-        // Convert DhtNodeId to PeerId (identity::NodeId)
+        // Convert PeerId to PeerId (identity::PeerId)
         let temporal_data: Vec<(PeerId, Duration, Instant)> = responses
             .iter()
-            .map(|r| {
-                (
-                    dht_to_identity_id(&r.peer_id),
-                    r.response_latency,
-                    r.received_at,
-                )
-            })
+            .map(|r| (r.peer_id, r.response_latency, r.received_at))
             .collect();
 
         // Check for temporal correlation
@@ -471,7 +450,7 @@ impl SecurityCoordinator {
 
     /// Check if a node should be evicted
     #[must_use]
-    pub fn should_evict(&self, node_id: &DhtNodeId) -> bool {
+    pub fn should_evict(&self, node_id: &PeerId) -> bool {
         // Check eviction manager first
         if self.eviction_manager.read().should_evict(node_id) {
             return true;
@@ -482,16 +461,13 @@ impl SecurityCoordinator {
             return true;
         }
 
-        // Convert to identity NodeId for detector checks
-        let peer_id = dht_to_identity_id(node_id);
-
         // Check if suspected Sybil
-        if self.sybil_detector.read().is_peer_suspected(&peer_id) {
+        if self.sybil_detector.read().is_peer_suspected(node_id) {
             return true;
         }
 
         // Check if suspected collusion
-        if self.collusion_detector.read().is_peer_suspected(&peer_id) {
+        if self.collusion_detector.read().is_peer_suspected(node_id) {
             return true;
         }
 
@@ -509,7 +485,7 @@ impl SecurityCoordinator {
 
     /// Get eviction reason for a node
     #[must_use]
-    pub fn get_eviction_reason(&self, node_id: &DhtNodeId) -> Option<EvictionReason> {
+    pub fn get_eviction_reason(&self, node_id: &PeerId) -> Option<EvictionReason> {
         // Check eviction manager reasons
         if let Some(reason) = self.eviction_manager.read().get_eviction_reason(node_id) {
             return Some(reason);
@@ -529,17 +505,16 @@ impl SecurityCoordinator {
 
     /// Get all nodes that should be evicted
     #[must_use]
-    pub fn get_eviction_candidates(&self) -> Vec<(DhtNodeId, EvictionReason)> {
+    pub fn get_eviction_candidates(&self) -> Vec<(PeerId, EvictionReason)> {
         let mut candidates = self.eviction_manager.read().get_eviction_candidates();
 
-        // Add Sybil suspects (convert PeerId to DhtNodeId)
+        // Add Sybil suspects
         for group in self.sybil_detector.read().get_suspected_groups() {
             if group.confidence >= 0.7 {
                 for member in &group.members {
-                    let dht_id = identity_to_dht_id(member);
-                    if !candidates.iter().any(|(id, _)| id == &dht_id) {
+                    if !candidates.iter().any(|(id, _)| id == member) {
                         candidates.push((
-                            dht_id,
+                            *member,
                             EvictionReason::LowTrust("Sybil suspected".to_string()),
                         ));
                     }
@@ -547,14 +522,13 @@ impl SecurityCoordinator {
             }
         }
 
-        // Add collusion suspects (convert PeerId to DhtNodeId)
+        // Add collusion suspects
         for group in self.collusion_detector.read().get_suspected_groups() {
             if group.confidence >= 0.7 {
                 for member in &group.members {
-                    let dht_id = identity_to_dht_id(member);
-                    if !candidates.iter().any(|(id, _)| id == &dht_id) {
+                    if !candidates.iter().any(|(id, _)| id == member) {
                         candidates.push((
-                            dht_id,
+                            *member,
                             EvictionReason::LowTrust("Collusion suspected".to_string()),
                         ));
                     }
@@ -567,7 +541,7 @@ impl SecurityCoordinator {
 
     /// Validate geographic diversity of a node set
     #[must_use]
-    pub fn validate_geographic_diversity(&self, node_ids: &[DhtNodeId]) -> bool {
+    pub fn validate_geographic_diversity(&self, node_ids: &[PeerId]) -> bool {
         let regions = self.node_regions.read();
         let unique_regions: HashSet<_> = node_ids.iter().filter_map(|id| regions.get(id)).collect();
 
@@ -576,17 +550,11 @@ impl SecurityCoordinator {
 
     /// Get security score for a node (composite of all factors)
     #[must_use]
-    pub fn get_security_score(&self, node_id: &DhtNodeId) -> f64 {
+    pub fn get_security_score(&self, node_id: &PeerId) -> f64 {
         let base_trust = self.get_trust_score(node_id).unwrap_or(0.5);
 
-        // Convert to identity NodeId for detector queries
-        let peer_id = dht_to_identity_id(node_id);
-
-        let sybil_penalty = self.sybil_detector.read().sybil_risk_score(&peer_id);
-        let collusion_penalty = self
-            .collusion_detector
-            .read()
-            .collusion_risk_score(&peer_id);
+        let sybil_penalty = self.sybil_detector.read().sybil_risk_score(node_id);
+        let collusion_penalty = self.collusion_detector.read().collusion_risk_score(node_id);
 
         // Composite score with penalties
         let score = base_trust * (1.0 - sybil_penalty * 0.5) * (1.0 - collusion_penalty * 0.5);
@@ -595,13 +563,10 @@ impl SecurityCoordinator {
 
     /// Check if a node is eligible for critical operations
     #[must_use]
-    pub fn is_eligible_for_critical_ops(&self, node_id: &DhtNodeId) -> bool {
-        // Convert to identity NodeId for detector queries
-        let peer_id = dht_to_identity_id(node_id);
-
+    pub fn is_eligible_for_critical_ops(&self, node_id: &PeerId) -> bool {
         self.get_security_score(node_id) >= 0.7
-            && !self.sybil_detector.read().is_peer_suspected(&peer_id)
-            && !self.collusion_detector.read().is_peer_suspected(&peer_id)
+            && !self.sybil_detector.read().is_peer_suspected(node_id)
+            && !self.collusion_detector.read().is_peer_suspected(node_id)
             && !self
                 .eviction_tracker
                 .read()
@@ -641,9 +606,9 @@ impl SecurityCoordinator {
     /// Returns: (valid_nodes, eviction_candidates)
     pub fn orchestrate_refresh_validation(
         &self,
-        refreshed_nodes: &[DhtNodeId],
-        responses_by_node: &HashMap<DhtNodeId, Vec<CloseGroupResponse>>,
-    ) -> (Vec<DhtNodeId>, Vec<(DhtNodeId, EvictionReason)>) {
+        refreshed_nodes: &[PeerId],
+        responses_by_node: &HashMap<PeerId, Vec<CloseGroupResponse>>,
+    ) -> (Vec<PeerId>, Vec<(PeerId, EvictionReason)>) {
         let mut valid_nodes = Vec::new();
         let mut eviction_candidates = Vec::new();
 
@@ -661,11 +626,11 @@ impl SecurityCoordinator {
             let validation_result = self.validate_node_comprehensive(node_id, responses);
 
             if validation_result.is_valid {
-                valid_nodes.push(node_id.clone());
+                valid_nodes.push(*node_id);
             } else {
                 // Determine eviction reason
                 let reason = self.determine_eviction_reason(&validation_result);
-                eviction_candidates.push((node_id.clone(), reason));
+                eviction_candidates.push((*node_id, reason));
             }
         }
 
@@ -686,15 +651,14 @@ impl SecurityCoordinator {
     /// Combines close group validation with additional security checks.
     fn validate_node_comprehensive(
         &self,
-        node_id: &DhtNodeId,
+        node_id: &PeerId,
         responses: &[CloseGroupResponse],
     ) -> CloseGroupValidationResult {
         // Get close group validation result
         let result = self.validate_close_group_membership(node_id, responses);
 
         // Additional Sybil check
-        let peer_id = dht_to_identity_id(node_id);
-        if self.sybil_detector.read().is_peer_suspected(&peer_id) {
+        if self.sybil_detector.read().is_peer_suspected(node_id) {
             // Return a modified result if Sybil suspected
             let mut modified = result.clone();
             if modified.is_valid {
@@ -707,7 +671,7 @@ impl SecurityCoordinator {
         }
 
         // Additional collusion check
-        if self.collusion_detector.read().is_peer_suspected(&peer_id) {
+        if self.collusion_detector.read().is_peer_suspected(node_id) {
             let mut modified = result.clone();
             if modified.is_valid {
                 modified.is_valid = false;
@@ -763,7 +727,7 @@ impl SecurityCoordinator {
     }
 
     /// Analyze a set of nodes for cross-node attack patterns.
-    fn analyze_node_set(&self, nodes: &[DhtNodeId]) {
+    fn analyze_node_set(&self, nodes: &[PeerId]) {
         // Check geographic diversity of the set
         if !nodes.is_empty() && !self.validate_geographic_diversity(nodes) {
             // Log warning but don't reject - this is informational
@@ -820,8 +784,8 @@ impl SecurityCoordinator {
     /// Record metrics for refresh validation results.
     fn record_refresh_metrics(
         &self,
-        valid_nodes: &[DhtNodeId],
-        eviction_candidates: &[(DhtNodeId, EvictionReason)],
+        valid_nodes: &[PeerId],
+        eviction_candidates: &[(PeerId, EvictionReason)],
     ) {
         let total = valid_nodes.len() + eviction_candidates.len();
         if total == 0 {
@@ -956,8 +920,8 @@ pub struct AttackIndicatorsSummary {
 mod tests {
     use super::*;
 
-    fn random_node_id() -> DhtNodeId {
-        DhtNodeId::random()
+    fn random_node_id() -> PeerId {
+        PeerId::random()
     }
 
     fn create_response(
@@ -1025,7 +989,7 @@ mod tests {
 
         // Record eviction
         coordinator.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            node_id,
             vec![CloseGroupFailure::InsufficientConfirmation],
             5,
         );
@@ -1127,7 +1091,7 @@ mod tests {
 
         // Record eviction
         coordinator.eviction_tracker.write().record_eviction(
-            node_id.clone(),
+            node_id,
             vec![CloseGroupFailure::InsufficientConfirmation],
             5,
         );

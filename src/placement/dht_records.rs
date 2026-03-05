@@ -100,7 +100,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 // authentication, reputation, and network-level controls.
 
 /// Node identifier for compatibility with existing saorsa-core
-pub use crate::adaptive::NodeId;
+pub use crate::PeerId;
 
 /// Group identifier for placement groups
 pub type GroupId = SerializableHash;
@@ -268,7 +268,7 @@ pub enum PolicyScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAd {
     /// Node identifier
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     /// Network addresses
     pub addrs: Vec<SocketAddr>,
     /// Node capabilities
@@ -292,7 +292,7 @@ pub struct NodeAd {
 impl NodeAd {
     /// Create a new node advertisement
     pub fn new(
-        node_id: NodeId,
+        node_id: PeerId,
         addrs: Vec<SocketAddr>,
         caps: NodeCapabilities,
         nat_type: NatType,
@@ -366,7 +366,7 @@ pub struct GroupBeacon {
     /// Merkle root of group members
     pub member_root: SerializableHash,
     /// Guardian nodes (subset of members with special permissions)
-    pub guardians: Vec<NodeId>,
+    pub guardians: Vec<PeerId>,
     /// Timestamp (seconds since UNIX epoch)
     pub ts: u64,
     /// Digital signature of the beacon (placeholder for actual signature)
@@ -379,7 +379,7 @@ impl GroupBeacon {
         group_id: GroupId,
         policy: PlacementPolicy,
         member_root: SerializableHash,
-        guardians: Vec<NodeId>,
+        guardians: Vec<PeerId>,
     ) -> P2pResult<Self> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -767,13 +767,13 @@ mod tests {
 
     #[test]
     fn test_node_ad_creation() {
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
         let caps = NodeCapabilities::new(1000, 500, 50).unwrap();
         let os_sig = OsSignature::current();
 
         let node_ad = NodeAd::new(
-            node_id.clone(),
+            node_id,
             vec![addr],
             caps,
             NatType::None,
@@ -791,14 +791,14 @@ mod tests {
 
     #[test]
     fn test_node_ad_validation() {
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let caps = NodeCapabilities::new(1000, 500, 50).unwrap();
         let os_sig = OsSignature::current();
 
         // No addresses
         assert!(
             NodeAd::new(
-                node_id.clone(),
+                node_id,
                 vec![],
                 caps.clone(),
                 NatType::None,
@@ -835,7 +835,7 @@ mod tests {
         let group_id = SerializableHash([3u8; 32]);
         let policy = PlacementPolicy::default();
         let member_root = SerializableHash::from(blake3::hash(b"members"));
-        let guardians = vec![NodeId::from_bytes([4u8; 32]), NodeId::from_bytes([5u8; 32])];
+        let guardians = vec![PeerId::from_bytes([4u8; 32]), PeerId::from_bytes([5u8; 32])];
 
         let beacon = GroupBeacon::new(group_id.clone(), policy, member_root, guardians).unwrap();
         assert_eq!(beacon.group_id, group_id);
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_dht_record_serialization() {
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
         let caps = NodeCapabilities::new(1000, 500, 50).unwrap();
         let os_sig = OsSignature::current();
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn test_record_size_limit() {
         // Create a record that would exceed size limit
-        let node_id = NodeId::from_bytes([1u8; 32]);
+        let node_id = PeerId::from_bytes([1u8; 32]);
         let many_addrs: Vec<SocketAddr> = (0..100)
             .map(|i| {
                 SocketAddr::V4(SocketAddrV4::new(

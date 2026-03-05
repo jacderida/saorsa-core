@@ -2,16 +2,13 @@
 //!
 //! Defines the interface for DHT operations with trust bias and capacity signaling.
 
-use crate::identity::node_identity::NodeId;
+pub use crate::identity::node_identity::PeerId;
 use anyhow::Result;
 use bytes::Bytes;
 use std::time::Duration;
 
 /// DHT key type (256-bit)
 pub type Key = [u8; 32];
-
-/// Peer identifier
-pub type PeerId = NodeId;
 
 /// Contact information for routing
 #[derive(Debug, Clone)]

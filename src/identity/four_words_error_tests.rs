@@ -17,12 +17,12 @@
 mod tests {
     use crate::error::{IdentityError, P2PError};
     use crate::identity::four_words::{FourWordAddress, WordEncoder};
-    use crate::identity::node_identity::NodeId;
+    use crate::identity::node_identity::PeerId;
 
     #[test]
     fn test_four_word_from_node_id_success() {
-        let node_id = NodeId([0x42; 32]);
-        let address = FourWordAddress::from_node_id(&node_id);
+        let peer_id = PeerId([0x42; 32]);
+        let address = FourWordAddress::from_peer_id(&peer_id);
         assert_eq!(address.words().len(), 4);
     }
 

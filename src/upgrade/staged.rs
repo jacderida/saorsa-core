@@ -36,7 +36,7 @@ pub struct StagedUpdate {
     /// Target platform.
     pub platform: Platform,
 
-    /// SHA-256 checksum of the binary.
+    /// BLAKE3 checksum of the binary.
     pub checksum: String,
 
     /// Size in bytes.
@@ -141,7 +141,7 @@ pub struct StagedUpdateMetadata {
     /// Target platform string.
     pub platform: String,
 
-    /// SHA-256 checksum.
+    /// BLAKE3 checksum.
     pub checksum: String,
 
     /// Size in bytes.

@@ -67,7 +67,7 @@ jobs:
 
       - name: QUIC Integration
         # Run sequentially to avoid port binding conflicts
-        run: cargo nextest run --test ant_quic_integration_test --features "mocks,h2_greedy,test-utils" --no-fail-fast --test-threads=1
+        run: cargo nextest run --test saorsa_transport_integration_test --features "mocks,h2_greedy,test-utils" --no-fail-fast --test-threads=1
 
       - name: Wait for socket cleanup
         run: sleep 5

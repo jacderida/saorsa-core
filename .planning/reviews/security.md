@@ -80,11 +80,11 @@ The project depends on 4 unmaintained crates with security advisories:
 
 #### 3. rustls-pemfile 2.2.0
 - **Advisory**: RUSTSEC-2025-0134 - Unmaintained (very recent)
-- **Dependency Chain**: `ant-quic 0.21.2 → saorsa-core`
+- **Dependency Chain**: `saorsa-transport 0.21.2 → saorsa-core`
 - **Recommendation**:
-  - Update ant-quic to version using maintained rustls-pemfile
+  - Update saorsa-transport to version using maintained rustls-pemfile
   - Contribute maintenance patches if critical
-  - Track ant-quic releases for fixes
+  - Track saorsa-transport releases for fixes
 
 #### 4. serde_cbor 0.11.2
 - **Advisory**: RUSTSEC-2021-0127 - Unmaintained

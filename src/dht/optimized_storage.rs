@@ -406,7 +406,7 @@ mod tests {
         let hash = blake3::hash(b"test_key");
         let key = *hash.as_bytes();
         let value = b"test_value".to_vec();
-        let publisher = crate::identity::node_identity::NodeId::from_bytes([123u8; 32]);
+        let publisher = crate::identity::node_identity::PeerId::from_bytes([123u8; 32]);
         let record = Record::new(key, value.clone(), publisher);
 
         // Store and retrieve
@@ -427,7 +427,7 @@ mod tests {
             let hash = blake3::hash(format!("key_{}", i).as_bytes());
             let key = *hash.as_bytes();
             let value = format!("value_{}", i).into_bytes();
-            let publisher = crate::identity::node_identity::NodeId::from_bytes([i as u8; 32]);
+            let publisher = crate::identity::node_identity::PeerId::from_bytes([i as u8; 32]);
             let record = Record::new(key, value, publisher);
             storage.store(record).await.unwrap();
         }
@@ -441,14 +441,14 @@ mod tests {
         let config = DHTConfig::default();
         let storage = OptimizedDHTStorage::new(config);
 
-        let publisher = crate::identity::node_identity::NodeId::from_bytes([42u8; 32]);
+        let publisher = crate::identity::node_identity::PeerId::from_bytes([42u8; 32]);
 
         // Store multiple records from same publisher
         for i in 0..3 {
             let hash = blake3::hash(format!("key_{}", i).as_bytes());
             let key = *hash.as_bytes();
             let value = format!("value_{}", i).into_bytes();
-            let record = Record::new(key, value, publisher.clone());
+            let record = Record::new(key, value, publisher);
             storage.store(record).await.unwrap();
         }
 
@@ -468,7 +468,7 @@ mod tests {
         let hash = blake3::hash(b"expired_key");
         let key = *hash.as_bytes();
         let value = b"expired_value".to_vec();
-        let publisher = crate::identity::node_identity::NodeId::from_bytes([123u8; 32]);
+        let publisher = crate::identity::node_identity::PeerId::from_bytes([123u8; 32]);
         let mut record = Record::new(key, value, publisher);
 
         // Set expiration to past

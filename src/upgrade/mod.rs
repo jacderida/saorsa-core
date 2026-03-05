@@ -247,7 +247,7 @@ mod tests {
             release_notes: "Test release".to_string(),
             binary: PlatformBinary {
                 url: "https://example.com/binary".to_string(),
-                sha256: "abc123".to_string(),
+                hash: "abc123".to_string(),
                 signature: "sig123".to_string(),
                 size: 1000,
             },

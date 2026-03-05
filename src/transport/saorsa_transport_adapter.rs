@@ -1,30 +1,20 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// Adapter for ant-quic integration
+// Adapter for saorsa-transport integration
 
 //! Ant-QUIC Transport Adapter
 //!
-//! This module provides a clean interface to ant-quic's peer-to-peer networking
+//! This module provides a clean interface to saorsa-transport's peer-to-peer networking
 //! with advanced NAT traversal and post-quantum cryptography.
 //!
 //! ## Architecture
 //!
-//! Uses ant-quic's LinkTransport trait abstraction:
+//! Uses saorsa-transport's LinkTransport trait abstraction:
 //! - `P2pLinkTransport` for real network communication
 //! - `MockTransport` for testing overlay logic
-//! - All communication uses `PeerId` instead of socket addresses
+//! - All communication uses `SocketAddr` for connection addressing
+//! - Authenticated public keys exposed via `LinkConn::peer_public_key()`
 //! - Built-in NAT traversal, peer discovery, and post-quantum crypto
-//!
-//! ## PeerId Format
-//!
-//! The `PeerId` type is a 32-byte array (256 bits) representing the cryptographic identity
-//! of a peer. This is derived from ML-DSA-65 (formerly CRYSTALS-Dilithium5) post-quantum
-//! signatures, providing:
-//! - 256-bit security level against quantum attacks
-//! - Unique identity per cryptographic keypair
-//! - Human-readable via four-word addresses (using `four-word-networking` crate)
-//!
-//! The PeerId is encoded as 64 hex characters when serialized to strings.
 //!
 //! ## Protocol Multiplexing
 //!
@@ -32,15 +22,15 @@
 //! - `SAORSA_DHT_PROTOCOL` ("saorsa-dht/1.0.0") for DHT operations
 //! - Custom protocols can be registered for different services
 //!
-//! **IMPORTANT**: Protocol-based filtering in `accept()` is not yet implemented in ant-quic.
+//! **IMPORTANT**: Protocol-based filtering in `accept()` is not yet implemented in saorsa-transport.
 //! The `accept()` method accepts all incoming connections regardless of protocol.
 //! Applications must validate the protocol on received connections.
 //!
 //! ## Quality-Based Peer Selection
 //!
-//! The adapter tracks peer quality scores from ant-quic's `Capabilities.quality_score()`
+//! The adapter tracks peer quality scores from saorsa-transport's `Capabilities.quality_score()`
 //! (range 0.0 to 1.0, where higher is better). Methods available:
-//! - `get_peer_quality(peer_id)` - Get quality for a specific peer
+//! - `get_peer_quality(addr)` - Get quality for a specific peer
 //! - `get_peers_by_quality()` - Get all peers sorted by quality (descending)
 //! - `get_top_peers_by_quality(n)` - Get top N peers by quality
 //! - `get_peers_above_quality_threshold(threshold)` - Filter peers by minimum quality
@@ -56,7 +46,7 @@
 //! ## Metrics Integration
 //!
 //! When saorsa-core is compiled with the `metrics` feature, this adapter
-//! automatically enables ant-quic's prometheus metrics collection.
+//! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoEnforcementMode, GeoRejectionError, GeographicConfig};
 use crate::telemetry::StreamClass;
@@ -70,14 +60,15 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-// Import ant-quic types using the new LinkTransport API (0.14+)
-use ant_quic::nat_traversal_api::PeerId;
-use ant_quic::{LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId};
+// Import saorsa-transport types using the new LinkTransport API (0.14+)
+use saorsa_transport::{
+    LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId,
+};
 
 // Import saorsa-transport types for SharedTransport integration
-use ant_quic::SharedTransport;
-use ant_quic::link_transport::StreamType;
 use futures::StreamExt;
+use saorsa_transport::SharedTransport;
+use saorsa_transport::link_transport::StreamType;
 
 /// Protocol identifier for saorsa DHT overlay
 ///
@@ -85,23 +76,29 @@ use futures::StreamExt;
 /// over the QUIC transport. Other protocols can be registered for different services.
 pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
 
-/// Connection lifecycle events from ant-quic
+/// Connection lifecycle events from saorsa-transport
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Connection successfully established
     Established {
-        peer_id: PeerId,
         remote_address: SocketAddr,
+        public_key: Option<Vec<u8>>,
     },
     /// Connection lost/closed
-    Lost { peer_id: PeerId, reason: String },
+    Lost {
+        remote_address: SocketAddr,
+        reason: String,
+    },
     /// Connection attempt failed
-    Failed { peer_id: PeerId, reason: String },
+    Failed {
+        remote_address: SocketAddr,
+        reason: String,
+    },
 }
 
-/// Native ant-quic network node using LinkTransport abstraction
+/// Native saorsa-transport network node using LinkTransport abstraction
 ///
-/// This provides a clean interface to ant-quic's peer-to-peer networking
+/// This provides a clean interface to saorsa-transport's peer-to-peer networking
 /// with advanced NAT traversal and post-quantum cryptography.
 ///
 /// Generic over the transport type to allow testing with MockTransport.
@@ -110,8 +107,8 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
     transport: Arc<T>,
     /// Our local binding address
     pub local_addr: SocketAddr,
-    /// Peer registry for tracking connected peers
-    pub peers: Arc<RwLock<Vec<(PeerId, SocketAddr)>>>,
+    /// Peer registry for tracking connected peer addresses
+    pub peers: Arc<RwLock<Vec<SocketAddr>>>,
     /// Connection event broadcaster
     event_tx: broadcast::Sender<ConnectionEvent>,
     /// Shutdown signal for event polling task
@@ -122,8 +119,8 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
     geo_config: Option<GeographicConfig>,
     /// Peer region tracking for geographic diversity
     peer_regions: Arc<RwLock<HashMap<String, usize>>>,
-    /// Peer quality scores from ant-quic Capabilities
-    peer_quality: Arc<RwLock<HashMap<PeerId, f32>>>,
+    /// Peer quality scores from saorsa-transport Capabilities, keyed by SocketAddr
+    peer_quality: Arc<RwLock<HashMap<SocketAddr, f32>>>,
     /// Shared transport for protocol multiplexing
     shared_transport: Arc<SharedTransport<T>>,
 }
@@ -135,7 +132,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 /// Maximum application-layer message size (1 MiB).
 ///
 /// This tunes both the QUIC stream receive window and the per-stream
-/// read buffer inside `ant-quic`.
+/// read buffer inside `saorsa-transport`.
 pub const MAX_MESSAGE_SIZE: usize = P2pConfig::DEFAULT_MAX_MESSAGE_SIZE;
 
 impl P2PNetworkNode<P2pLinkTransport> {
@@ -147,7 +144,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with a specific connection limit and
     /// optional message-size override.
     ///
-    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
+    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
     pub async fn new_with_max_connections(
         bind_addr: SocketAddr,
         max_connections: usize,
@@ -190,7 +187,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node from NetworkConfig with an optional
     /// message-size override.
     ///
-    /// When `max_msg_size` is `None` ant-quic's built-in default is used.
+    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
     pub async fn from_network_config(
         bind_addr: SocketAddr,
         net_config: &crate::transport::NetworkConfig,
@@ -225,26 +222,25 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// This method is specialized for P2pLinkTransport and uses the underlying
     /// P2pEndpoint's send() method which corresponds with recv() for proper
     /// bidirectional communication.
-    pub async fn send_to_peer_optimized(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
-        let peer_id_short = hex::encode(&peer_id.0[..8]);
+    pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         info!(
             "[QUIC SEND] Calling endpoint().send() to {} ({} bytes)",
-            peer_id_short,
+            addr,
             data.len()
         );
-        let result = self.transport.endpoint().send(peer_id, data).await;
+        let result = self.transport.endpoint().send(addr, data).await;
         match &result {
             Ok(()) => {
                 info!(
                     "[QUIC SEND] endpoint().send() returned Ok to {} ({} bytes)",
-                    peer_id_short,
+                    addr,
                     data.len()
                 );
             }
             Err(e) => {
                 info!(
                     "[QUIC SEND] endpoint().send() returned Err to {}: {}",
-                    peer_id_short, e
+                    addr, e
                 );
             }
         }
@@ -256,15 +252,15 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Calls `P2pEndpoint::disconnect()` to tear down the QUIC connection
     /// and abort the per-connection reader task, then removes the peer from
     /// the local registry.
-    pub async fn disconnect_peer_quic(&self, peer_id: &PeerId) {
-        if let Err(e) = self.transport.endpoint().disconnect(peer_id).await {
-            tracing::warn!("QUIC disconnect for peer {}: {}", peer_id, e);
+    pub async fn disconnect_peer_quic(&self, addr: &SocketAddr) {
+        if let Err(e) = self.transport.endpoint().disconnect(addr).await {
+            tracing::warn!("QUIC disconnect for peer {}: {}", addr, e);
         }
         // Also clean up from generic adapter state
         P2PNetworkNode::<P2pLinkTransport>::disconnect_peer_inner(
             &self.peers,
             &self.peer_quality,
-            peer_id,
+            addr,
         )
         .await;
     }
@@ -272,9 +268,9 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Spawn a background task that continuously receives messages from the
     /// QUIC endpoint and forwards them into the provided channel.
     ///
-    /// Uses ant-quic v0.20's channel-based `recv()` which is fully
+    /// Uses saorsa-transport v0.20's channel-based `recv()` which is fully
     /// event-driven — no polling or timeout parameter. Per-connection
-    /// reader tasks inside ant-quic feed a shared mpsc channel, so
+    /// reader tasks inside saorsa-transport feed a shared mpsc channel, so
     /// `recv()` wakes instantly when data arrives on any peer's QUIC
     /// stream. The task exits when the shutdown signal is set, the
     /// channel is closed, or the endpoint shuts down.
@@ -282,7 +278,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Returns the task handle for cleanup.
     pub fn spawn_recv_task(
         &self,
-        tx: tokio::sync::mpsc::Sender<(PeerId, Vec<u8>)>,
+        tx: tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         /// Maximum size of a single received message (16 MB).
@@ -298,15 +294,16 @@ impl P2PNetworkNode<P2pLinkTransport> {
                     }
                     result = transport.endpoint().recv() => {
                         match result {
-                            Ok((peer_id, data)) => {
+                            Ok((addr, data)) => {
                                 if data.len() > MAX_RECV_MESSAGE_SIZE {
                                     tracing::warn!(
-                                        "Dropping oversized message ({} bytes) from peer",
-                                        data.len()
+                                        "Dropping oversized message ({} bytes) from {}",
+                                        data.len(),
+                                        addr
                                     );
                                     continue;
                                 }
-                                if tx.send((peer_id, data)).await.is_err() {
+                                if tx.send((addr, data)).await.is_err() {
                                     break; // channel closed
                                 }
                             }
@@ -345,25 +342,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
                 tokio::select! {
                     () = shutdown_clone.cancelled() => break,
                     recv = link_events.recv() => match recv {
-                    Ok(LinkEvent::PeerConnected { peer, caps }) => {
-                        // Capture quality score from ant-quic Capabilities
+                    Ok(LinkEvent::PeerConnected { addr, public_key, caps }) => {
+                        // Capture quality score from saorsa-transport Capabilities
                         let quality = caps.quality_score();
                         {
                             let mut quality_map = peer_quality_for_task.write().await;
-                            quality_map.insert(peer, quality);
+                            quality_map.insert(addr, quality);
                         }
-
-                        // Use first observed address; skip event if none available
-                        let addr = match caps.observed_addrs.first().copied() {
-                            Some(a) => a,
-                            None => {
-                                tracing::warn!(
-                                    "Peer {} connected but no observed address available, skipping event",
-                                    peer
-                                );
-                                continue;
-                            }
-                        };
 
                         // Note: Peer tracking with geographic validation is done by
                         // add_peer() in connect_to_peer() and accept_connection().
@@ -372,24 +357,24 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
                         // geographic validation functionality.
 
                         let _ = event_tx_clone.send(ConnectionEvent::Established {
-                            peer_id: peer,
                             remote_address: addr,
+                            public_key,
                         });
                     }
-                    Ok(LinkEvent::PeerDisconnected { peer, reason }) => {
+                    Ok(LinkEvent::PeerDisconnected { addr, reason }) => {
                         // Remove the peer from tracking
                         {
                             let mut peers = peers_for_task.write().await;
-                            peers.retain(|(p, _)| *p != peer);
+                            peers.retain(|a| *a != addr);
                         }
                         // Also remove from quality scores
                         {
                             let mut quality_map = peer_quality_for_task.write().await;
-                            quality_map.remove(&peer);
+                            quality_map.remove(&addr);
                         }
 
                         let _ = event_tx_clone.send(ConnectionEvent::Lost {
-                            peer_id: peer,
+                            remote_address: addr,
                             reason: format!("{:?}", reason),
                         });
                     }
@@ -435,7 +420,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         dht_engine: Arc<RwLock<crate::dht::core_engine::DhtCoreEngine>>,
     ) -> Result<()> {
         use crate::transport::dht_handler::DhtStreamHandler;
-        use ant_quic::link_transport::ProtocolHandlerExt;
+        use saorsa_transport::link_transport::ProtocolHandlerExt;
 
         let handler = DhtStreamHandler::new(dht_engine);
         self.shared_transport
@@ -469,19 +454,19 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// The stream type byte is prepended automatically.
     pub async fn send_typed(
         &self,
-        peer_id: &PeerId,
+        addr: &SocketAddr,
         stream_type: StreamType,
         data: bytes::Bytes,
     ) -> Result<()> {
         self.shared_transport
-            .send(*peer_id, stream_type, data)
+            .send(addr, stream_type, data)
             .await
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to send typed data: {}", e))
     }
 
     /// Connect to a peer by address
-    pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<PeerId> {
+    pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
         // Add timeout to prevent indefinite hanging during NAT traversal/QUIC handshake
         const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -499,16 +484,16 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         })?
         .map_err(|e| anyhow::anyhow!("Failed to connect to peer {}: {}", peer_addr, e))?;
 
-        let peer_id = conn.peer();
+        let remote_addr = conn.remote_addr();
 
         // Register the peer with geographic validation
-        self.add_peer(peer_id, peer_addr).await;
+        self.add_peer(remote_addr).await;
 
         // Note: ConnectionEvent is broadcast by event forwarder
         // to avoid duplicate events
 
-        info!("Connected to peer {} at {}", peer_id, peer_addr);
-        Ok(peer_id)
+        info!("Connected to peer at {}", remote_addr);
+        Ok(remote_addr)
     }
 
     /// Try to accept one incoming connection.
@@ -517,19 +502,18 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// down. A `None` return is terminal — the caller should exit its
     /// accept loop.
     ///
-    /// **NOTE**: Protocol-based filtering is not yet implemented in ant-quic's `accept()` method.
+    /// **NOTE**: Protocol-based filtering is not yet implemented in saorsa-transport's `accept()` method.
     /// This method accepts connections for ANY protocol, not just `SAORSA_DHT_PROTOCOL`.
     /// Applications must validate that incoming connections are using the expected protocol.
-    pub async fn accept_connection(&self) -> Option<(PeerId, SocketAddr)> {
+    pub async fn accept_connection(&self) -> Option<SocketAddr> {
         let mut incoming = self.transport.accept(SAORSA_DHT_PROTOCOL);
         while let Some(conn_result) = incoming.next().await {
             match conn_result {
                 Ok(conn) => {
-                    let peer_id = conn.peer();
                     let addr = conn.remote_addr();
-                    self.add_peer(peer_id, addr).await;
-                    tracing::info!("Accepted connection from peer {} at {}", peer_id, addr);
-                    return Some((peer_id, addr));
+                    self.add_peer(addr).await;
+                    tracing::info!("Accepted connection from peer at {}", addr);
+                    return Some(addr);
                 }
                 Err(e) => {
                     tracing::warn!("Accept stream error: {}", e);
@@ -557,35 +541,16 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         }
     }
 
-    /// Send data to a specific peer
+    /// Send data to a specific peer by address.
     ///
-    /// This method first looks up the peer's address from our local peers list,
-    /// then connects by address. This is necessary because `dial(peer_id)` only
-    /// works if ant-quic already knows the peer's address, but for peers that
-    /// connected TO us, we only have their address in our application-level peers list.
-    pub async fn send_to_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
-        // Look up the peer's address from our peers list
-        let peer_addr = {
-            let peers = self.peers.read().await;
-            peers
-                .iter()
-                .find(|(p, _)| p == peer_id)
-                .map(|(_, addr)| *addr)
-        };
-
-        // Connect by address if we have it, otherwise try dial by peer_id
-        let conn = match peer_addr {
-            Some(addr) => self
-                .transport
-                .dial_addr(addr, SAORSA_DHT_PROTOCOL)
-                .await
-                .map_err(|e| anyhow::anyhow!("Dial by address failed: {}", e))?,
-            None => self
-                .transport
-                .dial(*peer_id, SAORSA_DHT_PROTOCOL)
-                .await
-                .map_err(|e| anyhow::anyhow!("Dial by peer_id failed: {}", e))?,
-        };
+    /// Dials the peer by address, opens a typed unidirectional stream,
+    /// writes the data, and finishes the stream.
+    pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+        let conn = self
+            .transport
+            .dial_addr(*addr, SAORSA_DHT_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("Dial by address failed: {}", e))?;
 
         // Open a typed unidirectional stream for DHT messages
         // Using DhtStore stream type for DHT protocol messages
@@ -609,11 +574,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Send data with a StreamClass (basic QoS wiring with telemetry)
     pub async fn send_with_class(
         &self,
-        peer_id: &PeerId,
+        addr: &SocketAddr,
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        self.send_to_peer(peer_id, data).await?;
+        self.send_to_peer_raw(addr, data).await?;
         crate::telemetry::telemetry()
             .record_stream_bandwidth(class, data.len() as u64)
             .await;
@@ -635,9 +600,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         Ok(self.local_addr)
     }
 
-    /// Get our peer ID
-    pub fn our_peer_id(&self) -> PeerId {
-        self.transport.local_peer()
+    /// Get our local public key (ML-DSA-65 SPKI bytes)
+    pub fn our_public_key(&self) -> Vec<u8> {
+        self.transport.local_public_key()
     }
 
     /// Get our observed external address as reported by peers
@@ -645,19 +610,19 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         self.transport.external_address()
     }
 
-    /// Get all connected peers
-    pub async fn get_connected_peers(&self) -> Vec<(PeerId, SocketAddr)> {
+    /// Get all connected peer addresses
+    pub async fn get_connected_peers(&self) -> Vec<SocketAddr> {
         self.peers.read().await.clone()
     }
 
     /// Check if a peer is connected
-    pub async fn is_connected(&self, peer_id: &PeerId) -> bool {
-        self.transport.is_connected(peer_id)
+    pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
+        self.transport.is_connected(addr)
     }
 
     /// Check if a peer is authenticated (always true with PQC auth)
-    pub async fn is_authenticated(&self, _peer_id: &PeerId) -> bool {
-        // With ant-quic 0.14+, all connections are PQC authenticated
+    pub async fn is_authenticated(&self, _addr: &SocketAddr) -> bool {
+        // With saorsa-transport 0.14+, all connections are PQC authenticated
         true
     }
 
@@ -665,13 +630,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     pub async fn bootstrap_from_nodes(
         &self,
         bootstrap_addrs: &[SocketAddr],
-    ) -> Result<Vec<PeerId>> {
+    ) -> Result<Vec<SocketAddr>> {
         let mut connected_peers = Vec::new();
 
         for &addr in bootstrap_addrs {
             match self.connect_to_peer(addr).await {
-                Ok(peer_id) => {
-                    connected_peers.push(peer_id);
+                Ok(peer_addr) => {
+                    connected_peers.push(peer_addr);
                     tracing::info!("Successfully bootstrapped from {}", addr);
                 }
                 Err(e) => {
@@ -688,20 +653,19 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     }
 
     /// Internal helper to register a peer with geographic validation
-    async fn add_peer(&self, peer_id: PeerId, addr: SocketAddr) {
+    async fn add_peer(&self, addr: SocketAddr) {
         // Perform geographic validation if configured
         if let Some(ref config) = self.geo_config {
             match self.validate_geographic_diversity(&addr, config).await {
                 Ok(()) => {}
                 Err(err) => match config.enforcement_mode {
                     GeoEnforcementMode::Strict => {
-                        tracing::warn!("REJECTED peer {} from {} - {}", peer_id, addr, err);
+                        tracing::warn!("REJECTED peer {} - {}", addr, err);
                         return;
                     }
                     GeoEnforcementMode::LogOnly => {
                         tracing::info!(
-                            "GEO_AUDIT: Would reject peer {} from {} - {} (log-only mode)",
-                            peer_id,
+                            "GEO_AUDIT: Would reject peer {} - {} (log-only mode)",
                             addr,
                             err
                         );
@@ -712,14 +676,14 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
         let mut peers = self.peers.write().await;
 
-        if !peers.iter().any(|(p, _)| *p == peer_id) {
-            peers.push((peer_id, addr));
+        if !peers.contains(&addr) {
+            peers.push(addr);
 
             let region = self.get_region_for_ip(&addr.ip());
             let mut regions = self.peer_regions.write().await;
             *regions.entry(region).or_insert(0) += 1;
 
-            tracing::debug!("Added peer {} from {}", peer_id, addr);
+            tracing::debug!("Added peer from {}", addr);
         }
     }
 
@@ -793,31 +757,27 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Get the quality score for a specific peer (0.0 to 1.0)
     ///
     /// Returns None if the peer is not connected or quality score is not available.
-    /// Quality scores come from ant-quic's Capabilities.quality_score() method.
-    pub async fn get_peer_quality(&self, peer_id: &PeerId) -> Option<f32> {
+    /// Quality scores come from saorsa-transport's Capabilities.quality_score() method.
+    pub async fn get_peer_quality(&self, addr: &SocketAddr) -> Option<f32> {
         let quality_map = self.peer_quality.read().await;
-        quality_map.get(peer_id).copied()
+        quality_map.get(addr).copied()
     }
 
     /// Get all connected peers sorted by quality score (highest first)
     ///
     /// Returns peers with their quality scores, sorted from highest to lowest quality.
     /// Peers without quality scores are excluded from the results.
-    pub async fn get_peers_by_quality(&self) -> Vec<(PeerId, SocketAddr, f32)> {
+    pub async fn get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)> {
         let peers = self.peers.read().await;
         let quality_map = self.peer_quality.read().await;
 
-        let mut peer_qualities: Vec<(PeerId, SocketAddr, f32)> = peers
+        let mut peer_qualities: Vec<(SocketAddr, f32)> = peers
             .iter()
-            .filter_map(|(peer_id, addr)| {
-                quality_map
-                    .get(peer_id)
-                    .map(|quality| (*peer_id, *addr, *quality))
-            })
+            .filter_map(|addr| quality_map.get(addr).map(|quality| (*addr, *quality)))
             .collect();
 
         // Sort by quality descending (highest first)
-        peer_qualities.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        peer_qualities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         peer_qualities
     }
@@ -826,7 +786,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     ///
     /// Returns at most `n` peers with highest quality scores.
     /// Useful for selecting the best peers for operations like storage or routing.
-    pub async fn get_top_peers_by_quality(&self, n: usize) -> Vec<(PeerId, SocketAddr, f32)> {
+    pub async fn get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)> {
         let mut peers = self.get_peers_by_quality().await;
         peers.truncate(n);
         peers
@@ -839,11 +799,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     pub async fn get_peers_above_quality_threshold(
         &self,
         threshold: f32,
-    ) -> Vec<(PeerId, SocketAddr, f32)> {
+    ) -> Vec<(SocketAddr, f32)> {
         self.get_peers_by_quality()
             .await
             .into_iter()
-            .filter(|(_, _, quality)| *quality >= threshold)
+            .filter(|(_, quality)| *quality >= threshold)
             .collect()
     }
 
@@ -860,22 +820,20 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         Some(sum / quality_map.len() as f32)
     }
 
-    /// Send data to a peer using String PeerId
-    pub async fn send_to_peer_string(&self, peer_id_str: &str, data: &[u8]) -> Result<()> {
-        let ant_peer_id = string_to_ant_peer_id(peer_id_str)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer(&ant_peer_id, data).await
+    /// Send data to a peer.
+    pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+        self.send_to_peer_raw(addr, data).await
     }
 
-    /// Connect to a peer and return String PeerId
+    /// Connect to a peer and return the remote address as a string.
     pub async fn connect_to_peer_string(&self, peer_addr: SocketAddr) -> Result<String> {
-        let ant_peer_id = self.connect_to_peer(peer_addr).await?;
-        Ok(ant_peer_id_to_string(&ant_peer_id))
+        let addr = self.connect_to_peer(peer_addr).await?;
+        Ok(addr.to_string())
     }
 
-    /// Send a message (compatibility method for network.rs)
-    pub async fn send_message(&self, peer_id: &str, data: Vec<u8>) -> Result<()> {
-        self.send_to_peer_string(peer_id, &data).await
+    /// Send a message to a peer.
+    pub async fn send_message(&self, addr: &SocketAddr, data: Vec<u8>) -> Result<()> {
+        self.send_to_peer(addr, &data).await
     }
 
     /// Subscribe to connection lifecycle events
@@ -887,25 +845,25 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     ///
     /// For `P2pLinkTransport`, prefer `disconnect_peer_quic()` which also
     /// tears down the underlying QUIC connection.
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) {
-        Self::disconnect_peer_inner(&self.peers, &self.peer_quality, peer_id).await;
+    pub async fn disconnect_peer(&self, addr: &SocketAddr) {
+        Self::disconnect_peer_inner(&self.peers, &self.peer_quality, addr).await;
     }
 
     /// Shared helper to remove a peer from adapter-level tracking.
     async fn disconnect_peer_inner(
-        peers: &RwLock<Vec<(PeerId, SocketAddr)>>,
-        peer_quality: &RwLock<HashMap<PeerId, f32>>,
-        peer_id: &PeerId,
+        peers: &RwLock<Vec<SocketAddr>>,
+        peer_quality: &RwLock<HashMap<SocketAddr, f32>>,
+        addr: &SocketAddr,
     ) {
         {
             let mut peers = peers.write().await;
-            peers.retain(|(p, _)| p != peer_id);
+            peers.retain(|a| a != addr);
         }
         {
             let mut quality_map = peer_quality.write().await;
-            quality_map.remove(peer_id);
+            quality_map.remove(addr);
         }
-        tracing::debug!("Disconnected peer {} from adapter", peer_id);
+        tracing::debug!("Disconnected peer {} from adapter", addr);
     }
 
     /// Shutdown the node gracefully
@@ -982,49 +940,48 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         Ok(Self { v6, v4 })
     }
 
-    /// Send to peer using P2pEndpoint's optimized send method
+    /// Send to peer using P2pEndpoint's optimized send method.
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
     /// bidirectional communication. Tries IPv6 first, then IPv4.
-    pub async fn send_to_peer_optimized(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
-        let peer_id_short = hex::encode(&peer_id.0[..8]);
+    pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6 {
             info!(
                 "[DUAL SEND] Attempting IPv6 send to {} ({} bytes)",
-                peer_id_short,
+                addr,
                 data.len()
             );
-            match v6.send_to_peer_optimized(peer_id, data).await {
+            match v6.send_to_peer_optimized(addr, data).await {
                 Ok(()) => {
                     info!(
                         "[DUAL SEND] IPv6 send SUCCESS to {} ({} bytes)",
-                        peer_id_short,
+                        addr,
                         data.len()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    info!("[DUAL SEND] IPv6 send FAILED to {}: {}", peer_id_short, e);
+                    info!("[DUAL SEND] IPv6 send FAILED to {}: {}", addr, e);
                 }
             }
         }
         if let Some(v4) = &self.v4 {
             info!(
                 "[DUAL SEND] Attempting IPv4 send to {} ({} bytes)",
-                peer_id_short,
+                addr,
                 data.len()
             );
-            match v4.send_to_peer_optimized(peer_id, data).await {
+            match v4.send_to_peer_optimized(addr, data).await {
                 Ok(()) => {
                     info!(
                         "[DUAL SEND] IPv4 send SUCCESS to {} ({} bytes)",
-                        peer_id_short,
+                        addr,
                         data.len()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    info!("[DUAL SEND] IPv4 send FAILED to {}: {}", peer_id_short, e);
+                    info!("[DUAL SEND] IPv4 send FAILED to {}: {}", addr, e);
                 }
             }
         }
@@ -1033,33 +990,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         ))
     }
 
-    /// Send to peer by string PeerId using optimized method
-    pub async fn send_to_peer_string_optimized(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer_optimized(&ant_peer, data).await
-    }
-
-    /// Disconnect a peer by closing the underlying QUIC connection.
+    /// Disconnect a peer, closing the underlying QUIC connection.
     ///
-    /// Tries both IPv6 and IPv4 stacks. Uses `P2pEndpoint::disconnect()`
-    /// to actively tear down the QUIC connection rather than waiting for
-    /// idle timeout.
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) {
+    /// Tries both IPv6 and IPv4 stacks.
+    pub async fn disconnect_peer_by_addr(&self, addr: &SocketAddr) {
         if let Some(ref v6) = self.v6 {
-            v6.disconnect_peer_quic(peer_id).await;
+            v6.disconnect_peer_quic(addr).await;
         }
         if let Some(ref v4) = self.v4 {
-            v4.disconnect_peer_quic(peer_id).await;
+            v4.disconnect_peer_quic(addr).await;
         }
     }
 
-    /// Disconnect a peer by string PeerId.
-    pub async fn disconnect_peer_string(&self, peer_id: &str) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.disconnect_peer(&ant_peer).await;
-        Ok(())
+    /// Disconnect a peer by address.
+    pub async fn disconnect_peer(&self, addr: &SocketAddr) {
+        self.disconnect_peer_by_addr(addr).await;
     }
 }
 
@@ -1070,7 +1015,7 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     }
 
     /// Happy Eyeballs connect: race IPv6 and IPv4 attempts
-    pub async fn connect_happy_eyeballs(&self, targets: &[SocketAddr]) -> Result<PeerId> {
+    pub async fn connect_happy_eyeballs(&self, targets: &[SocketAddr]) -> Result<SocketAddr> {
         let mut v6_targets: Vec<SocketAddr> = Vec::new();
         let mut v4_targets: Vec<SocketAddr> = Vec::new();
         for &t in targets {
@@ -1098,8 +1043,8 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
         let v6_fut = async {
             for addr in v6_targets_clone {
-                if let Ok(peer) = v6_node.connect_to_peer(addr).await {
-                    return Ok(peer);
+                if let Ok(connected_addr) = v6_node.connect_to_peer(addr).await {
+                    return Ok(connected_addr);
                 }
             }
             Err(anyhow::anyhow!("IPv6 connect attempts failed"))
@@ -1108,8 +1053,8 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         let v4_fut = async {
             sleep(Duration::from_millis(50)).await; // Slight delay per Happy Eyeballs
             for addr in v4_targets_clone {
-                if let Ok(peer) = v4_node.connect_to_peer(addr).await {
-                    return Ok(peer);
+                if let Ok(connected_addr) = v4_node.connect_to_peer(addr).await {
+                    return Ok(connected_addr);
                 }
             }
             Err(anyhow::anyhow!("IPv4 connect attempts failed"))
@@ -1117,22 +1062,22 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
         tokio::select! {
             res6 = v6_fut => match res6 {
-                Ok(peer) => Ok(peer),
+                Ok(connected_addr) => Ok(connected_addr),
                 Err(_) => {
                     for addr in v4_targets {
-                        if let Ok(peer) = v4_node.connect_to_peer(addr).await {
-                            return Ok(peer);
+                        if let Ok(connected_addr) = v4_node.connect_to_peer(addr).await {
+                            return Ok(connected_addr);
                         }
                     }
                     Err(anyhow::anyhow!("All connect attempts failed"))
                 }
             },
             res4 = v4_fut => match res4 {
-                Ok(peer) => Ok(peer),
+                Ok(connected_addr) => Ok(connected_addr),
                 Err(_) => {
                     for addr in v6_targets {
-                        if let Ok(peer) = v6_node.connect_to_peer(addr).await {
-                            return Ok(peer);
+                        if let Ok(connected_addr) = v6_node.connect_to_peer(addr).await {
+                            return Ok(connected_addr);
                         }
                     }
                     Err(anyhow::anyhow!("All connect attempts failed"))
@@ -1145,13 +1090,13 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         &self,
         node: &Option<P2PNetworkNode<T>>,
         targets: &[SocketAddr],
-    ) -> Result<PeerId> {
+    ) -> Result<SocketAddr> {
         let node = node
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("node not available"))?;
         for &addr in targets {
-            if let Ok(peer) = node.connect_to_peer(addr).await {
-                return Ok(peer);
+            if let Ok(connected_addr) = node.connect_to_peer(addr).await {
+                return Ok(connected_addr);
             }
         }
         Err(anyhow::anyhow!("All connect attempts failed"))
@@ -1174,7 +1119,7 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Accept the next incoming connection from either stack.
     ///
     /// Returns `None` when shutdown is signalled or no stacks are available.
-    pub async fn accept_any(&self) -> Option<(PeerId, SocketAddr)> {
+    pub async fn accept_any(&self) -> Option<SocketAddr> {
         match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) => {
                 tokio::select! {
@@ -1188,8 +1133,8 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         }
     }
 
-    /// Get all connected peers (merged from both stacks)
-    pub async fn get_connected_peers(&self) -> Vec<(PeerId, SocketAddr)> {
+    /// Get all connected peer addresses (merged from both stacks)
+    pub async fn get_connected_peers(&self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
         if let Some(v6) = &self.v6 {
             out.extend(v6.get_connected_peers().await);
@@ -1200,36 +1145,34 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         out
     }
 
-    /// Send to peer by PeerId; tries IPv6 first, then IPv4
-    pub async fn send_to_peer(&self, peer_id: &PeerId, data: &[u8]) -> Result<()> {
+    /// Send to peer by address; tries IPv6 first, then IPv4.
+    pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6
-            && v6.send_to_peer(peer_id, data).await.is_ok()
+            && v6.send_to_peer_raw(addr, data).await.is_ok()
         {
             return Ok(());
         }
         if let Some(v4) = &self.v4
-            && v4.send_to_peer(peer_id, data).await.is_ok()
+            && v4.send_to_peer_raw(addr, data).await.is_ok()
         {
             return Ok(());
         }
-        Err(anyhow::anyhow!("send_to_peer failed on both stacks"))
+        Err(anyhow::anyhow!("send_to_peer_raw failed on both stacks"))
     }
 
-    /// Send to peer by string PeerId
-    pub async fn send_to_peer_string(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let ant_peer = string_to_ant_peer_id(peer_id)
-            .map_err(|e| anyhow::anyhow!("Invalid peer ID: {}", e))?;
-        self.send_to_peer(&ant_peer, data).await
+    /// Send to peer by address.
+    pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+        self.send_to_peer_raw(addr, data).await
     }
 
     /// Send to peer with StreamClass
     pub async fn send_with_class(
         &self,
-        peer_id: &PeerId,
+        addr: &SocketAddr,
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        let res = self.send_to_peer(peer_id, data).await;
+        let res = self.send_to_peer_raw(addr, data).await;
         if res.is_ok() {
             crate::telemetry::telemetry()
                 .record_stream_bandwidth(class, data.len() as u64)
@@ -1302,171 +1245,12 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     }
 }
 
-/// Convert from ant_quic PeerId to our PeerId (String)
-pub fn ant_peer_id_to_string(peer_id: &PeerId) -> String {
-    hex::encode(peer_id.0)
-}
-
-/// Error type for PeerId conversion failures
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerIdConversionError {
-    InvalidHexEncoding,
-    InvalidLength { expected: usize, actual: usize },
-}
-
-impl std::fmt::Display for PeerIdConversionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerIdConversionError::InvalidHexEncoding => {
-                write!(f, "Invalid hex encoding for PeerId")
-            }
-            PeerIdConversionError::InvalidLength { expected, actual } => {
-                write!(
-                    f,
-                    "Invalid PeerId length: expected {} bytes, got {}",
-                    expected, actual
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for PeerIdConversionError {}
-
-/// Convert from our PeerId (String) to ant_quic PeerId
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The string is not valid hex encoding
-/// - The decoded bytes are not exactly 32 bytes (256 bits for ML-DSA-65)
-pub fn string_to_ant_peer_id(peer_id: &str) -> Result<PeerId, PeerIdConversionError> {
-    let decoded = hex::decode(peer_id).map_err(|_| PeerIdConversionError::InvalidHexEncoding)?;
-
-    if decoded.len() != 32 {
-        return Err(PeerIdConversionError::InvalidLength {
-            expected: 32,
-            actual: decoded.len(),
-        });
-    }
-
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&decoded);
-    Ok(PeerId(bytes))
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// Test TDD: string_to_ant_peer_id should reject invalid hex
-    #[test]
-    fn test_string_to_peer_id_invalid_hex() {
-        let result = string_to_ant_peer_id("not-hex-at-all!");
-        assert!(
-            matches!(result, Err(PeerIdConversionError::InvalidHexEncoding)),
-            "Should reject non-hex strings"
-        );
-    }
-
-    /// Test TDD: string_to_ant_peer_id should reject wrong length
-    #[test]
-    fn test_string_to_peer_id_wrong_length() {
-        // Too short (4 bytes = 8 hex chars)
-        let short_hex = "aabbccdd";
-        let result_short = string_to_ant_peer_id(short_hex);
-        assert!(
-            matches!(
-                result_short,
-                Err(PeerIdConversionError::InvalidLength {
-                    actual: 4,
-                    expected: 32
-                })
-            ),
-            "Should reject short PeerId (4 bytes)"
-        );
-
-        // Too long - should be rejected (96 bytes = 192 hex chars)
-        let long_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let result_long = string_to_ant_peer_id(long_hex);
-        assert!(
-            matches!(
-                result_long,
-                Err(PeerIdConversionError::InvalidLength {
-                    expected: 32,
-                    actual: 96
-                })
-            ),
-            "Should reject long PeerId (96 bytes)"
-        );
-    }
-
-    /// Test TDD: string_to_ant_peer_id should accept valid 32-byte hex
-    #[test]
-    fn test_string_to_peer_id_valid() {
-        // Valid 32-byte hex = 64 hex chars
-        let valid_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let result = string_to_ant_peer_id(valid_hex);
-        assert!(result.is_ok(), "Should accept valid 32-byte hex PeerId");
-
-        let peer_id = result.unwrap();
-        assert_eq!(peer_id.0.len(), 32, "PeerId should be exactly 32 bytes");
-
-        // Verify round-trip
-        let round_trip = ant_peer_id_to_string(&peer_id);
-        assert_eq!(
-            round_trip, valid_hex,
-            "Round-trip conversion should preserve value"
-        );
-    }
-
-    /// Test TDD: ant_peer_id_to_string should produce valid hex
-    #[test]
-    fn test_ant_peer_id_to_string() {
-        let bytes = [0xAA; 32];
-        let peer_id = PeerId(bytes);
-        let hex_string = ant_peer_id_to_string(&peer_id);
-
-        assert_eq!(hex_string.len(), 64, "32 bytes = 64 hex chars");
-        assert!(
-            hex_string.chars().all(|c| c.is_ascii_hexdigit()),
-            "Should be valid hex"
-        );
-    }
-
-    /// Test TDD: conversion should be idempotent
-    #[test]
-    fn test_peer_id_conversion_idempotent() {
-        let original = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let peer_id = string_to_ant_peer_id(original).unwrap();
-        let back_to_string = ant_peer_id_to_string(&peer_id);
-        let back_to_peer_id = string_to_ant_peer_id(&back_to_string).unwrap();
-
-        assert_eq!(
-            back_to_peer_id, peer_id,
-            "Double conversion should preserve identity"
-        );
-    }
-
-    /// Test TDD: verify no zero-padding collisions
-    #[test]
-    fn test_no_zero_padding_collisions() {
-        let peer1 = string_to_ant_peer_id(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
-        let peer2 = string_to_ant_peer_id(
-            "ffeeddccbba00112233445566778899aabbccddeeff001122334455667788900",
-        )
-        .unwrap();
-
-        assert_ne!(peer1, peer2, "Different inputs should not collide");
-    }
-
     /// Test TDD: verify no duplicate peer registration
     ///
     /// Fixed: Event forwarder no longer tracks peers, only broadcasts events.
@@ -1477,19 +1261,17 @@ mod tests {
     fn test_no_duplicate_peer_registration() {
         // The fix is verified by:
         // - test_send_to_peer_string: Exercises connect_to_peer with add_peer call
-        // - test_string_to_ant_peer_id_valid: Verifies PeerId validation works
         // Integration tests verify the ConnectionEvent broadcasts work correctly.
     }
 
     // TDD Phase 4: Quality-based peer selection implementation notes
     //
     // The following methods were added in Phase 4:
-    // - get_peer_quality(&self, peer_id: &PeerId) -> Option<f32>
-    // - get_peers_by_quality(&self) -> Vec<(PeerId, SocketAddr, f32)>
-    // - get_top_peers_by_quality(&self, n: usize) -> Vec<(PeerId, SocketAddr, f32)>
-    // - get_peers_above_quality_threshold(&self, threshold: f32) -> Vec<(PeerId, SocketAddr, f32)>
+    // - get_peer_quality(&self, addr: &SocketAddr) -> Option<f32>
+    // - get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)>
+    // - get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)>
+    // - get_peers_above_quality_threshold(&self, threshold: f32) -> Vec<(SocketAddr, f32)>
     // - get_average_peer_quality(&self) -> Option<f32>
-    // - update_peer_quality(&self, peer_id: PeerId, quality: f32)
     //
     // These methods are tested by integration tests in the test suite that
     // actually create connections and verify quality-based peer selection.

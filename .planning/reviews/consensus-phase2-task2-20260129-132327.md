@@ -350,7 +350,7 @@ All technical claims in the DHT storage analysis are accurate and backed by code
 **Impact on Phase 2**:
 - ✅ Question 1 of 5 architectural questions definitively answered
 - DHT storage = YES (encrypted) → Application-layer encryption REQUIRED
-- Cannot rely on transport-only encryption (ant-quic)
+- Cannot rely on transport-only encryption (saorsa-transport)
 - Must maintain ChaCha20Poly1305 before DHT storage
 
 **Remaining Questions** (Tasks 3-6):

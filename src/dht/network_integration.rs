@@ -3,9 +3,8 @@
 //! Bridges DHT operations with saorsa-core transport infrastructure, providing
 //! efficient protocol handling, connection management, and network optimization.
 
-use crate::dht::core_engine::{
-    ConsistencyLevel, DhtCoreEngine, DhtKey, NodeCapacity, NodeId, NodeInfo,
-};
+use crate::PeerId;
+use crate::dht::core_engine::{ConsistencyLevel, DhtCoreEngine, DhtKey, NodeCapacity, NodeInfo};
 use anyhow::{Result, anyhow};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -67,8 +66,8 @@ pub enum DhtMessage {
         capacity: NodeCapacity,
     },
     Leave {
-        node_id: NodeId,
-        handoff_data: Vec<(DhtKey, NodeId)>,
+        node_id: PeerId,
+        handoff_data: Vec<(DhtKey, PeerId)>,
     },
 
     // Replication
@@ -88,7 +87,7 @@ pub enum DhtMessage {
 pub enum DhtResponse {
     // Data Responses
     StoreAck {
-        replicas: Vec<NodeId>,
+        replicas: Vec<PeerId>,
     },
     RetrieveReply {
         value: Option<Vec<u8>>,
@@ -170,13 +169,13 @@ pub trait ConnectionListener: Send + Sync {
 /// Connection wrapper with metadata
 struct ManagedConnection {
     connection: Box<dyn Connection>,
-    _node_id: NodeId,
+    _node_id: PeerId,
     last_used: Instant,
     message_count: u64,
 }
 
 impl ManagedConnection {
-    fn new(connection: Box<dyn Connection>, node_id: NodeId) -> Self {
+    fn new(connection: Box<dyn Connection>, node_id: PeerId) -> Self {
         Self {
             connection,
             _node_id: node_id,
@@ -197,8 +196,8 @@ impl ManagedConnection {
 
 /// Connection pool for efficient connection management
 pub struct ConnectionPool {
-    active_connections: Arc<RwLock<HashMap<NodeId, ManagedConnection>>>,
-    connection_cache: Arc<RwLock<LruCache<NodeId, ManagedConnection>>>,
+    active_connections: Arc<RwLock<HashMap<PeerId, ManagedConnection>>>,
+    connection_cache: Arc<RwLock<LruCache<PeerId, ManagedConnection>>>,
     max_connections: usize,
 }
 
@@ -217,7 +216,7 @@ impl ConnectionPool {
 
     pub async fn get_connection(
         &self,
-        node_id: NodeId,
+        node_id: PeerId,
         transport: &dyn Transport,
         address: &str,
     ) -> Result<Box<dyn Connection>> {
@@ -249,7 +248,7 @@ impl ConnectionPool {
 
         // Create new connection
         let connection = transport.connect(address).await?;
-        let managed = ManagedConnection::new(connection, node_id.clone());
+        let managed = ManagedConnection::new(connection, node_id);
 
         // Store in active connections
         let mut active = self.active_connections.write().await;
@@ -259,7 +258,7 @@ impl ConnectionPool {
                 .iter()
                 .filter(|(_, c)| c.is_idle())
                 .min_by_key(|(_, c)| c.last_used)
-                .map(|(id, _)| id.clone());
+                .map(|(id, _)| *id);
 
             if let Some(id) = to_remove {
                 active.remove(&id);
@@ -268,12 +267,12 @@ impl ConnectionPool {
             }
         }
 
-        active.insert(node_id.clone(), managed);
+        active.insert(node_id, managed);
         // Create a new connection for this request
         transport.connect(address).await
     }
 
-    pub async fn release_connection(&self, node_id: NodeId) {
+    pub async fn release_connection(&self, node_id: PeerId) {
         let mut active = self.active_connections.write().await;
         if let Some(conn) = active.remove(&node_id)
             && conn.connection.is_alive()
@@ -295,9 +294,9 @@ impl ConnectionPool {
 
 /// Message router with batching and priority queuing
 pub struct MessageRouter {
-    high_priority: Arc<Mutex<VecDeque<(NodeId, DhtMessage)>>>,
-    normal_priority: Arc<Mutex<VecDeque<(NodeId, DhtMessage)>>>,
-    _batch_buffer: Arc<Mutex<Vec<(NodeId, DhtMessage)>>>,
+    high_priority: Arc<Mutex<VecDeque<(PeerId, DhtMessage)>>>,
+    normal_priority: Arc<Mutex<VecDeque<(PeerId, DhtMessage)>>>,
+    _batch_buffer: Arc<Mutex<Vec<(PeerId, DhtMessage)>>>,
     _last_batch_time: Arc<Mutex<Instant>>,
 }
 
@@ -317,7 +316,7 @@ impl MessageRouter {
         }
     }
 
-    pub async fn queue_message(&self, target: NodeId, message: DhtMessage, high_priority: bool) {
+    pub async fn queue_message(&self, target: PeerId, message: DhtMessage, high_priority: bool) {
         if high_priority {
             let mut queue = self.high_priority.lock().await;
             queue.push_back((target, message));
@@ -327,7 +326,7 @@ impl MessageRouter {
         }
     }
 
-    pub async fn get_next_batch(&self) -> Vec<(NodeId, DhtMessage)> {
+    pub async fn get_next_batch(&self) -> Vec<(PeerId, DhtMessage)> {
         let mut batch = Vec::new();
         let mut size = 0;
 
@@ -365,7 +364,7 @@ impl MessageRouter {
 
 /// Peer manager for network peer management
 pub struct PeerManager {
-    known_peers: Arc<RwLock<HashMap<NodeId, PeerInfo>>>,
+    known_peers: Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
     _bootstrap_nodes: Arc<RwLock<Vec<NodeInfo>>>,
 }
 
@@ -394,7 +393,7 @@ impl PeerManager {
     pub async fn add_peer(&self, node_info: NodeInfo) {
         let mut peers = self.known_peers.write().await;
         peers.insert(
-            node_info.id.clone(),
+            node_info.id,
             PeerInfo {
                 node_info,
                 last_seen: SystemTime::now(),
@@ -404,7 +403,7 @@ impl PeerManager {
         );
     }
 
-    pub async fn update_peer_status(&self, node_id: &NodeId, success: bool) {
+    pub async fn update_peer_status(&self, node_id: &PeerId, success: bool) {
         let mut peers = self.known_peers.write().await;
         if let Some(peer) = peers.get_mut(node_id) {
             peer.last_seen = SystemTime::now();
@@ -522,7 +521,7 @@ impl NetworkIntegrationLayer {
     }
 
     /// Send a message to a target node
-    pub async fn send_message(&self, target: NodeId, message: DhtMessage) -> Result<DhtResponse> {
+    pub async fn send_message(&self, target: PeerId, message: DhtMessage) -> Result<DhtResponse> {
         let mut retries = 0;
         let mut delay = INITIAL_RETRY_DELAY;
 
@@ -543,7 +542,7 @@ impl NetworkIntegrationLayer {
         }
     }
 
-    async fn try_send_message(&self, target: &NodeId, message: &DhtMessage) -> Result<DhtResponse> {
+    async fn try_send_message(&self, target: &PeerId, message: &DhtMessage) -> Result<DhtResponse> {
         // Get peer info
         let peers = self.peer_manager.known_peers.read().await;
         let peer_info = peers.get(target).ok_or_else(|| anyhow!("Unknown peer"))?;
@@ -553,7 +552,7 @@ impl NetworkIntegrationLayer {
         // Get connection
         let mut connection = self
             .connection_pool
-            .get_connection(target.clone(), self.transport.as_ref(), &address)
+            .get_connection(*target, self.transport.as_ref(), &address)
             .await?;
 
         // Serialize and send message
@@ -565,9 +564,7 @@ impl NetworkIntegrationLayer {
         let response: DhtResponse = postcard::from_bytes(&response_data)?;
 
         // Release connection
-        self.connection_pool
-            .release_connection(target.clone())
-            .await;
+        self.connection_pool.release_connection(*target).await;
 
         Ok(response)
     }
@@ -575,7 +572,7 @@ impl NetworkIntegrationLayer {
     /// Broadcast a message to multiple nodes
     pub async fn broadcast_message(
         &self,
-        targets: Vec<NodeId>,
+        targets: Vec<PeerId>,
         message: DhtMessage,
     ) -> Result<Vec<DhtResponse>> {
         let mut tasks = Vec::new();
@@ -638,10 +635,7 @@ impl NetworkIntegrationLayer {
 
         // Send FindNode messages to bootstrap nodes
         let target = DhtKey::new(b"discover");
-        let message = DhtMessage::FindNode {
-            target: target.clone(),
-            count: 20,
-        };
+        let message = DhtMessage::FindNode { target, count: 20 };
 
         let responses = self
             .broadcast_message(
@@ -743,7 +737,7 @@ mod tests {
             let response = DhtResponse::Pong {
                 timestamp: 0,
                 node_info: NodeInfo {
-                    id: NodeId::from_bytes([42u8; 32]),
+                    id: PeerId::from_bytes([42u8; 32]),
                     address: "mock".to_string(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
@@ -779,15 +773,15 @@ mod tests {
     async fn test_connection_pool() -> Result<()> {
         let pool = ConnectionPool::new(10);
         let transport = MockTransport;
-        let node_id = NodeId::from_bytes([42u8; 32]);
+        let node_id = PeerId::from_bytes([42u8; 32]);
 
         let conn1 = pool
-            .get_connection(node_id.clone(), &transport, "mock://test")
+            .get_connection(node_id, &transport, "mock://test")
             .await?;
 
         assert!(conn1.is_alive());
 
-        pool.release_connection(node_id.clone()).await;
+        pool.release_connection(node_id).await;
 
         Ok(())
     }
@@ -795,24 +789,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_router() -> Result<()> {
         let router = MessageRouter::new();
-        let node_id = NodeId::from_bytes([42u8; 32]);
+        let node_id = PeerId::from_bytes([42u8; 32]);
 
         let message = DhtMessage::Ping {
             timestamp: 0,
             sender_info: NodeInfo {
-                id: node_id.clone(),
+                id: node_id,
                 address: "test".to_string(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             },
         };
 
-        router
-            .queue_message(node_id.clone(), message.clone(), true)
-            .await;
-        router
-            .queue_message(node_id.clone(), message.clone(), false)
-            .await;
+        router.queue_message(node_id, message.clone(), true).await;
+        router.queue_message(node_id, message.clone(), false).await;
 
         let batch = router.get_next_batch().await;
         assert_eq!(batch.len(), 2);
@@ -825,7 +815,7 @@ mod tests {
         let manager = PeerManager::new();
 
         let node_info = NodeInfo {
-            id: NodeId::from_bytes([42u8; 32]),
+            id: PeerId::from_bytes([42u8; 32]),
             address: "test".to_string(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
@@ -843,15 +833,15 @@ mod tests {
     #[tokio::test]
     async fn test_network_integration_ping() -> Result<()> {
         let transport = Arc::new(MockTransport);
-        let dht_engine = Arc::new(RwLock::new(DhtCoreEngine::new(NodeId::from_bytes(
+        let dht_engine = Arc::new(RwLock::new(DhtCoreEngine::new(PeerId::from_bytes(
             [42u8; 32],
         ))?));
 
         let network = NetworkIntegrationLayer::new(transport, dht_engine);
 
-        let target = NodeId::from_bytes([42u8; 32]);
+        let target = PeerId::from_bytes([42u8; 32]);
         let peer_info = NodeInfo {
-            id: target.clone(),
+            id: target,
             address: "mock://test".to_string(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),

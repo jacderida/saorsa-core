@@ -262,7 +262,7 @@ mod tests {
         let mut sub = bus.subscribe_forwards(identity_key.clone()).await;
 
         let fwd = Forward {
-            proto: "ant-quic".to_string(),
+            proto: "saorsa-transport".to_string(),
             addr: "quic://example.com:9000".to_string(),
             exp: 1234567890,
         };
@@ -272,7 +272,7 @@ mod tests {
             .unwrap();
 
         let received = sub.recv().await.unwrap();
-        assert_eq!(received.proto, "ant-quic");
+        assert_eq!(received.proto, "saorsa-transport");
         assert_eq!(received.addr, "quic://example.com:9000");
     }
 

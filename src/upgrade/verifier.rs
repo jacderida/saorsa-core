@@ -18,7 +18,6 @@
 
 //! Signature verification for updates using ML-DSA-65.
 
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -96,14 +95,15 @@ impl SignatureVerifier {
         })?;
 
         // Use the quantum_crypto module for ML-DSA verification
-        let public_key = crate::quantum_crypto::ant_quic_integration::MlDsaPublicKey::from_bytes(
-            &public_key_bytes,
-        )
-        .map_err(|e| {
-            UpgradeError::SignatureVerification(format!("invalid public key: {:?}", e).into())
-        })?;
+        let public_key =
+            crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey::from_bytes(
+                &public_key_bytes,
+            )
+            .map_err(|e| {
+                UpgradeError::SignatureVerification(format!("invalid public key: {:?}", e).into())
+            })?;
 
-        let sig = crate::quantum_crypto::ant_quic_integration::MlDsaSignature::from_bytes(
+        let sig = crate::quantum_crypto::saorsa_transport_integration::MlDsaSignature::from_bytes(
             &signature_bytes,
         )
         .map_err(|e| {
@@ -120,13 +120,13 @@ impl SignatureVerifier {
     /// # Arguments
     ///
     /// * `path` - Path to the file
-    /// * `expected_sha256` - Expected SHA-256 hash (hex encoded)
+    /// * `expected_hash` - Expected BLAKE3 hash (hex encoded)
     /// * `key_id` - ID of the signing key
     /// * `signature` - The signature to verify (base64 encoded)
     pub async fn verify_file(
         &self,
         path: &Path,
-        expected_sha256: &str,
+        expected_hash: &str,
         key_id: &str,
         signature: &str,
     ) -> Result<(), UpgradeError> {
@@ -136,7 +136,7 @@ impl SignatureVerifier {
             .map_err(|e| UpgradeError::io(format!("failed to read file: {}", e)))?;
 
         // Verify checksum first (fast)
-        self.verify_checksum(&contents, expected_sha256)?;
+        self.verify_checksum(&contents, expected_hash)?;
 
         // Then verify signature (slower)
         let verified = self.verify_signature(key_id, &contents, signature)?;
@@ -151,31 +151,27 @@ impl SignatureVerifier {
     }
 
     /// Verify a checksum.
-    pub fn verify_checksum(&self, data: &[u8], expected_sha256: &str) -> Result<(), UpgradeError> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash = hasher.finalize();
-        let actual = hex::encode(hash);
+    pub fn verify_checksum(&self, data: &[u8], expected_hash: &str) -> Result<(), UpgradeError> {
+        let actual = Self::calculate_checksum(data);
 
-        if actual == expected_sha256.to_lowercase() {
+        if actual == expected_hash.to_lowercase() {
             Ok(())
         } else {
             Err(UpgradeError::ChecksumMismatch {
-                expected: expected_sha256.to_string(),
+                expected: expected_hash.to_string(),
                 actual,
             })
         }
     }
 
-    /// Calculate SHA-256 checksum of data.
+    /// Calculate BLAKE3 checksum of data.
     #[must_use]
     pub fn calculate_checksum(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hex::encode(hasher.finalize())
+        let hash = blake3::hash(data);
+        hash.to_hex().to_string()
     }
 
-    /// Calculate SHA-256 checksum of a file.
+    /// Calculate BLAKE3 checksum of a file.
     pub async fn calculate_file_checksum(path: &Path) -> Result<String, UpgradeError> {
         let contents = tokio::fs::read(path)
             .await
@@ -230,11 +226,9 @@ mod tests {
         let data = b"Hello, World!";
         let checksum = SignatureVerifier::calculate_checksum(data);
 
-        // SHA-256 of "Hello, World!" is known
-        assert_eq!(
-            checksum,
-            "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f"
-        );
+        // BLAKE3 of "Hello, World!" is known
+        let expected = blake3::hash(data).to_hex().to_string();
+        assert_eq!(checksum, expected);
     }
 
     #[test]

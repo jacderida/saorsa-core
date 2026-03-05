@@ -187,6 +187,12 @@ pub enum P2PError {
     Trust(Cow<'static, str>),
 }
 
+impl From<crate::identity::peer_id::PeerIdParseError> for P2PError {
+    fn from(err: crate::identity::peer_id::PeerIdParseError) -> Self {
+        P2PError::Identity(IdentityError::InvalidPeerId(Cow::Owned(err.to_string())))
+    }
+}
+
 /// Network-related errors
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -206,7 +212,7 @@ pub enum NetworkError {
     PeerNotFound(Cow<'static, str>),
 
     #[error("Peer disconnected - peer: {peer}, reason: {reason}")]
-    PeerDisconnected { peer: String, reason: String },
+    PeerDisconnected { peer: crate::PeerId, reason: String },
 
     #[error("Network timeout")]
     Timeout,

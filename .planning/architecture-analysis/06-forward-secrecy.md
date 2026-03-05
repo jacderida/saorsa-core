@@ -108,9 +108,9 @@ let session_key = if let Ok(key) = self
 
 ---
 
-## Question 5: Does ant-quic PQC provide forward secrecy for in-transit messages?
+## Question 5: Does saorsa-transport PQC provide forward secrecy for in-transit messages?
 
-**Answer**: **YES** - ant-quic uses ML-KEM-768 with ephemeral keys
+**Answer**: **YES** - saorsa-transport uses ML-KEM-768 with ephemeral keys
 
 **Evidence**:
 - ML-KEM-768 key encapsulation (post-quantum)
@@ -118,7 +118,7 @@ let session_key = if let Ok(key) = self
 - Forward secrecy guaranteed for transport layer
 
 **Distinction**:
-- ✅ **In-transit**: ant-quic ML-KEM-768 provides forward secrecy
+- ✅ **In-transit**: saorsa-transport ML-KEM-768 provides forward secrecy
 - ⚠️ **At-rest (DHT)**: Application-layer encryption may NOT provide forward secrecy (deterministic fallback)
 
 **Architecture**:
@@ -132,7 +132,7 @@ let session_key = if let Ok(key) = self
 │  └─ Deterministic fallback: BLAKE3 ✗ NO Forward Sec│
 │                                                     │
 │  Transport Layer (In-Transit):                      │
-│  └─ ant-quic ML-KEM-768 ✓ Forward Secrecy          │
+│  └─ saorsa-transport ML-KEM-768 ✓ Forward Secrecy          │
 │                                                     │
 └─────────────────────────────────────────────────────┘
 ```
@@ -162,7 +162,7 @@ let session_key = if let Ok(key) = self
 - ✅ No key derivation from long-lived secrets
 
 **Current state**:
-- ✅ ant-quic: Perfect forward secrecy (ML-KEM-768 ephemeral)
+- ✅ saorsa-transport: Perfect forward secrecy (ML-KEM-768 ephemeral)
 - ⚠️ Application E2E: Conditional (ephemeral if available, deterministic fallback)
 
 **Gap**: Deterministic fallback violates forward secrecy
@@ -178,14 +178,14 @@ let session_key = if let Ok(key) = self
 | Session key retrieval | encryption.rs | 49-56 | Try ephemeral, fallback to deterministic |
 | Session lifetime | encryption.rs | 211 | 24-hour expiration |
 | ML-KEM key exchange | key_exchange.rs | - | Quantum-safe key agreement |
-| ant-quic PQC | ant_quic_adapter.rs | - | ML-KEM-768 transport encryption |
+| saorsa-transport PQC | saorsa_transport_adapter.rs | - | ML-KEM-768 transport encryption |
 
 ---
 
 ## Summary
 
 **Forward Secrecy in Saorsa**:
-- **Transport layer (ant-quic)**: ✅ Forward secrecy guaranteed
+- **Transport layer (saorsa-transport)**: ✅ Forward secrecy guaranteed
 - **Application layer (E2E)**: ⚠️ Conditional (ephemeral preferred, deterministic fallback)
 - **DHT storage**: ⚠️ Vulnerable to retroactive decryption (deterministic keys)
 
@@ -195,7 +195,7 @@ The deterministic key derivation fallback creates a forward secrecy gap. If iden
 **Architectural decision impact**:
 - ❌ **Cannot remove application-layer encryption**: Still needed for DHT storage
 - ⚠️ **Should remove deterministic fallback**: Enforce ephemeral keys for forward secrecy
-- ✅ **ant-quic provides forward secrecy**: Transport layer is secure
+- ✅ **saorsa-transport provides forward secrecy**: Transport layer is secure
 
 ---
 

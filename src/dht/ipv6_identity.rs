@@ -17,10 +17,11 @@
 //! security with application-level S/Kademlia protections. It ensures that DHT node IDs
 //! are cryptographically bound to actual IPv6 addresses, preventing various attack vectors.
 
+use crate::PeerId;
 use crate::dht::{DHTNode, Key};
 use crate::error::SecurityError;
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer, IPv6NodeID};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
@@ -72,8 +73,8 @@ pub struct IPv6DHTIdentityManager {
     pub ip_enforcer: IPDiversityEnforcer,
     /// Verified IPv6 nodes
     verified_nodes: HashMap<PeerId, IPv6DHTNode>,
-    /// Node identity cache
-    identity_cache: HashMap<PeerId, (IPv6NodeID, SystemTime)>,
+    /// Node identity cache (keyed by IP address string, NOT peer ID)
+    identity_cache: HashMap<String, (IPv6NodeID, SystemTime)>,
     /// IP analysis cache
     ip_analysis_cache: HashMap<Ipv6Addr, (crate::security::IPAnalysis, SystemTime)>,
     /// Banned nodes for security violations
@@ -264,10 +265,8 @@ impl IPv6DHTIdentityManager {
         };
 
         // Cache the verified node
-        self.verified_nodes.insert(
-            enhanced_node.base_node.id.to_string(),
-            enhanced_node.clone(),
-        );
+        self.verified_nodes
+            .insert(enhanced_node.base_node.id, enhanced_node.clone());
 
         info!(
             "Enhanced DHT node with IPv6 identity: {}",
@@ -414,7 +413,7 @@ impl IPv6DHTIdentityManager {
         node: &DHTNode,
         ipv6_identity: &IPv6NodeID,
     ) -> Result<IPv6SecurityEvent> {
-        let node_peer_id = node.id.to_string();
+        let node_peer_id = node.id;
 
         // Check if node is banned
         if let Some(ban_time) = self.banned_nodes.get(&node_peer_id) {
@@ -436,7 +435,7 @@ impl IPv6DHTIdentityManager {
 
         if !verification_result.is_valid {
             let event = IPv6SecurityEvent::VerificationFailed {
-                peer_id: node_peer_id.clone(),
+                peer_id: node_peer_id,
                 ipv6_addr: ipv6_identity.ipv6_addr,
                 reason: verification_result
                     .error_message
@@ -495,7 +494,7 @@ impl IPv6DHTIdentityManager {
 
     /// Ban a node for security violations
     pub fn ban_node(&mut self, peer_id: &PeerId, reason: &str) {
-        self.banned_nodes.insert(peer_id.clone(), SystemTime::now());
+        self.banned_nodes.insert(*peer_id, SystemTime::now());
         warn!("Banned node {} for: {}", peer_id, reason);
     }
 
@@ -593,16 +592,17 @@ impl IPv6DHTNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+    use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
     use crate::security::{IPAnalysis, IPv6NodeID};
     use std::net::Ipv6Addr;
     use std::str::FromStr;
     use std::time::Duration;
 
     fn create_test_dht_node(peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
-        use crate::dht::{DhtNodeId, NodeCapacity};
+        use crate::PeerId;
+        use crate::dht::NodeCapacity;
         DHTNode {
-            id: DhtNodeId::from_bytes(id_bytes),
+            id: PeerId::from_bytes(id_bytes),
             address: format!("::1:8080:{}", peer_id),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
@@ -761,7 +761,7 @@ mod tests {
                 ipv6_addr,
                 verification_confidence,
             } => {
-                assert_eq!(peer_id, node.id.to_string());
+                assert_eq!(peer_id, node.id);
                 assert_eq!(ipv6_addr, identity.ipv6_addr);
                 assert!(verification_confidence > 0.0);
             }
@@ -782,7 +782,7 @@ mod tests {
         let config = IPv6DHTConfig::default();
         let mut manager = IPv6DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
 
         // Initially not banned
         assert!(!manager.is_node_banned(&peer_id));
@@ -802,18 +802,18 @@ mod tests {
         let config = IPv6DHTConfig::default();
         let mut manager = IPv6DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_bytes([1u8; 32]);
 
         // Initially no verified node
         assert!(manager.get_verified_node(&peer_id).is_none());
 
         // Add a verified node
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv6_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
 
         // Should now find the verified node
         assert!(manager.get_verified_node(&peer_id).is_some());
@@ -824,14 +824,14 @@ mod tests {
         let config = IPv6DHTConfig::default();
         let mut manager = IPv6DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv6_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
         // Add verified node
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
         assert!(manager.get_verified_node(&peer_id).is_some());
 
         // Remove node
@@ -844,13 +844,13 @@ mod tests {
         let config = IPv6DHTConfig::default();
         let mut manager = IPv6DHTIdentityManager::new(config);
 
-        let peer_id = "test_peer".to_string();
-        let base_node = create_test_dht_node(&peer_id, [1u8; 32]);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv6_identity();
         let ip_analysis = create_test_ip_analysis();
         let ipv6_node = IPv6DHTNode::new(base_node, identity, ip_analysis);
 
-        manager.verified_nodes.insert(peer_id.clone(), ipv6_node);
+        manager.verified_nodes.insert(peer_id, ipv6_node);
 
         let initial_reputation = manager.verified_nodes[&peer_id]
             .ip_analysis
@@ -885,7 +885,7 @@ mod tests {
         let ipv6_addr = Ipv6Addr::from_str("2001:db8::1").unwrap();
         let identity = create_test_ipv6_identity();
         let ip_analysis = create_test_ip_analysis();
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
 
         manager
             .identity_cache
@@ -893,9 +893,7 @@ mod tests {
         manager
             .ip_analysis_cache
             .insert(ipv6_addr, (ip_analysis, SystemTime::now()));
-        manager
-            .banned_nodes
-            .insert(peer_id.clone(), SystemTime::now());
+        manager.banned_nodes.insert(peer_id, SystemTime::now());
 
         // Sleep to let entries expire
         std::thread::sleep(Duration::from_millis(10));
@@ -986,12 +984,12 @@ mod tests {
 
     #[test]
     fn test_ipv6_security_event_variants() {
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
         let ipv6_addr = Ipv6Addr::from_str("2001:db8::1").unwrap();
 
         // Test NodeJoined event
         let joined_event = IPv6SecurityEvent::NodeJoined {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             verification_confidence: 0.9,
         };
@@ -1008,7 +1006,7 @@ mod tests {
 
         // Test VerificationFailed event
         let failed_event = IPv6SecurityEvent::VerificationFailed {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             reason: "Test failure".to_string(),
         };
@@ -1022,7 +1020,7 @@ mod tests {
 
         // Test DiversityViolation event
         let violation_event = IPv6SecurityEvent::DiversityViolation {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             subnet_type: "IPv6 subnet".to_string(),
         };
@@ -1036,7 +1034,7 @@ mod tests {
 
         // Test NodeBanned event
         let banned_event = IPv6SecurityEvent::NodeBanned {
-            peer_id: peer_id.clone(),
+            peer_id,
             ipv6_addr,
             reason: "Security violation".to_string(),
             ban_duration: Duration::from_secs(3600),

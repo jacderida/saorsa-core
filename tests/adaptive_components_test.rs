@@ -1,8 +1,9 @@
 //! Simple integration tests for adaptive network components
 //! Tests only the publicly exported adaptive features
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{
-    ContentHash, NodeId,
+    ContentHash,
     eviction::{CacheState, EvictionStrategy, LFUStrategy, LRUStrategy},
     learning::{ChurnPredictor, QLearnCacheManager, ThompsonSampling},
     multi_armed_bandit::{MABConfig, MultiArmedBandit},
@@ -228,7 +229,7 @@ async fn test_churn_predictor_basic() -> anyhow::Result<()> {
     println!("✓ Churn Predictor instance created successfully");
 
     // Test basic functionality exists
-    let node_id = NodeId { hash: [1u8; 32] };
+    let node_id = PeerId::from_bytes([1u8; 32]);
     let should_replicate = predictor.should_replicate(&node_id).await;
     println!("Should replicate from new node: {}", should_replicate);
 

@@ -21,7 +21,7 @@ use saorsa_core::adaptive::{
     ContentHash, HyperbolicCoordinate, TrustProvider, trust::MockTrustProvider,
 };
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::peer_record::UserId;
+use saorsa_core::peer_record::PeerId;
 use std::sync::Arc;
 
 /// Benchmark identity generation operations
@@ -55,8 +55,8 @@ fn bench_routing_operations(c: &mut Criterion) {
 
     // Node ID XOR distance calculation
     group.bench_function("node_id_xor_distance", |b| {
-        let id1 = UserId::from_bytes([1u8; 32]);
-        let id2 = UserId::from_bytes([2u8; 32]);
+        let id1 = PeerId::from_bytes([1u8; 32]);
+        let id2 = PeerId::from_bytes([2u8; 32]);
 
         b.iter(|| {
             let distance = xor_distance(&id1, &id2);
@@ -86,8 +86,8 @@ fn bench_ml_operations(c: &mut Criterion) {
         let data = [42u8; 32];
 
         b.iter(|| {
-            let node_id = UserId::from_bytes(data);
-            let hash = node_id.hash;
+            let node_id = PeerId::from_bytes(data);
+            let hash = node_id.0;
             black_box(hash);
         });
     });
@@ -102,7 +102,7 @@ fn bench_trust_operations(c: &mut Criterion) {
     // Trust score calculation
     group.bench_function("trust_score_calculation", |b| {
         let trust_provider = Arc::new(MockTrustProvider::new());
-        let node_id = UserId::from_bytes([42u8; 32]);
+        let node_id = PeerId::from_bytes([42u8; 32]);
 
         b.iter(|| {
             let score = trust_provider.get_trust(&node_id);
@@ -113,8 +113,8 @@ fn bench_trust_operations(c: &mut Criterion) {
     // Trust updates
     group.bench_function("trust_update", |b| {
         let trust_provider = Arc::new(MockTrustProvider::new());
-        let from = UserId::from_bytes([1u8; 32]);
-        let to = UserId::from_bytes([2u8; 32]);
+        let from = PeerId::from_bytes([1u8; 32]);
+        let to = PeerId::from_bytes([2u8; 32]);
 
         b.iter(|| {
             trust_provider.update_trust(&from, &to, true);
@@ -187,9 +187,9 @@ fn hyperbolic_distance(a: &HyperbolicCoordinate, b: &HyperbolicCoordinate) -> f6
 }
 
 /// Calculate XOR distance between two node IDs
-fn xor_distance(a: &UserId, b: &UserId) -> [u8; 32] {
+fn xor_distance(a: &PeerId, b: &PeerId) -> [u8; 32] {
     let mut result = [0u8; 32];
-    for (i, (a_byte, b_byte)) in a.hash.iter().zip(b.hash.iter()).enumerate() {
+    for (i, (a_byte, b_byte)) in a.0.iter().zip(b.0.iter()).enumerate() {
         result[i] = a_byte ^ b_byte;
     }
     result

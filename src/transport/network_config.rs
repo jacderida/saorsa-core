@@ -10,8 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
-// Import ant-quic NAT config type (unified config in 0.14+)
-use ant_quic::NatConfig;
+// Import saorsa-transport NAT config type (unified config in 0.14+)
+use saorsa_transport::NatConfig;
 
 /// Configuration for network port binding
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,8 +241,8 @@ impl NetworkConfig {
         }
     }
 
-    /// Convert to ant-quic NAT configuration
-    /// Note: ant-quic 0.14+ uses unified NatConfig from unified_config module
+    /// Convert to saorsa-transport NAT configuration
+    /// Note: saorsa-transport 0.14+ uses unified NatConfig from unified_config module
     pub fn to_ant_config(&self) -> Option<NatConfig> {
         self.nat_traversal.as_ref().map(|mode| match mode {
             NatTraversalMode::ClientOnly => NatConfig {

@@ -40,8 +40,7 @@ pub use node_failure_tracker::{DefaultNodeFailureTracker, DhtClient, NodeFailure
 
 // Re-export existing DHT components
 pub use core_engine::{
-    DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity,
-    NodeId as DhtNodeId, NodeInfo,
+    DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity, NodeInfo,
 };
 
 // Legacy type aliases for backward compatibility
@@ -55,48 +54,6 @@ pub use trust_weighted_dht::Key as DHT_Key;
 // Import additional types for compatibility
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-
-/// Canonical DHT key derivation from peer ID.
-///
-/// **IMPORTANT**: This is the single source of truth for converting peer IDs to DHT keys.
-/// All other code in the codebase MUST use this function to ensure consistent DHT positioning.
-///
-/// # Algorithm Choice: BLAKE3
-/// - **Uniform distribution**: Ensures even distribution across DHT keyspace
-/// - **Fast**: ~3x faster than SHA-256
-/// - **Collision resistant**: 256-bit output space (2^256 keys)
-/// - **Already a dependency**: No new deps needed
-///
-/// # Why not shortcuts?
-/// Previous code had a 32-byte shortcut that:
-/// - Created non-uniform distribution (ASCII 0x30-0x7A only)
-/// - Caused inconsistent behavior (31-char hashed, 32-char not, 33-char hashed)
-/// - Broke when hex-encoded IDs (common format) were exactly 32 chars
-///
-/// # Critical Fix
-/// This function replaced 4 different key derivation algorithms:
-/// - dht_network_manager.rs: SHA-256 with broken shortcut
-/// - network.rs:836: Truncation + zero-pad
-/// - network.rs:810,925,2586: Local BLAKE3 implementations
-/// - Other locations: Various inconsistent methods
-///
-/// Having multiple algorithms meant nodes calculated different DHT positions for the
-/// same peer, completely breaking routing and replication.
-///
-/// # Usage
-/// ```rust
-/// use saorsa_core::dht::derive_dht_key_from_peer_id;
-///
-/// let key = derive_dht_key_from_peer_id("peer-abc123");
-/// // Always produces same key for same peer_id, across all nodes
-/// ```
-pub fn derive_dht_key_from_peer_id(peer_id: &str) -> [u8; 32] {
-    use blake3::Hasher;
-    let mut hasher = Hasher::new();
-    hasher.update(peer_id.as_bytes());
-    let digest = hasher.finalize();
-    *digest.as_bytes()
-}
 
 /// DHT configuration parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,9 +170,7 @@ pub mod metrics;
 pub mod trust_peer_selector;
 
 // Re-export trust peer selector types
-pub use trust_peer_selector::{
-    TrustAwarePeerSelector, TrustSelectionConfig, adaptive_id_to_dht_node, dht_node_to_adaptive_id,
-};
+pub use trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
 
 // Re-export routing maintenance types for convenience
 pub use routing_maintenance::{

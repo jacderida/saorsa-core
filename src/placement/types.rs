@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::adaptive::NodeId;
+use crate::PeerId;
 use crate::placement::PlacementResult;
 
 /// Main configuration for the placement system
@@ -295,9 +295,9 @@ impl Default for OptimizationWeights {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlacementDecision {
     /// Selected nodes for placement
-    pub selected_nodes: Vec<NodeId>,
+    pub selected_nodes: Vec<PeerId>,
     /// Backup nodes for failover
-    pub backup_nodes: Vec<NodeId>,
+    pub backup_nodes: Vec<PeerId>,
     /// Strategy used for placement
     pub placement_strategy: String,
     /// Diversity score (0.0 - 1.0)
@@ -312,7 +312,7 @@ pub struct PlacementDecision {
 
 impl PlacementDecision {
     /// Create new placement decision
-    pub fn new(selected_nodes: Vec<NodeId>, placement_strategy: String) -> Self {
+    pub fn new(selected_nodes: Vec<PeerId>, placement_strategy: String) -> Self {
         Self {
             selected_nodes,
             backup_nodes: Vec::new(),
@@ -325,7 +325,7 @@ impl PlacementDecision {
     }
 
     /// Add backup nodes
-    pub fn with_backup_nodes(mut self, backup_nodes: Vec<NodeId>) -> Self {
+    pub fn with_backup_nodes(mut self, backup_nodes: Vec<PeerId>) -> Self {
         self.backup_nodes = backup_nodes;
         self
     }
@@ -686,8 +686,8 @@ mod tests {
     #[test]
     fn test_placement_decision() {
         let nodes = vec![
-            crate::peer_record::UserId::from_bytes([1u8; 32]),
-            crate::peer_record::UserId::from_bytes([2u8; 32]),
+            crate::peer_record::PeerId::from_bytes([1u8; 32]),
+            crate::peer_record::PeerId::from_bytes([2u8; 32]),
         ];
 
         let decision = PlacementDecision::new(nodes.clone(), "test_strategy".to_string())
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(metrics.success_rate(), 0.0);
 
         let decision = PlacementDecision::new(
-            vec![crate::peer_record::UserId::from_bytes([1u8; 32])],
+            vec![crate::peer_record::PeerId::from_bytes([1u8; 32])],
             "test".to_string(),
         );
 

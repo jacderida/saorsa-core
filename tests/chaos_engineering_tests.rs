@@ -4,6 +4,7 @@
 //! This module implements chaos engineering principles to test the
 //! adaptive network's resilience under various failure conditions.
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,9 +19,7 @@ async fn test_node_failure_resilience() -> anyhow::Result<()> {
     // Create a network of 5 nodes
     let mut nodes = Vec::new();
     for i in 0..5 {
-        let node_id = NodeId {
-            hash: [i as u8; 32],
-        };
+        let node_id = PeerId::from_bytes([i as u8; 32]);
         let node = AdaptiveNode::new(node_id).await?;
         nodes.push(node);
     }
@@ -90,9 +89,7 @@ async fn test_network_partition_recovery() -> anyhow::Result<()> {
     let mut partition_b = Vec::new();
 
     for i in 0..6 {
-        let node_id = NodeId {
-            hash: [i as u8; 32],
-        };
+        let node_id = PeerId::from_bytes([i as u8; 32]);
         let node = AdaptiveNode::new(node_id).await?;
 
         if i < 3 {
@@ -169,7 +166,7 @@ async fn test_network_partition_recovery() -> anyhow::Result<()> {
 async fn test_latency_spike_resilience() -> anyhow::Result<()> {
     println!("⚡ Testing latency spike resilience...");
 
-    let node = AdaptiveNode::new(NodeId { hash: [0u8; 32] }).await?;
+    let node = AdaptiveNode::new(PeerId::from_bytes([0u8; 32])).await?;
 
     // Establish baseline performance
     let mut baseline_latencies = Vec::new();
@@ -236,7 +233,7 @@ async fn test_latency_spike_resilience() -> anyhow::Result<()> {
 async fn test_resource_exhaustion_resilience() -> anyhow::Result<()> {
     println!("🪫 Testing resource exhaustion resilience...");
 
-    let node = AdaptiveNode::new(NodeId { hash: [0u8; 32] }).await?;
+    let node = AdaptiveNode::new(PeerId::from_bytes([0u8; 32])).await?;
 
     // Monitor initial resource usage
     let initial_memory = node.get_memory_usage().await?;
@@ -300,9 +297,7 @@ async fn test_cascading_failure_prevention() -> anyhow::Result<()> {
     // Create a network with potential cascading failure points
     let mut nodes = Vec::new();
     for i in 0..8 {
-        let node_id = NodeId {
-            hash: [i as u8; 32],
-        };
+        let node_id = PeerId::from_bytes([i as u8; 32]);
         let node = AdaptiveNode::new(node_id).await?;
         nodes.push(node);
     }
@@ -376,9 +371,7 @@ async fn test_byzantine_behavior_detection() -> anyhow::Result<()> {
 
     let mut nodes = Vec::new();
     for i in 0..5 {
-        let node_id = NodeId {
-            hash: [i as u8; 32],
-        };
+        let node_id = PeerId::from_bytes([i as u8; 32]);
         let node = AdaptiveNode::new(node_id).await?;
         nodes.push(node);
     }
@@ -453,7 +446,7 @@ async fn test_byzantine_behavior_detection() -> anyhow::Result<()> {
 // Helper implementations for chaos engineering tests
 
 impl AdaptiveNode {
-    async fn new(id: NodeId) -> anyhow::Result<Self> {
+    async fn new(id: PeerId) -> anyhow::Result<Self> {
         Ok(Self {
             id,
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -467,7 +460,7 @@ impl AdaptiveNode {
 
     async fn connect_to(&self, other: &AdaptiveNode) -> anyhow::Result<()> {
         let mut connections = self.connections.write().await;
-        connections.insert(other.id.clone(), true);
+        connections.insert(other.id, true);
         Ok(())
     }
 
@@ -498,7 +491,7 @@ impl AdaptiveNode {
         for node_a in nodes_a {
             for node_b in nodes_b {
                 let mut connections = node_a.connections.write().await;
-                connections.insert(node_b.id.clone(), false);
+                connections.insert(node_b.id, false);
             }
         }
         Ok(())
@@ -512,7 +505,7 @@ impl AdaptiveNode {
         for node_a in nodes_a {
             for node_b in nodes_b {
                 let mut connections = node_a.connections.write().await;
-                connections.insert(node_b.id.clone(), true);
+                connections.insert(node_b.id, true);
             }
         }
         Ok(())
@@ -556,7 +549,7 @@ impl AdaptiveNode {
         Ok(*self.memory_usage.read().await)
     }
 
-    async fn send_message(&self, target: NodeId, _message: &[u8]) -> anyhow::Result<()> {
+    async fn send_message(&self, target: PeerId, _message: &[u8]) -> anyhow::Result<()> {
         if !*self.operational.read().await {
             return Err(anyhow::anyhow!("Node is not operational"));
         }
@@ -571,11 +564,11 @@ impl AdaptiveNode {
 
     async fn establish_trust(&self, other: &AdaptiveNode) -> anyhow::Result<()> {
         let mut trust_scores = self.trust_scores.write().await;
-        trust_scores.insert(other.id.clone(), 0.8); // Initial high trust
+        trust_scores.insert(other.id, 0.8); // Initial high trust
         Ok(())
     }
 
-    async fn get_trust_score(&self, peer: NodeId) -> anyhow::Result<f64> {
+    async fn get_trust_score(&self, peer: PeerId) -> anyhow::Result<f64> {
         let trust_scores = self.trust_scores.read().await;
         Ok(*trust_scores.get(&peer).unwrap_or(&0.5))
     }
@@ -602,13 +595,13 @@ impl AdaptiveNode {
         {
             let mut trust_scores = self.trust_scores.write().await;
             trust_scores
-                .entry(peer.id.clone())
+                .entry(peer.id)
                 .and_modify(|score| *score = (*score * 0.2).min(0.2))
                 .or_insert(0.2);
         }
 
         let mut connections = self.connections.write().await;
-        connections.insert(peer.id.clone(), false);
+        connections.insert(peer.id, false);
         Ok(())
     }
 
@@ -623,8 +616,8 @@ impl AdaptiveNode {
         Ok(*self.operational.read().await && *self.memory_usage.read().await > 20)
     }
 
-    fn get_id(&self) -> NodeId {
-        self.id.clone()
+    fn get_id(&self) -> PeerId {
+        self.id
     }
 
     async fn measure_network_stability(nodes: &[AdaptiveNode]) -> anyhow::Result<f64> {
@@ -641,10 +634,10 @@ impl AdaptiveNode {
 
 #[derive(Debug)]
 struct AdaptiveNode {
-    id: NodeId,
-    connections: Arc<RwLock<HashMap<NodeId, bool>>>, // true = up, false = down
+    id: PeerId,
+    connections: Arc<RwLock<HashMap<PeerId, bool>>>, // true = up, false = down
     operational: Arc<RwLock<bool>>,
-    trust_scores: Arc<RwLock<HashMap<NodeId, f64>>>,
+    trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
     memory_usage: Arc<RwLock<usize>>,
     base_latency: Duration,
     latency_spike: Arc<RwLock<Option<std::time::Instant>>>,

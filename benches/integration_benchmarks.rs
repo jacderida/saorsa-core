@@ -17,10 +17,10 @@
 //! Measures performance of integration test scenarios for regression detection.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{TrustProvider, trust::MockTrustProvider};
-use saorsa_core::dht::{Key, PeerId, Record};
-use saorsa_core::identity::{NodeIdentity, node_identity::NodeId};
-use saorsa_core::peer_record::UserId;
+use saorsa_core::dht::{Key, Record};
+use saorsa_core::identity::NodeIdentity;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -86,7 +86,7 @@ fn benchmark_adaptive_operations(c: &mut Criterion) {
     // Benchmark trust operations
     group.bench_function("trust_operations", |b| {
         let trust_provider = Arc::new(MockTrustProvider::new());
-        let node_id = UserId::from_bytes([42u8; 32]);
+        let node_id = PeerId::from_bytes([42u8; 32]);
 
         b.iter(|| {
             let score = trust_provider.get_trust(&node_id);
@@ -145,7 +145,7 @@ async fn benchmark_encryption_operations(
 
 /// Create a test PeerId from bytes
 fn create_test_peer_id(bytes: [u8; 32]) -> PeerId {
-    NodeId::from_bytes(bytes)
+    PeerId::from_bytes(bytes)
 }
 
 /// Calculate XOR distance between two keys

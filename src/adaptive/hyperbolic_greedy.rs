@@ -17,8 +17,8 @@
 //! with Kademlia fallback. It uses HyperMap/Mercator-style background embedding
 //! with drift detection and partial re-fitting.
 
-use crate::dht::core_engine::NodeId;
-use crate::{P2PError, PeerId, Result};
+use crate::PeerId;
+use crate::{P2PError, Result};
 use blake3::Hasher;
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,7 @@ impl HyperbolicCoordinate {
     }
 
     /// Deterministically derive coordinates from a peer identifier
-    pub fn from_peer(peer: &PeerId, dimensions: usize) -> Self {
+    pub fn from_peer(peer: &str, dimensions: usize) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(peer.as_bytes());
         let digest = hasher.finalize();
@@ -160,9 +160,9 @@ pub struct HyperbolicGradient {
 #[derive(Debug, Clone)]
 pub struct NetworkSnapshot {
     /// Peer IDs in the snapshot
-    pub peers: Vec<PeerId>,
+    pub peers: Vec<String>,
     /// Observed distances between peers (RTT or hop count)
-    pub distances: HashMap<(PeerId, PeerId), f64>,
+    pub distances: HashMap<(String, String), f64>,
     /// Timestamp of snapshot
     pub timestamp: Instant,
 }
@@ -173,7 +173,7 @@ pub struct Embedding {
     /// Configuration used for embedding
     pub config: EmbeddingConfig,
     /// Coordinates for each peer
-    pub coordinates: HashMap<PeerId, HyperbolicCoordinate>,
+    pub coordinates: HashMap<String, HyperbolicCoordinate>,
     /// Quality metrics of the embedding
     pub quality: EmbeddingQuality,
     /// Timestamp of embedding creation
@@ -217,7 +217,7 @@ pub struct HyperbolicGreedyRouter {
     /// Drift detection state
     drift_detector: Arc<RwLock<DriftDetector>>,
     /// Local peer ID
-    local_id: PeerId,
+    local_id: String,
     /// Performance metrics
     metrics: Arc<RwLock<RoutingMetrics>>,
 }
@@ -326,7 +326,7 @@ impl RoutingMetrics {
 
 impl HyperbolicGreedyRouter {
     /// Create a new hyperbolic greedy router
-    pub fn new(local_id: PeerId) -> Self {
+    pub fn new(local_id: String) -> Self {
         Self {
             embedding: Arc::new(RwLock::new(None)),
             config: EmbeddingConfig::default(),
@@ -361,7 +361,7 @@ impl HyperbolicGreedyRouter {
     }
 
     /// Embed a snapshot of peers using HyperMap/Mercator-style approach
-    pub async fn embed_snapshot(&self, peers: &[PeerId]) -> Result<Embedding> {
+    pub async fn embed_snapshot(&self, peers: &[String]) -> Result<Embedding> {
         let includes_local = peers.iter().any(|p| p == &self.local_id);
         let effective_count = if includes_local {
             peers.len()
@@ -416,7 +416,7 @@ impl HyperbolicGreedyRouter {
     }
 
     /// Measure distance between two peers
-    async fn measure_distance(&self, peer1: &PeerId, peer2: &PeerId) -> Result<f64> {
+    async fn measure_distance(&self, peer1: &str, peer2: &str) -> Result<f64> {
         Ok(deterministic_distance(peer1, peer2))
     }
 
@@ -480,15 +480,15 @@ impl HyperbolicGreedyRouter {
     /// Greedy next-hop selection with Kademlia fallback
     pub async fn greedy_next(
         &self,
-        target: NodeId,
-        here: PeerId,
+        target: PeerId,
+        here: String,
         emb: &Embedding,
-    ) -> Option<PeerId> {
+    ) -> Option<String> {
         // Get current coordinate
         let here_coord = emb.coordinates.get(&here)?;
 
         // Check if we have target's coordinate; if not, approximate using any coordinate
-        let target_peer = node_id_to_peer_id(&target);
+        let target_peer = peer_id_to_hex(&target);
         let target_coord = emb
             .coordinates
             .get(&target_peer)
@@ -541,8 +541,8 @@ impl HyperbolicGreedyRouter {
     }
 
     /// Perform partial re-fit of embedding
-    pub async fn partial_refit(&self, new_peers: &[PeerId]) -> Result<()> {
-        let existing_peers: Vec<PeerId> = {
+    pub async fn partial_refit(&self, new_peers: &[String]) -> Result<()> {
+        let existing_peers: Vec<String> = {
             let guard = self.embedding.read().await;
             guard
                 .as_ref()
@@ -550,7 +550,7 @@ impl HyperbolicGreedyRouter {
                 .unwrap_or_default()
         };
 
-        let mut combined: Vec<PeerId> = existing_peers;
+        let mut combined: Vec<String> = existing_peers;
         combined.extend_from_slice(new_peers);
         combined.push(self.local_id.clone());
         combined.sort();
@@ -587,13 +587,12 @@ impl HyperbolicGreedyRouter {
     }
 }
 
-/// Convert NodeId to PeerId
-fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
-    // Convert NodeId bytes to hex string for PeerId
-    hex::encode(node_id.as_bytes())
+/// Hex-encode a `PeerId` to a string.
+fn peer_id_to_hex(peer_id: &PeerId) -> String {
+    hex::encode(peer_id.as_bytes())
 }
 
-fn deterministic_distance(peer1: &PeerId, peer2: &PeerId) -> f64 {
+fn deterministic_distance(peer1: &str, peer2: &str) -> f64 {
     let (a, b) = if peer1 <= peer2 {
         (peer1, peer2)
     } else {
@@ -615,7 +614,7 @@ fn deterministic_distance(peer1: &PeerId, peer2: &PeerId) -> f64 {
 ///
 /// This function creates a HyperMap/Mercator-style embedding of the network topology.
 /// It measures distances between peers and optimizes coordinates using gradient descent.
-pub async fn embed_snapshot(peers: &[PeerId]) -> Result<Embedding> {
+pub async fn embed_snapshot(peers: &[String]) -> Result<Embedding> {
     // Create a temporary router for embedding
     let local_id = peers
         .first()
@@ -630,12 +629,12 @@ pub async fn embed_snapshot(peers: &[PeerId]) -> Result<Embedding> {
 ///
 /// Attempts greedy routing first - if a neighbor is closer to the target
 /// in hyperbolic space, route to them. Otherwise, fall back to Kademlia.
-pub async fn greedy_next(target: NodeId, here: PeerId, emb: &Embedding) -> Option<PeerId> {
+pub async fn greedy_next(target: PeerId, here: String, emb: &Embedding) -> Option<String> {
     // Get current coordinate
     let here_coord = emb.coordinates.get(&here)?;
 
     // Check if we have target's coordinate
-    let target_peer = node_id_to_peer_id(&target);
+    let target_peer = peer_id_to_hex(&target);
     let target_coord = emb.coordinates.get(&target_peer).or_else(|| {
         // If target not present, approximate by nearest available coordinate (best-effort)
         emb.coordinates.values().next()
@@ -712,7 +711,7 @@ mod tests {
 
         let router = HyperbolicGreedyRouter::new(local_id.clone());
 
-        let peers: Vec<PeerId> = (0..10).map(|i| format!("peer_{}", i)).collect();
+        let peers: Vec<String> = (0..10).map(|i| format!("peer_{}", i)).collect();
         let embedding = router.embed_snapshot(&peers).await;
 
         assert!(embedding.is_ok());
@@ -774,12 +773,12 @@ mod tests {
             created_at: Instant::now(),
         };
 
-        // Create a NodeId from the target peer string
+        // Create a PeerId from the target peer string
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target_peer.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target = NodeId::from_bytes(node_id_bytes);
+        let target = PeerId::from_bytes(node_id_bytes);
         let next = router.greedy_next(target, local_id, &embedding).await;
 
         assert!(next.is_some());
@@ -792,13 +791,13 @@ mod tests {
         let router = HyperbolicGreedyRouter::new(local_id.clone());
 
         // Create initial embedding
-        let initial_peers: Vec<PeerId> = (0..5).map(|i| format!("initial_{}", i)).collect();
+        let initial_peers: Vec<String> = (0..5).map(|i| format!("initial_{}", i)).collect();
         let embedding = router.embed_snapshot(&initial_peers).await.unwrap();
 
         *router.embedding.write().await = Some(embedding);
 
         // Add new peers via partial refit
-        let new_peers: Vec<PeerId> = (0..3).map(|i| format!("new_{}", i)).collect();
+        let new_peers: Vec<String> = (0..3).map(|i| format!("new_{}", i)).collect();
         let result = router.partial_refit(&new_peers).await;
 
         assert!(result.is_ok());

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use saorsa_core::adaptive::NodeId;
+    use saorsa_core::PeerId;
     use saorsa_core::adaptive::trust::*;
     use std::collections::HashSet;
 
@@ -13,8 +13,8 @@ mod tests {
         // Create simple test
         let engine = EigenTrustEngine::new(HashSet::new());
 
-        let node1 = NodeId::from_bytes([1u8; 32]);
-        let node2 = NodeId::from_bytes([2u8; 32]);
+        let node1 = PeerId::from_bytes([1u8; 32]);
+        let node2 = PeerId::from_bytes([2u8; 32]);
 
         // Update trust
         engine.update_local_trust(&node1, &node2, true).await;

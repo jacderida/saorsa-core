@@ -12,13 +12,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::dht::{DhtNodeId, PeerId};
+use crate::PeerId;
 
 /// Voting record for collusion analysis
 #[derive(Debug, Clone)]
 pub struct VotingRecord {
     /// The vote target (what was being voted on)
-    pub target: DhtNodeId,
+    pub target: PeerId,
     /// The vote (true = approve, false = reject)
     pub vote: bool,
     /// When the vote was cast
@@ -252,13 +252,7 @@ impl CollusionDetector {
     }
 
     /// Record a vote from a peer
-    pub fn record_vote(
-        &mut self,
-        peer_id: PeerId,
-        target: DhtNodeId,
-        vote: bool,
-        latency: Duration,
-    ) {
+    pub fn record_vote(&mut self, peer_id: PeerId, target: PeerId, vote: bool, latency: Duration) {
         let record = VotingRecord {
             target,
             vote,
@@ -273,10 +267,10 @@ impl CollusionDetector {
     /// Record that two peers agreed on a vote
     pub fn record_agreement(&mut self, peer_a: PeerId, peer_b: PeerId) {
         if let Some(pattern) = self.voting_history.get_mut(&peer_a) {
-            pattern.record_agreement(peer_b.clone());
+            pattern.record_agreement(peer_b);
         }
         if let Some(pattern) = self.voting_history.get_mut(&peer_b) {
-            pattern.record_agreement(peer_a.clone());
+            pattern.record_agreement(peer_a);
         }
 
         // Update correlation matrix with running agreement count
@@ -293,9 +287,9 @@ impl CollusionDetector {
     #[must_use]
     pub fn get_peer_correlation(&self, peer_a: &PeerId, peer_b: &PeerId) -> f64 {
         let key = if peer_a.0 < peer_b.0 {
-            (peer_a.clone(), peer_b.clone())
+            (*peer_a, *peer_b)
         } else {
-            (peer_b.clone(), peer_a.clone())
+            (*peer_b, *peer_a)
         };
         self.correlation_matrix.get(&key).copied().unwrap_or(0.0)
     }
@@ -336,7 +330,7 @@ impl CollusionDetector {
             if let [(peer_a, _, time_a), (peer_b, _, time_b)] = window {
                 let diff = time_b.duration_since(*time_a);
                 if diff < self.config.temporal_threshold {
-                    suspicious_pairs.push((peer_a.clone(), peer_b.clone(), diff));
+                    suspicious_pairs.push((*peer_a, *peer_b, diff));
                 }
             }
         }
@@ -344,7 +338,7 @@ impl CollusionDetector {
         if !suspicious_pairs.is_empty() {
             let peers: Vec<_> = suspicious_pairs
                 .iter()
-                .flat_map(|(a, b, _)| vec![a.clone(), b.clone()])
+                .flat_map(|(a, b, _)| vec![*a, *b])
                 .collect();
             let min_diff = suspicious_pairs
                 .iter()
@@ -378,8 +372,8 @@ impl CollusionDetector {
                 let rate = pattern_a.agreement_rate(peer_b);
                 if rate >= self.config.agreement_threshold {
                     evidence.push(CollusionEvidence::HighAgreementRate {
-                        peer_a: peer_a.clone(),
-                        peer_b: peer_b.clone(),
+                        peer_a: *peer_a,
+                        peer_b: *peer_b,
                         rate,
                     });
                 }
@@ -404,7 +398,7 @@ impl CollusionDetector {
                     .filter(|&c| c >= self.config.trust_correlation_threshold)
                 {
                     evidence.push(CollusionEvidence::TrustCoMovement {
-                        peers: vec![peer_a.clone(), peer_b.clone()],
+                        peers: vec![*peer_a, *peer_b],
                         correlation,
                     });
                 }
@@ -487,11 +481,9 @@ impl CollusionDetector {
                     peers.iter().cloned().collect()
                 }
                 CollusionEvidence::HighAgreementRate { peer_a, peer_b, .. } => {
-                    [peer_a.clone(), peer_b.clone()].into_iter().collect()
+                    [*peer_a, *peer_b].into_iter().collect()
                 }
-                CollusionEvidence::LocationMismatch { peer, .. } => {
-                    [peer.clone()].into_iter().collect()
-                }
+                CollusionEvidence::LocationMismatch { peer, .. } => [*peer].into_iter().collect(),
                 CollusionEvidence::TrustCoMovement { peers, .. } => peers.iter().cloned().collect(),
                 CollusionEvidence::BehavioralMatch { peers, .. } => peers.iter().cloned().collect(),
             };
@@ -576,7 +568,7 @@ mod tests {
     fn random_peer_id() -> PeerId {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill(&mut bytes);
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        crate::identity::node_identity::PeerId::from_bytes(bytes)
     }
 
     #[test]
@@ -584,7 +576,7 @@ mod tests {
         let mut pattern = VotingPattern::new(10);
 
         let record = VotingRecord {
-            target: DhtNodeId::random(),
+            target: PeerId::random(),
             vote: true,
             timestamp: Instant::now(),
             latency: Duration::from_millis(50),
@@ -603,7 +595,7 @@ mod tests {
         // Record 10 votes, 8 agreeing with peer
         for i in 0..10 {
             let record = VotingRecord {
-                target: DhtNodeId::random(),
+                target: PeerId::random(),
                 vote: true,
                 timestamp: Instant::now(),
                 latency: Duration::from_millis(50),
@@ -611,7 +603,7 @@ mod tests {
             pattern.record_vote(record);
 
             if i < 8 {
-                pattern.record_agreement(peer.clone());
+                pattern.record_agreement(peer);
             }
         }
 
@@ -683,15 +675,10 @@ mod tests {
 
         // Record votes for both peers
         for _ in 0..10 {
-            let target = DhtNodeId::random();
-            detector.record_vote(
-                peer_a.clone(),
-                target.clone(),
-                true,
-                Duration::from_millis(50),
-            );
-            detector.record_vote(peer_b.clone(), target, true, Duration::from_millis(55));
-            detector.record_agreement(peer_a.clone(), peer_b.clone());
+            let target = PeerId::random();
+            detector.record_vote(peer_a, target, true, Duration::from_millis(50));
+            detector.record_vote(peer_b, target, true, Duration::from_millis(55));
+            detector.record_agreement(peer_a, peer_b);
         }
 
         let evidence = detector.check_agreement_rates();
@@ -706,11 +693,11 @@ mod tests {
     fn test_collusion_group_creation() {
         let peer_a = random_peer_id();
         let peer_b = random_peer_id();
-        let members: HashSet<_> = [peer_a.clone(), peer_b.clone()].into_iter().collect();
+        let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
 
         let evidence = vec![CollusionEvidence::HighAgreementRate {
-            peer_a: peer_a.clone(),
-            peer_b: peer_b.clone(),
+            peer_a,
+            peer_b,
             rate: 0.98,
         }];
 
@@ -730,13 +717,13 @@ mod tests {
         let peer_c = random_peer_id();
 
         // Create a suspected group
-        let members: HashSet<_> = [peer_a.clone(), peer_b.clone()].into_iter().collect();
+        let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
         let group = CollusionGroup::new(
             members,
             0.5,
             vec![CollusionEvidence::HighAgreementRate {
-                peer_a: peer_a.clone(),
-                peer_b: peer_b.clone(),
+                peer_a,
+                peer_b,
                 rate: 0.98,
             }],
         );
@@ -753,12 +740,12 @@ mod tests {
         let peer_a = random_peer_id();
         let peer_b = random_peer_id();
 
-        let members: HashSet<_> = [peer_a.clone(), peer_b.clone()].into_iter().collect();
+        let members: HashSet<_> = [peer_a, peer_b].into_iter().collect();
         let group = CollusionGroup::new(
             members,
             0.75,
             vec![CollusionEvidence::TemporalCorrelation {
-                peers: vec![peer_a.clone(), peer_b.clone()],
+                peers: vec![peer_a, peer_b],
                 time_diff: Duration::from_millis(5),
             }],
         );
@@ -777,8 +764,8 @@ mod tests {
         // Record similar trust score changes - both with varying changes
         for i in 0..10 {
             let change = (i % 3) as f64 * 0.1; // Varying changes: 0, 0.1, 0.2, 0, 0.1...
-            detector.record_trust_score(peer_a.clone(), 0.5 + change);
-            detector.record_trust_score(peer_b.clone(), 0.5 + change + 0.01); // Same pattern, slight offset
+            detector.record_trust_score(peer_a, 0.5 + change);
+            detector.record_trust_score(peer_b, 0.5 + change + 0.01); // Same pattern, slight offset
         }
 
         // Verify we have enough history
@@ -806,12 +793,7 @@ mod tests {
         });
 
         let peer = random_peer_id();
-        detector.record_vote(
-            peer.clone(),
-            DhtNodeId::random(),
-            true,
-            Duration::from_millis(50),
-        );
+        detector.record_vote(peer, PeerId::random(), true, Duration::from_millis(50));
 
         // Wait a bit and cleanup
         std::thread::sleep(Duration::from_millis(15));
@@ -834,15 +816,10 @@ mod tests {
 
         // Record many agreements
         for _ in 0..10 {
-            let target = DhtNodeId::random();
-            detector.record_vote(
-                peer_a.clone(),
-                target.clone(),
-                true,
-                Duration::from_millis(50),
-            );
-            detector.record_vote(peer_b.clone(), target, true, Duration::from_millis(55));
-            detector.record_agreement(peer_a.clone(), peer_b.clone());
+            let target = PeerId::random();
+            detector.record_vote(peer_a, target, true, Duration::from_millis(50));
+            detector.record_vote(peer_b, target, true, Duration::from_millis(55));
+            detector.record_agreement(peer_a, peer_b);
         }
 
         // Verify voting history was recorded

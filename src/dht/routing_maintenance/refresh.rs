@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-use crate::dht::{DhtKey, DhtNodeId};
+use crate::PeerId;
+use crate::dht::DhtKey;
 
 use super::close_group_validator::{
     CloseGroupValidationResult, CloseGroupValidator, CloseGroupValidatorConfig,
@@ -67,7 +68,7 @@ pub struct BucketRefreshState {
     /// Last validation timestamp
     pub last_validation: Option<Instant>,
     /// Tracked node IDs for validation
-    pub tracked_nodes: Vec<DhtNodeId>,
+    pub tracked_nodes: Vec<PeerId>,
 }
 
 impl Default for BucketRefreshState {
@@ -166,7 +167,7 @@ impl BucketRefreshState {
 /// Manages refresh operations for all buckets
 pub struct BucketRefreshManager {
     /// Our local node ID (for key generation)
-    local_id: DhtNodeId,
+    local_id: PeerId,
     /// State for each bucket (indexed 0-255)
     bucket_states: HashMap<usize, BucketRefreshState>,
     /// Close group bucket indices
@@ -184,7 +185,7 @@ pub struct BucketRefreshManager {
 impl BucketRefreshManager {
     /// Create a new bucket refresh manager
     #[must_use]
-    pub fn new(local_id: DhtNodeId) -> Self {
+    pub fn new(local_id: PeerId) -> Self {
         Self {
             local_id,
             bucket_states: HashMap::new(),
@@ -198,7 +199,7 @@ impl BucketRefreshManager {
 
     /// Create a new bucket refresh manager with validation enabled
     #[must_use]
-    pub fn new_with_validation(local_id: DhtNodeId, config: CloseGroupValidatorConfig) -> Self {
+    pub fn new_with_validation(local_id: PeerId, config: CloseGroupValidatorConfig) -> Self {
         let validator = CloseGroupValidator::new(config);
         Self {
             local_id,
@@ -406,7 +407,7 @@ impl BucketRefreshManager {
     /// For now, returns tracked nodes from state or generates placeholder node IDs
     /// based on bucket state.
     #[must_use]
-    pub fn get_nodes_in_bucket(&self, bucket_idx: usize) -> Vec<DhtNodeId> {
+    pub fn get_nodes_in_bucket(&self, bucket_idx: usize) -> Vec<PeerId> {
         self.bucket_states
             .get(&bucket_idx)
             .map(|state| {
@@ -418,14 +419,14 @@ impl BucketRefreshManager {
     }
 
     /// Add a node to bucket tracking for validation
-    pub fn track_node_in_bucket(&mut self, bucket_idx: usize, node_id: DhtNodeId) {
+    pub fn track_node_in_bucket(&mut self, bucket_idx: usize, node_id: PeerId) {
         let state = self.get_or_create_state(bucket_idx);
         state.tracked_nodes.push(node_id);
         state.node_count = state.tracked_nodes.len();
     }
 
     /// Remove a node from bucket tracking
-    pub fn untrack_node_from_bucket(&mut self, bucket_idx: usize, node_id: &DhtNodeId) {
+    pub fn untrack_node_from_bucket(&mut self, bucket_idx: usize, node_id: &PeerId) {
         if let Some(state) = self.bucket_states.get_mut(&bucket_idx) {
             state.tracked_nodes.retain(|id| id != node_id);
             state.node_count = state.tracked_nodes.len();
@@ -486,18 +487,15 @@ impl BucketRefreshManager {
     pub async fn validate_refreshed_nodes(
         &mut self,
         bucket_idx: usize,
-        nodes: &[DhtNodeId],
+        nodes: &[PeerId],
         responses_by_node: &std::collections::HashMap<
-            DhtNodeId,
+            PeerId,
             Vec<super::close_group_validator::CloseGroupResponse>,
         >,
-        trust_scores: &std::collections::HashMap<DhtNodeId, f64>,
+        trust_scores: &std::collections::HashMap<PeerId, f64>,
     ) -> (
-        Vec<DhtNodeId>,
-        Vec<(
-            DhtNodeId,
-            Vec<super::close_group_validator::CloseGroupFailure>,
-        )>,
+        Vec<PeerId>,
+        Vec<(PeerId, Vec<super::close_group_validator::CloseGroupFailure>)>,
     ) {
         let mut valid_nodes = Vec::new();
         let mut invalid_nodes = Vec::new();
@@ -528,7 +526,7 @@ impl BucketRefreshManager {
 
                 // Perform validation
                 let result = validator_read.validate_membership(node_id, responses, trust_score);
-                (node_id.clone(), result)
+                (*node_id, result)
             })
             .collect();
         drop(validator_read);
@@ -555,11 +553,8 @@ impl BucketRefreshManager {
     /// Update attack indicators based on validation results
     async fn update_attack_indicators_from_results(
         &self,
-        valid_nodes: &[DhtNodeId],
-        invalid_nodes: &[(
-            DhtNodeId,
-            Vec<super::close_group_validator::CloseGroupFailure>,
-        )],
+        valid_nodes: &[PeerId],
+        invalid_nodes: &[(PeerId, Vec<super::close_group_validator::CloseGroupFailure>)],
     ) {
         let Some(validator) = &self.validator else {
             return;
@@ -620,7 +615,7 @@ impl BucketRefreshManager {
     /// Get nodes that should be evicted based on validation failures
     pub async fn get_nodes_for_eviction(
         &self,
-    ) -> Vec<(DhtNodeId, super::close_group_validator::CloseGroupFailure)> {
+    ) -> Vec<(PeerId, super::close_group_validator::CloseGroupFailure)> {
         let mut eviction_candidates = Vec::new();
 
         let Some(validator) = &self.validator else {
@@ -793,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_generate_key_for_bucket_lands_in_correct_bucket() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let manager = BucketRefreshManager::new(local_id);
 
         // Test a few bucket indices
@@ -810,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_generate_key_produces_different_keys() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let manager = BucketRefreshManager::new(local_id);
 
         let key1 = manager.generate_key_for_bucket(100).unwrap();
@@ -822,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_generate_key_invalid_bucket() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let manager = BucketRefreshManager::new(local_id);
 
         assert!(manager.generate_key_for_bucket(256).is_none());
@@ -831,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_mark_close_group() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
         manager.initialize_buckets(256);
 
@@ -848,7 +843,7 @@ mod tests {
 
     #[test]
     fn test_mark_recently_used() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
         manager.initialize_buckets(256);
 
@@ -870,7 +865,7 @@ mod tests {
             return;
         }
 
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
         manager.initialize_buckets(256);
 
@@ -902,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_initialize_buckets() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
 
         manager.initialize_buckets(256);
@@ -914,7 +909,7 @@ mod tests {
 
     #[test]
     fn test_record_refresh_success() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
 
         manager.record_refresh_success(10, 8);
@@ -926,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_record_refresh_failure() {
-        let local_id = DhtNodeId::random();
+        let local_id = PeerId::random();
         let mut manager = BucketRefreshManager::new(local_id);
 
         manager.record_refresh_failure(10);

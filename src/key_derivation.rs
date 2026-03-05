@@ -30,7 +30,7 @@
 //! - Async key generation for non-blocking operations
 
 use crate::error::SecurityError;
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSecretKey};
+use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::secure_memory::SecureMemory;
 use crate::{P2PError, Result};
 use rand::{RngCore, thread_rng};
@@ -482,7 +482,7 @@ impl HierarchicalKeyDerivation {
             ))
         })?;
 
-        crate::quantum_crypto::ant_quic_integration::register_debug_ml_dsa_keypair(
+        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
             &secret_key,
             &public_key,
         );

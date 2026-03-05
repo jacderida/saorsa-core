@@ -9,7 +9,7 @@
 
 //! DHT Protocol Handler for SharedTransport
 //!
-//! This module implements the `ProtocolHandler` trait from ant-quic
+//! This module implements the `ProtocolHandler` trait from saorsa-transport
 //! for routing DHT-related streams to the appropriate handlers.
 //!
 //! ## Stream Types Handled
@@ -21,11 +21,11 @@
 //! | DhtWitness | 0x12 | (removed) |
 //! | DhtReplication | 0x13 | Background replication traffic |
 
-use ant_quic::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
-use ant_quic::nat_traversal_api::PeerId;
 use async_trait::async_trait;
 use bytes::Bytes;
+use saorsa_transport::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
@@ -77,8 +77,12 @@ impl DhtStreamHandler {
     }
 
     /// Handle a DHT query request.
-    async fn handle_query(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>> {
-        trace!(peer = ?peer, size = data.len(), "Processing DHT query");
+    async fn handle_query(
+        &self,
+        remote_addr: SocketAddr,
+        data: Bytes,
+    ) -> LinkResult<Option<Bytes>> {
+        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT query");
 
         let message: DhtMessage = postcard::from_bytes(&data)
             .map_err(|e| LinkError::Internal(format!("Failed to deserialize query: {e}")))?;
@@ -92,8 +96,12 @@ impl DhtStreamHandler {
     }
 
     /// Handle a DHT store request.
-    async fn handle_store(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>> {
-        trace!(peer = ?peer, size = data.len(), "Processing DHT store");
+    async fn handle_store(
+        &self,
+        remote_addr: SocketAddr,
+        data: Bytes,
+    ) -> LinkResult<Option<Bytes>> {
+        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT store");
 
         let message: DhtMessage = postcard::from_bytes(&data)
             .map_err(|e| LinkError::Internal(format!("Failed to deserialize store: {e}")))?;
@@ -107,8 +115,12 @@ impl DhtStreamHandler {
     }
 
     /// Handle a DHT replication request.
-    async fn handle_replication(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>> {
-        trace!(peer = ?peer, size = data.len(), "Processing DHT replication");
+    async fn handle_replication(
+        &self,
+        remote_addr: SocketAddr,
+        data: Bytes,
+    ) -> LinkResult<Option<Bytes>> {
+        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT replication");
 
         let message: DhtMessage = postcard::from_bytes(&data)
             .map_err(|e| LinkError::Internal(format!("Failed to deserialize replication: {e}")))?;
@@ -283,14 +295,15 @@ impl ProtocolHandler for DhtStreamHandler {
 
     async fn handle_stream(
         &self,
-        peer: PeerId,
+        remote_addr: SocketAddr,
+        _public_key: Option<&[u8]>,
         stream_type: StreamType,
         data: Bytes,
     ) -> LinkResult<Option<Bytes>> {
         match stream_type {
-            StreamType::DhtQuery => self.handle_query(peer, data).await,
-            StreamType::DhtStore => self.handle_store(peer, data).await,
-            StreamType::DhtReplication => self.handle_replication(peer, data).await,
+            StreamType::DhtQuery => self.handle_query(remote_addr, data).await,
+            StreamType::DhtStore => self.handle_store(remote_addr, data).await,
+            StreamType::DhtReplication => self.handle_replication(remote_addr, data).await,
             _ => {
                 error!(
                     stream_type = %stream_type,
@@ -303,12 +316,13 @@ impl ProtocolHandler for DhtStreamHandler {
 
     async fn handle_datagram(
         &self,
-        peer: PeerId,
+        remote_addr: SocketAddr,
+        _public_key: Option<&[u8]>,
         stream_type: StreamType,
         data: Bytes,
     ) -> LinkResult<()> {
         trace!(
-            peer = ?peer,
+            remote_addr = %remote_addr,
             stream_type = %stream_type,
             size = data.len(),
             "DHT datagram received (ignored)"
@@ -347,7 +361,7 @@ pub enum DhtStreamType {
 }
 
 impl DhtStreamType {
-    /// Convert to the ant-quic StreamType.
+    /// Convert to the saorsa-transport StreamType.
     pub fn to_stream_type(self) -> StreamType {
         match self {
             Self::Query => StreamType::DhtQuery,

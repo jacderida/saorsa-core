@@ -16,6 +16,7 @@
 //! Benchmarks for the validation framework
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use saorsa_core::PeerId;
 use saorsa_core::validation::*;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -23,14 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn benchmark_peer_id_validation(c: &mut Criterion) {
-    c.bench_function("validate_peer_id_valid", |b| {
-        b.iter(|| validate_peer_id(black_box("valid_peer_id_123456")));
-    });
-
-    c.bench_function("validate_peer_id_invalid", |b| {
-        b.iter(|| {
-            let _ = validate_peer_id(black_box("short"));
-        });
+    let peer = PeerId::random();
+    c.bench_function("validate_peer_id", |b| {
+        b.iter(|| validate_peer_id(black_box(&peer)));
     });
 }
 
@@ -97,7 +93,7 @@ fn benchmark_complex_validation(c: &mut Criterion) {
     c.bench_function("network_message_validation", |b| {
         b.iter_batched(
             || NetworkMessage {
-                peer_id: "valid_peer_id_123456".to_string(),
+                peer_id: PeerId::random(),
                 payload: vec![0u8; 1024],
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

@@ -17,10 +17,10 @@
 //! - ML-KEM (Module-Lattice Key Encapsulation Mechanism) for key exchange
 //! - ML-DSA (Module-Lattice Digital Signature Algorithm) for signatures
 
-pub mod ant_quic_integration;
+pub mod saorsa_transport_integration;
 pub mod types;
 
-// NOTE: Not using wildcard import to avoid conflicts with ant-quic types
+// NOTE: Not using wildcard import to avoid conflicts with saorsa-transport types
 // Selectively re-export only non-conflicting types from our types module
 pub use self::types::{
     FrostCommitment, FrostGroupPublicKey, FrostKeyShare, FrostPublicKey, FrostSignature, GroupId,
@@ -28,8 +28,8 @@ pub use self::types::{
     SessionState,
 };
 
-// Re-export all ant-quic PQC functions for convenience
-pub use self::ant_quic_integration::{
+// Re-export all saorsa-transport PQC functions for convenience
+pub use self::saorsa_transport_integration::{
     // Configuration functions
     create_default_pqc_config,
     create_pqc_memory_pool,

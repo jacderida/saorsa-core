@@ -25,13 +25,13 @@ This phase focuses on understanding the exact message flow patterns in saorsa-co
 **Files to analyze**:
 - `src/messaging/service.rs` (lines 1-350)
 - `src/messaging/transport.rs` (lines 1-200)
-- `src/transport/ant_quic_adapter.rs` (lines 1-100)
+- `src/transport/saorsa_transport_adapter.rs` (lines 1-100)
 - `src/messaging/types.rs` (lines 80-145 - RichMessage structure)
 
 **Questions to answer**:
 1. What is the exact flow from `send_message()` to wire transmission?
 2. Which layers perform serialization (JSON vs bincode)?
-3. Where does ant-quic encryption begin and end?
+3. Where does saorsa-transport encryption begin and end?
 4. What is the packet format at each layer?
 5. Are direct messages always synchronous, or can they be queued?
 
@@ -202,7 +202,7 @@ This phase focuses on understanding the exact message flow patterns in saorsa-co
 2. Are ephemeral keys used per message, or long-lived keys?
 3. How often are encryption keys rotated?
 4. If keys are compromised, can historical DHT messages be decrypted?
-5. Does ant-quic PQC provide forward secrecy for in-transit messages?
+5. Does saorsa-transport PQC provide forward secrecy for in-transit messages?
 
 **Output**:
 - Create `.planning/architecture-analysis/06-forward-secrecy.md`
@@ -226,7 +226,7 @@ This phase focuses on understanding the exact message flow patterns in saorsa-co
 
 **Files to analyze**:
 - `src/messaging/encryption.rs` (application-layer encryption)
-- `src/transport/ant_quic_adapter.rs` (transport-layer PQC)
+- `src/transport/saorsa_transport_adapter.rs` (transport-layer PQC)
 - `src/messaging/types.rs` (line 360-369 - EncryptedMessage wrapper)
 - `.planning/baseline-measurements.md` (encryption overhead data)
 

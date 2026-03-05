@@ -80,7 +80,7 @@
 - Need to verify error propagation in remaining transport layer
 
 ### Async/Concurrency
-- ✅ QUIC transport (`ant_quic_adapter.rs`) preserved with minimal changes
+- ✅ QUIC transport (`saorsa_transport_adapter.rs`) preserved with minimal changes
 - ✅ Network integration code appears intact
 
 ---

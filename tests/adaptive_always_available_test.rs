@@ -16,9 +16,10 @@
 // ---- Compile-time checks: these imports must resolve without any feature flag ----
 
 // Adaptive module
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{
-    EigenTrustEngine, HyperbolicCoordinate, MultiArmedBandit, NodeId, StrategyChoice,
-    ThompsonSampling, TrustProvider,
+    EigenTrustEngine, HyperbolicCoordinate, MultiArmedBandit, StrategyChoice, ThompsonSampling,
+    TrustProvider,
 };
 
 // Placement module
@@ -51,8 +52,8 @@ fn adaptive_module_types_constructible() {
     let _ = std::any::type_name::<MultiArmedBandit>();
     let _ = StrategyChoice::Kademlia;
 
-    // NodeId
-    let _nid = NodeId::from_bytes([0u8; 32]);
+    // PeerId
+    let _nid = PeerId::from_bytes([0u8; 32]);
 
     // HyperbolicCoordinate (public fields)
     let _coord = HyperbolicCoordinate { r: 0.5, theta: 1.0 };
@@ -78,7 +79,7 @@ fn trust_peer_selector_accessible() {
 fn prelude_exports_adaptive_types() {
     // These types should be available via prelude
     let _ = prelude::StrategyChoice::Kademlia;
-    let _ = prelude::NodeId::from_bytes([0u8; 32]);
+    let _ = prelude::PeerId::from_bytes([0u8; 32]);
 }
 
 #[test]

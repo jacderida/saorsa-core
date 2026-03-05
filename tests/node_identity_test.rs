@@ -16,7 +16,7 @@
 //! Test for new node identity implementation
 
 use saorsa_core::Result;
-use saorsa_core::identity::{NodeId, NodeIdentity};
+use saorsa_core::identity::{NodeIdentity, PeerId};
 
 #[test]
 fn test_node_identity_generation() -> Result<()> {
@@ -25,15 +25,15 @@ fn test_node_identity_generation() -> Result<()> {
 
     // Check all fields are set
     // Word address functionality removed - using PQC addresses instead
-    assert!(!identity.node_id().to_string().is_empty());
+    assert!(!identity.peer_id().to_string().is_empty());
     // POW functionality removed - using PQC signatures instead
     let message = b"test message";
     let signature = identity.sign(message).unwrap();
     assert!(identity.verify(message, &signature).unwrap());
 
     println!("Generated identity:");
-    println!("  Node ID: {}", identity.node_id());
-    println!("  Node ID: {}", identity.node_id());
+    println!("  Node ID: {}", identity.peer_id());
+    println!("  Node ID: {}", identity.peer_id());
     println!(
         "  PoW computation time: {:?}",
         // POW computation time no longer tracked
@@ -51,8 +51,8 @@ fn test_deterministic_identity() {
     let id2 = NodeIdentity::from_seed(&seed).unwrap();
 
     // Should be identical
-    assert_eq!(id1.node_id(), id2.node_id());
-    assert_eq!(id1.node_id(), id2.node_id());
+    assert_eq!(id1.peer_id(), id2.peer_id());
+    assert_eq!(id1.peer_id(), id2.peer_id());
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn test_signing_and_verification() {
 #[test]
 fn test_persistence() {
     let identity = NodeIdentity::generate().unwrap();
-    let original_id = identity.node_id().clone();
+    let original_id = *identity.peer_id();
 
     // Export to data
     let data = identity.export();
@@ -82,7 +82,7 @@ fn test_persistence() {
     let restored = NodeIdentity::import(&data).unwrap();
 
     // Should be identical
-    assert_eq!(restored.node_id(), &original_id);
+    assert_eq!(restored.peer_id(), &original_id);
 
     // Should be able to sign with restored identity
     let msg = b"Persistence test";
@@ -92,8 +92,8 @@ fn test_persistence() {
 
 #[test]
 fn test_node_id_xor_distance() {
-    let id1 = NodeId([0xFF; 32]);
-    let id2 = NodeId([0x00; 32]);
+    let id1 = PeerId::from_bytes([0xFF; 32]);
+    let id2 = PeerId::from_bytes([0x00; 32]);
 
     let distance = id1.xor_distance(&id2);
 

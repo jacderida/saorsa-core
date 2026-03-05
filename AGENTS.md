@@ -43,7 +43,7 @@ trust_engine
 - **Serialization**: `serde` with derive features
 - **Error handling**: `anyhow`, `thiserror`
 - **Logging**: `tracing` (never `println!` in production)
-- **Crypto**: `saorsa-pqc` (primary), `ant-quic` (QUIC transport)
+- **Crypto**: `saorsa-pqc` (primary), `saorsa-transport` (QUIC transport)
 
 ### Naming Conventions
 - **Modules**: `snake_case` (e.g., `dht`, `transport`, `adaptive`)

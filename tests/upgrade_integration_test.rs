@@ -24,7 +24,7 @@
 //! 6. Update Manager Lifecycle
 //! 7. Security Scenarios
 
-use saorsa_core::quantum_crypto::ant_quic_integration::{
+use saorsa_core::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
 };
 use saorsa_core::quantum_crypto::{generate_ml_dsa_keypair, ml_dsa_sign, ml_dsa_verify};
@@ -76,12 +76,10 @@ fn corrupt_signature(signature: &MlDsaSignature) -> MlDsaSignature {
     MlDsaSignature::from_bytes(&bytes).unwrap_or_else(|_| signature.clone())
 }
 
-/// Calculate SHA-256 hash
-fn calculate_sha256(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+/// Calculate BLAKE3 hash
+fn calculate_hash(data: &[u8]) -> String {
+    let hash = blake3::hash(data);
+    hash.to_hex().to_string()
 }
 
 /// Create a test binary file
@@ -108,7 +106,7 @@ fn create_test_manifest(
 ) -> UpdateManifest {
     let binary_content = format!("Binary content for version {}", version);
     let binary_bytes = binary_content.as_bytes();
-    let sha256 = calculate_sha256(binary_bytes);
+    let hash = calculate_hash(binary_bytes);
     let signature = sign_binary(binary_bytes, secret_key);
     let signature_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
@@ -120,7 +118,7 @@ fn create_test_manifest(
         Platform::LinuxX64,
         PlatformBinary {
             url: format!("https://test.example.com/binary-{}", version),
-            sha256: sha256.clone(),
+            hash: hash.clone(),
             signature: signature_b64.clone(),
             size: binary_bytes.len() as u64,
         },
@@ -131,7 +129,7 @@ fn create_test_manifest(
         Platform::MacOsArm64,
         PlatformBinary {
             url: format!("https://test.example.com/binary-{}-macos", version),
-            sha256: sha256.clone(),
+            hash: hash.clone(),
             signature: signature_b64.clone(),
             size: binary_bytes.len() as u64,
         },
@@ -142,7 +140,7 @@ fn create_test_manifest(
         Platform::WindowsX64,
         PlatformBinary {
             url: format!("https://test.example.com/binary-{}.exe", version),
-            sha256,
+            hash,
             signature: signature_b64,
             size: binary_bytes.len() as u64,
         },
@@ -309,7 +307,7 @@ async fn test_wrong_public_key() {
 #[tokio::test]
 async fn test_checksum_verification() {
     let test_data = b"Test binary for checksum verification";
-    let expected_checksum = calculate_sha256(test_data);
+    let expected_checksum = calculate_hash(test_data);
 
     let verifier = SignatureVerifier::default();
 
@@ -336,7 +334,7 @@ async fn test_file_checksum_calculation() {
         .await
         .expect("Failed to calculate file checksum");
 
-    let expected_checksum = calculate_sha256(test_content);
+    let expected_checksum = calculate_hash(test_content);
     assert_eq!(
         calculated_checksum, expected_checksum,
         "File checksum should match"
@@ -418,7 +416,7 @@ async fn test_staged_update_creation() {
         .await
         .expect("Failed to create binary");
 
-    let checksum = calculate_sha256(test_content);
+    let checksum = calculate_hash(test_content);
     let staged = StagedUpdate::new(
         "1.0.0",
         binary_path.clone(),
@@ -768,7 +766,7 @@ async fn test_staging_manager_workflow() {
         .await
         .expect("Failed to create staged binary");
 
-    let checksum = calculate_sha256(test_content);
+    let checksum = calculate_hash(test_content);
     let staged = StagedUpdate::new(
         "1.0.0",
         binary_path,
@@ -1039,7 +1037,7 @@ async fn test_verify_file_integration() {
         .await
         .expect("Failed to create binary");
 
-    let checksum = calculate_sha256(test_content);
+    let checksum = calculate_hash(test_content);
     let signature = sign_binary(test_content, &secret_key);
     let signature_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,

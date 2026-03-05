@@ -17,7 +17,7 @@
 //! Benchmarks for security features including cryptographic operations and peer ID generation.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use saorsa_core::peer_record::UserId;
+use saorsa_core::peer_record::PeerId;
 use std::net::Ipv6Addr;
 
 /// Benchmark cryptographic operations
@@ -37,15 +37,15 @@ fn crypto_benchmarks(c: &mut Criterion) {
     group.bench_function("peer_id_generation", |b| {
         let data = vec![rand::random::<u8>(); 32];
         b.iter(|| {
-            let peer_id = UserId::from_bytes(black_box(data.as_slice().try_into().unwrap()));
+            let peer_id = PeerId::from_bytes(black_box(data.as_slice().try_into().unwrap()));
             black_box(peer_id);
         });
     });
 
     // Benchmark peer ID distance calculation
     group.bench_function("peer_id_distance", |b| {
-        let id1 = UserId::from_bytes([1u8; 32]);
-        let id2 = UserId::from_bytes([2u8; 32]);
+        let id1 = PeerId::from_bytes([1u8; 32]);
+        let id2 = PeerId::from_bytes([2u8; 32]);
 
         b.iter(|| {
             let distance = xor_distance(&id1, &id2);
@@ -82,10 +82,10 @@ fn ipv6_benchmarks(c: &mut Criterion) {
 }
 
 /// Calculate XOR distance between two peer IDs
-fn xor_distance(a: &UserId, b: &UserId) -> [u8; 32] {
+fn xor_distance(a: &PeerId, b: &PeerId) -> [u8; 32] {
     let mut result = [0u8; 32];
     for (i, byte) in result.iter_mut().enumerate() {
-        *byte = a.hash[i] ^ b.hash[i];
+        *byte = a.0[i] ^ b.0[i];
     }
     result
 }

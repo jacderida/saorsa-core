@@ -220,7 +220,7 @@ impl IdentityMigrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer_record::UserId;
+    use crate::peer_record::PeerId;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -233,7 +233,7 @@ mod tests {
 
         // Create a plaintext identity file
         let identity = Identity {
-            id: UserId::from_bytes([1u8; 32]),
+            id: PeerId::from_bytes([1u8; 32]),
             four_word_address: "test.word.address.here".to_string(),
             state: crate::identity_manager::IdentityState::Active,
             display_name: Some("Test User".to_string()),

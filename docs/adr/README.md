@@ -18,7 +18,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | ADR | Title | Status | Summary |
 |-----|-------|--------|---------|
 | [ADR-001](./ADR-001-multi-layer-architecture.md) | Multi-Layer P2P Architecture | Accepted | Layered design separating transport, DHT, identity, and application concerns |
-| [ADR-002](./ADR-002-delegated-transport.md) | Delegated Transport via ant-quic | Accepted | Using ant-quic for QUIC transport, NAT traversal, and bootstrap cache |
+| [ADR-002](./ADR-002-delegated-transport.md) | Delegated Transport via saorsa-transport | Accepted | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
 | [ADR-003](./ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | Accepted | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
 
 ### Identity & Addressing
@@ -42,7 +42,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | ADR | Title | Status | Summary |
 |-----|-------|--------|---------|
 | [ADR-007](./ADR-007-adaptive-networking.md) | Adaptive Networking with ML | Accepted | Machine learning for dynamic routing optimization |
-| [ADR-008](./ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Accepted | Delegating bootstrap to ant-quic with Sybil protection |
+| [ADR-008](./ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Accepted | Delegating bootstrap to saorsa-transport with Sybil protection |
 | [ADR-011](./ADR-011-geographic-placement.md) | Geographic-Aware Placement | Accepted | Region-aware storage for regulatory compliance |
 
 ### Messaging

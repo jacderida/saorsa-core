@@ -278,9 +278,9 @@ impl KeyspaceRegion {
         self
     }
 
-    /// Check if a NodeId falls within this region.
+    /// Check if a PeerId falls within this region.
     #[must_use]
-    pub fn contains(&self, node_id: &super::NodeId) -> bool {
+    pub fn contains(&self, node_id: &super::PeerId) -> bool {
         let node_bytes = node_id.to_bytes();
         let full_bytes = self.prefix_len as usize / 8;
         let remaining_bits = self.prefix_len as usize % 8;
@@ -653,11 +653,11 @@ mod tests {
         let region = KeyspaceRegion::new(vec![0x80], 1, 0.5);
 
         // NodeId starting with 1... should be in region
-        let in_region = super::super::NodeId([0xFF; 32]);
+        let in_region = super::super::PeerId([0xFF; 32]);
         assert!(region.contains(&in_region));
 
         // NodeId starting with 0... should NOT be in region
-        let not_in_region = super::super::NodeId([0x00; 32]);
+        let not_in_region = super::super::PeerId([0x00; 32]);
         assert!(!region.contains(&not_in_region));
     }
 

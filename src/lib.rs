@@ -208,7 +208,7 @@ pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemet
 // Back-compat exports for tests
 pub use config::Config;
 pub use network::P2PNode as Node;
-pub use peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache, UserId};
+pub use peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache};
 pub use persistent_state::{
     FlushStrategy, IntegrityReport, PersistentStateManager, RecoveryMode, RecoveryStats,
     StateChangeEvent, StateConfig, TransactionType, WalEntry,
@@ -248,7 +248,7 @@ pub use threshold::{
     GroupMetadata, ParticipantInfo, ThresholdGroup, ThresholdGroupManager, ThresholdSignature,
 };
 
-// Post-quantum cryptography exports (using ant-quic types exclusively)
+// Post-quantum cryptography exports (using saorsa-transport types exclusively)
 pub use quantum_crypto::{
     CryptoCapabilities,
     KemAlgorithm,
@@ -270,7 +270,7 @@ pub use quantum_crypto::{
     // Algorithm implementations
     MlDsa65,
     MlDsaOperations,
-    // Use ant-quic types for better trait implementations
+    // Use saorsa-transport types for better trait implementations
     MlDsaPublicKey as AntMlDsaPublicKey,
     MlDsaSecretKey as AntMlDsaSecretKey,
     MlDsaSignature as AntMlDsaSignature,
@@ -322,18 +322,8 @@ pub use crate::placement::{
     WeightedPlacementStrategy,
 };
 
-// Network address types
-/// Peer identifier used throughout Saorsa
-///
-/// Currently implemented as a String for simplicity, but should be enhanced
-/// with cryptographic verification and validation in future versions.
-///
-/// TODO: Replace with a proper newtype that includes validation:
-/// - Non-empty string validation
-/// - Character set validation (alphanumeric + - _)
-/// - Length limits (max 256 characters)
-/// - Optional cryptographic verification
-pub type PeerId = String;
+// Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
+pub use identity::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 
 /// Network address used for peer-to-peer communication
 ///

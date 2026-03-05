@@ -513,7 +513,7 @@ spawn(async move {
 
 ## Version Compatibility
 
-| saorsa-core | ant-quic | Rust | Features |
+| saorsa-core | saorsa-transport | Rust | Features |
 |-------------|----------|------|----------|
 | 0.11.x | 0.21.x | 1.75+ | Full PQC, placement system, threshold crypto |
 | 0.10.x | 0.20.x | 1.75+ | Full PQC, unified config |

@@ -26,6 +26,7 @@
 //! - Monitoring and security
 
 use super::*;
+use crate::PeerId;
 use crate::adaptive::StrategyChoice;
 use crate::adaptive::coordinator_extensions::{
     AdaptiveDHTExtensions, AdaptiveGossipSubExtensions, AdaptiveRouterExtensions,
@@ -400,7 +401,7 @@ impl NetworkCoordinator {
 
         // Create trust provider for components that need it
         let mut pre_trusted = HashSet::new();
-        pre_trusted.insert(identity.to_user_id());
+        pre_trusted.insert(*identity.peer_id());
         let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
 
         // Initialize routing components
@@ -442,7 +443,7 @@ impl NetworkCoordinator {
 
         // Initialize gossip
         let gossip = Arc::new(AdaptiveGossipSub::new(
-            identity.to_user_id(),
+            *identity.peer_id(),
             trust_engine.clone(),
         ));
 
@@ -500,7 +501,7 @@ impl NetworkCoordinator {
         // Initialize churn handler
         let churn_config = ChurnConfig::default();
         let churn_handler = Arc::new(ChurnHandler::new(
-            identity.to_user_id(),
+            *identity.peer_id(),
             churn_predictor.clone(),
             trust_engine.clone(),
             replication.clone(),
@@ -637,7 +638,7 @@ impl NetworkCoordinator {
     pub async fn join_network(&self) -> Result<()> {
         info!(
             "Joining P2P network with identity: {:?}",
-            self.network.identity.node_id()
+            self.network.identity.peer_id()
         );
 
         // Connect to bootstrap nodes
@@ -678,7 +679,7 @@ impl NetworkCoordinator {
         // Security check
         self.operations
             .security
-            .check_rate_limit(&self.network.identity.to_user_id(), None)
+            .check_rate_limit(&self.network.identity.peer_id().clone(), None)
             .await
             .map_err(|e| {
                 P2PError::Network(crate::error::NetworkError::ProtocolError(
@@ -759,7 +760,7 @@ impl NetworkCoordinator {
         let msg = GossipMessage {
             topic: topic.to_string(),
             data: message,
-            from: NodeId::from_bytes(self.network.identity.node_id().0),
+            from: PeerId::from_bytes(self.network.identity.peer_id().0),
             seqno: 0, // Will be set by gossip
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -934,7 +935,7 @@ impl NetworkCoordinator {
     /// Public accessor for basic node information used by tests/examples
     pub async fn get_node_info(&self) -> Result<NodeDescriptor> {
         Ok(NodeDescriptor {
-            id: self.network.identity.to_user_id(),
+            id: *self.network.identity.peer_id(),
             public_key: self.network.identity.public_key().clone(),
             addresses: vec![],
             hyperbolic: None,
@@ -1001,7 +1002,7 @@ impl NetworkCoordinator {
 /// Layer coordination protocols
 impl NetworkCoordinator {
     /// Coordinate between routing layers
-    pub async fn coordinate_routing(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    pub async fn coordinate_routing(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Get recommendations from each layer
         let kademlia_path = self.network.router.get_kademlia_path(target).await?;
         let hyperbolic_path = self.network.router.get_hyperbolic_path(target).await?;
@@ -1011,21 +1012,21 @@ impl NetworkCoordinator {
         let paths = vec![
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::Kademlia,
                 },
                 kademlia_path,
             ),
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::Hyperbolic,
                 },
                 hyperbolic_path,
             ),
             (
                 RouteId {
-                    node_id: target.clone(),
+                    node_id: *target,
                     strategy: StrategyChoice::TrustPath,
                 },
                 trust_path,
@@ -1155,7 +1156,7 @@ mod tests {
             Ok(Ok(coordinator)) => {
                 let message = NetworkMessage {
                     id: "test-123".to_string(),
-                    sender: NodeId::from_bytes(*coordinator.network.identity.node_id().to_bytes()),
+                    sender: *coordinator.network.identity.peer_id(),
                     content: vec![1, 2, 3],
                     msg_type: ContentType::DHTLookup,
                     timestamp: 0,

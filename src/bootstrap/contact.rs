@@ -277,7 +277,7 @@ impl ContactEntry {
 
         format!(
             "Peer {} (Quality: {:.2}, Success: {:.1}%, Latency: {:.0}ms, Verified: {}{})",
-            self.peer_id.to_string().chars().take(8).collect::<String>(),
+            self.peer_id.to_hex().chars().take(8).collect::<String>(),
             self.quality_metrics.quality_score,
             self.quality_metrics.success_rate * 100.0,
             self.quality_metrics.avg_latency_ms,
@@ -641,10 +641,10 @@ mod tests {
 
     #[test]
     fn test_contact_entry_creation() {
-        let peer_id = PeerId::from("test-peer");
+        let peer_id = PeerId::random();
         let addresses = vec!["127.0.0.1:9000".parse().unwrap()];
 
-        let contact = ContactEntry::new(peer_id.clone(), addresses.clone());
+        let contact = ContactEntry::new(peer_id, addresses.clone());
 
         assert_eq!(contact.peer_id, peer_id);
         assert_eq!(contact.addresses, addresses);
@@ -654,10 +654,8 @@ mod tests {
 
     #[test]
     fn test_quality_calculation() {
-        let mut contact = ContactEntry::new(
-            PeerId::from("test-peer"),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-        );
+        let mut contact =
+            ContactEntry::new(PeerId::random(), vec!["127.0.0.1:9000".parse().unwrap()]);
 
         // Simulate successful connections
         contact.update_connection_result(true, Some(50), None);
@@ -671,10 +669,8 @@ mod tests {
 
     #[test]
     fn test_capability_bonus() {
-        let mut contact = ContactEntry::new(
-            PeerId::from("test-peer"),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-        );
+        let mut contact =
+            ContactEntry::new(PeerId::random(), vec!["127.0.0.1:9000".parse().unwrap()]);
 
         let initial_score = contact.quality_metrics.quality_score;
 
@@ -685,10 +681,8 @@ mod tests {
 
     #[test]
     fn test_stale_detection() {
-        let mut contact = ContactEntry::new(
-            PeerId::from("test-peer"),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-        );
+        let mut contact =
+            ContactEntry::new(PeerId::random(), vec!["127.0.0.1:9000".parse().unwrap()]);
 
         // Set last seen to 2 hours ago
         contact.last_seen = chrono::Utc::now() - chrono::Duration::hours(2);
@@ -725,7 +719,7 @@ mod tests {
         let quic_info = QuicContactInfo::new(addresses);
 
         let contact = ContactEntry::new_with_quic(
-            PeerId::from("test-peer"),
+            PeerId::random(),
             vec!["127.0.0.1:9000".parse().unwrap()],
             quic_info,
         );
@@ -741,7 +735,7 @@ mod tests {
         let quic_info = QuicContactInfo::new(addresses);
 
         let mut contact = ContactEntry::new_with_quic(
-            PeerId::from("test-peer"),
+            PeerId::random(),
             vec!["127.0.0.1:9000".parse().unwrap()],
             quic_info,
         );
@@ -774,15 +768,13 @@ mod tests {
         let quic_info = QuicContactInfo::new(addresses);
 
         // Contact without QUIC
-        let mut contact_no_quic = ContactEntry::new(
-            PeerId::from("test-peer-no-quic"),
-            vec!["127.0.0.1:9000".parse().unwrap()],
-        );
+        let mut contact_no_quic =
+            ContactEntry::new(PeerId::random(), vec!["127.0.0.1:9000".parse().unwrap()]);
         contact_no_quic.update_connection_result(true, Some(100), None);
 
         // Contact with QUIC
         let mut contact_with_quic = ContactEntry::new_with_quic(
-            PeerId::from("test-peer-with-quic"),
+            PeerId::random(),
             vec!["127.0.0.1:9000".parse().unwrap()],
             quic_info,
         );

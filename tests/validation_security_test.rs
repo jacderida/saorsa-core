@@ -136,9 +136,9 @@ fn test_xss_prevention() {
 fn test_buffer_overflow_protection() {
     let ctx = ValidationContext::default();
 
-    // Test various size limits
-    let large_peer_id = "x".repeat(1000);
-    assert!(validate_peer_id(&large_peer_id).is_err());
+    // PeerId is always valid by construction (fixed 32 bytes), so no size-limit test needed.
+    let _peer = saorsa_core::PeerId::from_bytes([0xFFu8; 32]);
+    assert!(validate_peer_id(&_peer).is_ok());
 
     // Test message size limits
     let huge_size = usize::MAX;
@@ -232,42 +232,41 @@ fn test_timing_attack_resistance() -> anyhow::Result<()> {
     use std::time::Instant;
 
     // Ensure validation timing doesn't leak information
-    let valid_peer = "valid_peer_id_123";
-    let invalid_short = "short";
-    let _invalid_long = "x".repeat(100);
+    // PeerId is a fixed-size [u8; 32] validated by construction.
+    // Timing test validates that validation is constant-time across different byte patterns.
+    let peer_a = saorsa_core::PeerId::from_bytes([0xAA; 32]);
+    let peer_b = saorsa_core::PeerId::from_bytes([0x00; 32]);
 
-    let mut valid_times = Vec::new();
-    let mut invalid_times = Vec::new();
+    let mut a_times = Vec::new();
+    let mut b_times = Vec::new();
 
     // Measure validation times
     for _ in 0..100 {
         let start = Instant::now();
-        let _ = validate_peer_id(valid_peer);
-        valid_times.push(start.elapsed());
+        let _ = validate_peer_id(&peer_a);
+        a_times.push(start.elapsed());
 
         let start = Instant::now();
-        let _ = validate_peer_id(invalid_short);
-        invalid_times.push(start.elapsed());
+        let _ = validate_peer_id(&peer_b);
+        b_times.push(start.elapsed());
     }
 
     // Calculate average times
-    let valid_avg: u128 =
-        valid_times.iter().map(|d| d.as_nanos()).sum::<u128>() / valid_times.len() as u128;
-    let invalid_avg: u128 =
-        invalid_times.iter().map(|d| d.as_nanos()).sum::<u128>() / invalid_times.len() as u128;
+    let a_avg: u128 = a_times.iter().map(|d| d.as_nanos()).sum::<u128>() / a_times.len() as u128;
+    let b_avg: u128 = b_times.iter().map(|d| d.as_nanos()).sum::<u128>() / b_times.len() as u128;
 
     // Times should be similar (constant-time validation)
-    let diff = valid_avg.abs_diff(invalid_avg);
+    let diff = a_avg.abs_diff(b_avg);
 
     // Allow up to 5x difference - timing tests are inherently flaky in CI
     // due to CPU scheduling, cache effects, and system load variations.
     // This test verifies there's no *extreme* timing leak, not constant-time.
-    let max_diff = valid_avg.max(invalid_avg) * 5;
+    let max_diff = a_avg.max(b_avg) * 5;
     assert!(
         diff < max_diff,
-        "Extreme timing difference: valid={:?}ns, invalid={:?}ns, diff={:?}ns",
-        valid_avg,
-        invalid_avg,
+        "Extreme timing difference: a={:?}ns, b={:?}ns, diff={:?}ns",
+        a_avg,
+        b_avg,
         diff
     );
     Ok(())
@@ -285,17 +284,19 @@ fn test_regex_dos_protection() -> anyhow::Result<()> {
         "-".repeat(500) + "_" + &"-".repeat(500),
     ];
 
-    for input in malicious_inputs {
+    // PeerId is a fixed [u8; 32] type, so no regex is involved.
+    // Validate that the no-op check completes quickly for various patterns.
+    for _input in malicious_inputs {
+        let peer = saorsa_core::PeerId::from_bytes([0xFFu8; 32]);
         let start = Instant::now();
-        let _ = validate_peer_id(&input);
+        let _ = validate_peer_id(&peer);
         let elapsed = start.elapsed();
 
-        // Should complete quickly even with long input
+        // Should complete quickly (no-op validation)
         assert!(
             elapsed.as_millis() < 100,
-            "Regex took too long: {:?}ms for input length {}",
+            "Validation took too long: {:?}ms",
             elapsed.as_millis(),
-            input.len()
         );
     }
     Ok(())
@@ -305,17 +306,19 @@ fn test_regex_dos_protection() -> anyhow::Result<()> {
 fn test_memory_exhaustion_protection() {
     let ctx = ValidationContext::default();
 
+    let test_peer = saorsa_core::PeerId::from_bytes([0xAAu8; 32]);
+
     // Try to exhaust memory with large allocations
     let memory_attacks = vec![
         // Large message
         NetworkMessage {
-            peer_id: "valid_peer_id_123".to_string(),
+            peer_id: test_peer,
             payload: vec![0u8; 100 * 1024 * 1024], // 100MB
             timestamp: 0,
         },
         // Many small allocations
         NetworkMessage {
-            peer_id: "x".repeat(64),
+            peer_id: test_peer,
             payload: vec![0u8; ctx.max_message_size + 1],
             timestamp: 0,
         },

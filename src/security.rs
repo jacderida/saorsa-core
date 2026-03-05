@@ -18,13 +18,13 @@
 //! large-scale Sybil attacks while maintaining network openness.
 
 use crate::PeerId;
-use crate::quantum_crypto::ant_quic_integration::{
+use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, ml_dsa_sign, ml_dsa_verify,
 };
 use anyhow::{Result, anyhow};
+use blake3;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -68,7 +68,7 @@ impl NodeIpAddress for Ipv4Addr {
 /// node identities, reducing code duplication while maintaining type safety.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenericIpNodeID<A: NodeIpAddress> {
-    /// Derived node ID (SHA256 of ip_addr + public_key + salt + timestamp)
+    /// Derived node ID (BLAKE3 of ip_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
     /// IP address this node ID is bound to
     pub ip_addr: A,
@@ -97,7 +97,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
         let public_key = public.as_bytes().to_vec();
         let ip_octets = ip_addr.octets_vec();
 
-        // Generate node ID: SHA256(ip_address || public_key || salt || timestamp)
+        // Generate node ID: BLAKE3(ip_address || public_key || salt || timestamp)
         let node_id = Self::compute_node_id(&ip_octets, &public_key, &salt, timestamp_secs);
 
         // Create signature proving ownership
@@ -179,12 +179,12 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
         salt: &[u8],
         timestamp_secs: u64,
     ) -> Vec<u8> {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(ip_octets);
         hasher.update(public_key);
         hasher.update(salt);
-        hasher.update(timestamp_secs.to_le_bytes());
-        hasher.finalize().to_vec()
+        hasher.update(&timestamp_secs.to_le_bytes());
+        hasher.finalize().as_bytes().to_vec()
     }
 
     #[inline]
@@ -210,7 +210,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
 /// IPv6-based node identity that binds node ID to actual network location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPv6NodeID {
-    /// Derived node ID (SHA256 of ipv6_addr + public_key + salt)
+    /// Derived node ID (BLAKE3 of ipv6_addr + public_key + salt)
     pub node_id: Vec<u8>,
     /// IPv6 address this node ID is bound to
     pub ipv6_addr: Ipv6Addr,
@@ -489,7 +489,7 @@ impl IPv6NodeID {
 /// Mirrors IPv6NodeID for security parity on IPv4 networks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPv4NodeID {
-    /// Derived node ID (SHA256 of ipv4_addr + public_key + salt + timestamp)
+    /// Derived node ID (BLAKE3 of ipv4_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
     /// IPv4 address this node ID is bound to
     pub ipv4_addr: Ipv4Addr,
@@ -1255,19 +1255,19 @@ impl ReputationManager {
 
     /// Update reputation based on interaction
     pub fn update_reputation(&mut self, peer_id: &PeerId, success: bool, response_time: Duration) {
-        let reputation =
-            self.reputations
-                .entry(peer_id.clone())
-                .or_insert_with(|| NodeReputation {
-                    peer_id: peer_id.clone(),
-                    response_rate: 0.5,
-                    response_time: Duration::from_millis(500),
-                    consistency_score: 0.5,
-                    uptime_estimate: Duration::from_secs(0),
-                    routing_accuracy: 0.5,
-                    last_seen: SystemTime::now(),
-                    interaction_count: 0,
-                });
+        let reputation = self
+            .reputations
+            .entry(*peer_id)
+            .or_insert_with(|| NodeReputation {
+                peer_id: *peer_id,
+                response_rate: 0.5,
+                response_time: Duration::from_millis(500),
+                consistency_score: 0.5,
+                uptime_estimate: Duration::from_secs(0),
+                routing_accuracy: 0.5,
+                last_seen: SystemTime::now(),
+                interaction_count: 0,
+            });
 
         // Use higher learning rate for faster convergence in tests
         let alpha = 0.3; // Increased from 0.1 for better test convergence
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(node_id.ipv6_addr, ipv6_addr);
         assert_eq!(node_id.public_key.len(), 1952); // ML-DSA-65 public key size
         assert_eq!(node_id.signature.len(), 3309); // ML-DSA-65 signature size
-        assert_eq!(node_id.node_id.len(), 32); // SHA256 output
+        assert_eq!(node_id.node_id.len(), 32); // BLAKE3 output
         assert_eq!(node_id.salt.len(), 16);
         assert!(node_id.timestamp_secs > 0);
 
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(node_id.ipv4_addr, ipv4_addr);
         assert_eq!(node_id.public_key.len(), 1952); // ML-DSA-65 public key size
         assert_eq!(node_id.signature.len(), 3309); // ML-DSA-65 signature size
-        assert_eq!(node_id.node_id.len(), 32); // SHA256 output
+        assert_eq!(node_id.node_id.len(), 32); // BLAKE3 output
         assert_eq!(node_id.salt.len(), 16);
         assert!(node_id.timestamp_secs > 0);
 
@@ -1800,7 +1800,7 @@ mod tests {
     #[test]
     fn test_reputation_get_nonexistent() {
         let manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         let reputation = manager.get_reputation(&peer_id);
         assert!(reputation.is_none());
@@ -1809,7 +1809,7 @@ mod tests {
     #[test]
     fn test_reputation_update_creates_entry() {
         let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         manager.update_reputation(&peer_id, true, Duration::from_millis(100));
 
@@ -1825,7 +1825,7 @@ mod tests {
     #[test]
     fn test_reputation_update_success_improves_rate() {
         let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Multiple successful interactions
         for _ in 0..15 {
@@ -1840,7 +1840,7 @@ mod tests {
     #[test]
     fn test_reputation_update_failure_decreases_rate() {
         let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Multiple failed interactions
         for _ in 0..15 {
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn test_reputation_response_time_tracking() {
         let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Update with specific response time
         manager.update_reputation(&peer_id, true, Duration::from_millis(200));
@@ -1869,7 +1869,7 @@ mod tests {
     #[test]
     fn test_reputation_decay() {
         let mut manager = ReputationManager::new(1.0, 0.01); // High decay rate
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Create a reputation entry
         manager.update_reputation(&peer_id, true, Duration::from_millis(100));
@@ -1894,7 +1894,7 @@ mod tests {
     #[test]
     fn test_reputation_decay_removes_low_reputation() {
         let mut manager = ReputationManager::new(0.1, 0.5); // High min reputation
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Create a low reputation entry
         for _ in 0..10 {
@@ -1932,9 +1932,9 @@ mod tests {
 
     #[test]
     fn test_node_reputation_structure() {
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
         let reputation = NodeReputation {
-            peer_id: peer_id.clone(),
+            peer_id,
             response_rate: 0.85,
             response_time: Duration::from_millis(150),
             consistency_score: 0.9,
@@ -2075,7 +2075,7 @@ mod tests {
     #[test]
     fn test_reputation_mixed_interactions() {
         let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::random();
 
         // Mix of successful and failed interactions
         for i in 0..15 {

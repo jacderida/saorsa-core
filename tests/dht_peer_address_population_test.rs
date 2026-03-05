@@ -30,20 +30,16 @@
 //! 3. **Address Consistency Between Layers**: Verifies that addresses stored
 //!    in the DHT layer match the addresses from the P2P layer.
 //!
-//! ## Expected Initial Behavior
+//! ## Authentication Requirement
 //!
-//! These tests are expected to FAIL initially because address population from
-//! the P2P layer may not be fully implemented. The failures will show:
-//! - Empty address lists in DHT peer info
-//! - Missing addresses in find_closest_nodes results
-//! - Mismatches between P2P and DHT address information
-//!
-//! This test serves as both verification and specification for proper address
-//! population implementation.
+//! Peers must exchange signed messages to be recognized as authenticated peers.
+//! The DHT layer only tracks authenticated peers (identified by their ML-DSA-65
+//! node IDs), not raw transport-level channel IDs.
 
 use anyhow::Result;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::NodeConfig;
 use saorsa_core::transport_handle::{TransportConfig, TransportHandle};
 use std::sync::Arc;
@@ -52,7 +48,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 const NODE_STARTUP_DELAY: Duration = Duration::from_millis(500);
-const ADDRESS_PROPAGATION_DELAY: Duration = Duration::from_millis(500);
+const AUTH_PROPAGATION_DELAY: Duration = Duration::from_millis(500);
 
 /// Helper to create a unique 32-byte key from a string
 fn key_from_str(s: &str) -> Key {
@@ -63,17 +59,24 @@ fn key_from_str(s: &str) -> Key {
     key
 }
 
-/// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation
-async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+/// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation.
+///
+/// Returns the transport handle, config, and the generated node identity (needed for
+/// determining the app-level peer ID that other nodes will see after authentication).
+async fn create_test_dht_config(
+    peer_id: &str,
+) -> Result<(Arc<TransportHandle>, DhtNetworkConfig, Arc<NodeIdentity>)> {
+    let identity = Arc::new(
+        NodeIdentity::generate().map_err(|e| anyhow::anyhow!("identity generation failed: {e}"))?,
+    );
+
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
         .listen_port(0) // Random port
         .ipv6(false)
         .build()?;
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: peer_id.to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -82,12 +85,13 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
+            node_identity: identity.clone(),
         })
         .await?,
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: saorsa_core::PeerId::from_name(peer_id),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),
@@ -96,25 +100,41 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
         enable_security: false,
     };
 
-    Ok((transport, config))
+    Ok((transport, config, identity))
 }
 
-/// Creates and starts a DhtNetworkManager for testing
-async fn create_test_manager(name: &str) -> Result<Arc<DhtNetworkManager>> {
-    let (transport, config) = create_test_dht_config(name).await?;
+/// Creates and starts a DhtNetworkManager for testing.
+///
+/// Returns the manager and the node identity (needed for determining the
+/// app-level peer ID that remote nodes will use to identify this node).
+async fn create_test_manager(name: &str) -> Result<(Arc<DhtNetworkManager>, Arc<NodeIdentity>)> {
+    let (transport, config, identity) = create_test_dht_config(name).await?;
     transport.start_network_listeners().await?;
     let manager = Arc::new(DhtNetworkManager::new(transport, None, config).await?);
     manager.start().await?;
     sleep(NODE_STARTUP_DELAY).await;
-    Ok(manager)
+    Ok((manager, identity))
+}
+
+/// Perform bidirectional authentication between two managers.
+///
+/// Both sides send an automatic identity announce on connect, so we just
+/// need to connect and wait for the announces to propagate.
+///
+/// Returns the channel ID from the initial connection.
+async fn authenticate_bidirectional(manager_a: &DhtNetworkManager, addr_b: &str) -> Result<String> {
+    let channel_id_b = manager_a.connect_to_peer(addr_b).await?;
+    // Auto identity announce handles bidirectional authentication.
+    sleep(AUTH_PROPAGATION_DELAY).await;
+    Ok(channel_id_b)
 }
 
 // =============================================================================
 // TEST 1: Direct Connection Address Propagation
 // =============================================================================
 
-/// Test that when two nodes connect, both populate each other's addresses
-/// in their DHT peer info.
+/// Test that when two nodes connect and authenticate, both populate each other's
+/// addresses in their DHT peer info.
 ///
 /// ## Topology
 /// ```text
@@ -122,12 +142,10 @@ async fn create_test_manager(name: &str) -> Result<Arc<DhtNetworkManager>> {
 /// ```
 ///
 /// ## Expected Behavior
-/// - After connection, Node A's get_connected_peers() should show Node B with addresses
-/// - After connection, Node B's get_connected_peers() should show Node A with addresses
+/// - After bidirectional authentication, Node A's get_connected_peers() should show Node B
+/// - After bidirectional authentication, Node B's get_connected_peers() should show Node A
+/// - Peers are identified by app-level node IDs (ML-DSA-65), not channel IDs
 /// - Addresses should be valid network addresses (not empty strings)
-///
-/// ## Current Expected Result
-/// FAIL - addresses will likely be empty because address population is not implemented
 #[tokio::test]
 async fn test_direct_connection_address_propagation() -> Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -137,35 +155,32 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
 
     info!("=== TEST: Direct Connection Address Propagation ===");
 
-    // Create two nodes
-    let manager_a = create_test_manager("address_test_a").await?;
-    let manager_b = create_test_manager("address_test_b").await?;
+    // Create two nodes (each with its own ML-DSA-65 identity)
+    let (manager_a, identity_a) = create_test_manager("address_test_a").await?;
+    let (manager_b, identity_b) = create_test_manager("address_test_b").await?;
 
-    info!("Created nodes A and B");
+    let a_node_id = *identity_a.peer_id();
+    let b_node_id = *identity_b.peer_id();
+    info!(
+        "Created nodes A (node_id={}) and B (node_id={})",
+        a_node_id, b_node_id
+    );
 
     // Get Node B's listen address
     let addr_b = manager_b
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("Node B has no listen address"))?;
 
-    // Node A connects to Node B
-    info!("Node A connecting to Node B at {}", addr_b);
-    let peer_id_b = manager_a.connect_to_peer(&addr_b).await?;
-    info!("Node A connected to Node B (peer_id: {})", peer_id_b);
+    // Connect and authenticate bidirectionally
+    info!("Connecting and authenticating A ←→ B");
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
-    // Wait for address propagation
-    info!(
-        "Waiting {} ms for address propagation...",
-        ADDRESS_PROPAGATION_DELAY.as_millis()
-    );
-    sleep(ADDRESS_PROPAGATION_DELAY).await;
-
-    // Check Node A's view of Node B
+    // Check Node A's view of Node B (look up by B's app-level node_id)
     info!("Checking Node A's view of connected peers...");
     let peers_from_a = manager_a.get_connected_peers().await;
     info!("Node A sees {} connected peers", peers_from_a.len());
 
-    let peer_b_in_a = peers_from_a.iter().find(|p| p.peer_id == peer_id_b);
+    let peer_b_in_a = peers_from_a.iter().find(|p| p.peer_id == b_node_id);
 
     match peer_b_in_a {
         Some(peer_info) => {
@@ -179,49 +194,38 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
 
             if peer_info.addresses.is_empty() {
                 warn!(
-                    "❌ TEST FAILED: Node A sees peer B but has ZERO addresses.\n\
+                    "TEST FAILED: Node A sees peer B but has ZERO addresses.\n\
                     \n\
                     Expected behavior:\n\
-                    - When Node A connects to Node B, the DHT layer should populate peer B's addresses\n\
+                    - When Node A authenticates Node B, the DHT layer should populate peer B's addresses\n\
                     - Addresses should come from the P2P layer's PeerInfo\n\
                     \n\
                     Actual behavior:\n\
                     - peer_info.addresses is empty\n\
                     \n\
                     Implementation needed:\n\
-                    - Populate addresses from P2P layer when peers connect\n\
-                    - Update addresses in DHT peer info on connection events"
+                    - Populate addresses from P2P layer when peers authenticate\n\
+                    - Update addresses in DHT peer info on PeerConnected events"
                 );
                 return Err(anyhow::anyhow!(
                     "Address propagation failed: Node A has no addresses for Node B"
                 ));
             }
 
-            info!("✅ Node A successfully populated addresses for Node B");
+            info!("Node A successfully populated addresses for Node B");
         }
         None => {
-            warn!("❌ Node A does not see peer B in connected peers at all!");
+            warn!("Node A does not see peer B in connected peers at all!");
             return Err(anyhow::anyhow!("Node B not in Node A's connected peers"));
         }
     }
 
-    // Check Node B's view of Node A
+    // Check Node B's view of Node A (look up by A's app-level node_id)
     info!("Checking Node B's view of connected peers...");
     let peers_from_b = manager_b.get_connected_peers().await;
     info!("Node B sees {} connected peers", peers_from_b.len());
 
-    // Get Node A's transport peer ID (cryptographic ID used on the wire)
-    let transport_peer_id_a = manager_a
-        .transport_peer_id()
-        .ok_or_else(|| anyhow::anyhow!("Node A has no transport peer ID"))?;
-    info!(
-        "Looking for Node A's transport_peer_id: {}",
-        transport_peer_id_a
-    );
-
-    let peer_a_in_b = peers_from_b
-        .iter()
-        .find(|p| p.peer_id == transport_peer_id_a);
+    let peer_a_in_b = peers_from_b.iter().find(|p| p.peer_id == a_node_id);
 
     match peer_a_in_b {
         Some(peer_info) => {
@@ -235,7 +239,7 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
 
             if peer_info.addresses.is_empty() {
                 warn!(
-                    "❌ TEST FAILED: Node B sees peer A but has ZERO addresses.\n\
+                    "TEST FAILED: Node B sees peer A but has ZERO addresses.\n\
                     This indicates address population is not working correctly."
                 );
                 return Err(anyhow::anyhow!(
@@ -243,10 +247,10 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
                 ));
             }
 
-            info!("✅ Node B successfully populated addresses for Node A");
+            info!("Node B successfully populated addresses for Node A");
         }
         None => {
-            warn!("❌ Node B does not see peer A in connected peers at all!");
+            warn!("Node B does not see peer A in connected peers at all!");
             return Err(anyhow::anyhow!("Node A not in Node B's connected peers"));
         }
     }
@@ -255,7 +259,7 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     let _ = manager_a.stop().await;
     let _ = manager_b.stop().await;
 
-    info!("✅ TEST PASSED: Both nodes correctly populated peer addresses!");
+    info!("TEST PASSED: Both nodes correctly populated peer addresses!");
     Ok(())
 }
 
@@ -274,9 +278,6 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
 /// ## Expected Behavior
 /// - When Node B calls find_closest_nodes(), the returned nodes should have addresses
 /// - Addresses should be usable for making connections
-///
-/// ## Current Expected Result
-/// FAIL - returned nodes may have empty address fields
 #[tokio::test]
 async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -286,14 +287,14 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
 
     info!("=== TEST: Find Closest Nodes Returns Addresses ===");
 
-    // Create three nodes
-    let manager_a = create_test_manager("find_nodes_a").await?;
-    let manager_b = create_test_manager("find_nodes_b").await?;
-    let manager_c = create_test_manager("find_nodes_c").await?;
+    // Create three nodes (each with its own ML-DSA-65 identity)
+    let (manager_a, _identity_a) = create_test_manager("find_nodes_a").await?;
+    let (manager_b, _identity_b) = create_test_manager("find_nodes_b").await?;
+    let (manager_c, _identity_c) = create_test_manager("find_nodes_c").await?;
 
     info!("Created nodes A, B, and C");
 
-    // Connect in chain: A ←→ B ←→ C
+    // Get listen addresses
     let addr_b = manager_b
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("Node B has no listen address"))?;
@@ -301,18 +302,13 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("Node C has no listen address"))?;
 
-    info!("Connecting A → B");
-    let _peer_id_b = manager_a.connect_to_peer(&addr_b).await?;
+    // Connect and authenticate A ←→ B
+    info!("Connecting and authenticating A ←→ B");
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
-    info!("Connecting B → C");
-    let _peer_id_c = manager_b.connect_to_peer(&addr_c).await?;
-
-    // Wait for network stabilization
-    info!(
-        "Waiting {} ms for network stabilization...",
-        ADDRESS_PROPAGATION_DELAY.as_millis()
-    );
-    sleep(ADDRESS_PROPAGATION_DELAY).await;
+    // Connect and authenticate B ←→ C
+    info!("Connecting and authenticating B ←→ C");
+    authenticate_bidirectional(&manager_b, &addr_c).await?;
 
     // Node B calls find_closest_nodes for a test key
     let test_key = key_from_str("test_find_nodes_key");
@@ -326,7 +322,7 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
     info!("find_closest_nodes returned {} nodes", closest_nodes.len());
 
     if closest_nodes.is_empty() {
-        warn!("❌ TEST FAILED: find_closest_nodes returned ZERO nodes");
+        warn!("TEST FAILED: find_closest_nodes returned ZERO nodes");
         return Err(anyhow::anyhow!("No nodes returned from find_closest_nodes"));
     }
 
@@ -340,10 +336,10 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
         debug!("  reliability: {}", node.reliability);
 
         if node.address.is_empty() {
-            warn!("  ⚠️  Node {} has EMPTY address field", i);
+            warn!("  Node {} has EMPTY address field", i);
             nodes_without_addresses += 1;
         } else {
-            debug!("  ✅ Node {} has address: {}", i, node.address);
+            debug!("  Node {} has address: {}", i, node.address);
             nodes_with_addresses += 1;
         }
     }
@@ -355,7 +351,7 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
 
     if nodes_without_addresses > 0 {
         warn!(
-            "❌ TEST FAILED: {}/{} nodes returned by find_closest_nodes have NO addresses.\n\
+            "TEST FAILED: {}/{} nodes returned by find_closest_nodes have NO addresses.\n\
             \n\
             Expected behavior:\n\
             - find_closest_nodes should return nodes with populated address fields\n\
@@ -382,7 +378,7 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
     let _ = manager_b.stop().await;
     let _ = manager_c.stop().await;
 
-    info!("✅ TEST PASSED: All returned nodes have populated addresses!");
+    info!("TEST PASSED: All returned nodes have populated addresses!");
     Ok(())
 }
 
@@ -398,13 +394,10 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
 /// ```
 ///
 /// ## Expected Behavior
-/// - When Node A connects to Node B:
-///   - P2P layer stores peer info with addresses
+/// - When Node A authenticates Node B:
+///   - P2P layer stores peer info with addresses (keyed by app-level node ID)
 ///   - DHT layer should have matching addresses
 /// - Addresses should be consistent between both layers
-///
-/// ## Current Expected Result
-/// FAIL - addresses may differ or be missing in DHT layer
 #[tokio::test]
 async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -414,31 +407,27 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
 
     info!("=== TEST: Address Consistency Between P2P and DHT Layers ===");
 
-    // Create two nodes
-    let manager_a = create_test_manager("consistency_a").await?;
-    let manager_b = create_test_manager("consistency_b").await?;
+    // Create two nodes (each with its own ML-DSA-65 identity)
+    let (manager_a, _identity_a) = create_test_manager("consistency_a").await?;
+    let (manager_b, identity_b) = create_test_manager("consistency_b").await?;
 
-    info!("Created nodes A and B");
+    let b_peer_id = *identity_b.peer_id();
+    info!("Created nodes A and B (B's node_id={})", b_peer_id);
 
-    // Node A connects to Node B
+    // Connect and authenticate bidirectionally
     let addr_b = manager_b
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("Node B has no listen address"))?;
 
-    info!("Node A connecting to Node B at {}", addr_b);
-    let peer_id_b = manager_a.connect_to_peer(&addr_b).await?;
-    info!("Connection established, peer_id_b: {}", peer_id_b);
+    info!("Connecting and authenticating A ←→ B");
+    authenticate_bidirectional(&manager_a, &addr_b).await?;
 
-    // Wait for address propagation
+    // Query P2P layer for peer B's info (using B's app-level node ID)
     info!(
-        "Waiting {} ms for address propagation...",
-        ADDRESS_PROPAGATION_DELAY.as_millis()
+        "Querying P2P layer for peer B's info (node_id={})...",
+        b_peer_id
     );
-    sleep(ADDRESS_PROPAGATION_DELAY).await;
-
-    // Query P2P layer for peer B's info
-    info!("Querying P2P layer for peer B's info...");
-    let p2p_peer_info = manager_a.transport().peer_info(&peer_id_b).await;
+    let p2p_peer_info = manager_a.transport().peer_info(&b_peer_id).await;
 
     let p2p_addresses = match p2p_peer_info {
         Some(info) => {
@@ -452,15 +441,15 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
             info.addresses
         }
         None => {
-            warn!("❌ P2P layer has NO peer info for peer B!");
+            warn!("P2P layer has NO peer info for peer B!");
             return Err(anyhow::anyhow!("P2P layer missing peer info"));
         }
     };
 
-    // Query DHT layer for peer B's info
+    // Query DHT layer for peer B's info (using B's app-level node ID)
     info!("Querying DHT layer for peer B's info...");
     let dht_peers = manager_a.get_connected_peers().await;
-    let dht_peer_info = dht_peers.iter().find(|p| p.peer_id == peer_id_b);
+    let dht_peer_info = dht_peers.iter().find(|p| p.peer_id == b_peer_id);
 
     let dht_addresses = match dht_peer_info {
         Some(info) => {
@@ -474,7 +463,7 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
             info.addresses.clone()
         }
         None => {
-            warn!("❌ DHT layer has NO peer info for peer B!");
+            warn!("DHT layer has NO peer info for peer B!");
             return Err(anyhow::anyhow!("DHT layer missing peer info"));
         }
     };
@@ -482,7 +471,7 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     // Compare address counts
     if p2p_addresses.len() != dht_addresses.len() {
         warn!(
-            "❌ TEST FAILED: Address count mismatch!\n\
+            "TEST FAILED: Address count mismatch!\n\
             P2P layer has {} addresses\n\
             DHT layer has {} addresses",
             p2p_addresses.len(),
@@ -515,18 +504,18 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
                 );
                 mismatches += 1;
             } else {
-                debug!("  ✅ Address {} matches: {}", i, p2p_addr);
+                debug!("  Address {} matches: {}", i, p2p_addr);
             }
         }
     }
 
     if mismatches > 0 {
         warn!(
-            "❌ TEST FAILED: Found {} address mismatches between P2P and DHT layers.\n\
+            "TEST FAILED: Found {} address mismatches between P2P and DHT layers.\n\
             \n\
             Expected behavior:\n\
             - DHT layer should store the same addresses as P2P layer\n\
-            - Addresses should be synchronized when peers connect\n\
+            - Addresses should be synchronized when peers authenticate\n\
             \n\
             Actual behavior:\n\
             - {} addresses differ between layers\n\
@@ -543,6 +532,6 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
     let _ = manager_a.stop().await;
     let _ = manager_b.stop().await;
 
-    info!("✅ TEST PASSED: Addresses are consistent between P2P and DHT layers!");
+    info!("TEST PASSED: Addresses are consistent between P2P and DHT layers!");
     Ok(())
 }

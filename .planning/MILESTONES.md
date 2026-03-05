@@ -13,14 +13,14 @@
    
 2. **Architecture Analysis**
    - Document current message flow
-   - Map ant-quic PQC integration points
+   - Map saorsa-transport PQC integration points
    - Identify redundant encryption layers
    - Plan simplified stack
 
 3. **Solution Design**
    - Design binary framing format
    - Plan bincode integration
-   - Specify encryption strategy (ant-quic only)
+   - Specify encryption strategy (saorsa-transport only)
    - Create migration checklist
 
 **Deliverable**: Benchmark suite + design spec
@@ -34,7 +34,7 @@
 ### Phases
 1. **Remove Redundant Encryption**
    - Remove application-layer encryption
-   - Use ant-quic's PQC exclusively (saorsa-pqc)
+   - Use saorsa-transport's PQC exclusively (saorsa-pqc)
    - Simplify message types
 
 2. **Binary Encoding Migration**
@@ -109,4 +109,4 @@
 - ✅ All tests passing
 - ✅ Benchmarks show performance improvement
 - ✅ Zero panics/unwraps in production code
-- ✅ Single encryption layer (ant-quic PQC only)
+- ✅ Single encryption layer (saorsa-transport PQC only)

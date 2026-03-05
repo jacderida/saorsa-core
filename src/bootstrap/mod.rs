@@ -14,13 +14,13 @@
 //! Bootstrap Cache System
 //!
 //! Provides decentralized peer discovery through local caching of known contacts.
-//! Uses ant-quic's BootstrapCache internally with additional Sybil protection
+//! Uses saorsa-transport's BootstrapCache internally with additional Sybil protection
 //! via rate limiting and IP diversity enforcement.
 
 pub mod contact;
 pub mod manager;
 
-// Re-export the primary BootstrapManager (wraps ant-quic)
+// Re-export the primary BootstrapManager (wraps saorsa-transport)
 pub use manager::BootstrapManager;
 pub use manager::{
     BootstrapConfig, BootstrapStats, CacheConfig, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_CONTACTS,

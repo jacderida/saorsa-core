@@ -28,7 +28,7 @@ fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u
 ## Goals
 
 1. **Reduce wire overhead**: 8KB → 9KB (instead of 29KB) - **70%+ reduction**
-2. **Use ant-quic PQC**: Leverage existing saorsa-pqc instead of double-encrypting
+2. **Use saorsa-transport PQC**: Leverage existing saorsa-pqc instead of double-encrypting
 3. **Improve performance**: Faster serialization (bincode > JSON)
 4. **Simplify stack**: Remove redundant encryption layers
 
@@ -38,7 +38,7 @@ fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u
 - [ ] All tests pass
 - [ ] Performance benchmarks show improvement
 - [ ] Zero panics/unwraps in production code
-- [ ] Using ant-quic's PQC (no redundant encryption)
+- [ ] Using saorsa-transport's PQC (no redundant encryption)
 
 ## Solution Approach
 
@@ -48,7 +48,7 @@ fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u
 - Identify redundant encryption
 
 ### Phase 2: Simplify Encryption
-- Remove application-layer encryption (use ant-quic's PQC)
+- Remove application-layer encryption (use saorsa-transport's PQC)
 - Keep only transport-level encryption via saorsa-pqc
 
 ### Phase 3: Replace JSON with Bincode
@@ -76,12 +76,12 @@ fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u
 
 ## Architecture Notes
 
-**ant-quic already provides**:
+**saorsa-transport already provides**:
 - PQC encryption via saorsa-pqc (ML-KEM-768)
 - Post-quantum signatures (ML-DSA-65)
 - Secure transport layer
 
 **We should**:
-- Use ant-quic's encryption (no redundant layers)
+- Use saorsa-transport's encryption (no redundant layers)
 - Focus on efficient serialization only
 - Binary framing for protocol messages

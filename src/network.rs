@@ -16,16 +16,17 @@
 //! This module provides core networking functionality for the P2P Foundation.
 //! It handles peer connections, network events, and node lifecycle management.
 
-use crate::adaptive::{
-    EigenTrustEngine, NodeId, NodeId as AdaptiveNodeId, NodeStatisticsUpdate, TrustProvider,
-};
+use crate::PeerId;
+use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
 use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
+use crate::NetworkAddress;
+use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
-use crate::{NetworkAddress, PeerId};
+use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,9 +49,15 @@ pub(crate) struct WireMessage {
     /// Raw payload bytes
     pub(crate) data: Vec<u8>,
     /// Sender's peer ID (verified against transport-level identity)
-    pub(crate) from: String,
+    pub(crate) from: PeerId,
     /// Unix timestamp in seconds
     pub(crate) timestamp: u64,
+    /// Sender's ML-DSA-65 public key (1952 bytes). Empty if unsigned.
+    #[serde(default)]
+    pub(crate) public_key: Vec<u8>,
+    /// ML-DSA-65 signature over the signable bytes. Empty if unsigned.
+    #[serde(default)]
+    pub(crate) signature: Vec<u8>,
 }
 
 /// Payload bytes used for keepalive messages to prevent connection timeouts.
@@ -89,23 +96,20 @@ const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
+/// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Local peer ID for this node
-    pub peer_id: Option<PeerId>,
-
     /// Addresses to listen on for incoming connections
     pub listen_addrs: Vec<std::net::SocketAddr>,
 
     /// Primary listen address (for compatibility)
     pub listen_addr: std::net::SocketAddr,
 
-    /// Bootstrap peers to connect to on startup (legacy)
+    /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<std::net::SocketAddr>,
-
-    /// Bootstrap peers as strings (for integration tests)
-    pub bootstrap_peers_str: Vec<String>,
 
     /// Enable IPv6 support
     pub enable_ipv6: bool,
@@ -148,9 +152,16 @@ pub struct NodeConfig {
 
     /// Optional override for the maximum application-layer message size.
     ///
-    /// When `None`, the underlying ant-quic default is used.
+    /// When `None`, the underlying saorsa-transport default is used.
     #[serde(default)]
     pub max_message_size: Option<usize>,
+
+    /// Optional node identity for app-level message signing.
+    ///
+    /// When set, outgoing messages are signed with the node's ML-DSA-65 key
+    /// and incoming signed messages are verified at the transport layer.
+    #[serde(skip)]
+    pub node_identity: Option<Arc<NodeIdentity>>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -235,11 +246,14 @@ impl NodeConfig {
         let listen_addr = config.listen_socket_addr()?;
 
         Ok(Self {
-            peer_id: None,
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
-            bootstrap_peers: Vec::new(),
-            bootstrap_peers_str: config.network.bootstrap_nodes.clone(),
+            bootstrap_peers: config
+                .network
+                .bootstrap_nodes
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -252,6 +266,7 @@ impl NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         })
     }
 
@@ -268,7 +283,6 @@ impl NodeConfig {
 /// Builder for constructing NodeConfig with fluent API
 #[derive(Debug, Clone, Default)]
 pub struct NodeConfigBuilder {
-    peer_id: Option<PeerId>,
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
@@ -282,12 +296,6 @@ pub struct NodeConfigBuilder {
 }
 
 impl NodeConfigBuilder {
-    /// Set the peer ID
-    pub fn peer_id(mut self, peer_id: PeerId) -> Self {
-        self.peer_id = Some(peer_id);
-        self
-    }
-
     /// Set the listen port
     pub fn listen_port(mut self, port: u16) -> Self {
         self.listen_port = Some(port);
@@ -300,7 +308,7 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Add a bootstrap peer
+    /// Add a bootstrap peer.
     pub fn bootstrap_peer(mut self, addr: std::net::SocketAddr) -> Self {
         self.bootstrap_peers.push(addr);
         self
@@ -344,7 +352,7 @@ impl NodeConfigBuilder {
 
     /// Set maximum application-layer message size in bytes.
     ///
-    /// If this method is not called, ant-quic's built-in default is used.
+    /// If this method is not called, saorsa-transport's built-in default is used.
     pub fn max_message_size(mut self, max_message_size: usize) -> Self {
         self.max_message_size = Some(max_message_size);
         self
@@ -368,11 +376,9 @@ impl NodeConfigBuilder {
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
 
         Ok(NodeConfig {
-            peer_id: self.peer_id,
             listen_addrs: build_listen_addrs(port, ipv6_enabled),
             listen_addr,
             bootstrap_peers: self.bootstrap_peers.clone(),
-            bootstrap_peers_str: self.bootstrap_peers.iter().map(|a| a.to_string()).collect(),
             enable_ipv6: ipv6_enabled,
             connection_timeout: self
                 .connection_timeout
@@ -393,6 +399,7 @@ impl NodeConfigBuilder {
             max_message_size: self
                 .max_message_size
                 .or(base_config.transport.max_message_size),
+            node_identity: None,
         })
     }
 }
@@ -408,11 +415,9 @@ impl Default for NodeConfig {
         });
 
         Self {
-            peer_id: None,
             listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: Vec::new(),
-            bootstrap_peers_str: Vec::new(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -425,6 +430,7 @@ impl Default for NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         }
     }
 }
@@ -433,21 +439,15 @@ impl NodeConfig {
     /// Create NodeConfig from Config
     pub fn from_config(config: &Config) -> Result<Self> {
         let listen_addr = config.listen_socket_addr()?;
-        let bootstrap_addrs = config.bootstrap_addrs()?;
 
         let mut node_config = Self {
-            peer_id: None,
             listen_addrs: vec![listen_addr],
             listen_addr,
-            bootstrap_peers: bootstrap_addrs
-                .iter()
-                .map(|addr| addr.socket_addr())
-                .collect(),
-            bootstrap_peers_str: config
+            bootstrap_peers: config
                 .network
                 .bootstrap_nodes
                 .iter()
-                .map(|addr| addr.to_string())
+                .filter_map(|s| s.parse().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
 
@@ -483,6 +483,7 @@ impl NodeConfig {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
+            node_identity: None,
         };
 
         // Add IPv6 listen address if enabled
@@ -545,8 +546,9 @@ impl Default for SecurityConfig {
 /// Information about a connected peer
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    /// Peer identifier
-    pub peer_id: PeerId,
+    /// Transport-level channel identifier (internal use only).
+    #[allow(dead_code)]
+    pub(crate) channel_id: String,
 
     /// Peer's addresses
     pub addresses: Vec<String>,
@@ -648,14 +650,15 @@ pub enum P2PEvent {
     Message {
         /// Topic or channel the message was sent on
         topic: String,
-        /// Peer ID of the message sender
-        source: PeerId,
+        /// For signed messages this is the authenticated app-level [`PeerId`];
+        /// `None` for unsigned messages.
+        source: Option<PeerId>,
         /// Raw message data payload
         data: Vec<u8>,
     },
-    /// A new peer has connected to the network
+    /// An authenticated peer has connected (first signed message verified on any channel).
     PeerConnected(PeerId),
-    /// A peer has disconnected from the network
+    /// An authenticated peer has fully disconnected (all channels closed).
     PeerDisconnected(PeerId),
 }
 
@@ -692,7 +695,7 @@ pub(crate) struct PendingRequest {
     /// Oneshot sender for delivering the response payload.
     pub(crate) response_tx: tokio::sync::oneshot::Sender<Vec<u8>>,
     /// The peer we expect the response from (for origin validation).
-    pub(crate) expected_peer: String,
+    pub(crate) expected_peer: PeerId,
 }
 
 /// Main P2P network node that manages connections, routing, and communication
@@ -749,7 +752,7 @@ pub struct P2PNode {
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
 ///
-/// ant-quic correctly rejects "unspecified" addresses (0.0.0.0 and [::]) for remote connections
+/// saorsa-transport correctly rejects "unspecified" addresses (0.0.0.0 and [::]) for remote connections
 /// because you cannot connect TO an unspecified address - these are only valid for BINDING.
 ///
 /// This function converts wildcard addresses to appropriate loopback addresses for local connections:
@@ -781,23 +784,14 @@ pub(crate) fn normalize_wildcard_to_loopback(addr: std::net::SocketAddr) -> std:
 impl P2PNode {
     /// Create a new P2P node with the given configuration
     pub async fn new(config: NodeConfig) -> Result<Self> {
-        let peer_id = config.peer_id.clone().unwrap_or_else(|| {
-            // Generate a random peer ID for now
-            // Safe: UUID v4 canonical format is always 36 characters
-            let uuid_str = uuid::Uuid::new_v4().to_string();
-            format!("peer_{}", &uuid_str[..8])
-        });
+        // Ensure a cryptographic identity exists — generate one if not provided.
+        let node_identity = match config.node_identity.clone() {
+            Some(identity) => identity,
+            None => Arc::new(NodeIdentity::generate()?),
+        };
 
-        // Initialize and register a TrustWeightedKademlia DHT for the global API
-        // Use a deterministic local NodeId derived from the peer_id
-        {
-            let nid = crate::dht::derive_dht_key_from_peer_id(&peer_id);
-            let _twdht = std::sync::Arc::new(crate::dht::TrustWeightedKademlia::new(
-                crate::identity::node_identity::NodeId::from_bytes(nid),
-            ));
-            // TODO: Update to use new clean API
-            // let _ = crate::api::set_dht_instance(twdht);
-        }
+        // Derive the canonical peer ID from the cryptographic identity.
+        let peer_id = *node_identity.peer_id();
 
         // Initialize production resource manager if configured
         let resource_manager = config
@@ -806,59 +800,32 @@ impl P2PNode {
             .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
 
         // Initialize bootstrap cache manager
+        let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
         let diversity_config = config.diversity_config.clone().unwrap_or_default();
-        let bootstrap_manager = if let Some(ref cache_config) = config.bootstrap_cache_config {
-            match BootstrapManager::with_full_config(
-                cache_config.clone(),
-                crate::rate_limit::JoinRateLimiterConfig::default(),
-                diversity_config.clone(),
-            )
-            .await
-            {
-                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize bootstrap manager: {}, continuing without cache",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            match BootstrapManager::with_full_config(
-                crate::bootstrap::CacheConfig::default(),
-                crate::rate_limit::JoinRateLimiterConfig::default(),
-                diversity_config,
-            )
-            .await
-            {
-                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize bootstrap manager: {}, continuing without cache",
-                        e
-                    );
-                    None
-                }
+        let bootstrap_manager = match BootstrapManager::with_full_config(
+            cache_config,
+            crate::rate_limit::JoinRateLimiterConfig::default(),
+            diversity_config,
+        )
+        .await
+        {
+            Ok(manager) => Some(Arc::new(RwLock::new(manager))),
+            Err(e) => {
+                warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
+                None
             }
         };
 
-        // Initialize EigenTrust engine for reputation management
-        let trust_engine = {
-            let mut pre_trusted = HashSet::new();
-            for bootstrap_peer in &config.bootstrap_peers_str {
-                let node_id_bytes = crate::dht::derive_dht_key_from_peer_id(bootstrap_peer);
-                pre_trusted.insert(NodeId::from_bytes(node_id_bytes));
-            }
-
-            let engine = Arc::new(EigenTrustEngine::new(pre_trusted));
-            engine.clone().start_background_updates();
-            Some(engine)
-        };
+        // Initialize EigenTrust engine for reputation management.
+        // The pre-trusted set starts empty — real PeerIds are learned
+        // via identity exchange after connecting to bootstrap peers.
+        let pre_trusted: HashSet<PeerId> = HashSet::new();
+        let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
+        trust_engine.clone().start_background_updates();
+        let trust_engine = Some(trust_engine);
 
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig {
-            peer_id: peer_id.clone(),
             listen_addr: config.listen_addr,
             enable_ipv6: config.enable_ipv6,
             connection_timeout: config.connection_timeout,
@@ -867,6 +834,7 @@ impl P2PNode {
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: config.max_message_size,
+            node_identity: node_identity.clone(),
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -882,7 +850,7 @@ impl P2PNode {
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
-            local_peer_id: peer_id.clone(),
+            peer_id,
             dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
@@ -930,7 +898,7 @@ impl P2PNode {
         NodeBuilder::new()
     }
 
-    /// Get the peer ID of this node
+    /// Get the peer ID of this node.
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
     }
@@ -940,9 +908,10 @@ impl P2PNode {
         &self.transport
     }
 
-    /// Get the hex-encoded transport-level peer ID.
-    pub fn transport_peer_id(&self) -> Option<String> {
-        self.transport.transport_peer_id()
+    /// Get the hex-encoded channel ID (QUIC connection identifier).
+    #[allow(dead_code)]
+    pub(crate) fn channel_id(&self) -> Option<String> {
+        self.transport.channel_id()
     }
 
     pub fn local_addr(&self) -> Option<String> {
@@ -992,13 +961,6 @@ impl P2PNode {
         self.trust_engine.clone()
     }
 
-    /// Canonical conversion from PeerId string to adaptive NodeId for trust.
-    ///
-    /// Delegates to the standalone [`peer_id_to_trust_node_id`] function.
-    fn peer_id_to_trust_node_id(peer_id: &str) -> AdaptiveNodeId {
-        crate::network::peer_id_to_trust_node_id(peer_id)
-    }
-
     /// Report a successful interaction with a peer
     ///
     /// Call this after successful data operations to increase the peer's trust score.
@@ -1017,12 +979,10 @@ impl P2PNode {
     ///     node.report_peer_success(&peer_id).await?;
     /// }
     /// ```
-    pub async fn report_peer_success(&self, peer_id: &str) -> Result<()> {
+    pub async fn report_peer_success(&self, peer_id: &PeerId) -> Result<()> {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
-
             engine
-                .update_node_stats(&node_id, NodeStatisticsUpdate::CorrectResponse)
+                .update_node_stats(peer_id, NodeStatisticsUpdate::CorrectResponse)
                 .await;
             Ok(())
         } else {
@@ -1050,7 +1010,7 @@ impl P2PNode {
     ///     Err(_) => node.report_peer_failure(&peer_id).await?,
     /// }
     /// ```
-    pub async fn report_peer_failure(&self, peer_id: &str) -> Result<()> {
+    pub async fn report_peer_failure(&self, peer_id: &PeerId) -> Result<()> {
         // Delegate to the enriched version with a generic transport-level reason
         self.report_peer_failure_with_reason(peer_id, PeerFailureReason::ConnectionFailed)
             .await
@@ -1085,12 +1045,10 @@ impl P2PNode {
     /// ```
     pub async fn report_peer_failure_with_reason(
         &self,
-        peer_id: &str,
+        peer_id: &PeerId,
         reason: PeerFailureReason,
     ) -> Result<()> {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
-
             let update = match reason {
                 PeerFailureReason::Timeout | PeerFailureReason::ConnectionFailed => {
                     NodeStatisticsUpdate::FailedResponse
@@ -1101,7 +1059,7 @@ impl P2PNode {
                 PeerFailureReason::Refused => NodeStatisticsUpdate::FailedResponse,
             };
 
-            engine.update_node_stats(&node_id, update).await;
+            engine.update_node_stats(peer_id, update).await;
             Ok(())
         } else {
             // Trust engine not initialized - this is not an error, just a no-op
@@ -1117,7 +1075,7 @@ impl P2PNode {
     ///
     /// # Arguments
     ///
-    /// * `peer_id` - The peer ID (as a string) to query
+    /// * `peer_id` - The peer ID to query
     ///
     /// # Example
     ///
@@ -1127,11 +1085,9 @@ impl P2PNode {
     ///     tracing::warn!("Low trust peer: {}", peer_id);
     /// }
     /// ```
-    pub fn peer_trust(&self, peer_id: &str) -> f64 {
+    pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
         if let Some(ref engine) = self.trust_engine {
-            let node_id = Self::peer_id_to_trust_node_id(peer_id);
-
-            engine.get_trust(&node_id)
+            engine.get_trust(peer_id)
         } else {
             // Trust engine not initialized - return neutral trust
             DEFAULT_NEUTRAL_TRUST
@@ -1363,29 +1319,61 @@ impl P2PNode {
         self.transport.peer_info(peer_id).await
     }
 
-    /// Get the peer ID for a given socket address, if connected
-    pub async fn get_peer_id_by_address(&self, addr: &str) -> Option<PeerId> {
-        self.transport.get_peer_id_by_address(addr).await
+    /// Get the channel ID for a given socket address, if connected (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
+        self.transport.get_channel_id_by_address(addr).await
     }
 
-    /// List all active connections with their peer IDs and addresses
-    pub async fn list_active_connections(&self) -> Vec<(PeerId, Vec<String>)> {
+    /// List all active transport-level connections (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
         self.transport.list_active_connections().await
     }
 
-    /// Remove a peer from the peers map
-    pub async fn remove_peer(&self, peer_id: &PeerId) -> bool {
-        self.transport.remove_peer(peer_id).await
+    /// Remove a channel from the peers map (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn remove_channel(&self, channel_id: &str) -> bool {
+        self.transport.remove_channel(channel_id).await
     }
 
-    /// Check if a peer is connected
+    /// Close a channel's QUIC connection and remove it from all tracking maps.
+    ///
+    /// Use when a transport-level connection was established but identity
+    /// exchange failed, so no [`PeerId`] is available for [`disconnect_peer`].
+    pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
+        self.transport.disconnect_channel(channel_id).await;
+    }
+
+    /// Check if an authenticated peer is connected (has at least one active channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
         self.transport.is_peer_connected(peer_id).await
     }
 
-    /// Connect to a peer
-    pub async fn connect_peer(&self, address: &str) -> Result<PeerId> {
+    /// Connect to a peer, returning the transport-level channel ID.
+    ///
+    /// The returned channel ID is **not** the app-level [`PeerId`]. To obtain
+    /// the authenticated peer identity, call
+    /// [`wait_for_peer_identity`](Self::wait_for_peer_identity) with the
+    /// returned channel ID.
+    pub async fn connect_peer(&self, address: &str) -> Result<String> {
         self.transport.connect_peer(address).await
+    }
+
+    /// Wait for the identity exchange on `channel_id` to complete, returning
+    /// the authenticated [`PeerId`].
+    ///
+    /// Use this after [`connect_peer`](Self::connect_peer) to bridge the gap
+    /// between the transport-level channel ID and the app-level peer identity
+    /// required by [`send_message`](Self::send_message).
+    pub async fn wait_for_peer_identity(
+        &self,
+        channel_id: &str,
+        timeout: Duration,
+    ) -> Result<PeerId> {
+        self.transport
+            .wait_for_peer_identity(channel_id, timeout)
+            .await
     }
 
     /// Disconnect from a peer
@@ -1393,12 +1381,13 @@ impl P2PNode {
         self.transport.disconnect_peer(peer_id).await
     }
 
-    /// Check if a connection to a peer is active
-    pub async fn is_connection_active(&self, peer_id: &str) -> bool {
-        self.transport.is_connection_active(peer_id).await
+    /// Check if a connection to a peer is active (internal only).
+    #[allow(dead_code)]
+    pub(crate) async fn is_connection_active(&self, channel_id: &str) -> bool {
+        self.transport.is_connection_active(channel_id).await
     }
 
-    /// Send a message to a peer
+    /// Send a message to an authenticated peer.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
@@ -1427,24 +1416,6 @@ const MAX_MESSAGE_AGE_SECS: u64 = 300;
 /// Maximum allowed future timestamp (30 seconds to account for clock drift)
 const MAX_FUTURE_SECS: u64 = 30;
 
-/// Canonical conversion from PeerId string to adaptive NodeId for trust.
-///
-/// PeerId strings are hex-encoded 32-byte identifiers. This decodes them
-/// back to raw bytes, matching the DHT NodeId representation used by
-/// `trust_peer_selector`. Falls back to blake3 hash for non-hex IDs.
-pub fn peer_id_to_trust_node_id(peer_id: &str) -> AdaptiveNodeId {
-    if let Ok(bytes) = hex::decode(peer_id)
-        && bytes.len() == 32
-    {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        return AdaptiveNodeId::from_bytes(arr);
-    }
-    // Non-hex or wrong length: use canonical derivation
-    let hash = crate::dht::derive_dht_key_from_peer_id(peer_id);
-    AdaptiveNodeId::from_bytes(hash)
-}
-
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
     P2PError::Network(NetworkError::ProtocolError(msg.to_string().into()))
@@ -1457,7 +1428,15 @@ pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent)
     }
 }
 
-pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<P2PEvent> {
+/// Result of parsing a protocol message, including optional authenticated identity.
+pub(crate) struct ParsedMessage {
+    /// The P2P event to broadcast.
+    pub(crate) event: P2PEvent,
+    /// If the message was signed and verified, the authenticated app-level [`PeerId`].
+    pub(crate) authenticated_node_id: Option<PeerId>,
+}
+
+pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
 
     // Validate timestamp to prevent replay attacks
@@ -1488,19 +1467,86 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<P2PEv
         return None;
     }
 
+    // Verify app-level signature if present
+    let authenticated_node_id = if !message.signature.is_empty() {
+        match verify_message_signature(&message) {
+            Ok(peer_id) => {
+                debug!(
+                    "Message from {} authenticated as app-level NodeId {}",
+                    source, peer_id
+                );
+                Some(peer_id)
+            }
+            Err(e) => {
+                warn!(
+                    "Rejecting message from {}: signature verification failed: {}",
+                    source, e
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
     debug!(
-        "Parsed P2PEvent::Message - topic: {}, source: {} (logical: {}), payload_len: {}",
+        "Parsed P2PEvent::Message - topic: {}, source: {:?} (transport: {}, logical: {}), payload_len: {}",
         message.protocol,
+        authenticated_node_id,
         source,
         message.from,
         message.data.len()
     );
 
-    Some(P2PEvent::Message {
-        topic: message.protocol,
-        source: source.to_string(),
-        data: message.data,
+    Some(ParsedMessage {
+        event: P2PEvent::Message {
+            topic: message.protocol,
+            source: authenticated_node_id,
+            data: message.data,
+        },
+        authenticated_node_id,
     })
+}
+
+/// Verify the ML-DSA-65 signature on a WireMessage and return the authenticated [`PeerId`].
+///
+/// Besides verifying the cryptographic signature, this also checks that the
+/// self-asserted `from` field matches the [`PeerId`] derived from the public
+/// key. This prevents a sender from signing with their real key while
+/// claiming a different identity in the `from` field.
+fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId, String> {
+    let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
+        .map_err(|e| format!("invalid public key: {e:?}"))?;
+
+    let peer_id = peer_id_from_public_key(&pubkey);
+
+    // Validate that the self-asserted `from` field matches the public key.
+    if message.from != peer_id {
+        return Err(format!(
+            "from field mismatch: message claims '{}' but public key derives '{}'",
+            message.from, peer_id
+        ));
+    }
+
+    let signable = postcard::to_stdvec(&(
+        &message.protocol,
+        &message.data as &[u8],
+        &message.from,
+        message.timestamp,
+    ))
+    .map_err(|e| format!("failed to serialize signable bytes: {e}"))?;
+
+    let sig = MlDsaSignature::from_bytes(&message.signature)
+        .map_err(|e| format!("invalid signature: {e:?}"))?;
+
+    let valid = crate::quantum_crypto::ml_dsa_verify(&pubkey, &signable, &sig)
+        .map_err(|e| format!("verification error: {e}"))?;
+
+    if valid {
+        Ok(peer_id)
+    } else {
+        Err("signature is invalid".to_string())
+    }
 }
 
 impl P2PNode {
@@ -1611,7 +1657,7 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        peer_id: &PeerId,
+        addr: &std::net::SocketAddr,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
@@ -1638,7 +1684,7 @@ impl P2PNode {
             };
 
             manager
-                .update_contact_metrics(peer_id, metrics)
+                .update_contact_metrics(addr, metrics)
                 .await
                 .map_err(|e| protocol_error(format!("Failed to update peer metrics: {e}")))?;
         }
@@ -1675,39 +1721,23 @@ impl P2PNode {
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
-        // CLI-provided bootstrap peers take priority - always include them first
-        let cli_bootstrap_peers = if !self.config.bootstrap_peers_str.is_empty() {
-            self.config.bootstrap_peers_str.clone()
-        } else {
-            // Convert Multiaddr to strings
-            self.config
-                .bootstrap_peers
-                .iter()
-                .map(|addr| addr.to_string())
-                .collect::<Vec<_>>()
-        };
-
-        if !cli_bootstrap_peers.is_empty() {
+        // Configured bootstrap peers take priority — always include them first.
+        if !self.config.bootstrap_peers.is_empty() {
             info!(
-                "Using {} CLI-provided bootstrap peers (priority)",
-                cli_bootstrap_peers.len()
+                "Using {} configured bootstrap peers (priority)",
+                self.config.bootstrap_peers.len()
             );
-            for addr in &cli_bootstrap_peers {
-                if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
-                    seen_addresses.insert(socket_addr);
-                    let contact = ContactEntry::new(
-                        format!("cli_peer_{}", addr.chars().take(8).collect::<String>()),
-                        vec![socket_addr],
-                    );
-                    bootstrap_contacts.push(contact);
-                } else {
-                    warn!("Invalid bootstrap address format: {}", addr);
-                }
+            for socket_addr in &self.config.bootstrap_peers {
+                seen_addresses.insert(*socket_addr);
+                // Use a zero sentinel PeerId — the real identity comes
+                // from wait_for_peer_identity() after connecting.
+                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![*socket_addr]);
+                bootstrap_contacts.push(contact);
             }
         }
 
         // Supplement with cached bootstrap peers (after CLI peers)
-        // Use QUIC-specific peer selection since we're using ant-quic transport
+        // Use QUIC-specific peer selection since we're using saorsa-transport transport
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
             match manager
@@ -1757,29 +1787,49 @@ impl P2PNode {
             return Ok(());
         }
 
-        // Connect to bootstrap peers and perform peer discovery
+        // Connect to bootstrap peers, wait for identity exchange, then
+        // perform DHT peer discovery using the real cryptographic PeerIds.
+        let identity_timeout = Duration::from_secs(BOOTSTRAP_IDENTITY_TIMEOUT_SECS);
         let mut successful_connections = 0;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
                 match self.connect_peer(&addr.to_string()).await {
-                    Ok(peer_id) => {
-                        successful_connections += 1;
-                        connected_peer_ids.push(peer_id.clone());
+                    Ok(channel_id) => {
+                        // Wait for the remote peer's signed identity announce
+                        // so we get a real cryptographic PeerId.
+                        match self
+                            .transport
+                            .wait_for_peer_identity(&channel_id, identity_timeout)
+                            .await
+                        {
+                            Ok(real_peer_id) => {
+                                successful_connections += 1;
+                                connected_peer_ids.push(real_peer_id);
 
-                        // Update bootstrap cache with successful connection
-                        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.write().await;
-                            let mut updated_contact = contact.clone();
-                            updated_contact.peer_id = peer_id.clone();
-                            updated_contact.update_connection_result(true, Some(100), None); // Assume 100ms latency for now
+                                // Update bootstrap cache with successful connection
+                                if let Some(ref bootstrap_manager) = self.bootstrap_manager {
+                                    let manager = bootstrap_manager.write().await;
+                                    let mut updated_contact = contact.clone();
+                                    updated_contact.peer_id = real_peer_id;
+                                    updated_contact.update_connection_result(true, Some(100), None);
 
-                            if let Err(e) = manager.add_contact(updated_contact).await {
-                                warn!("Failed to update bootstrap cache: {}", e);
+                                    if let Err(e) = manager.add_contact(updated_contact).await {
+                                        warn!("Failed to update bootstrap cache: {}", e);
+                                    }
+                                }
+                                break; // Successfully connected, move to next contact
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Timeout waiting for identity from bootstrap peer {}: {}, \
+                                     closing channel {}",
+                                    addr, e, channel_id
+                                );
+                                self.disconnect_channel(&channel_id).await;
                             }
                         }
-                        break; // Successfully connected, move to next contact
                     }
                     Err(e) => {
                         warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
@@ -1817,8 +1867,7 @@ impl P2PNode {
             successful_connections
         );
 
-        // Perform DHT peer discovery from connected bootstrap peers
-        // Uses the DHT manager's postcard protocol for correct deserialization
+        // Perform DHT peer discovery from connected bootstrap peers.
         match self
             .dht_manager
             .bootstrap_from_peers(&connected_peer_ids)
@@ -1846,11 +1895,11 @@ impl P2PNode {
 /// Network sender trait for sending messages
 #[async_trait::async_trait]
 pub trait NetworkSender: Send + Sync {
-    /// Send a message to a specific peer
+    /// Send a message to an authenticated peer.
     async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()>;
 
-    /// Get our local peer ID
-    fn local_peer_id(&self) -> &PeerId;
+    /// Get our local peer ID (cryptographic identity).
+    fn local_peer_id(&self) -> PeerId;
 }
 
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
@@ -1874,12 +1923,6 @@ impl NodeBuilder {
         }
     }
 
-    /// Set the peer ID
-    pub fn with_peer_id(mut self, peer_id: PeerId) -> Self {
-        self.config.peer_id = Some(peer_id);
-        self
-    }
-
     /// Add a listen address
     pub fn listen_on(mut self, addr: &str) -> Self {
         if let Ok(multiaddr) = addr.parse() {
@@ -1890,10 +1933,9 @@ impl NodeBuilder {
 
     /// Add a bootstrap peer
     pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse() {
-            self.config.bootstrap_peers.push(multiaddr);
+        if let Ok(socket_addr) = addr.parse() {
+            self.config.bootstrap_peers.push(socket_addr);
         }
-        self.config.bootstrap_peers_str.push(addr.to_string());
         self
     }
 
@@ -1919,7 +1961,7 @@ impl NodeBuilder {
 
     /// Set maximum application-layer message size in bytes.
     ///
-    /// If this method is not called, ant-quic's built-in default is used.
+    /// If this method is not called, saorsa-transport's built-in default is used.
     pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
         self.config.max_message_size = Some(max_message_size);
         self
@@ -1999,15 +2041,15 @@ mod diversity_tests {
     }
 }
 
-/// Helper function to register a new peer
-pub(crate) async fn register_new_peer(
-    peers: &Arc<RwLock<HashMap<PeerId, PeerInfo>>>,
-    peer_id: &PeerId,
+/// Helper function to register a new channel
+pub(crate) async fn register_new_channel(
+    peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
+    channel_id: &str,
     remote_addr: &NetworkAddress,
 ) {
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
-        peer_id: peer_id.clone(),
+        channel_id: channel_id.to_owned(),
         addresses: vec![remote_addr.to_string()],
         connected_at: tokio::time::Instant::now(),
         last_seen: tokio::time::Instant::now(),
@@ -2015,7 +2057,7 @@ pub(crate) async fn register_new_peer(
         protocols: vec!["p2p-core/1.0.0".to_string()],
         heartbeat_count: 0,
     };
-    peers_guard.insert(peer_id.clone(), peer_info);
+    peers_guard.insert(channel_id.to_owned(), peer_info);
 }
 
 #[cfg(test)]
@@ -2025,6 +2067,9 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    /// 2 MiB — used in builder tests to verify max_message_size configuration.
+    const TEST_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+
     // Test tool handler for network tests
 
     // MCP removed
@@ -2032,7 +2077,6 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            peer_id: Some("test_peer_123".to_string()),
             listen_addrs: vec![
                 std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
@@ -2042,7 +2086,6 @@ mod tests {
                 0,
             ),
             bootstrap_peers: vec![],
-            bootstrap_peers_str: vec![],
             enable_ipv6: true,
 
             connection_timeout: Duration::from_secs(2),
@@ -2056,6 +2099,7 @@ mod tests {
             diversity_config: None,
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
+            node_identity: None,
         }
     }
 
@@ -2066,7 +2110,6 @@ mod tests {
     async fn test_node_config_default() {
         let config = NodeConfig::default();
 
-        assert!(config.peer_id.is_none());
         assert_eq!(config.listen_addrs.len(), 2);
         assert!(config.enable_ipv6);
         assert_eq!(config.max_connections, 10000); // Fixed: matches actual default
@@ -2133,24 +2176,11 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        assert_eq!(node.peer_id(), "test_peer_123");
+        // PeerId is derived from the cryptographic identity (32-byte BLAKE3 hash)
+        assert_eq!(node.peer_id().to_hex().len(), 64);
         assert!(!node.is_running());
         assert_eq!(node.peer_count().await, 0);
         assert!(node.connected_peers().await.is_empty());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_node_creation_without_peer_id() -> Result<()> {
-        let mut config = create_test_node_config();
-        config.peer_id = None;
-
-        let node = P2PNode::new(config).await?;
-
-        // Should have generated a peer ID
-        assert!(node.peer_id().starts_with("peer_"));
-        assert!(!node.is_running());
 
         Ok(())
     }
@@ -2184,8 +2214,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_connection() -> Result<()> {
         let config1 = create_test_node_config();
-        let mut config2 = create_test_node_config();
-        config2.peer_id = Some("test_peer_456".to_string());
+        let config2 = create_test_node_config();
 
         let node1 = P2PNode::new(config1).await?;
         let node2 = P2PNode::new(config2).await?;
@@ -2204,28 +2233,25 @@ mod tests {
                 ))
             })?;
 
-        // Connect to a real peer
-        let peer_id = node1.connect_peer(&node2_addr.to_string()).await?;
+        // Connect to a real peer (unsigned — no node_identity configured).
+        // connect_peer returns a transport-level channel ID (String), not a PeerId.
+        let channel_id = node1.connect_peer(&node2_addr.to_string()).await?;
 
-        // Check peer count
-        assert_eq!(node1.peer_count().await, 1);
+        // Unauthenticated connections don't appear in the app-level peer maps.
+        // Verify transport-level tracking via is_connection_active / peers map.
+        assert!(node1.is_connection_active(&channel_id).await);
 
-        // Check connected peers
-        let connected_peers = node1.connected_peers().await;
-        assert_eq!(connected_peers.len(), 1);
-        assert_eq!(connected_peers[0], peer_id);
-
-        // Get peer info
-        let peer_info = node1.peer_info(&peer_id).await;
+        // Get peer info from the transport-level peers map (keyed by channel ID)
+        let peer_info = node1.transport.peer_info_by_channel(&channel_id).await;
         assert!(peer_info.is_some());
-        let info = peer_info.expect("Peer info should exist after adding peer");
-        assert_eq!(info.peer_id, peer_id);
+        let info = peer_info.expect("Peer info should exist after connect");
+        assert_eq!(info.channel_id, channel_id);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.protocols.contains(&"p2p-foundation/1.0".to_string()));
 
-        // Disconnect from peer
-        node1.disconnect_peer(&peer_id).await?;
-        assert_eq!(node1.peer_count().await, 0);
+        // Disconnect the channel
+        node1.remove_channel(&channel_id).await;
+        assert!(!node1.is_connection_active(&channel_id).await);
 
         node1.stop().await?;
         node2.stop().await?;
@@ -2236,29 +2262,35 @@ mod tests {
     // TODO(windows): Investigate QUIC connection issues on Windows CI
     // This test consistently fails on Windows GitHub Actions runners with
     // "All connect attempts failed" even with IPv4-only config, long delays,
-    // and multiple retry attempts. The underlying ant-quic library may have
+    // and multiple retry attempts. The underlying saorsa-transport library may have
     // issues on Windows that need investigation.
     // See: https://github.com/dirvine/saorsa-core/issues/TBD
     #[cfg_attr(target_os = "windows", ignore)]
     #[tokio::test]
     async fn test_event_subscription() -> Result<()> {
-        // Configure both nodes to use only IPv4 for reliable cross-platform testing
-        // This is important because:
-        // 1. local_addr() returns the first address from listen_addrs
-        // 2. The default config puts IPv6 first, which may not work on all Windows setups
+        // PeerConnected/PeerDisconnected only fire for authenticated peers
+        // (nodes with node_identity that send signed messages).
+        // Configure both nodes with identities so the event subscription test works.
         let ipv4_localhost =
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
+        let identity1 =
+            Arc::new(NodeIdentity::generate().expect("should generate identity for test node1"));
+        let identity2 =
+            Arc::new(NodeIdentity::generate().expect("should generate identity for test node2"));
 
         let mut config1 = create_test_node_config();
         config1.listen_addr = ipv4_localhost;
         config1.listen_addrs = vec![ipv4_localhost];
         config1.enable_ipv6 = false;
+        config1.node_identity = Some(identity1);
 
+        let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
-        config2.peer_id = Some("test_peer_456".to_string());
         config2.listen_addr = ipv4_localhost;
         config2.listen_addrs = vec![ipv4_localhost];
         config2.enable_ipv6 = false;
+        config2.node_identity = Some(identity2);
 
         let node1 = P2PNode::new(config1).await?;
         let node2 = P2PNode::new(config2).await?;
@@ -2266,70 +2298,63 @@ mod tests {
         node1.start().await?;
         node2.start().await?;
 
-        // Wait for nodes to fully bind their listening sockets
-        // Windows network stack initialization can be significantly slower
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let mut events = node1.subscribe_events();
+        // Subscribe to node2's events (node2 will receive the signed message)
+        let mut events = node2.subscribe_events();
 
-        // Get the actual listening address using local_addr() for reliability
         let node2_addr = node2.local_addr().ok_or_else(|| {
             P2PError::Network(crate::error::NetworkError::ProtocolError(
                 "No listening address".to_string().into(),
             ))
         })?;
 
-        // Connect to a peer with retry logic for Windows reliability
-        // The QUIC library may need additional time to fully initialize
-        let mut peer_id = None;
+        // Connect node1 → node2
+        let mut channel_id = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
             match timeout(Duration::from_secs(2), node1.connect_peer(&node2_addr)).await {
                 Ok(Ok(id)) => {
-                    peer_id = Some(id);
+                    channel_id = Some(id);
                     break;
                 }
                 Ok(Err(_)) | Err(_) => continue,
             }
         }
-        let peer_id = peer_id.ok_or_else(|| {
-            P2PError::Network(crate::error::NetworkError::ProtocolError(
-                "Failed to connect after 3 attempts".to_string().into(),
-            ))
-        })?;
+        let channel_id = channel_id.expect("Failed to connect after 3 attempts");
 
-        // Check for PeerConnected event
-        let event = timeout(Duration::from_secs(2), events.recv()).await;
-        assert!(event.is_ok());
+        // Wait for identity exchange to complete via wait_for_peer_identity.
+        let target_peer_id = node1
+            .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
+            .await?;
+        assert_eq!(target_peer_id, node2_peer_id);
 
-        let event_result = event
-            .expect("Should receive event")
-            .expect("Event should not be error");
-        match event_result {
-            P2PEvent::PeerConnected(event_peer_id) => {
-                assert_eq!(event_peer_id, peer_id);
+        // node1 sends a signed message → node2 authenticates → PeerConnected fires on node2
+        node1
+            .send_message(&target_peer_id, "test-topic", b"hello".to_vec())
+            .await?;
+
+        // Check for PeerConnected event on node2
+        let event = timeout(Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Ok(P2PEvent::PeerConnected(id)) => return Ok(id),
+                    Ok(P2PEvent::Message { .. }) => continue, // skip messages
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
             }
-            _ => panic!("Expected PeerConnected event"),
-        }
-
-        // Disconnect from peer (this should emit another event)
-        node1.disconnect_peer(&peer_id).await?;
-
-        // Check for PeerDisconnected event
-        let event = timeout(Duration::from_secs(2), events.recv()).await;
-        assert!(event.is_ok());
-
-        let event_result = event
-            .expect("Should receive event")
-            .expect("Event should not be error");
-        match event_result {
-            P2PEvent::PeerDisconnected(event_peer_id) => {
-                assert_eq!(event_peer_id, peer_id);
-            }
-            _ => panic!("Expected PeerDisconnected event"),
-        }
+        })
+        .await;
+        assert!(event.is_ok(), "Should receive PeerConnected event");
+        let connected_peer_id = event.expect("Timed out").expect("Channel error");
+        // The connected peer ID should be node1's app-level ID (a valid PeerId)
+        assert!(
+            connected_peer_id.0.iter().any(|&b| b != 0),
+            "PeerConnected should carry a non-zero peer ID"
+        );
 
         node1.stop().await?;
         node2.stop().await?;
@@ -2365,20 +2390,23 @@ mod tests {
         })?;
 
         // Connect node1 to node2
-        let peer_id =
+        let channel_id =
             match timeout(Duration::from_millis(500), node1.connect_peer(&node2_addr)).await {
                 Ok(res) => res?,
                 Err(_) => return Err(P2PError::Network(NetworkError::Timeout)),
             };
 
-        // Wait a bit for connection to establish
-        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        // Wait for identity exchange via wait_for_peer_identity.
+        let target_peer_id = node1
+            .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
+            .await?;
+        assert_eq!(target_peer_id, node2.peer_id().clone());
 
         // Send a message
         let message_data = b"Hello, peer!".to_vec();
         let result = match timeout(
             Duration::from_millis(500),
-            node1.send_message(&peer_id, "test-protocol", message_data),
+            node1.send_message(&target_peer_id, "test-protocol", message_data),
         )
         .await
         {
@@ -2392,11 +2420,14 @@ mod tests {
         }
 
         // Try to send to non-existent peer
-        let non_existent_peer = "non_existent_peer".to_string();
+        let non_existent_peer = PeerId::from_bytes([0xFFu8; 32]);
         let result = node1
             .send_message(&non_existent_peer, "test-protocol", vec![])
             .await;
         assert!(result.is_err(), "Sending to non-existent peer should fail");
+
+        node1.stop().await?;
+        node2.stop().await?;
 
         Ok(())
     }
@@ -2448,11 +2479,9 @@ mod tests {
     #[tokio::test]
     async fn test_node_config_access() -> Result<()> {
         let config = create_test_node_config();
-        let expected_peer_id = config.peer_id.clone();
         let node = P2PNode::new(config).await?;
 
         let node_config = node.config();
-        assert_eq!(node_config.peer_id, expected_peer_id);
         assert_eq!(node_config.max_connections, 100);
         // MCP removed
 
@@ -2483,24 +2512,22 @@ mod tests {
     async fn test_node_builder() -> Result<()> {
         // Create a config using the builder but don't actually build a real node
         let builder = P2PNode::builder()
-            .with_peer_id("builder_test_peer".to_string())
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
-            .with_bootstrap_peer("/ip4/127.0.0.1/tcp/9000") // Use a valid port number
+            .with_bootstrap_peer("127.0.0.1:9000")
             .with_ipv6(true)
             .with_connection_timeout(Duration::from_secs(15))
             .with_max_connections(200)
-            .with_max_message_size(2 * 1024 * 1024);
+            .with_max_message_size(TEST_MAX_MESSAGE_SIZE);
 
         // Test the configuration that was built
         let config = builder.config;
-        assert_eq!(config.peer_id, Some("builder_test_peer".to_string()));
         assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
-        assert_eq!(config.bootstrap_peers_str.len(), 1); // Check bootstrap_peers_str instead
+        assert_eq!(config.bootstrap_peers.len(), 1);
         assert!(config.enable_ipv6);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.max_connections, 200);
-        assert_eq!(config.max_message_size, Some(2 * 1024 * 1024));
+        assert_eq!(config.max_message_size, Some(TEST_MAX_MESSAGE_SIZE));
 
         Ok(())
     }
@@ -2546,27 +2573,27 @@ mod tests {
     #[tokio::test]
     async fn test_network_event_variants() {
         // Test that all network event variants can be created
-        let peer_id = "test_peer".to_string();
+        let peer_id = PeerId::from_name("test_peer");
         let address = "/ip4/127.0.0.1/tcp/9000".to_string();
 
         let _peer_connected = NetworkEvent::PeerConnected {
-            peer_id: peer_id.clone(),
+            peer_id,
             addresses: vec![address.clone()],
         };
 
         let _peer_disconnected = NetworkEvent::PeerDisconnected {
-            peer_id: peer_id.clone(),
+            peer_id,
             reason: "test disconnect".to_string(),
         };
 
         let _message_received = NetworkEvent::MessageReceived {
-            peer_id: peer_id.clone(),
+            peer_id,
             protocol: "test-protocol".to_string(),
             data: vec![1, 2, 3],
         };
 
         let _connection_failed = NetworkEvent::ConnectionFailed {
-            peer_id: Some(peer_id.clone()),
+            peer_id: Some(peer_id),
             address: address.clone(),
             error: "connection refused".to_string(),
         };
@@ -2585,7 +2612,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_info_structure() {
         let peer_info = PeerInfo {
-            peer_id: "test_peer".to_string(),
+            channel_id: "test_peer".to_string(),
             addresses: vec!["/ip4/127.0.0.1/tcp/9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2594,7 +2621,7 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        assert_eq!(peer_info.peer_id, "test_peer");
+        assert_eq!(peer_info.channel_id, "test_peer");
         assert_eq!(peer_info.addresses.len(), 1);
         assert_eq!(peer_info.status, ConnectionStatus::Connected);
         assert_eq!(peer_info.protocols.len(), 1);
@@ -2607,7 +2634,6 @@ mod tests {
         let serialized = serde_json::to_string(&config)?;
         let deserialized: NodeConfig = serde_json::from_str(&serialized)?;
 
-        assert_eq!(config.peer_id, deserialized.peer_id);
         assert_eq!(config.listen_addrs, deserialized.listen_addrs);
         assert_eq!(config.enable_ipv6, deserialized.enable_ipv6);
 
@@ -2615,16 +2641,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_found() -> Result<()> {
+    async fn test_get_channel_id_by_address_found() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Manually insert a peer for testing
-        let test_peer_id = "peer_test_123".to_string();
+        let test_channel_id = "peer_test_123".to_string();
         let test_address = "192.168.1.100:9000".to_string();
 
         let peer_info = PeerInfo {
-            peer_id: test_peer_id.clone(),
+            channel_id: test_channel_id.clone(),
             addresses: vec![test_address.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2634,42 +2660,42 @@ mod tests {
         };
 
         node.transport
-            .inject_peer(test_peer_id.clone(), peer_info)
+            .inject_peer(test_channel_id.clone(), peer_info)
             .await;
 
-        // Test: Find peer by address
-        let found_peer_id = node.get_peer_id_by_address(&test_address).await;
-        assert_eq!(found_peer_id, Some(test_peer_id));
+        // Test: Find channel by address
+        let found_channel_id = node.get_channel_id_by_address(&test_address).await;
+        assert_eq!(found_channel_id, Some(test_channel_id));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_not_found() -> Result<()> {
+    async fn test_get_channel_id_by_address_not_found() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Test: Try to find a peer that doesn't exist
-        let result = node.get_peer_id_by_address("192.168.1.200:9000").await;
+        // Test: Try to find a channel that doesn't exist
+        let result = node.get_channel_id_by_address("192.168.1.200:9000").await;
         assert_eq!(result, None);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_invalid_format() -> Result<()> {
+    async fn test_get_channel_id_by_address_invalid_format() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Test: Invalid address format should return None
-        let result = node.get_peer_id_by_address("invalid-address").await;
+        let result = node.get_channel_id_by_address("invalid-address").await;
         assert_eq!(result, None);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_peer_id_by_address_multiple_peers() -> Result<()> {
+    async fn test_get_channel_id_by_address_multiple_peers() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
@@ -2681,7 +2707,7 @@ mod tests {
         let peer2_addr = "192.168.1.102:9002".to_string();
 
         let peer1_info = PeerInfo {
-            peer_id: peer1_id.clone(),
+            channel_id: peer1_id.clone(),
             addresses: vec![peer1_addr.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2691,7 +2717,7 @@ mod tests {
         };
 
         let peer2_info = PeerInfo {
-            peer_id: peer2_id.clone(),
+            channel_id: peer2_id.clone(),
             addresses: vec![peer2_addr.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2707,9 +2733,9 @@ mod tests {
             .inject_peer(peer2_id.clone(), peer2_info)
             .await;
 
-        // Test: Find each peer by their unique address
-        let found_peer1 = node.get_peer_id_by_address(&peer1_addr).await;
-        let found_peer2 = node.get_peer_id_by_address(&peer2_addr).await;
+        // Test: Find each channel by their unique address
+        let found_peer1 = node.get_channel_id_by_address(&peer1_addr).await;
+        let found_peer2 = node.get_channel_id_by_address(&peer2_addr).await;
 
         assert_eq!(found_peer1, Some(peer1_id));
         assert_eq!(found_peer2, Some(peer2_id));
@@ -2745,7 +2771,7 @@ mod tests {
         let peer2_addrs = vec!["192.168.1.102:9003".to_string()];
 
         let peer1_info = PeerInfo {
-            peer_id: peer1_id.clone(),
+            channel_id: peer1_id.clone(),
             addresses: peer1_addrs.clone(),
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2755,7 +2781,7 @@ mod tests {
         };
 
         let peer2_info = PeerInfo {
-            peer_id: peer2_id.clone(),
+            channel_id: peer2_id.clone(),
             addresses: peer2_addrs.clone(),
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2798,14 +2824,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_peer_success() -> Result<()> {
+    async fn test_remove_channel_success() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
         // Add a peer
-        let peer_id = "peer_to_remove".to_string();
+        let channel_id = "peer_to_remove".to_string();
+        let channel_peer_id = PeerId::from_name(&channel_id);
         let peer_info = PeerInfo {
-            peer_id: peer_id.clone(),
+            channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2814,28 +2841,33 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        node.transport.inject_peer(peer_id.clone(), peer_info).await;
+        node.transport
+            .inject_peer(channel_id.clone(), peer_info)
+            .await;
+        node.transport
+            .inject_peer_to_channel(channel_peer_id, channel_id.clone())
+            .await;
 
         // Verify peer exists
-        assert!(node.is_peer_connected(&peer_id).await);
+        assert!(node.is_peer_connected(&channel_peer_id).await);
 
-        // Remove the peer
-        let removed = node.remove_peer(&peer_id).await;
+        // Remove the channel
+        let removed = node.remove_channel(&channel_id).await;
         assert!(removed);
 
         // Verify peer no longer exists
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_remove_peer_nonexistent() -> Result<()> {
+    async fn test_remove_channel_nonexistent() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Try to remove a peer that doesn't exist
-        let removed = node.remove_peer(&"nonexistent_peer".to_string()).await;
+        // Try to remove a channel that doesn't exist
+        let removed = node.remove_channel("nonexistent_peer").await;
         assert!(!removed);
 
         Ok(())
@@ -2846,14 +2878,15 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        let peer_id = "test_peer".to_string();
+        let channel_id = "test_peer".to_string();
+        let channel_peer_id = PeerId::from_name(&channel_id);
 
         // Initially not connected
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         // Add peer
         let peer_info = PeerInfo {
-            peer_id: peer_id.clone(),
+            channel_id: channel_id.clone(),
             addresses: vec!["192.168.1.100:9000".to_string()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
@@ -2862,16 +2895,21 @@ mod tests {
             heartbeat_count: 0,
         };
 
-        node.transport.inject_peer(peer_id.clone(), peer_info).await;
+        node.transport
+            .inject_peer(channel_id.clone(), peer_info)
+            .await;
+        node.transport
+            .inject_peer_to_channel(channel_peer_id, channel_id.clone())
+            .await;
 
         // Now connected
-        assert!(node.is_peer_connected(&peer_id).await);
+        assert!(node.is_peer_connected(&channel_peer_id).await);
 
-        // Remove peer
-        node.remove_peer(&peer_id).await;
+        // Remove channel
+        node.remove_channel(&channel_id).await;
 
         // No longer connected
-        assert!(!node.is_peer_connected(&peer_id).await);
+        assert!(!node.is_peer_connected(&channel_peer_id).await);
 
         Ok(())
     }
@@ -2934,35 +2972,35 @@ mod tests {
         let msg = WireMessage {
             protocol: protocol.to_string(),
             data,
-            from: from.to_string(),
+            from: PeerId::from_name(from),
             timestamp,
+            public_key: Vec::new(),
+            signature: Vec::new(),
         };
         postcard::to_stdvec(&msg).unwrap()
     }
 
     #[test]
     fn test_parse_protocol_message_uses_transport_peer_id_as_source() {
-        // Regression: P2PEvent::Message.source must be the transport peer ID,
-        // NOT the "from" field from the wire message.  This ensures consumers
-        // can pass source directly to send_message().
+        // Regression: For unsigned messages, P2PEvent::Message.source must be the
+        // transport peer ID, NOT the "from" field from the wire message.
         let transport_id = "abcdef0123456789";
         let logical_id = "spoofed-logical-id";
         let bytes = make_wire_bytes("test/v1", vec![1, 2, 3], logical_id, current_timestamp());
 
-        let event =
+        let parsed =
             parse_protocol_message(&bytes, transport_id).expect("valid message should parse");
 
-        match event {
+        // Unsigned message: no authenticated node ID
+        assert!(parsed.authenticated_node_id.is_none());
+
+        match parsed.event {
             P2PEvent::Message {
                 topic,
                 source,
                 data,
             } => {
-                assert_eq!(source, transport_id, "source must be the transport peer ID");
-                assert_ne!(
-                    source, logical_id,
-                    "source must NOT be the logical 'from' field"
-                );
+                assert!(source.is_none(), "unsigned message source must be None");
                 assert_eq!(topic, "test/v1");
                 assert_eq!(data, vec![1u8, 2, 3]);
             }
@@ -2988,10 +3026,10 @@ mod tests {
     fn test_parse_protocol_message_empty_payload() {
         let bytes = make_wire_bytes("ping", vec![], "sender", current_timestamp());
 
-        let event = parse_protocol_message(&bytes, "transport-peer")
+        let parsed = parse_protocol_message(&bytes, "transport-peer")
             .expect("valid message with empty data should parse");
 
-        match event {
+        match parsed.event {
             P2PEvent::Message { data, .. } => assert!(data.is_empty()),
             other => panic!("expected P2PEvent::Message, got {:?}", other),
         }
@@ -3003,10 +3041,10 @@ mod tests {
         let payload: Vec<u8> = (0..=255).collect();
         let bytes = make_wire_bytes("binary/v1", payload.clone(), "sender", current_timestamp());
 
-        let event = parse_protocol_message(&bytes, "peer-id")
+        let parsed = parse_protocol_message(&bytes, "peer-id")
             .expect("valid message with full byte range should parse");
 
-        match event {
+        match parsed.event {
             P2PEvent::Message { data, topic, .. } => {
                 assert_eq!(topic, "binary/v1");
                 assert_eq!(
@@ -3016,5 +3054,107 @@ mod tests {
             }
             other => panic!("expected P2PEvent::Message, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_signed_message_verifies_and_uses_node_id() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/signed";
+        let data: Vec<u8> = vec![10, 20, 30];
+        // The `from` field must match the PeerId derived from the public key.
+        let from = *identity.peer_id();
+        let timestamp = current_timestamp();
+
+        // Compute signable bytes the same way create_protocol_message does
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data: data.clone(),
+            from,
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        let parsed =
+            parse_protocol_message(&bytes, "transport-xyz").expect("signed message should parse");
+
+        let expected_peer_id = *identity.peer_id();
+        assert_eq!(
+            parsed.authenticated_node_id.as_ref(),
+            Some(&expected_peer_id)
+        );
+
+        match parsed.event {
+            P2PEvent::Message { source, .. } => {
+                assert_eq!(
+                    source.as_ref(),
+                    Some(&expected_peer_id),
+                    "source should be the verified PeerId"
+                );
+            }
+            other => panic!("expected P2PEvent::Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_message_with_bad_signature_is_rejected() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/bad-sig";
+        let data: Vec<u8> = vec![1, 2, 3];
+        let from = *identity.peer_id();
+        let timestamp = current_timestamp();
+
+        // Sign correct signable bytes
+        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        // Tamper with the data (signature was over [1,2,3], not [99,99,99])
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data: vec![99, 99, 99],
+            from,
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        assert!(
+            parse_protocol_message(&bytes, "transport-xyz").is_none(),
+            "message with bad signature should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_message_with_mismatched_from_is_rejected() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let protocol = "test/from-mismatch";
+        let data: Vec<u8> = vec![1, 2, 3];
+        // Use a `from` field that does NOT match the public key's PeerId.
+        let fake_from = PeerId::from_bytes([0xDE; 32]);
+        let timestamp = current_timestamp();
+
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), &fake_from, timestamp)).unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data,
+            from: fake_from,
+            timestamp,
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+
+        assert!(
+            parse_protocol_message(&bytes, "transport-xyz").is_none(),
+            "message with mismatched from field should be rejected"
+        );
     }
 }

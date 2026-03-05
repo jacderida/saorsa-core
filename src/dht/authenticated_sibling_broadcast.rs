@@ -108,7 +108,7 @@ impl AuthenticatedSiblingBroadcast {
     pub fn to_bytes_for_signing(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(256); // Pre-allocate reasonable size
 
-        // Broadcaster identity (NodeId is 32 bytes)
+        // Broadcaster identity (PeerId is 32 bytes)
         bytes.extend_from_slice(self.broadcaster.to_bytes());
 
         // Broadcaster position (Key is [u8; 32])
@@ -280,11 +280,7 @@ impl SiblingBroadcastValidator {
         }
 
         // Check for duplicate entries
-        let unique_siblings: HashSet<_> = broadcast
-            .siblings
-            .iter()
-            .map(|s| s.node.id.clone())
-            .collect();
+        let unique_siblings: HashSet<_> = broadcast.siblings.iter().map(|s| s.node.id).collect();
         if unique_siblings.len() != broadcast.siblings.len() {
             failures.push(BroadcastValidationFailure::DuplicateEntries);
             is_valid = false;
@@ -307,11 +303,8 @@ impl SiblingBroadcastValidator {
         }
 
         // Calculate overlap with local siblings
-        let broadcast_peer_ids: HashSet<PeerId> = broadcast
-            .siblings
-            .iter()
-            .map(|s| crate::identity::node_identity::NodeId::from_bytes(*s.node.id.as_bytes()))
-            .collect();
+        let broadcast_peer_ids: HashSet<PeerId> =
+            broadcast.siblings.iter().map(|s| s.node.id).collect();
 
         let overlap_count = self
             .local_siblings
@@ -333,7 +326,7 @@ impl SiblingBroadcastValidator {
 
         // Track this broadcast
         self.recent_broadcasts.push_back((
-            broadcast.broadcaster.clone(),
+            broadcast.broadcaster,
             broadcast.sequence_number,
             broadcast.timestamp,
         ));
@@ -386,7 +379,7 @@ impl SiblingBroadcastValidator {
         broadcast: &AuthenticatedSiblingBroadcast,
         public_key_bytes: &[u8],
     ) -> bool {
-        use crate::quantum_crypto::ant_quic_integration::{
+        use crate::quantum_crypto::saorsa_transport_integration::{
             MlDsaPublicKey, MlDsaSignature, ml_dsa_verify,
         };
 
@@ -572,9 +565,9 @@ impl SiblingBroadcastBuilder {
     /// - Signing fails
     pub fn build_and_sign(
         self,
-        secret_key: &crate::quantum_crypto::ant_quic_integration::MlDsaSecretKey,
+        secret_key: &crate::quantum_crypto::saorsa_transport_integration::MlDsaSecretKey,
     ) -> Result<AuthenticatedSiblingBroadcast, &'static str> {
-        use crate::quantum_crypto::ant_quic_integration::ml_dsa_sign;
+        use crate::quantum_crypto::saorsa_transport_integration::ml_dsa_sign;
 
         // Build the unsigned broadcast
         let mut broadcast = self.build()?;
@@ -595,13 +588,14 @@ impl SiblingBroadcastBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::core_engine::{NodeCapacity, NodeId};
+    use crate::PeerId;
+    use crate::dht::core_engine::NodeCapacity;
     use rand::Rng;
 
     fn random_peer_id() -> PeerId {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill(&mut bytes);
-        crate::identity::node_identity::NodeId::from_bytes(bytes)
+        PeerId::from_bytes(bytes)
     }
 
     fn random_key() -> Key {
@@ -610,8 +604,8 @@ mod tests {
         Key::from(bytes)
     }
 
-    fn random_node_id() -> NodeId {
-        NodeId::random()
+    fn random_node_id() -> PeerId {
+        PeerId::random()
     }
 
     fn create_test_node() -> DHTNode {
@@ -638,7 +632,7 @@ mod tests {
         let peer1 = random_peer_id();
         let peer2 = random_peer_id();
 
-        let siblings: HashSet<_> = [peer1.clone(), peer2.clone()].into_iter().collect();
+        let siblings: HashSet<_> = [peer1, peer2].into_iter().collect();
         validator.update_local_siblings(siblings);
 
         assert_eq!(validator.local_siblings.len(), 2);
@@ -650,7 +644,7 @@ mod tests {
         let mut validator = SiblingBroadcastValidator::with_defaults(position);
 
         let peer = random_peer_id();
-        validator.add_local_sibling(peer.clone());
+        validator.add_local_sibling(peer);
         assert!(validator.local_siblings.contains(&peer));
 
         validator.remove_local_sibling(&peer);
@@ -861,7 +855,7 @@ mod tests {
         };
 
         let broadcast = SiblingBroadcastBuilder::new()
-            .broadcaster(broadcaster.clone(), position)
+            .broadcaster(broadcaster, position)
             .add_sibling(sibling)
             .sequence_number(42)
             .build()
@@ -882,7 +876,7 @@ mod tests {
         // First broadcast with seq 1
         validator
             .recent_broadcasts
-            .push_back((peer.clone(), 1, SystemTime::now()));
+            .push_back((peer, 1, SystemTime::now()));
 
         // Seq 2 should be valid
         assert!(validator.is_valid_sequence(&peer, 2));
@@ -948,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_build_and_sign_creates_valid_signature() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let broadcaster = random_peer_id();
@@ -962,7 +956,7 @@ mod tests {
         };
 
         let broadcast = SiblingBroadcastBuilder::new()
-            .broadcaster(broadcaster.clone(), position)
+            .broadcaster(broadcaster, position)
             .add_sibling(sibling)
             .sequence_number(1)
             .build_and_sign(&secret_key)
@@ -980,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_wrong_key() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         // Generate two different keypairs
         let (_public_key1, secret_key1) = generate_ml_dsa_keypair().unwrap();
@@ -1012,7 +1006,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_tampered_data() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let broadcaster = random_peer_id();
@@ -1043,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_empty_signature() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, _secret_key) = generate_ml_dsa_keypair().unwrap();
 
@@ -1069,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_verify_signature_rejects_invalid_public_key() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (_public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
 
@@ -1095,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_validate_broadcast_with_signature_success() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (public_key, secret_key) = generate_ml_dsa_keypair().unwrap();
         let position = random_key();
@@ -1134,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_validate_broadcast_with_signature_rejects_invalid() {
-        use crate::quantum_crypto::ant_quic_integration::generate_ml_dsa_keypair;
+        use crate::quantum_crypto::saorsa_transport_integration::generate_ml_dsa_keypair;
 
         let (_public_key1, secret_key1) = generate_ml_dsa_keypair().unwrap();
         let (public_key2, _secret_key2) = generate_ml_dsa_keypair().unwrap();
@@ -1190,7 +1184,7 @@ mod tests {
         };
 
         let broadcast = AuthenticatedSiblingBroadcast {
-            broadcaster: broadcaster.clone(),
+            broadcaster,
             broadcaster_position: position,
             siblings: vec![sibling.clone()],
             timestamp,

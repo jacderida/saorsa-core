@@ -5,9 +5,9 @@
 
 use rand::RngCore;
 use saorsa_core::{
+    PeerId,
     adaptive::{
-        ContentHash, ContentType, LearningContext, NetworkConditions, NodeId, Outcome,
-        StrategyChoice,
+        ContentHash, ContentType, LearningContext, NetworkConditions, Outcome, StrategyChoice,
         eviction::{AdaptiveStrategy, EvictionStrategy, EvictionStrategyType},
         gossip::{AdaptiveGossipSub, GossipMessage, TopicPriority},
         learning::{ChurnPredictor, ThompsonSampling},
@@ -17,8 +17,7 @@ use saorsa_core::{
         trust::MockTrustProvider,
     },
     identity::NodeIdentity,
-    peer_record::UserId,
-    quantum_crypto::ant_quic_integration::MlDsaPublicKey,
+    quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
 };
 use std::{
     collections::HashMap,
@@ -48,7 +47,7 @@ impl Default for TestConfig {
 
 /// Helper struct to manage test network nodes
 struct TestNetwork {
-    nodes: Vec<NodeId>,
+    nodes: Vec<PeerId>,
 }
 
 impl TestNetwork {
@@ -58,7 +57,7 @@ impl TestNetwork {
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
             rand::thread_rng().fill_bytes(&mut hash);
-            nodes.push(UserId::from_bytes(hash));
+            nodes.push(PeerId::from_bytes(hash));
         }
         Ok(Self { nodes })
     }
@@ -73,7 +72,7 @@ impl TestNetwork {
         Ok(())
     }
 
-    fn get_nodes(&self) -> &[NodeId] {
+    fn get_nodes(&self) -> &[PeerId] {
         &self.nodes
     }
 }
@@ -147,7 +146,7 @@ async fn test_multi_armed_bandit_routing() -> anyhow::Result<()> {
     // Create destination node
     let mut dest_hash = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut dest_hash);
-    let destination = UserId::from_bytes(dest_hash);
+    let destination = PeerId::from_bytes(dest_hash);
 
     // Available strategies
     let strategies = vec![
@@ -348,7 +347,7 @@ async fn test_lstm_churn_prediction() -> anyhow::Result<()> {
     // Create test node
     let mut node_hash = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut node_hash);
-    let test_node = UserId::from_bytes(node_hash);
+    let test_node = PeerId::from_bytes(node_hash);
 
     // Generate synthetic node behavior data and train
     for i in 0..100 {
@@ -401,7 +400,7 @@ async fn test_lstm_churn_prediction() -> anyhow::Result<()> {
     // Test with unknown node (should return low confidence)
     let mut unknown_hash = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut unknown_hash);
-    let unknown_node = UserId::from_bytes(unknown_hash);
+    let unknown_node = PeerId::from_bytes(unknown_hash);
 
     let unknown_prediction = predictor.predict(&unknown_node).await;
     println!(
@@ -581,7 +580,7 @@ async fn test_adaptive_gossip_protocol() -> anyhow::Result<()> {
     let trust_provider = Arc::new(MockTrustProvider::new());
 
     // Create gossip instance
-    let local_node = network.get_nodes()[0].clone();
+    let local_node = network.get_nodes()[0];
     let gossip = AdaptiveGossipSub::new(local_node, trust_provider);
 
     // Subscribe to topics
@@ -609,7 +608,7 @@ async fn test_adaptive_gossip_protocol() -> anyhow::Result<()> {
         let message_data = format!("Test message {} for {}", i, topic);
         let mut from_hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut from_hash);
-        let from_node = UserId::from_bytes(from_hash);
+        let from_node = PeerId::from_bytes(from_hash);
 
         let message = GossipMessage {
             topic: topic.to_string(),
@@ -683,7 +682,7 @@ async fn test_security_monitoring() -> anyhow::Result<()> {
         let mut hash = [0u8; 32];
         hash[0] = (10 + i) as u8; // Different from network nodes
         rand::thread_rng().fill_bytes(&mut hash);
-        test_nodes.push(UserId::from_bytes(hash));
+        test_nodes.push(PeerId::from_bytes(hash));
     }
 
     // Simulate various network events
@@ -722,14 +721,14 @@ async fn test_security_monitoring() -> anyhow::Result<()> {
     let bad_node = &test_nodes[1];
     monitor
         .blacklist_node(
-            bad_node.clone(),
+            *bad_node,
             saorsa_core::adaptive::security::BlacklistReason::RateLimitViolation,
         )
         .await;
 
     // Try to validate join from blacklisted node
     let node_descriptor = saorsa_core::adaptive::NodeDescriptor {
-        id: bad_node.clone(),
+        id: *bad_node,
         public_key: MlDsaPublicKey::from_bytes(&[0u8; 1952]).unwrap(),
         addresses: vec!["127.0.0.1:8080".to_string()],
         hyperbolic: None,
@@ -1081,9 +1080,12 @@ async fn test_adaptive_network_resilience() -> anyhow::Result<()> {
     for i in 0..5 {
         let node_idx = rand::random::<usize>() % config.num_nodes;
         let failed_node = &network.get_nodes()[node_idx];
-        failed_nodes.push(failed_node.clone());
+        failed_nodes.push(*failed_node);
 
-        println!("  Simulating failure of node {:?}", &failed_node.hash[..4]);
+        println!(
+            "  Simulating failure of node {:?}",
+            &failed_node.as_bytes()[..4]
+        );
 
         // Update churn predictor with failure
         let mut churn = churn_predictor.lock().await;
@@ -1233,7 +1235,7 @@ async fn test_adaptive_network_resilience() -> anyhow::Result<()> {
         let prediction = churn.predict(failed_node).await;
         println!(
             "Failed node {:?} churn risk: {:.2}%",
-            &failed_node.hash[..4],
+            &failed_node.as_bytes()[..4],
             prediction.probability_1h * 100.0
         );
         assert!(

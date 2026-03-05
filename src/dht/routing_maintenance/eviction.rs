@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::dht::DhtNodeId;
+use crate::PeerId;
 
 use super::config::MaintenanceConfig;
 use super::liveness::NodeLivenessState;
@@ -33,11 +33,11 @@ pub struct EvictionManager {
     /// Configuration for eviction thresholds
     config: MaintenanceConfig,
     /// Liveness state for each tracked node
-    liveness_states: HashMap<DhtNodeId, NodeLivenessState>,
+    liveness_states: HashMap<PeerId, NodeLivenessState>,
     /// Trust scores (from EigenTrust integration)
-    trust_scores: HashMap<DhtNodeId, f64>,
+    trust_scores: HashMap<PeerId, f64>,
     /// Nodes explicitly marked for eviction with reason
-    marked_for_eviction: HashMap<DhtNodeId, EvictionReason>,
+    marked_for_eviction: HashMap<PeerId, EvictionReason>,
 }
 
 impl EvictionManager {
@@ -54,7 +54,7 @@ impl EvictionManager {
 
     /// Create with pre-populated trust scores
     #[must_use]
-    pub fn with_trust(config: MaintenanceConfig, trust_scores: HashMap<DhtNodeId, f64>) -> Self {
+    pub fn with_trust(config: MaintenanceConfig, trust_scores: HashMap<PeerId, f64>) -> Self {
         Self {
             config,
             liveness_states: HashMap::new(),
@@ -64,14 +64,14 @@ impl EvictionManager {
     }
 
     /// Record a communication failure for a node
-    pub fn record_failure(&mut self, node_id: &DhtNodeId) {
-        let state = self.liveness_states.entry(node_id.clone()).or_default();
+    pub fn record_failure(&mut self, node_id: &PeerId) {
+        let state = self.liveness_states.entry(*node_id).or_default();
         state.record_failure();
     }
 
     /// Record a successful communication with a node
-    pub fn record_success(&mut self, node_id: &DhtNodeId) {
-        let state = self.liveness_states.entry(node_id.clone()).or_default();
+    pub fn record_success(&mut self, node_id: &PeerId) {
+        let state = self.liveness_states.entry(*node_id).or_default();
         state.record_success();
     }
 
@@ -79,13 +79,13 @@ impl EvictionManager {
     ///
     /// This is used when a node fails validation during close group
     /// validation or other explicit eviction scenarios.
-    pub fn record_eviction(&mut self, node_id: &DhtNodeId, reason: EvictionReason) {
-        self.marked_for_eviction.insert(node_id.clone(), reason);
+    pub fn record_eviction(&mut self, node_id: &PeerId, reason: EvictionReason) {
+        self.marked_for_eviction.insert(*node_id, reason);
     }
 
     /// Update trust score for a node
-    pub fn update_trust_score(&mut self, node_id: &DhtNodeId, score: f64) {
-        self.trust_scores.insert(node_id.clone(), score);
+    pub fn update_trust_score(&mut self, node_id: &PeerId, score: f64) {
+        self.trust_scores.insert(*node_id, score);
     }
 
     /// Get trust score for a node
@@ -93,13 +93,13 @@ impl EvictionManager {
     /// Returns the cached EigenTrust score for a node, or None if unknown.
     /// This cache is populated by the EigenTrust engine via `update_trust_score()`.
     #[must_use]
-    pub fn get_trust_score(&self, node_id: &DhtNodeId) -> Option<f64> {
+    pub fn get_trust_score(&self, node_id: &PeerId) -> Option<f64> {
         self.trust_scores.get(node_id).copied()
     }
 
     /// Get consecutive failure count for a node
     #[must_use]
-    pub fn get_consecutive_failures(&self, node_id: &DhtNodeId) -> u32 {
+    pub fn get_consecutive_failures(&self, node_id: &PeerId) -> u32 {
         self.liveness_states
             .get(node_id)
             .map(|s| s.consecutive_failures)
@@ -108,7 +108,7 @@ impl EvictionManager {
 
     /// Check if a node should be evicted based on failures
     #[must_use]
-    pub fn should_evict(&self, node_id: &DhtNodeId) -> bool {
+    pub fn should_evict(&self, node_id: &PeerId) -> bool {
         self.liveness_states
             .get(node_id)
             .map(|s| s.should_evict(&self.config))
@@ -117,7 +117,7 @@ impl EvictionManager {
 
     /// Check if a node should be evicted due to low trust
     #[must_use]
-    pub fn should_evict_for_trust(&self, node_id: &DhtNodeId) -> bool {
+    pub fn should_evict_for_trust(&self, node_id: &PeerId) -> bool {
         self.trust_scores
             .get(node_id)
             .map(|&score| score < self.config.min_trust_threshold)
@@ -126,7 +126,7 @@ impl EvictionManager {
 
     /// Get the eviction reason if any
     #[must_use]
-    pub fn get_eviction_reason(&self, node_id: &DhtNodeId) -> Option<EvictionReason> {
+    pub fn get_eviction_reason(&self, node_id: &PeerId) -> Option<EvictionReason> {
         // Check explicitly marked nodes first (highest priority)
         if let Some(reason) = self.marked_for_eviction.get(node_id) {
             return Some(reason.clone());
@@ -157,12 +157,12 @@ impl EvictionManager {
 
     /// Get list of all nodes that should be evicted
     #[must_use]
-    pub fn get_eviction_candidates(&self) -> Vec<(DhtNodeId, EvictionReason)> {
+    pub fn get_eviction_candidates(&self) -> Vec<(PeerId, EvictionReason)> {
         let mut candidates = Vec::new();
 
         // Check explicitly marked nodes first (highest priority)
         for (node_id, reason) in &self.marked_for_eviction {
-            candidates.push((node_id.clone(), reason.clone()));
+            candidates.push((*node_id, reason.clone()));
         }
 
         // Check all nodes in liveness states
@@ -172,7 +172,7 @@ impl EvictionManager {
                 continue;
             }
             if let Some(reason) = self.get_eviction_reason(node_id) {
-                candidates.push((node_id.clone(), reason));
+                candidates.push((*node_id, reason));
             }
         }
 
@@ -185,7 +185,7 @@ impl EvictionManager {
                 continue;
             }
             if let Some(reason) = self.get_eviction_reason(node_id) {
-                candidates.push((node_id.clone(), reason));
+                candidates.push((*node_id, reason));
             }
         }
 
@@ -193,7 +193,7 @@ impl EvictionManager {
     }
 
     /// Remove a node from tracking (after eviction)
-    pub fn remove_node(&mut self, node_id: &DhtNodeId) {
+    pub fn remove_node(&mut self, node_id: &PeerId) {
         self.liveness_states.remove(node_id);
         self.trust_scores.remove(node_id);
         self.marked_for_eviction.remove(node_id);
@@ -201,7 +201,7 @@ impl EvictionManager {
 
     /// Get liveness state for a node
     #[must_use]
-    pub fn get_liveness_state(&self, node_id: &DhtNodeId) -> Option<&NodeLivenessState> {
+    pub fn get_liveness_state(&self, node_id: &PeerId) -> Option<&NodeLivenessState> {
         self.liveness_states.get(node_id)
     }
 }
@@ -210,8 +210,8 @@ impl EvictionManager {
 mod tests {
     use super::*;
 
-    fn make_node_id() -> DhtNodeId {
-        DhtNodeId::random()
+    fn make_node_id() -> PeerId {
+        PeerId::random()
     }
 
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.10); // Below threshold
+        trust_scores.insert(node_id, 0.10); // Below threshold
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         assert!(manager.should_evict_for_trust(&node_id));
@@ -253,7 +253,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.50); // Above threshold
+        trust_scores.insert(node_id, 0.50); // Above threshold
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         assert!(!manager.should_evict_for_trust(&node_id));
@@ -301,7 +301,7 @@ mod tests {
         };
         let node_id = make_node_id();
         let mut trust_scores = HashMap::new();
-        trust_scores.insert(node_id.clone(), 0.05);
+        trust_scores.insert(node_id, 0.05);
 
         let manager = EvictionManager::with_trust(config, trust_scores);
         let reason = manager.get_eviction_reason(&node_id);

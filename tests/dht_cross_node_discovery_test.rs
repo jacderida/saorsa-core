@@ -35,6 +35,7 @@
 use anyhow::Result;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::NodeConfig;
 use saorsa_core::transport_handle::{TransportConfig, TransportHandle};
 use std::collections::HashMap;
@@ -68,15 +69,14 @@ fn key_from_str(s: &str) -> Key {
 
 /// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
         .listen_port(0) // Use 0 for automatic port allocation
         .ipv6(false)
         .build()?;
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: peer_id.to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -85,12 +85,13 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
+            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
         })
         .await?,
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -139,11 +140,12 @@ async fn connect_managers(
 /// Stores a peer record in DHT
 async fn register_peer_in_dht(
     manager: &Arc<DhtNetworkManager>,
-    peer_id: &str,
+    peer_id: &saorsa_core::PeerId,
     addresses: Vec<String>,
 ) -> Result<()> {
     // Create a simple peer record: peer_id -> serialized addresses
-    let key = key_from_str(&format!("peer_record:{peer_id}"));
+    let peer_hex = peer_id.to_hex();
+    let key = key_from_str(&format!("peer_record:{peer_hex}"));
     let value = addresses.join(",").into_bytes();
 
     let result = manager.put(key, value).await?;
@@ -151,7 +153,7 @@ async fn register_peer_in_dht(
         DhtNetworkResult::PutSuccess { replicated_to, .. } => {
             info!(
                 "Registered peer {} in DHT, replicated to {} nodes",
-                peer_id, replicated_to
+                peer_hex, replicated_to
             );
             Ok(())
         }
@@ -165,10 +167,11 @@ async fn register_peer_in_dht(
 /// Queries DHT for a peer record with timeout
 async fn discover_peer_via_dht(
     manager: &Arc<DhtNetworkManager>,
-    target_peer_id: &str,
+    target_peer_id: &saorsa_core::PeerId,
     timeout_duration: Duration,
 ) -> Result<Option<Vec<String>>> {
-    let key = key_from_str(&format!("peer_record:{target_peer_id}"));
+    let target_hex = target_peer_id.to_hex();
+    let key = key_from_str(&format!("peer_record:{target_hex}"));
 
     let result = timeout(timeout_duration, manager.get(&key)).await??;
     match result {
@@ -177,12 +180,12 @@ async fn discover_peer_via_dht(
             let addresses: Vec<String> = addresses_str.split(',').map(|s| s.to_string()).collect();
             info!(
                 "Discovered peer {} via DHT from source {}, addresses: {:?}",
-                target_peer_id, source, addresses
+                target_hex, source, addresses
             );
             Ok(Some(addresses))
         }
         DhtNetworkResult::GetNotFound { .. } => {
-            debug!("Peer {} not found in DHT", target_peer_id);
+            debug!("Peer {} not found in DHT", target_hex);
             Ok(None)
         }
         other => Err(anyhow::anyhow!("DHT get failed: {:?}", other)),
@@ -192,7 +195,7 @@ async fn discover_peer_via_dht(
 /// Verifies no direct P2P connection exists between two managers
 async fn assert_not_directly_connected(
     manager: &Arc<DhtNetworkManager>,
-    other_peer_id: &str,
+    other_peer_id: &saorsa_core::PeerId,
 ) -> Result<()> {
     let connected_peers = manager.transport().connected_peers().await;
     let is_connected = connected_peers.iter().any(|p| p == other_peer_id);
@@ -200,7 +203,7 @@ async fn assert_not_directly_connected(
     if is_connected {
         Err(anyhow::anyhow!(
             "Unexpected direct connection to peer {}",
-            other_peer_id
+            other_peer_id.to_hex()
         ))
     } else {
         Ok(())
@@ -466,13 +469,13 @@ async fn test_concurrent_peer_registration() -> Result<()> {
     let mut registration_handles = vec![];
     for manager in &managers {
         let manager_clone = manager.clone();
-        let peer_id = manager.peer_id().to_string();
+        let peer_id = *manager.peer_id();
         let addr = match manager.local_addr() {
             Some(a) => a,
             None => {
                 warn!(
                     "Manager {} has no local address, skipping registration",
-                    peer_id
+                    peer_id.to_hex()
                 );
                 continue;
             }

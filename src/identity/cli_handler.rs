@@ -16,7 +16,6 @@
 use super::node_identity::NodeIdentity;
 use crate::Result;
 use clap::{Parser, Subcommand};
-use sha2::Digest;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -131,8 +130,8 @@ impl IdentityCliHandler {
         let identity = if let Some(seed_str) = seed {
             // Deterministic generation from seed
             let mut seed_bytes = [0u8; 32];
-            let seed_hash = sha2::Sha256::digest(seed_str.as_bytes());
-            seed_bytes.copy_from_slice(&seed_hash);
+            let seed_hash = blake3::hash(seed_str.as_bytes());
+            seed_bytes.copy_from_slice(seed_hash.as_bytes());
             NodeIdentity::from_seed(&seed_bytes)?
         } else {
             NodeIdentity::generate()?
@@ -142,7 +141,7 @@ impl IdentityCliHandler {
 
         Ok(format!(
             "Generated new identity\nNode ID: {}\nSaved to: {}",
-            identity.node_id(),
+            identity.peer_id(),
             output_path.display()
         ))
     }
@@ -158,7 +157,7 @@ impl IdentityCliHandler {
 
         Ok(format!(
             "Identity Information\nNode ID: {}\nPublic Key: {}",
-            identity.node_id(),
+            identity.peer_id(),
             hex::encode(identity.public_key().as_bytes())
         ))
     }
@@ -251,8 +250,8 @@ impl IdentityCliHandler {
                 })?;
         }
 
-        let message_hash = hex::encode(sha2::Sha256::digest(&message_bytes));
-        Ok(format!("Signature: {}\nMessage hash: {}", sig_hex, message_hash).into())
+        let message_hash = blake3::hash(&message_bytes).to_hex();
+        Ok(format!("Signature: {}\nMessage hash: {}", sig_hex, message_hash))
     }
 }
 

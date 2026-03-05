@@ -47,7 +47,7 @@ Finished in 16.20s
 **Key Test Modules Verified**:
 - ✅ Adaptive components (beta distribution, churn prediction, client, coordinator)
 - ✅ DHT core operations
-- ✅ Transport layer (ant-quic adapter, handlers)
+- ✅ Transport layer (saorsa-transport adapter, handlers)
 - ✅ Security and cryptography
 - ✅ Threshold schemes (DKG, FROST)
 - ✅ Identity and presence

@@ -21,8 +21,9 @@
 //! - Topology rebalancing for network health
 //! - Graceful degradation under high churn
 
+use crate::PeerId;
 use crate::adaptive::{
-    ContentHash, NodeId, TrustProvider,
+    ContentHash, TrustProvider,
     gossip::{AdaptiveGossipSub, GossipMessage},
     learning::ChurnPredictor,
     replication::ReplicationManager,
@@ -40,7 +41,7 @@ use tokio::sync::RwLock;
 /// Churn detection and recovery system
 pub struct ChurnHandler {
     /// Local node ID
-    node_id: NodeId,
+    node_id: PeerId,
 
     /// Churn predictor for proactive measures
     predictor: Arc<ChurnPredictor>,
@@ -104,10 +105,10 @@ impl Default for ChurnConfig {
 /// Node monitoring system
 pub struct NodeMonitor {
     /// Node status tracking
-    node_status: Arc<RwLock<HashMap<NodeId, NodeStatus>>>,
+    node_status: Arc<RwLock<HashMap<PeerId, NodeStatus>>>,
 
     /// Heartbeat tracking
-    heartbeats: Arc<RwLock<HashMap<NodeId, Instant>>>,
+    heartbeats: Arc<RwLock<HashMap<PeerId, Instant>>>,
 
     /// Configuration
     config: ChurnConfig,
@@ -117,7 +118,7 @@ pub struct NodeMonitor {
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
     /// Node identifier
-    pub node_id: NodeId,
+    pub node_id: PeerId,
 
     /// Last seen timestamp
     pub last_seen: Instant,
@@ -177,7 +178,7 @@ struct ContentTracker {
     hash: ContentHash,
 
     /// Nodes storing this content
-    storing_nodes: HashSet<NodeId>,
+    storing_nodes: HashSet<PeerId>,
 
     /// Target replication factor
     target_replicas: u32,
@@ -194,7 +195,7 @@ struct RecoveryTask {
     content_hash: ContentHash,
 
     /// Failed nodes
-    failed_nodes: Vec<NodeId>,
+    failed_nodes: Vec<PeerId>,
 
     /// Priority level
     priority: RecoveryPriority,
@@ -227,10 +228,10 @@ struct RecoveryStatus {
     started_at: Instant,
 
     /// Nodes contacted for recovery
-    contacted_nodes: Vec<NodeId>,
+    contacted_nodes: Vec<PeerId>,
 
     /// Successful recoveries
-    successful_nodes: Vec<NodeId>,
+    successful_nodes: Vec<PeerId>,
 
     /// Failed attempts
     failed_attempts: u32,
@@ -279,7 +280,7 @@ pub struct ChurnStats {
 impl ChurnHandler {
     /// Create a new churn handler
     pub fn new(
-        node_id: NodeId,
+        node_id: PeerId,
         predictor: Arc<ChurnPredictor>,
         trust_provider: Arc<dyn TrustProvider>,
         replication_manager: Arc<ReplicationManager>,
@@ -306,7 +307,7 @@ impl ChurnHandler {
 
     /// Create a new churn handler with node failure tracker for grace periods
     pub fn with_failure_tracker(
-        node_id: NodeId,
+        node_id: PeerId,
         predictor: Arc<ChurnPredictor>,
         trust_provider: Arc<dyn TrustProvider>,
         replication_manager: Arc<ReplicationManager>,
@@ -411,7 +412,7 @@ impl ChurnHandler {
     }
 
     /// Handle imminent node departure (predicted)
-    async fn handle_imminent_departure(&self, node_id: &NodeId) -> Result<()> {
+    async fn handle_imminent_departure(&self, node_id: &PeerId) -> Result<()> {
         // log::info!("Handling imminent departure for node {:?}", node_id);
 
         // 1. Mark node as departing
@@ -437,7 +438,7 @@ impl ChurnHandler {
             topic: "node_departing".to_string(),
             data: postcard::to_stdvec(&node_id)
                 .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?,
-            from: self.node_id.clone(),
+            from: self.node_id,
             seqno: 0, // Will be set by gossip subsystem
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -450,7 +451,7 @@ impl ChurnHandler {
     }
 
     /// Handle confirmed node failure
-    async fn handle_node_failure(&self, node_id: &NodeId) -> Result<()> {
+    async fn handle_node_failure(&self, node_id: &PeerId) -> Result<()> {
         let start_time = Instant::now();
         // log::warn!("Handling node failure for {:?}", node_id);
 
@@ -478,7 +479,7 @@ impl ChurnHandler {
             self.recovery_manager
                 .queue_recovery_with_grace_period(
                     content_hash,
-                    vec![node_id.clone()],
+                    vec![*node_id],
                     RecoveryPriority::Critical,
                     &grace_config,
                 )
@@ -534,7 +535,7 @@ impl ChurnHandler {
             topic: "high_churn_alert".to_string(),
             data: postcard::to_stdvec(&churn_rate)
                 .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?,
-            from: self.node_id.clone(),
+            from: self.node_id,
             seqno: 0, // Will be set by gossip subsystem
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -547,7 +548,7 @@ impl ChurnHandler {
     }
 
     /// Remove failed node from routing tables
-    async fn remove_from_routing_tables(&self, node_id: &NodeId) -> Result<()> {
+    async fn remove_from_routing_tables(&self, node_id: &PeerId) -> Result<()> {
         // Remove from Kademlia routing table
         self.router.remove_node(node_id).await;
 
@@ -564,13 +565,13 @@ impl ChurnHandler {
     }
 
     /// Get content stored by a specific node
-    async fn get_content_stored_by(&self, node_id: &NodeId) -> Result<Vec<ContentHash>> {
+    async fn get_content_stored_by(&self, node_id: &PeerId) -> Result<Vec<ContentHash>> {
         let status = self.node_monitor.get_node_status(node_id).await;
         Ok(status.stored_content.into_iter().collect())
     }
 
     /// Identify content that may be lost due to node failure
-    async fn identify_lost_content(&self, failed_node: &NodeId) -> Result<Vec<ContentHash>> {
+    async fn identify_lost_content(&self, failed_node: &PeerId) -> Result<Vec<ContentHash>> {
         let all_content = self.get_content_stored_by(failed_node).await?;
         let mut at_risk_content = Vec::new();
 
@@ -590,9 +591,9 @@ impl ChurnHandler {
     }
 
     /// Penalize node for unexpected departure
-    async fn penalize_unexpected_departure(&self, node_id: &NodeId) {
+    async fn penalize_unexpected_departure(&self, node_id: &PeerId) {
         self.trust_provider.update_trust(
-            &NodeId { hash: [0u8; 32] }, // System node
+            &PeerId::from_bytes([0u8; 32]), // System node
             node_id,
             false, // Negative interaction
         );
@@ -613,13 +614,13 @@ impl ChurnHandler {
     }
 
     /// Handle heartbeat from a node
-    pub async fn handle_heartbeat(&self, node_id: &NodeId) -> Result<()> {
+    pub async fn handle_heartbeat(&self, node_id: &PeerId) -> Result<()> {
         self.node_monitor.record_heartbeat(node_id).await;
         Ok(())
     }
 
     /// Handle gossip activity from a node
-    pub async fn handle_gossip_activity(&self, node_id: &NodeId) -> Result<()> {
+    pub async fn handle_gossip_activity(&self, node_id: &PeerId) -> Result<()> {
         self.node_monitor.record_gossip_activity(node_id).await;
         Ok(())
     }
@@ -632,7 +633,7 @@ impl ChurnHandler {
     /// Clone for spawning tasks
     fn clone_for_task(&self) -> Self {
         Self {
-            node_id: self.node_id.clone(),
+            node_id: self.node_id,
             predictor: self.predictor.clone(),
             node_monitor: self.node_monitor.clone(),
             recovery_manager: self.recovery_manager.clone(),
@@ -657,19 +658,19 @@ impl NodeMonitor {
     }
 
     /// Get all monitored nodes
-    pub async fn get_all_nodes(&self) -> Vec<NodeId> {
+    pub async fn get_all_nodes(&self) -> Vec<PeerId> {
         self.node_status.read().await.keys().cloned().collect()
     }
 
     /// Get node status
-    pub async fn get_node_status(&self, node_id: &NodeId) -> NodeStatus {
+    pub async fn get_node_status(&self, node_id: &PeerId) -> NodeStatus {
         self.node_status
             .read()
             .await
             .get(node_id)
             .cloned()
             .unwrap_or(NodeStatus {
-                node_id: node_id.clone(),
+                node_id: *node_id,
                 last_seen: Instant::now(),
                 last_heartbeat: None,
                 last_gossip: None,
@@ -680,36 +681,34 @@ impl NodeMonitor {
     }
 
     /// Update node state
-    pub async fn update_node_state(&self, node_id: &NodeId, state: NodeState) {
+    pub async fn update_node_state(&self, node_id: &PeerId, state: NodeState) {
         if let Some(status) = self.node_status.write().await.get_mut(node_id) {
             status.status = state;
         }
     }
 
     /// Record heartbeat from node
-    pub async fn record_heartbeat(&self, node_id: &NodeId) {
+    pub async fn record_heartbeat(&self, node_id: &PeerId) {
         let now = Instant::now();
-        self.heartbeats.write().await.insert(node_id.clone(), now);
+        self.heartbeats.write().await.insert(*node_id, now);
 
         let mut status_map = self.node_status.write().await;
-        let status = status_map
-            .entry(node_id.clone())
-            .or_insert_with(|| NodeStatus {
-                node_id: node_id.clone(),
-                last_seen: now,
-                last_heartbeat: None,
-                last_gossip: None,
-                status: NodeState::Active,
-                reliability: 1.0,
-                stored_content: HashSet::new(),
-            });
+        let status = status_map.entry(*node_id).or_insert_with(|| NodeStatus {
+            node_id: *node_id,
+            last_seen: now,
+            last_heartbeat: None,
+            last_gossip: None,
+            status: NodeState::Active,
+            reliability: 1.0,
+            stored_content: HashSet::new(),
+        });
         status.last_heartbeat = Some(now);
         status.last_seen = now;
         status.status = NodeState::Active;
     }
 
     /// Record gossip activity
-    pub async fn record_gossip_activity(&self, node_id: &NodeId) {
+    pub async fn record_gossip_activity(&self, node_id: &PeerId) {
         let now = Instant::now();
 
         if let Some(status) = self.node_status.write().await.get_mut(node_id) {
@@ -719,7 +718,7 @@ impl NodeMonitor {
     }
 
     /// Check if node is alive
-    pub async fn is_alive(&self, node_id: &NodeId) -> bool {
+    pub async fn is_alive(&self, node_id: &PeerId) -> bool {
         if let Some(last_heartbeat) = self.heartbeats.read().await.get(node_id) {
             last_heartbeat.elapsed() < self.config.heartbeat_timeout
         } else {
@@ -774,7 +773,7 @@ impl RecoveryManager {
     pub async fn queue_recovery(
         &self,
         content_hash: ContentHash,
-        failed_nodes: Vec<NodeId>,
+        failed_nodes: Vec<PeerId>,
         priority: RecoveryPriority,
     ) -> Result<()> {
         let task = RecoveryTask {
@@ -797,7 +796,7 @@ impl RecoveryManager {
     pub async fn get_remaining_replicas(
         &self,
         content_hash: &ContentHash,
-        exclude_node: &NodeId,
+        exclude_node: &PeerId,
     ) -> Result<u32> {
         if let Some(tracker) = self.content_tracker.read().await.get(content_hash) {
             let remaining = tracker
@@ -815,7 +814,7 @@ impl RecoveryManager {
     pub async fn queue_recovery_with_grace_period(
         &self,
         content_hash: ContentHash,
-        failed_nodes: Vec<NodeId>,
+        failed_nodes: Vec<PeerId>,
         priority: RecoveryPriority,
         config: &ReplicationGracePeriodConfig,
     ) -> Result<()> {
@@ -830,7 +829,7 @@ impl RecoveryManager {
             for node_id in &failed_nodes {
                 failure_tracker
                     .record_node_failure(
-                        node_id.clone(),
+                        *node_id,
                         crate::dht::replication_grace_period::NodeFailureReason::NetworkTimeout,
                         config,
                     )
@@ -842,9 +841,9 @@ impl RecoveryManager {
 
             for node_id in &failed_nodes {
                 if failure_tracker.should_start_replication(node_id).await {
-                    immediate_recovery_nodes.push(node_id.clone());
+                    immediate_recovery_nodes.push(*node_id);
                 } else {
-                    delayed_recovery_nodes.push(node_id.clone());
+                    delayed_recovery_nodes.push(*node_id);
                 }
             }
 
@@ -887,7 +886,7 @@ impl RecoveryManager {
     async fn schedule_grace_period_check(
         &self,
         content_hash: ContentHash,
-        failed_nodes: Vec<NodeId>,
+        failed_nodes: Vec<PeerId>,
         _priority: RecoveryPriority,
         failure_tracker: Arc<dyn NodeFailureTracker>,
     ) -> Result<()> {
@@ -903,7 +902,7 @@ impl RecoveryManager {
 
                 for node_id in &failed_nodes {
                     if failure_tracker.should_start_replication(node_id).await {
-                        nodes_to_recover.push(node_id.clone());
+                        nodes_to_recover.push(*node_id);
                     }
                 }
 
@@ -930,7 +929,7 @@ impl RecoveryManager {
     }
 
     /// Check if a node should be recovered immediately or wait for grace period
-    pub async fn should_recover_node(&self, node_id: &NodeId) -> bool {
+    pub async fn should_recover_node(&self, node_id: &PeerId) -> bool {
         if let Some(ref failure_tracker) = *self.node_failure_tracker.read().await {
             failure_tracker.should_start_replication(node_id).await
         } else {
@@ -956,16 +955,13 @@ mod tests {
             Arc::new(AdaptiveRouter::new(trust_provider.clone())),
         ));
         let router = Arc::new(AdaptiveRouter::new(trust_provider.clone()));
-        // Create a test NodeId
-        use crate::peer_record::UserId;
+        // Create a test PeerId
+        use crate::peer_record::PeerId;
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let node_id = UserId::from_bytes(hash);
+        let node_id = PeerId::from_bytes(hash);
 
-        let gossip = Arc::new(AdaptiveGossipSub::new(
-            node_id.clone(),
-            trust_provider.clone(),
-        ));
+        let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
         // Create default ChurnConfig
         let config = ChurnConfig {
@@ -990,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn test_node_monitoring() {
         let handler = create_test_churn_handler().await;
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Record heartbeat
         handler.node_monitor.record_heartbeat(&node_id).await;
@@ -1013,7 +1009,7 @@ mod tests {
         if let Some(nm) = Arc::get_mut(&mut handler.node_monitor) {
             nm.config.heartbeat_timeout = Duration::from_millis(100);
         }
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Record initial heartbeat
         handler.handle_heartbeat(&node_id).await.unwrap();
@@ -1028,7 +1024,7 @@ mod tests {
     #[tokio::test]
     async fn test_proactive_replication() {
         let handler = create_test_churn_handler().await;
-        let node_id = NodeId { hash: [1u8; 32] };
+        let node_id = PeerId::from_bytes([1u8; 32]);
 
         // Add node with high churn probability
         // Ensure node is tracked as active first
@@ -1067,13 +1063,13 @@ mod tests {
 
         // Add some nodes
         for i in 0..10 {
-            let node_id = NodeId { hash: [i; 32] };
+            let node_id = PeerId::from_bytes([i; 32]);
             handler.handle_heartbeat(&node_id).await.unwrap();
         }
 
         // Mark some as failed
         for i in 0..3 {
-            let node_id = NodeId { hash: [i; 32] };
+            let node_id = PeerId::from_bytes([i; 32]);
             handler
                 .node_monitor
                 .update_node_state(&node_id, NodeState::Failed)

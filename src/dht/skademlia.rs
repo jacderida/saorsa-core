@@ -17,10 +17,11 @@
 //! S/Kademlia provides enhanced security through disjoint path routing, sibling lists,
 //! and cryptographic verification mechanisms to resist various attacks on the DHT.
 
-use crate::PeerId;
-use crate::dht::{DHTNode, DhtKey, Key};
+use crate::dht::{DHTNode, DhtKey, Key, PeerId};
 use crate::error::{P2PError, P2pResult as Result};
-use crate::quantum_crypto::ant_quic_integration::{MlDsaPublicKey, MlDsaSignature, ml_dsa_verify};
+use crate::quantum_crypto::saorsa_transport_integration::{
+    MlDsaPublicKey, MlDsaSignature, ml_dsa_verify,
+};
 use crate::security::ReputationManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -59,8 +60,8 @@ pub trait NetworkQuerier: Send + Sync {
     /// A distance measurement from the witness's perspective
     fn query_distance_measurement(
         &self,
-        witness: &PeerId,
-        target_node: &PeerId,
+        witness: &str,
+        target_node: &str,
         target_key: &Key,
     ) -> Pin<Box<dyn Future<Output = Result<DistanceMeasurement>> + Send + '_>>;
 
@@ -179,7 +180,7 @@ pub struct SecurityBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistanceChallenge {
     /// Challenger node ID
-    pub challenger: PeerId,
+    pub challenger: String,
     /// Target key for distance verification
     pub target_key: Key,
     /// Expected distance
@@ -196,7 +197,7 @@ pub struct DistanceProof {
     /// Original challenge
     pub challenge: DistanceChallenge,
     /// Proof nodes that can verify distance
-    pub proof_nodes: Vec<PeerId>,
+    pub proof_nodes: Vec<String>,
     /// Signatures from proof nodes
     pub signatures: Vec<Vec<u8>>,
     /// Response time (distance indicator)
@@ -207,7 +208,7 @@ pub struct DistanceProof {
 #[derive(Debug, Clone)]
 pub struct EnhancedDistanceChallenge {
     /// Peer being challenged
-    pub challenger: PeerId,
+    pub challenger: String,
     /// Target key for distance measurement
     pub target_key: Key,
     /// Expected distance based on claimed position
@@ -230,7 +231,7 @@ pub struct DistanceConsensus {
     /// Target key
     pub target_key: Key,
     /// Node being verified
-    pub target_node: PeerId,
+    pub target_node: String,
     /// Consensus distance
     pub consensus_distance: Key,
     /// Individual measurements from witness nodes
@@ -245,7 +246,7 @@ pub struct DistanceConsensus {
 #[derive(Debug, Clone)]
 pub struct DistanceMeasurement {
     /// Witness node that made the measurement
-    pub witness: PeerId,
+    pub witness: String,
     /// Measured distance
     pub distance: Key,
     /// Measurement confidence
@@ -262,7 +263,7 @@ pub struct ConsistencyReport {
     /// Number of inconsistencies found
     pub inconsistencies: usize,
     /// Suspicious nodes
-    pub suspicious_nodes: Vec<PeerId>,
+    pub suspicious_nodes: Vec<String>,
     /// Validation timestamp
     pub validated_at: Instant,
 }
@@ -371,12 +372,9 @@ impl DisjointPathLookup {
         // Get next unqueried node
         let mut next_node = None;
         while let Some(node) = self.path_states[path_id].to_query.pop_front() {
-            if !self.path_states[path_id]
-                .queried
-                .contains(&node.id.to_string())
-            {
+            if !self.path_states[path_id].queried.contains(&node.id) {
                 // Check if using this node would violate disjointness
-                if self.would_violate_disjointness(path_id, &node.id.to_string()) {
+                if self.would_violate_disjointness(path_id, &node.id) {
                     continue;
                 }
 
@@ -386,9 +384,7 @@ impl DisjointPathLookup {
         }
 
         if let Some(node) = next_node {
-            self.path_states[path_id]
-                .queried
-                .insert(node.id.to_string().clone());
+            self.path_states[path_id].queried.insert(node.id);
             return Some(node);
         }
 
@@ -432,10 +428,7 @@ impl DisjointPathLookup {
             }
 
             // Add to query queue if not already queried
-            if !self.path_states[path_id]
-                .queried
-                .contains(&node.id.to_string())
-            {
+            if !self.path_states[path_id].queried.contains(&node.id) {
                 self.path_states[path_id].to_query.push_back(node);
             }
         }
@@ -546,7 +539,7 @@ impl DisjointPathLookup {
         let check_count = std::cmp::min(min_results, 5); // Check top 5 results
 
         for i in 0..check_count {
-            let mut node_counts: HashMap<PeerId, usize> = HashMap::new();
+            let mut node_counts: HashMap<String, usize> = HashMap::new();
 
             for path_result in &path_results {
                 if i < path_result.len() {
@@ -633,8 +626,8 @@ impl SiblingList {
         let expected_distance = target_key.distance(&local_key);
 
         for proposed in proposed_nodes {
-            // NodeInfo has id field of type NodeId
-            // Get the underlying bytes from the NodeId
+            // NodeInfo has id field of type PeerId
+            // Get the underlying bytes from the PeerId
             let proposed_id = *proposed.id.as_bytes();
 
             let proposed_key = DhtKey::from_bytes(proposed_id);
@@ -910,7 +903,7 @@ impl SKademlia {
 
                             // Update reputation for successful query
                             self.reputation_manager.update_reputation(
-                                &node.id.to_string(),
+                                &node.id,
                                 true,
                                 response_time,
                             );
@@ -927,7 +920,7 @@ impl SKademlia {
 
                             // Update reputation for failed query
                             self.reputation_manager.update_reputation(
-                                &node.id.to_string(),
+                                &node.id,
                                 false,
                                 response_time,
                             );
@@ -985,21 +978,17 @@ impl SKademlia {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         let challenge = DistanceChallenge {
-            challenger: target.clone(), // This should be our peer ID
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
-                let mut target_key = [0u8; 32];
-                let len = target_bytes.len().min(32);
-                target_key[..len].copy_from_slice(&target_bytes[..len]);
-                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(target_key))
+                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(*target_bytes))
             },
             nonce,
             timestamp: SystemTime::now(),
         };
 
-        self.pending_challenges
-            .insert(target.clone(), challenge.clone());
+        self.pending_challenges.insert(*target, challenge.clone());
         challenge
     }
 
@@ -1014,14 +1003,11 @@ impl SKademlia {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         let challenge = EnhancedDistanceChallenge {
-            challenger: target.clone(),
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
-                let mut target_key = [0u8; 32];
-                let len = target_bytes.len().min(32);
-                target_key[..len].copy_from_slice(&target_bytes[..len]);
-                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(target_key))
+                DhtKey::from_bytes(*key).distance(&DhtKey::from_bytes(*target_bytes))
             },
             nonce,
             timestamp: SystemTime::now(),
@@ -1031,7 +1017,7 @@ impl SKademlia {
         };
 
         self.pending_challenges.insert(
-            target.clone(),
+            *target,
             DistanceChallenge {
                 challenger: challenge.challenger.clone(),
                 target_key: challenge.target_key,
@@ -1089,7 +1075,17 @@ impl SKademlia {
             .enumerate()
         {
             // Look up the peer's public key from registry
-            let public_key_bytes = match self.peer_public_keys.get(peer_id) {
+            let peer_key = match PeerId::from_hex(peer_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    debug!(
+                        "Distance proof verification: Invalid hex peer ID '{}' (signature {})",
+                        peer_id, i
+                    );
+                    continue;
+                }
+            };
+            let public_key_bytes = match self.peer_public_keys.get(&peer_key) {
                 Some(pk) => pk,
                 None => {
                     debug!(
@@ -1243,7 +1239,7 @@ impl SKademlia {
     /// * `querier` - Network querier for making actual network calls
     pub async fn verify_distance_consensus<Q: NetworkQuerier>(
         &mut self,
-        target_node: &PeerId,
+        target_node: &str,
         target_key: &Key,
         witness_nodes: Vec<PeerId>,
         querier: &Q,
@@ -1253,19 +1249,17 @@ impl SKademlia {
         for witness in &witness_nodes {
             // Request distance measurement from witness node via network call
             let query_start = std::time::Instant::now();
+            let witness_hex = witness.to_hex();
 
             match querier
-                .query_distance_measurement(witness, target_node, target_key)
+                .query_distance_measurement(&witness_hex, target_node, target_key)
                 .await
             {
                 Ok(mut measurement) => {
                     // Update reputation for successful query
                     let response_time = query_start.elapsed();
-                    self.reputation_manager.update_reputation(
-                        &witness.to_string(),
-                        true,
-                        response_time,
-                    );
+                    self.reputation_manager
+                        .update_reputation(witness, true, response_time);
 
                     // Recalculate confidence based on current reputation and response time
                     // (the measurement may have its own confidence, but we weight it by reputation)
@@ -1291,11 +1285,8 @@ impl SKademlia {
                 Err(e) => {
                     // Update reputation for failed query
                     let response_time = query_start.elapsed();
-                    self.reputation_manager.update_reputation(
-                        &witness.to_string(),
-                        false,
-                        response_time,
-                    );
+                    self.reputation_manager
+                        .update_reputation(witness, false, response_time);
 
                     tracing::warn!(
                         witness = %witness,
@@ -1325,7 +1316,7 @@ impl SKademlia {
 
         Ok(DistanceConsensus {
             target_key: *target_key,
-            target_node: target_node.clone(),
+            target_node: target_node.to_owned(),
             consensus_distance,
             measurements,
             confidence,
@@ -1439,16 +1430,15 @@ impl SKademlia {
         // 1. First, collect trusted nodes from security buckets (highest priority)
         for security_bucket in self.security_buckets.values() {
             for node in &security_bucket.trusted_nodes {
-                let node_id_str = hex::encode(node.id.as_bytes());
                 // Don't select the target as a witness
-                if &node_id_str == target {
+                if node.id == *target {
                     continue;
                 }
 
                 // Get reputation score (trusted nodes get bonus)
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node_id_str)
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.5)
                     * 1.5; // Trusted node bonus
@@ -1466,9 +1456,8 @@ impl SKademlia {
         // 2. Then collect sibling nodes from sibling lists
         for sibling_list in self.sibling_lists.values() {
             for node in &sibling_list.siblings {
-                let node_id_str = hex::encode(node.id.as_bytes());
                 // Don't select the target as a witness
-                if &node_id_str == target {
+                if node.id == *target {
                     continue;
                 }
 
@@ -1480,7 +1469,7 @@ impl SKademlia {
                 // Get reputation score
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node_id_str)
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.5);
 
@@ -1505,7 +1494,7 @@ impl SKademlia {
         let witness_nodes: Vec<PeerId> = candidate_nodes
             .into_iter()
             .take(witness_count)
-            .map(|(node, _)| hex::encode(node.id.as_bytes()))
+            .map(|(node, _)| node.id)
             .collect();
 
         tracing::debug!(
@@ -1520,7 +1509,7 @@ impl SKademlia {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
 
         EnhancedDistanceChallenge {
-            challenger: target.clone(),
+            challenger: target.to_hex(),
             target_key: *key,
             expected_distance: {
                 let target_bytes = target.as_bytes();
@@ -1554,9 +1543,7 @@ impl SKademlia {
         for security_bucket in self.security_buckets.values() {
             for trusted_node in &security_bucket.trusted_nodes {
                 // Only use nodes with good reputation as validators
-                if let Some(reputation) = self
-                    .reputation_manager
-                    .get_reputation(&hex::encode(trusted_node.id.as_bytes()))
+                if let Some(reputation) = self.reputation_manager.get_reputation(&trusted_node.id)
                     && reputation.response_rate >= 0.7
                     && reputation.consistency_score >= 0.8
                 {
@@ -1573,7 +1560,7 @@ impl SKademlia {
             let node_id_hex = hex::encode(node.id.as_bytes());
 
             // Check reputation threshold
-            if let Some(reputation) = self.reputation_manager.get_reputation(&node_id_hex)
+            if let Some(reputation) = self.reputation_manager.get_reputation(&node.id)
                 && reputation.response_rate < self.config.min_routing_reputation
             {
                 inconsistencies += 1;
@@ -1723,7 +1710,7 @@ impl SKademlia {
 
                 let reputation_score = self
                     .reputation_manager
-                    .get_reputation(&node.id.to_string())
+                    .get_reputation(&node.id)
                     .map(|rep| rep.response_rate * rep.consistency_score)
                     .unwrap_or(0.0);
 
@@ -1784,8 +1771,8 @@ mod tests {
 
         fn query_distance_measurement(
             &self,
-            _witness: &PeerId,
-            _target_node: &PeerId,
+            _witness: &str,
+            _target_node: &str,
             _target_key: &Key,
         ) -> Pin<Box<dyn Future<Output = Result<DistanceMeasurement>> + Send + '_>> {
             Box::pin(async {
@@ -1809,9 +1796,7 @@ mod tests {
 
     fn create_test_dht_node(peer_id: &str, _distance_bytes: [u8; 32]) -> NodeInfo {
         NodeInfo {
-            id: crate::dht::core_engine::NodeId::from_key(crate::dht::core_engine::DhtKey::new(
-                &[42u8; 32],
-            )),
+            id: PeerId::new(&[42u8; 32]),
             address: peer_id.to_string(),
             last_seen: std::time::SystemTime::now(),
             capacity: NodeCapacity::default(),
@@ -1914,7 +1899,7 @@ mod tests {
         assert!(next_node.is_some());
 
         if let Some(node) = next_node {
-            assert!(lookup.path_states[0].queried.contains(&node.id.to_string()));
+            assert!(lookup.path_states[0].queried.contains(&node.id));
         }
 
         Ok(())
@@ -2213,12 +2198,12 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
 
         let challenge = skademlia.create_distance_challenge(&target, &key);
 
-        assert_eq!(challenge.challenger, target);
+        assert_eq!(challenge.challenger, target.to_hex());
         assert_eq!(challenge.target_key, key);
         assert!(skademlia.pending_challenges.contains_key(&target));
     }
@@ -2228,14 +2213,14 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
-        let witness_nodes = vec!["witness1".to_string(), "witness2".to_string()];
+        let witness_nodes = vec![PeerId::random(), PeerId::random()];
 
         let challenge =
             skademlia.create_enhanced_distance_challenge(&target, &key, witness_nodes.clone());
 
-        assert_eq!(challenge.challenger, target);
+        assert_eq!(challenge.challenger, target.to_hex());
         assert_eq!(challenge.target_key, key);
         assert_eq!(challenge.witness_nodes, witness_nodes);
         assert_eq!(challenge.challenge_round, 1);
@@ -2247,7 +2232,7 @@ mod tests {
         let config = SKademliaConfig::default();
         let mut skademlia = SKademlia::new(config);
 
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
         let key = create_test_key([1u8; 32]);
 
         // Test normal challenge (empty network - no witness nodes available)
@@ -2287,7 +2272,7 @@ mod tests {
 
         // Add some test data
         let key = create_test_key([1u8; 32]);
-        let target = "test_peer".to_string();
+        let target = PeerId::from_name("test_peer");
 
         skademlia.create_distance_challenge(&target, &key);
 

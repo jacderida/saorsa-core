@@ -167,6 +167,7 @@ pub use crate::placement::{
 // Adaptive Networking
 // ============================================================================
 
+pub use crate::PeerId;
 /// Adaptive network types
 pub use crate::adaptive::{
     // Traits
@@ -184,7 +185,6 @@ pub use crate::adaptive::{
     NetworkStats,
     NodeCapabilities,
     NodeDescriptor,
-    NodeId,
     Outcome,
     RoutingStrategy,
     StrategyChoice,

@@ -15,6 +15,7 @@
 use anyhow::Result;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::NodeConfig;
 use saorsa_core::transport_handle::{TransportConfig, TransportHandle};
 use std::sync::Arc;
@@ -36,8 +37,8 @@ async fn create_test_dht_config(
     port: u16,
     replication_factor: usize,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
         .listen_port(port)
         .ipv6(false)
         .build()
@@ -45,7 +46,6 @@ async fn create_test_dht_config(
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: peer_id.to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -54,12 +54,13 @@ async fn create_test_dht_config(
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
+            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
         })
         .await?,
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),

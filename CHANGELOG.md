@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.10.2] - 2026-02-01
 
 ### Changed
-- **ant-quic v0.20+ Migration**: Migrated from polling-based `receive_from_any_peer` API to event-driven channel-based `recv()` architecture
+- **saorsa-transport v0.20+ Migration**: Migrated from polling-based `receive_from_any_peer` API to event-driven channel-based `recv()` architecture
 - **Wire Protocol**: Replaced JSON wire protocol with bincode for compact binary encoding via typed `WireMessage` struct
 - **Graceful Shutdown**: Implemented proper shutdown: signal tasks → shut down QUIC endpoints → join task handles
 - **Keepalive Optimization**: Converted sequential keepalive sending to concurrent via `join_all()`
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.10.1] - 2026-01-29
 
 ### Changed
-- **Bootstrap Consolidation**: AdaptiveDHT now bootstraps through P2PNode (ant-quic) cache/selection
+- **Bootstrap Consolidation**: AdaptiveDHT now bootstraps through P2PNode (saorsa-transport) cache/selection
 - **Bootstrap Context**: Refactored bootstrap/connect logic into reusable `BootstrapContext`
 - **Adaptive Coordinator**: Create P2PNode in AdaptiveCoordinator and attach to AdaptiveDHT
 - **Listen Port**: Introduced `NetworkConfig.listen_port` with coordinator/builder plumbing
@@ -123,7 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Wildcard Address Normalization for Local Connections** 🌐
-  - ant-quic correctly rejects wildcard addresses (`0.0.0.0`, `[::]`) as invalid remote addresses
+  - saorsa-transport correctly rejects wildcard addresses (`0.0.0.0`, `[::]`) as invalid remote addresses
   - Added `normalize_wildcard_to_loopback()` to convert wildcard bind addresses to loopback addresses
   - IPv6 `[::]:port` → `::1:port` (IPv6 loopback)
   - IPv4 `0.0.0.0:port` → `127.0.0.1:port` (IPv4 loopback)
@@ -137,7 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **P2PNode Connection Logic** 📡
-  - `connect_peer()` now normalizes addresses before passing to ant-quic
+  - `connect_peer()` now normalizes addresses before passing to saorsa-transport
   - Supports both IPv4 and IPv6 loopback connections
   - Non-wildcard addresses pass through unchanged
 
@@ -157,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Full Connection Lifecycle Tracking** 🔄
   - Replaced automatic reconnection with comprehensive connection lifecycle tracking
-  - P2PNode now synchronizes with ant-quic connection events (ConnectionEstablished/ConnectionLost)
+  - P2PNode now synchronizes with saorsa-transport connection events (ConnectionEstablished/ConnectionLost)
   - Added `active_connections` HashSet tracking actual connection state
   - Keepalive task prevents 30-second idle timeout with 15-second heartbeats
   - Resolves root cause of "send_to_peer failed on both stacks" errors
@@ -166,7 +166,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Connection Lifecycle Infrastructure** 🛠️
   - `P2PNode::is_connection_active()` - Validate connection state via active_connections
   - `P2PNode::keepalive_task()` - Background task sending heartbeats every 15 seconds
-  - Connection event subscription to ant-quic lifecycle events
+  - Connection event subscription to saorsa-transport lifecycle events
   - Proper shutdown coordination with AtomicBool flags
 
 ### Changed
@@ -184,8 +184,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Technical Details
 - Implements full connection lifecycle tracking (Option 1 from status doc)
-- Keepalive prevents ant-quic's 30-second max_idle_timeout
-- active_connections synchronized with ant-quic connection events
+- Keepalive prevents saorsa-transport's 30-second max_idle_timeout
+- active_connections synchronized with saorsa-transport connection events
 - Maintains zero breaking changes - purely internal reliability improvement
 - All 669 unit tests passing with zero failures
 - Integration tests prove infrastructure is in place
@@ -199,7 +199,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Connection State Synchronization** 🔄
-  - Fixed critical issue where P2PNode peers map didn't track when ant-quic connections closed
+  - Fixed critical issue where P2PNode peers map didn't track when saorsa-transport connections closed
   - Added automatic reconnection logic in `MessageTransport::try_direct_delivery()`
   - Connections now properly cleaned up when detected as closed
   - Resolves "send_to_peer failed on both stacks" errors
@@ -220,7 +220,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Technical Details
 - Addresses root cause identified in P2P_MESSAGING_STATUS_2025-10-02_FINAL.md
-- Connection state gap between P2PNode layer and ant-quic connection layer now bridged
+- Connection state gap between P2PNode layer and saorsa-transport connection layer now bridged
 - Error patterns detected: "closed", "connection", "send_to_peer failed", "peer not found"
 - Maintains zero breaking changes - purely internal reliability improvement
 - All 669 unit tests passing with zero failures
@@ -329,14 +329,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **P2P NAT Traversal Support** 🎉
   - Added `NatTraversalMode` enum with `ClientOnly` and `P2PNode` variants
-  - Integrated ant-quic 0.10.0's NAT traversal capabilities
+  - Integrated saorsa-transport 0.10.0's NAT traversal capabilities
   - `P2PNetworkNode::from_network_config()` for NAT-aware network creation
   - Full P2P messaging support between MessagingService instances
   - NAT configuration logging in MessagingService
   - Comprehensive P2P integration tests (6 new tests)
 
 ### Changed
-- **Breaking Change**: Updated to ant-quic 0.10.0
+- **Breaking Change**: Updated to saorsa-transport 0.10.0
   - New endpoint role system (Client, Server, Bootstrap)
   - Improved NAT traversal with symmetric ServerSupport
   - Bootstrap role for P2P nodes without external infrastructure
@@ -345,7 +345,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated `P2PNetworkNode` to use `EndpointRole::Bootstrap` for compatibility
 
 ### Dependencies
-- Updated `ant-quic` from 0.9.0 to 0.10.0
+- Updated `saorsa-transport` from 0.9.0 to 0.10.0
 
 ### Documentation
 - Updated CHANGELOG with v0.5.0 release notes
@@ -374,11 +374,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New behavior: Uses port 0 (OS-assigned) by default for maximum compatibility
   - Migration: Existing code continues to work, but will get different ports
   - To use explicit port: Use `new_with_config()` with `PortConfig::Explicit(port)`
-- Updated to ant-quic 0.9.0 with post-quantum cryptography enhancements
+- Updated to saorsa-transport 0.9.0 with post-quantum cryptography enhancements
 - Refactored `MessagingService::new()` to delegate to `new_with_config()` with default NetworkConfig
 
 ### Dependencies
-- Updated `ant-quic` from 0.8.17 to 0.9.0
+- Updated `saorsa-transport` from 0.8.17 to 0.9.0
 
 ### Documentation
 - Added comprehensive port configuration guide in SAORSA_CORE_PORT_STATUS.md

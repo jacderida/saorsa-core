@@ -14,17 +14,16 @@ use saorsa_core::PeerId;
 use saorsa_core::adaptive::hyperbolic_greedy::{
     Embedding, EmbeddingConfig, HyperbolicGreedyRouter, embed_snapshot, greedy_next,
 };
-use saorsa_core::dht::DhtNodeId as NodeId;
 use std::collections::HashMap;
 
 /// Generate a synthetic graph for testing
-fn generate_synthetic_graph(num_nodes: usize, _connectivity: f64) -> Vec<PeerId> {
+fn generate_synthetic_graph(num_nodes: usize, _connectivity: f64) -> Vec<String> {
     (0..num_nodes).map(|i| format!("node_{:04}", i)).collect()
 }
 
 /// Generate a scale-free graph using preferential attachment
-fn generate_scale_free_graph(num_nodes: usize) -> (Vec<PeerId>, HashMap<(PeerId, PeerId), bool>) {
-    let nodes: Vec<PeerId> = (0..num_nodes)
+fn generate_scale_free_graph(num_nodes: usize) -> (Vec<String>, HashMap<(String, String), bool>) {
+    let nodes: Vec<String> = (0..num_nodes)
         .map(|i| format!("sf_node_{:04}", i))
         .collect();
     let mut edges = HashMap::new();
@@ -57,16 +56,16 @@ fn generate_scale_free_graph(num_nodes: usize) -> (Vec<PeerId>, HashMap<(PeerId,
 }
 
 /// Calculate success ratio for greedy routing
-async fn calculate_success_ratio(embedding: &Embedding, test_pairs: &[(PeerId, PeerId)]) -> f64 {
+async fn calculate_success_ratio(embedding: &Embedding, test_pairs: &[(String, String)]) -> f64 {
     let mut successes = 0;
 
     for (source, target) in test_pairs {
-        // Convert target to NodeId
+        // Convert target to PeerId
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target_node = NodeId::from_bytes(node_id_bytes);
+        let target_node = PeerId::from_bytes(node_id_bytes);
 
         // Try greedy routing
         if let Some(_next_hop) = greedy_next(target_node, source.clone(), embedding).await {
@@ -80,10 +79,13 @@ async fn calculate_success_ratio(embedding: &Embedding, test_pairs: &[(PeerId, P
 /// Calculate stretch (actual hops / optimal hops)
 async fn calculate_stretch(
     embedding: &Embedding,
-    source: &PeerId,
-    target: &PeerId,
-    edges: &HashMap<(PeerId, PeerId), bool>,
+    source: &str,
+    target: &str,
+    edges: &HashMap<(String, String), bool>,
 ) -> Option<f64> {
+    let source = source.to_owned();
+    let target = target.to_owned();
+
     // Simple BFS to find shortest path
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
@@ -94,7 +96,7 @@ async fn calculate_stretch(
     visited.insert(source.clone());
 
     while let Some(current) = queue.pop_front() {
-        if current == *target {
+        if current == target {
             break;
         }
 
@@ -110,22 +112,22 @@ async fn calculate_stretch(
         }
     }
 
-    let optimal_hops = distances.get(target)?;
+    let optimal_hops = distances.get(&target)?;
 
     // Now trace greedy path
     let mut greedy_hops = 0;
     let mut current = source.clone();
     let mut visited_greedy = std::collections::HashSet::new();
 
-    while current != *target && greedy_hops < 100 {
+    while current != target && greedy_hops < 100 {
         visited_greedy.insert(current.clone());
 
-        // Convert target to NodeId
+        // Convert target to PeerId
         let mut node_id_bytes = [0u8; 32];
         let target_bytes = target.as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target_node = NodeId::from_bytes(node_id_bytes);
+        let target_node = PeerId::from_bytes(node_id_bytes);
 
         match greedy_next(target_node, current.clone(), embedding).await {
             Some(next) if !visited_greedy.contains(&next) => {
@@ -136,7 +138,7 @@ async fn calculate_stretch(
         }
     }
 
-    if current == *target {
+    if current == target {
         Some(greedy_hops as f64 / *optimal_hops as f64)
     } else {
         None // Greedy routing failed
@@ -171,7 +173,7 @@ async fn test_greedy_routing_success_ratio() {
     let embedding = embed_snapshot(&nodes).await.unwrap();
 
     // Generate test pairs
-    let test_pairs: Vec<(PeerId, PeerId)> = (0..20)
+    let test_pairs: Vec<(String, String)> = (0..20)
         .map(|_| {
             let source = nodes[rand::random::<usize>() % nodes.len()].clone();
             let target = nodes[rand::random::<usize>() % nodes.len()].clone();
@@ -236,14 +238,14 @@ async fn test_fallback_correctness() {
     let router = HyperbolicGreedyRouter::new(local_id.clone());
 
     // Create a minimal embedding with just a few nodes
-    let nodes: Vec<PeerId> = (0..5).map(|i| format!("fb_node_{}", i)).collect();
+    let nodes: Vec<String> = (0..5).map(|i| format!("fb_node_{}", i)).collect();
     let embedding = router.embed_snapshot(&nodes).await.unwrap();
 
     // Store embedding
     router.set_embedding(embedding.clone()).await;
 
     // Test with a target not in the embedding (should fall back to Kad)
-    let unknown_target = NodeId::from_bytes([99u8; 32]);
+    let unknown_target = PeerId::from_bytes([99u8; 32]);
     let result = router
         .greedy_next(unknown_target, local_id.clone(), &embedding)
         .await;
@@ -288,12 +290,12 @@ async fn test_partial_refit_performance() {
     let router = HyperbolicGreedyRouter::new(local_id);
 
     // Create initial embedding
-    let initial_nodes: Vec<PeerId> = (0..20).map(|i| format!("init_{}", i)).collect();
+    let initial_nodes: Vec<String> = (0..20).map(|i| format!("init_{}", i)).collect();
     let embedding = router.embed_snapshot(&initial_nodes).await.unwrap();
     router.set_embedding(embedding).await;
 
     // Measure partial refit time
-    let new_nodes: Vec<PeerId> = (0..5).map(|i| format!("new_{}", i)).collect();
+    let new_nodes: Vec<String> = (0..5).map(|i| format!("new_{}", i)).collect();
 
     let start = std::time::Instant::now();
     router.partial_refit(&new_nodes).await.unwrap();
@@ -355,7 +357,7 @@ async fn test_routing_metrics() {
     let router = HyperbolicGreedyRouter::new(local_id.clone());
 
     // Create embedding
-    let nodes: Vec<PeerId> = (0..10).map(|i| format!("m_node_{}", i)).collect();
+    let nodes: Vec<String> = (0..10).map(|i| format!("m_node_{}", i)).collect();
     let embedding = router.embed_snapshot(&nodes).await.unwrap();
     router.set_embedding(embedding.clone()).await;
 
@@ -366,7 +368,7 @@ async fn test_routing_metrics() {
         let target_bytes = nodes[target_idx].as_bytes();
         let len = target_bytes.len().min(32);
         node_id_bytes[..len].copy_from_slice(&target_bytes[..len]);
-        let target = NodeId::from_bytes(node_id_bytes);
+        let target = PeerId::from_bytes(node_id_bytes);
 
         let _ = router
             .greedy_next(target, local_id.clone(), &embedding)

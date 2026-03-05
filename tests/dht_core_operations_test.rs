@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 use saorsa_core::dht::{DHTConfig, Record, optimized_storage::OptimizedDHTStorage};
-use saorsa_core::identity::node_identity::NodeId;
+use saorsa_core::identity::node_identity::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -26,7 +26,7 @@ fn create_test_record(key_suffix: &str, publisher: &str, value: &str) -> Record 
     let value = value.as_bytes().to_vec();
     // Create NodeId from publisher string by hashing it
     let publisher_bytes = *blake3::hash(publisher.as_bytes()).as_bytes();
-    let publisher = NodeId::from_bytes(publisher_bytes);
+    let publisher = PeerId::from_bytes(publisher_bytes);
     Record::new(key, value, publisher)
 }
 
@@ -239,7 +239,7 @@ async fn test_publisher_index_consistency() -> Result<()> {
         let mut record = record;
         // Create NodeId from publisher string by hashing it
         let publisher_bytes = *blake3::hash(publisher_name.as_bytes()).as_bytes();
-        let node_id = NodeId::from_bytes(publisher_bytes);
+        let node_id = PeerId::from_bytes(publisher_bytes);
         let node_id_str = node_id.to_string();
 
         // Track the mapping for later queries
@@ -407,7 +407,7 @@ async fn test_concurrent_access_safety() -> Result<()> {
                 // Publisher query - convert to NodeId string representation
                 let publisher_str = format!("task_{}", task_id);
                 let publisher_bytes = *blake3::hash(publisher_str.as_bytes()).as_bytes();
-                let publisher_node_id = NodeId::from_bytes(publisher_bytes);
+                let publisher_node_id = PeerId::from_bytes(publisher_bytes);
                 let publisher_records = storage_clone
                     .get_records_by_publisher(&publisher_node_id.to_string(), None)
                     .await;
@@ -445,7 +445,7 @@ async fn test_concurrent_access_safety() -> Result<()> {
     for task_id in 0..10 {
         let publisher_str = format!("task_{}", task_id);
         let publisher_bytes = *blake3::hash(publisher_str.as_bytes()).as_bytes();
-        let publisher_node_id = NodeId::from_bytes(publisher_bytes);
+        let publisher_node_id = PeerId::from_bytes(publisher_bytes);
         let publisher_records = storage
             .get_records_by_publisher(&publisher_node_id.to_string(), None)
             .await;
@@ -592,7 +592,7 @@ async fn test_performance_characteristics() -> Result<()> {
         .map(|i| {
             let publisher_str = format!("publisher_{}", i);
             let publisher_bytes = *blake3::hash(publisher_str.as_bytes()).as_bytes();
-            let publisher_node_id = NodeId::from_bytes(publisher_bytes);
+            let publisher_node_id = PeerId::from_bytes(publisher_bytes);
             publisher_node_id.to_string()
         })
         .collect();
@@ -685,7 +685,7 @@ async fn test_stress_scenarios() -> Result<()> {
         .iter()
         .map(|name| {
             let publisher_bytes = *blake3::hash(name.as_bytes()).as_bytes();
-            let publisher_node_id = NodeId::from_bytes(publisher_bytes);
+            let publisher_node_id = PeerId::from_bytes(publisher_bytes);
             publisher_node_id.to_string()
         })
         .collect();
@@ -742,7 +742,7 @@ async fn test_stress_scenarios() -> Result<()> {
                 if i % 10 == 0 {
                     let publisher_str = format!("task_{}", task_id);
                     let publisher_bytes = *blake3::hash(publisher_str.as_bytes()).as_bytes();
-                    let publisher_node_id = NodeId::from_bytes(publisher_bytes);
+                    let publisher_node_id = PeerId::from_bytes(publisher_bytes);
                     let _ = storage_clone
                         .get_records_by_publisher(&publisher_node_id.to_string(), Some(5))
                         .await;
@@ -834,7 +834,7 @@ async fn test_dht_system_integration() -> Result<()> {
 
             // Query for the target node's data - convert to NodeId string representation
             let target_publisher_bytes = *blake3::hash(target_node.id.as_bytes()).as_bytes();
-            let target_publisher_node_id = NodeId::from_bytes(target_publisher_bytes);
+            let target_publisher_node_id = PeerId::from_bytes(target_publisher_bytes);
             let target_records = storage
                 .get_records_by_publisher(&target_publisher_node_id.to_string(), Some(5))
                 .await;
@@ -886,7 +886,7 @@ async fn test_dht_system_integration() -> Result<()> {
     for node in &nodes {
         // Convert node.id to NodeId string representation
         let node_publisher_bytes = *blake3::hash(node.id.as_bytes()).as_bytes();
-        let node_publisher_node_id = NodeId::from_bytes(node_publisher_bytes);
+        let node_publisher_node_id = PeerId::from_bytes(node_publisher_bytes);
         let node_records = storage
             .get_records_by_publisher(&node_publisher_node_id.to_string(), None)
             .await;

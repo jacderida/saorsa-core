@@ -172,7 +172,7 @@ Message 0 failed: Transport error: Stream error: send_to_peer failed on both sta
 - ✅ src/messaging/service.rs:664
 - ✅ src/messaging/transport.rs:246
 - ✅ src/network.rs:1658-1663
-- ✅ src/transport/ant_quic_adapter.rs:391-407
+- ✅ src/transport/saorsa_transport_adapter.rs:391-407
 - (5 more verified - all correct)
 
 **Conclusion**: Documentation quality excellent

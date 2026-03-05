@@ -123,10 +123,10 @@ impl NetworkTestFramework {
         for i in 0..partition_point {
             for j in partition_point..self.nodes.len() {
                 self.nodes[i]
-                    .disconnect_peer(&format!("node_{}", j))
+                    .disconnect_peer(&saorsa_core::PeerId::from_name(&format!("node_{}", j)))
                     .await?;
                 self.nodes[j]
-                    .disconnect_peer(&format!("node_{}", i))
+                    .disconnect_peer(&saorsa_core::PeerId::from_name(&format!("node_{}", i)))
                     .await?;
             }
         }
@@ -310,7 +310,7 @@ async fn test_peer_discovery_under_load() -> Result<()> {
 ///
 /// NOTE: This test is ignored because it relies on timing-sensitive failure
 /// detection that varies based on:
-/// - ant-quic idle timeout configuration
+/// - saorsa-transport idle timeout configuration
 /// - System load during test execution
 /// - Keepalive task timing
 ///
@@ -334,7 +334,7 @@ async fn test_connection_failure_recovery() -> Result<()> {
 
     // Wait for failure detection.
     //
-    // ant-quic uses an idle timeout (and this crate uses a keepalive task), so peer removal is not
+    // saorsa-transport uses an idle timeout (and this crate uses a keepalive task), so peer removal is not
     // guaranteed to be instantaneous. Poll for convergence instead of assuming a fixed delay.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
@@ -414,16 +414,18 @@ async fn test_high_throughput_messaging() -> Result<()> {
 
     let start_time = std::time::Instant::now();
 
-    // Send messages from node 0 to all other nodes
-    for i in 1..framework.nodes.len() {
+    // Get authenticated peer IDs from connected_peers
+    let peers = framework.nodes[0].connected_peers().await;
+
+    // Send messages from node 0 to all connected peers
+    for (i, peer_id) in peers.iter().enumerate() {
         for msg_id in 0..message_count {
             let message = vec![msg_id as u8; message_size];
-            let peer_id = format!("node_{}", i);
 
             framework.nodes[0]
-                .send_message(&peer_id, "test_topic", message)
+                .send_message(peer_id, "test_topic", message)
                 .await
-                .context(format!("Failed to send message {} to node {}", msg_id, i))?;
+                .context(format!("Failed to send message {} to peer {}", msg_id, i))?;
         }
     }
 

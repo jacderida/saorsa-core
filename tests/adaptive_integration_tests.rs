@@ -1,5 +1,6 @@
 //! Adaptive integration tests aligned with current APIs
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::q_learning_cache::{ActionType, StateVector};
 use saorsa_core::adaptive::*;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ async fn test_security_manager_validate_join() -> anyhow::Result<()> {
     let sm = SecurityManager::new(SecurityConfig::default(), &identity);
 
     let desc = NodeDescriptor {
-        id: saorsa_core::peer_record::UserId::from_public_key(identity.public_key()),
+        id: saorsa_core::identity::node_identity::peer_id_from_public_key(identity.public_key()),
         public_key: identity.public_key().clone(),
         addresses: vec!["127.0.0.1:0".to_string()],
         hyperbolic: None,
@@ -71,20 +72,20 @@ async fn test_adaptive_router_routes_with_registered_strategy() -> anyhow::Resul
     struct DirectStrategy;
     #[async_trait::async_trait]
     impl RoutingStrategy for DirectStrategy {
-        async fn find_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
-            Ok(vec![target.clone()])
+        async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
+            Ok(vec![*target])
         }
-        fn route_score(&self, _from: &NodeId, _to: &NodeId) -> f64 {
+        fn route_score(&self, _from: &PeerId, _to: &PeerId) -> f64 {
             1.0
         }
-        fn update_metrics(&self, _path: &[NodeId], _success: bool) {}
+        fn update_metrics(&self, _path: &[PeerId], _success: bool) {}
     }
 
     router
         .register_strategy(StrategyChoice::Kademlia, Arc::new(DirectStrategy))
         .await;
 
-    let target = NodeId::from_bytes([1u8; 32]);
+    let target = PeerId::from_bytes([1u8; 32]);
     let path = router.route(&target, ContentType::DHTLookup).await?;
     assert_eq!(path.len(), 1);
     assert_eq!(path[0], target);

@@ -13,8 +13,9 @@
 
 //! Integration tests for Multi-Armed Bandit routing optimization
 
+use saorsa_core::PeerId;
 use saorsa_core::adaptive::{
-    ContentType, MABConfig, MultiArmedBandit, NodeId, Outcome, RouteId, StrategyChoice,
+    ContentType, MABConfig, MultiArmedBandit, Outcome, RouteId, StrategyChoice,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -147,7 +148,7 @@ async fn test_mab_learns_optimal_strategies() {
 
     let mab = MultiArmedBandit::new(config).await.unwrap();
     let simulator = NetworkSimulator::new();
-    let destination = NodeId::from_bytes([42u8; 32]);
+    let destination = PeerId::from_bytes([42u8; 32]);
     let all_strategies = vec![
         StrategyChoice::Kademlia,
         StrategyChoice::Hyperbolic,
@@ -262,7 +263,7 @@ async fn test_mab_exploration_vs_exploitation() {
     };
 
     let mab = MultiArmedBandit::new(config).await.unwrap();
-    let destination = NodeId::from_bytes([1u8; 32]);
+    let destination = PeerId::from_bytes([1u8; 32]);
     let strategies = vec![StrategyChoice::Kademlia, StrategyChoice::Hyperbolic];
 
     let mut exploration_count = 0;
@@ -301,7 +302,7 @@ async fn test_mab_exploration_vs_exploitation() {
 #[tokio::test]
 async fn test_mab_persistence_and_recovery() {
     let temp_dir = TempDir::new().unwrap();
-    let destination = NodeId::from_bytes([1u8; 32]);
+    let destination = PeerId::from_bytes([1u8; 32]);
 
     // Phase 1: Create MAB and add statistics
     {
@@ -318,7 +319,7 @@ async fn test_mab_persistence_and_recovery() {
 
         // Add statistics for different routes
         for i in 0..100 {
-            let route_id = RouteId::new(destination.clone(), StrategyChoice::Kademlia);
+            let route_id = RouteId::new(destination, StrategyChoice::Kademlia);
             let outcome = Outcome {
                 success: i % 2 == 0,
                 latency_ms: 50 + i,
@@ -350,7 +351,7 @@ async fn test_mab_persistence_and_recovery() {
         assert!(!stats.is_empty(), "Statistics should be loaded from disk");
 
         let key = (
-            RouteId::new(destination.clone(), StrategyChoice::Kademlia),
+            RouteId::new(destination, StrategyChoice::Kademlia),
             ContentType::DHTLookup,
         );
         assert!(stats.contains_key(&key));
@@ -363,8 +364,8 @@ async fn test_mab_persistence_and_recovery() {
 async fn test_mab_confidence_intervals() {
     let config = MABConfig::default();
     let mab = MultiArmedBandit::new(config).await.unwrap();
-    let destination = NodeId::from_bytes([1u8; 32]);
-    let route_id = RouteId::new(destination.clone(), StrategyChoice::Kademlia);
+    let destination = PeerId::from_bytes([1u8; 32]);
+    let route_id = RouteId::new(destination, StrategyChoice::Kademlia);
 
     // Initially, confidence interval should be maximum uncertainty
     let (lower, upper) = mab
@@ -431,14 +432,14 @@ async fn test_mab_adaptive_to_network_changes() {
     };
 
     let mab = MultiArmedBandit::new(config).await.unwrap();
-    let destination = NodeId::from_bytes([1u8; 32]);
+    let destination = PeerId::from_bytes([1u8; 32]);
     let strategies = vec![StrategyChoice::Kademlia, StrategyChoice::Hyperbolic];
 
     // Phase 1: Kademlia is better (90% success)
     // Use more rounds to establish stronger prior
     for _ in 0..150 {
         for strategy in &strategies {
-            let route_id = RouteId::new(destination.clone(), *strategy);
+            let route_id = RouteId::new(destination, *strategy);
             let success = match strategy {
                 StrategyChoice::Kademlia => rand::random::<f64>() < 0.9,
                 _ => rand::random::<f64>() < 0.3,
@@ -476,7 +477,7 @@ async fn test_mab_adaptive_to_network_changes() {
     // Use more rounds with even stronger signal
     for _ in 0..200 {
         for strategy in &strategies {
-            let route_id = RouteId::new(destination.clone(), *strategy);
+            let route_id = RouteId::new(destination, *strategy);
             let success = match strategy {
                 StrategyChoice::Hyperbolic => rand::random::<f64>() < 0.98,
                 _ => rand::random::<f64>() < 0.1,

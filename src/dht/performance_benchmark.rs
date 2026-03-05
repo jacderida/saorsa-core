@@ -3,8 +3,7 @@
 //! This module provides benchmarking tools to measure the performance improvements
 //! from the optimized DHT storage implementation.
 
-use crate::dht::{Key, Record, DHTConfig, DHTStorage, optimized_storage::OptimizedDHTStorage};
-use crate::PeerId;
+use crate::dht::{Key, Record, DHTConfig, DHTStorage, PeerId, optimized_storage::OptimizedDHTStorage};
 use std::collections::HashMap;
 use std::time::{Instant, Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -77,7 +76,10 @@ impl DHTPerformanceBenchmark {
         for i in 0..record_count {
             let key = Key::new(format!("test_key_{}", i).as_bytes());
             let value = format!("test_value_{}", i).into_bytes();
-            let publisher = PeerId::from(format!("publisher_{}", i % 10)); // 10 different publishers
+            let publisher = {
+                let hash = blake3::hash(format!("publisher_{}", i % 10).as_bytes());
+                PeerId::from_bytes(*hash.as_bytes())
+            }; // 10 different publishers
             let record = Record::new(key, value, publisher);
             test_data.push(record);
         }
@@ -228,7 +230,10 @@ impl DHTPerformanceBenchmark {
         for i in 0..self.test_data.len() / 2 {
             let key = Key::new(format!("expired_key_{}", i).as_bytes());
             let value = format!("expired_value_{}", i).into_bytes();
-            let publisher = PeerId::from("expired_publisher".to_string());
+            let publisher = {
+                let hash = blake3::hash(b"expired_publisher");
+                PeerId::from_bytes(*hash.as_bytes())
+            };
             let mut record = Record::new(key, value, publisher);
             
             // Set expiration to past
@@ -317,7 +322,10 @@ pub async fn demonstrate_memory_bounds() {
     for i in 0..200 {
         let key = Key::new(format!("memory_test_{}", i).as_bytes());
         let value = vec![0u8; 1024]; // 1KB records
-        let publisher = PeerId::from("memory_tester".to_string());
+        let publisher = {
+            let hash = blake3::hash(b"memory_tester");
+            PeerId::from_bytes(*hash.as_bytes())
+        };
         let record = Record::new(key, value, publisher);
         
         small_cache_storage.store(record).await.unwrap();

@@ -24,7 +24,7 @@ The saorsa-core codebase exhibits **moderate to high complexity** with some area
 | src/persistent_state.rs | 1,697 | **MEDIUM** |
 | src/dht/metrics/security_dashboard.rs | 1,490 | **MEDIUM** |
 | src/adaptive/security.rs | 1,425 | **MEDIUM** |
-| src/transport/ant_quic_adapter.rs | 1,369 | **MEDIUM** |
+| src/transport/saorsa_transport_adapter.rs | 1,369 | **MEDIUM** |
 
 ## Function Complexity Analysis
 

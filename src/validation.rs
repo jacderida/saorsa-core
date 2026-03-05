@@ -40,7 +40,7 @@
 //!
 //! #[derive(Debug)]
 //! struct NetworkMessage {
-//!     peer_id: String,
+//!     peer_id: PeerId,
 //!     payload: Vec<u8>,
 //! }
 //!
@@ -57,6 +57,7 @@
 //! }
 //! ```
 
+use crate::PeerId;
 use crate::error::{P2PError, P2pResult};
 
 use std::collections::HashMap;
@@ -67,8 +68,6 @@ use std::time::Duration;
 use thiserror::Error;
 
 // Constants for validation rules
-const MAX_PEER_ID_LENGTH: usize = 64;
-const MIN_PEER_ID_LENGTH: usize = 16;
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 const MAX_PATH_LENGTH: usize = 4096;
 const MAX_KEY_SIZE: usize = 1024 * 1024; // 1MB for DHT keys
@@ -227,27 +226,11 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 
 // ===== Peer ID Validation =====
 
-/// Validate a peer ID
-pub fn validate_peer_id(peer_id: &str) -> P2pResult<()> {
-    // Simple length and character set validation; constant-time not required here
-    if peer_id.len() < MIN_PEER_ID_LENGTH || peer_id.len() > MAX_PEER_ID_LENGTH {
-        return Err(ValidationError::InvalidPeerId(format!(
-            "Length must be between {} and {} characters",
-            MIN_PEER_ID_LENGTH, MAX_PEER_ID_LENGTH
-        ))
-        .into());
-    }
-
-    if !peer_id
-        .chars()
-        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
-    {
-        return Err(ValidationError::InvalidPeerId(
-            "Must contain only alphanumeric characters, hyphens, and underscores".to_string(),
-        )
-        .into());
-    }
-
+/// Validate a peer ID.
+///
+/// PeerId is a strongly-typed 32-byte identifier that is always valid by
+/// construction, so this is a no-op. Kept for API compatibility.
+pub fn validate_peer_id(_peer_id: &PeerId) -> P2pResult<()> {
     Ok(())
 }
 
@@ -478,14 +461,14 @@ impl RateLimiter {
 /// Network message validation
 #[derive(Debug)]
 pub struct NetworkMessage {
-    pub peer_id: String,
+    pub peer_id: PeerId,
     pub payload: Vec<u8>,
     pub timestamp: u64,
 }
 
 impl Validate for NetworkMessage {
     fn validate(&self, ctx: &ValidationContext) -> P2pResult<()> {
-        // Validate peer ID
+        // PeerId is valid by construction
         validate_peer_id(&self.peer_id)?;
 
         // Validate payload size
@@ -645,15 +628,9 @@ mod tests {
 
     #[test]
     fn test_peer_id_validation() {
-        // Valid peer IDs
-        assert!(validate_peer_id("valid_peer_id_123").is_ok());
-        assert!(validate_peer_id("PEER-ID-WITH-CAPS").is_ok());
-
-        // Invalid peer IDs
-        assert!(validate_peer_id("short").is_err()); // Too short
-        assert!(validate_peer_id(&"x".repeat(100)).is_err()); // Too long
-        assert!(validate_peer_id("invalid peer id").is_err()); // Contains space
-        assert!(validate_peer_id("peer@id").is_err()); // Invalid character
+        // PeerId is always valid by construction
+        let peer = PeerId::random();
+        assert!(validate_peer_id(&peer).is_ok());
     }
 
     #[test]
@@ -714,7 +691,7 @@ mod tests {
         let ctx = ValidationContext::default();
 
         let valid_msg = NetworkMessage {
-            peer_id: "valid_peer_id_123".to_string(),
+            peer_id: PeerId::random(),
             payload: vec![0u8; 1024],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -723,15 +700,6 @@ mod tests {
         };
 
         assert!(valid_msg.validate(&ctx).is_ok());
-
-        // Test invalid message
-        let invalid_msg = NetworkMessage {
-            peer_id: "short".to_string(),
-            payload: vec![0u8; 1024],
-            timestamp: 0,
-        };
-
-        assert!(invalid_msg.validate(&ctx).is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use proptest::prelude::*;
 use saorsa_core::dht::{DHTConfig, Key, Record, optimized_storage::OptimizedDHTStorage};
-use saorsa_core::identity::node_identity::NodeId;
+use saorsa_core::identity::node_identity::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
@@ -23,12 +23,12 @@ fn arb_key() -> impl Strategy<Value = Key> {
         })
 }
 
-/// Strategy to generate random peer IDs (NodeId)
-fn arb_peer_id() -> impl Strategy<Value = NodeId> {
+/// Strategy to generate random peer IDs (PeerId)
+fn arb_peer_id() -> impl Strategy<Value = PeerId> {
     "[a-zA-Z0-9_-]{3,20}".prop_map(|s| {
         // Create NodeId from string by hashing it
         let hash_bytes = *blake3::hash(s.as_bytes()).as_bytes();
-        NodeId::from_bytes(hash_bytes)
+        PeerId::from_bytes(hash_bytes)
     })
 }
 
@@ -181,7 +181,7 @@ proptest! {
                 let retrieved = retrieved.unwrap();
                 prop_assert_eq!(retrieved.key, record.key);
                 prop_assert_eq!(retrieved.value, record.value.clone());
-                prop_assert_eq!(retrieved.publisher, record.publisher.clone());
+                prop_assert_eq!(retrieved.publisher, record.publisher);
             }
             Ok(())
         })?;
@@ -458,7 +458,7 @@ mod deterministic_properties {
                     key
                 },
                 format!("value_{}", i).into_bytes(),
-                NodeId::from_bytes(
+                PeerId::from_bytes(
                     *blake3::hash(format!("publisher_{}", i % 3).as_bytes()).as_bytes(),
                 ),
             );
@@ -483,7 +483,7 @@ mod deterministic_properties {
                     key
                 },
                 format!("data_for_{}", publisher).into_bytes(),
-                NodeId::from_bytes(*blake3::hash(publisher.as_bytes()).as_bytes()),
+                PeerId::from_bytes(*blake3::hash(publisher.as_bytes()).as_bytes()),
             );
             storage.store(record).await?;
         }
@@ -509,7 +509,7 @@ mod deterministic_properties {
                 key
             },
             b"expired_data".to_vec(),
-            NodeId::from_bytes(*blake3::hash(b"expired_publisher").as_bytes()),
+            PeerId::from_bytes(*blake3::hash(b"expired_publisher").as_bytes()),
         );
         expired_record.expires_at = SystemTime::now() - Duration::from_secs(3600);
 

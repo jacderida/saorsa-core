@@ -55,7 +55,11 @@ impl ControlMessageHandler {
                 } = event
                     && topic == "control"
                 {
-                    self.handle_control_message(&source, &data).await;
+                    let source_str = source
+                        .as_ref()
+                        .map(|id| id.to_hex())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.handle_control_message(&source_str, &data).await;
                 }
             }
 

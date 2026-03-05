@@ -1,6 +1,6 @@
 # Saorsa Network Infrastructure
 
-This document describes the VPS infrastructure used for running bootstrap nodes, relay nodes, and test nodes across the Saorsa ecosystem (ant-quic, saorsa-node, communitas).
+This document describes the VPS infrastructure used for running bootstrap nodes, relay nodes, and test nodes across the Saorsa ecosystem (saorsa-transport, saorsa-node, communitas).
 
 ## Node Overview
 
@@ -22,7 +22,7 @@ Each network uses a dedicated port RANGE to allow running multiple instances on 
 
 | Service | UDP Port Range | Default | Description |
 |---------|----------------|---------|-------------|
-| ant-quic | 9000-9999 | 9000 | QUIC transport layer testing |
+| saorsa-transport | 9000-9999 | 9000 | QUIC transport layer testing |
 | saorsa-node | 10000-10999 | 10000 | Core P2P network nodes |
 | communitas | 11000-11999 | 11000 | Collaboration platform nodes |
 
@@ -51,7 +51,7 @@ saorsa-9.saorsalabs.com  →  45.77.176.184
 
 ## Bootstrap Endpoints
 
-### ant-quic Bootstrap
+### saorsa-transport Bootstrap
 ```
 saorsa-2.saorsalabs.com:9000
 saorsa-3.saorsalabs.com:9000
@@ -124,7 +124,7 @@ Applied to all nodes tagged with `saorsa`:
 - TCP 22 (SSH)
 - TCP 80 (HTTP)
 - TCP 443 (HTTPS)
-- UDP 9000 (ant-quic)
+- UDP 9000 (saorsa-transport)
 - UDP 10000 (saorsa-node)
 - UDP 11000 (communitas)
 
@@ -140,7 +140,7 @@ Applied to all saorsa servers:
 - TCP 22 (SSH)
 - TCP 80 (HTTP)
 - TCP 443 (HTTPS)
-- UDP 9000 (ant-quic)
+- UDP 9000 (saorsa-transport)
 - UDP 10000 (saorsa-node)
 - UDP 11000 (communitas)
 - ICMP
@@ -197,11 +197,11 @@ VULTR_API_KEY="$VULTR_API_TOKEN" vultr-cli instance create \
 
 ## Running Bootstrap Nodes
 
-### ant-quic Bootstrap
+### saorsa-transport Bootstrap
 ```bash
 # On saorsa-2 or saorsa-3
-cd /opt/ant-quic
-./ant-quic-node --listen 0.0.0.0:9000 --bootstrap
+cd /opt/saorsa-transport
+./saorsa-transport-node --listen 0.0.0.0:9000 --bootstrap
 ```
 
 ### saorsa-node Bootstrap
@@ -220,17 +220,17 @@ cd /opt/communitas
 
 ## Systemd Service Templates
 
-### ant-quic Bootstrap Service
+### saorsa-transport Bootstrap Service
 ```ini
-# /etc/systemd/system/ant-quic-bootstrap.service
+# /etc/systemd/system/saorsa-transport-bootstrap.service
 [Unit]
-Description=ant-quic Bootstrap Node
+Description=saorsa-transport Bootstrap Node
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/opt/ant-quic/ant-quic-node --listen 0.0.0.0:9000 --bootstrap
+ExecStart=/opt/saorsa-transport/saorsa-transport-node --listen 0.0.0.0:9000 --bootstrap
 Restart=always
 RestartSec=10
 
@@ -298,7 +298,7 @@ nc -vzu saorsa-2.saorsalabs.com 11000
 
 ### Check Service Status (on node)
 ```bash
-systemctl status ant-quic-bootstrap
+systemctl status saorsa-transport-bootstrap
 systemctl status saorsa-node-bootstrap
 systemctl status communitas-bootstrap
 ```
@@ -346,16 +346,16 @@ apt update && apt upgrade -y
 
 ### Restart Services
 ```bash
-systemctl restart ant-quic-bootstrap
+systemctl restart saorsa-transport-bootstrap
 systemctl restart saorsa-node-bootstrap
 systemctl restart communitas-bootstrap
 ```
 
 ### Deploy New Binary
 ```bash
-# Example: deploy ant-quic update
-scp target/release/ant-quic-node root@saorsa-2.saorsalabs.com:/opt/ant-quic/
-ssh root@saorsa-2.saorsalabs.com "systemctl restart ant-quic-bootstrap"
+# Example: deploy saorsa-transport update
+scp target/release/saorsa-transport-node root@saorsa-2.saorsalabs.com:/opt/saorsa-transport/
+ssh root@saorsa-2.saorsalabs.com "systemctl restart saorsa-transport-bootstrap"
 ```
 
 ## Troubleshooting
@@ -386,7 +386,7 @@ ssh root@saorsa-2.saorsalabs.com "systemctl restart ant-quic-bootstrap"
 
 ## Related Documentation
 
-- [ant-quic README](https://github.com/maidsafe/ant-quic)
+- [saorsa-transport README](https://github.com/maidsafe/saorsa-transport)
 - [saorsa-gossip](../../../saorsa-gossip/README.md)
 - [communitas Architecture](../architecture/README.md)
 - [Port Allocation](./PORTS.md)

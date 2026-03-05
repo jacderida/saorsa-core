@@ -27,8 +27,8 @@
 // use super::*; // Removed unused import
 use super::ContentHash;
 use super::eviction::{CacheState, EvictionStrategy, EvictionStrategyType};
+use crate::PeerId;
 use crate::Result;
-use crate::identity::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -112,7 +112,7 @@ pub enum CacheAction {
     /// Replicate content to another node
     Replicate {
         content: ContentHash,
-        target: NodeId,
+        target: PeerId,
     },
     /// Do nothing
     DoNothing,
@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn test_action_types() {
         let content_hash = ContentHash([1u8; 32]);
-        let node_id = NodeId([2u8; 32]);
+        let peer_id = PeerId([2u8; 32]);
 
         let cache_action = CacheAction::Cache(content_hash);
         assert_eq!(cache_action.action_type(), ActionType::Cache);
@@ -788,7 +788,7 @@ mod tests {
 
         let replicate_action = CacheAction::Replicate {
             content: content_hash,
-            target: node_id,
+            target: peer_id,
         };
         assert_eq!(replicate_action.action_type(), ActionType::Replicate);
 

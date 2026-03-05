@@ -16,6 +16,7 @@
 //! Implements greedy routing in hyperbolic space using the Poincaré disk model
 
 use super::*;
+use crate::PeerId;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ pub struct HyperbolicSpace {
     my_coordinate: RwLock<HyperbolicCoordinate>,
 
     /// Neighbor coordinates
-    neighbor_coordinates: Arc<RwLock<HashMap<NodeId, HyperbolicCoordinate>>>,
+    neighbor_coordinates: Arc<RwLock<HashMap<PeerId, HyperbolicCoordinate>>>,
 
     /// Coordinate adjustment rate
     adjustment_rate: f64,
@@ -68,7 +69,7 @@ impl HyperbolicSpace {
     }
 
     /// Test helper: expose neighbor map for read access
-    pub fn neighbors_arc(&self) -> Arc<RwLock<HashMap<NodeId, HyperbolicCoordinate>>> {
+    pub fn neighbors_arc(&self) -> Arc<RwLock<HashMap<PeerId, HyperbolicCoordinate>>> {
         Arc::clone(&self.neighbor_coordinates)
     }
 
@@ -93,7 +94,7 @@ impl HyperbolicSpace {
     }
 
     /// Perform greedy routing to find next hop
-    pub async fn greedy_route(&self, target: &HyperbolicCoordinate) -> Option<NodeId> {
+    pub async fn greedy_route(&self, target: &HyperbolicCoordinate) -> Option<PeerId> {
         let my_coord = self.my_coordinate.read().await;
         let my_distance = Self::distance(&my_coord, target);
         let epsilon = 1e-9;
@@ -104,7 +105,7 @@ impl HyperbolicSpace {
             .filter_map(|(id, coord)| {
                 let dist = Self::distance(coord, target);
                 if dist + epsilon < my_distance {
-                    Some((id.clone(), dist))
+                    Some((*id, dist))
                 } else {
                     None
                 }
@@ -118,7 +119,7 @@ impl HyperbolicSpace {
     }
 
     /// Adjust our coordinate based on neighbor positions
-    pub async fn adjust_coordinate(&self, neighbor_coords: &[(NodeId, HyperbolicCoordinate)]) {
+    pub async fn adjust_coordinate(&self, neighbor_coords: &[(PeerId, HyperbolicCoordinate)]) {
         let mut my_coord = self.my_coordinate.write().await;
 
         // Adjust radial coordinate based on degree and neighbors' radial positions
@@ -163,13 +164,13 @@ impl HyperbolicSpace {
     }
 
     /// Update a neighbor's coordinate
-    pub async fn update_neighbor(&self, node_id: NodeId, coord: HyperbolicCoordinate) {
+    pub async fn update_neighbor(&self, node_id: PeerId, coord: HyperbolicCoordinate) {
         let mut neighbors = self.neighbor_coordinates.write().await;
         neighbors.insert(node_id, coord);
     }
 
     /// Remove a neighbor
-    pub async fn remove_neighbor(&self, node_id: &NodeId) {
+    pub async fn remove_neighbor(&self, node_id: &PeerId) {
         let mut neighbors = self.neighbor_coordinates.write().await;
         neighbors.remove(node_id);
     }
@@ -240,7 +241,7 @@ pub struct HyperbolicRoutingStrategy {
     space: Arc<HyperbolicSpace>,
 
     /// Local node ID
-    local_id: NodeId,
+    local_id: PeerId,
 
     /// Maximum hops before declaring failure
     max_hops: usize,
@@ -248,7 +249,7 @@ pub struct HyperbolicRoutingStrategy {
 
 impl HyperbolicRoutingStrategy {
     /// Create a new hyperbolic routing strategy
-    pub fn new(local_id: NodeId, space: Arc<HyperbolicSpace>) -> Self {
+    pub fn new(local_id: PeerId, space: Arc<HyperbolicSpace>) -> Self {
         Self {
             space,
             local_id,
@@ -257,7 +258,7 @@ impl HyperbolicRoutingStrategy {
     }
 
     /// Find path using greedy hyperbolic routing
-    async fn find_hyperbolic_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn find_hyperbolic_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Check if we have the target's coordinate
         let target_coord = {
             let neighbors = self.space.neighbor_coordinates.read().await;
@@ -278,9 +279,9 @@ impl HyperbolicRoutingStrategy {
         };
 
         let mut path = Vec::new();
-        let mut _current = self.local_id.clone();
-        let mut visited = std::collections::HashSet::<NodeId>::new();
-        visited.insert(_current.clone());
+        let mut _current = self.local_id;
+        let mut visited = std::collections::HashSet::<PeerId>::new();
+        visited.insert(_current);
 
         // Greedy routing with loop detection
         for _ in 0..self.max_hops {
@@ -305,8 +306,8 @@ impl HyperbolicRoutingStrategy {
                         ));
                     }
 
-                    path.push(next.clone());
-                    visited.insert(next.clone());
+                    path.push(next);
+                    visited.insert(next);
                     _current = next;
                 }
                 None => {
@@ -334,7 +335,7 @@ impl HyperbolicRoutingStrategy {
 
 #[async_trait]
 impl RoutingStrategy for HyperbolicRoutingStrategy {
-    async fn find_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         // Try hyperbolic routing
         let result = self.find_hyperbolic_path(target).await;
 
@@ -351,13 +352,13 @@ impl RoutingStrategy for HyperbolicRoutingStrategy {
         result
     }
 
-    fn route_score(&self, _neighbor: &NodeId, _target: &NodeId) -> f64 {
+    fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
         // This is synchronous, so we can't access async coordinates
         // Return a default score - the actual routing logic is in find_path
         0.5
     }
 
-    fn update_metrics(&self, _path: &[NodeId], _success: bool) {
+    fn update_metrics(&self, _path: &[PeerId], _success: bool) {
         // Metrics are updated in find_path via record_routing_result
     }
 }
@@ -412,11 +413,11 @@ mod tests {
 
         let neighbors = vec![
             (
-                NodeId::from_bytes(hash1),
+                PeerId::from_bytes(hash1),
                 HyperbolicCoordinate { r: 0.9, theta: 0.0 },
             ),
             (
-                NodeId::from_bytes(hash2),
+                PeerId::from_bytes(hash2),
                 HyperbolicCoordinate {
                     r: 0.9,
                     theta: std::f64::consts::PI,
@@ -459,38 +460,32 @@ mod tests {
 
         let mut hash = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash);
-        let local_id = NodeId::from_bytes(hash);
+        let local_id = PeerId::from_bytes(hash);
 
-        let strategy = HyperbolicRoutingStrategy::new(local_id.clone(), space.clone());
+        let strategy = HyperbolicRoutingStrategy::new(local_id, space.clone());
 
         // Add some neighbors with coordinates
         let mut hash1 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash1);
-        let neighbor1 = NodeId::from_bytes(hash1);
+        let neighbor1 = PeerId::from_bytes(hash1);
 
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);
-        let neighbor2 = NodeId::from_bytes(hash2);
+        let neighbor2 = PeerId::from_bytes(hash2);
 
         let mut hash_target = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash_target);
-        let target = NodeId::from_bytes(hash_target);
+        let target = PeerId::from_bytes(hash_target);
 
         // Set up coordinates
         space
-            .update_neighbor(
-                neighbor1.clone(),
-                HyperbolicCoordinate { r: 0.3, theta: 0.0 },
-            )
+            .update_neighbor(neighbor1, HyperbolicCoordinate { r: 0.3, theta: 0.0 })
             .await;
         space
-            .update_neighbor(
-                neighbor2.clone(),
-                HyperbolicCoordinate { r: 0.7, theta: 1.0 },
-            )
+            .update_neighbor(neighbor2, HyperbolicCoordinate { r: 0.7, theta: 1.0 })
             .await;
         space
-            .update_neighbor(target.clone(), HyperbolicCoordinate { r: 0.8, theta: 1.5 })
+            .update_neighbor(target, HyperbolicCoordinate { r: 0.8, theta: 1.5 })
             .await;
 
         // Try routing to target
@@ -517,14 +512,14 @@ mod tests {
         for i in 0..5 {
             let mut hash = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut hash);
-            let node_id = NodeId::from_bytes(hash);
+            let node_id = PeerId::from_bytes(hash);
 
             let coord = HyperbolicCoordinate {
                 r: 0.1 + (i as f64) * 0.2,
                 theta: (i as f64) * std::f64::consts::PI / 3.0,
             };
 
-            space.update_neighbor(node_id.clone(), coord).await;
+            space.update_neighbor(node_id, coord).await;
             neighbors.push((node_id, coord));
         }
 

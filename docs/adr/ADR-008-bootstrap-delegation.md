@@ -28,7 +28,7 @@ Building a robust bootstrap cache requires:
 - Merging caches from different sources
 - Protection against cache poisoning
 
-The MaidSafe ecosystem has already solved these problems in `ant-quic`, which provides:
+The MaidSafe ecosystem has already solved these problems in `saorsa-transport`, which provides:
 - Persistent peer cache with quality metrics
 - Automatic cache merging
 - Connection history tracking
@@ -36,7 +36,7 @@ The MaidSafe ecosystem has already solved these problems in `ant-quic`, which pr
 
 ## Decision
 
-We **delegate bootstrap cache management to ant-quic**, adding a thin wrapper that provides Sybil protection specific to saorsa-core.
+We **delegate bootstrap cache management to saorsa-transport**, adding a thin wrapper that provides Sybil protection specific to saorsa-core.
 
 ### Architecture
 
@@ -55,7 +55,7 @@ We **delegate bootstrap cache management to ant-quic**, adding a thin wrapper th
 │  │                          │                               │   │
 │  │                          ▼                               │   │
 │  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │            ant-quic BootstrapCache                  │ │   │
+│  │  │            saorsa-transport BootstrapCache                  │ │   │
 │  │  │ • Persistent storage (JSON/binary)                 │ │   │
 │  │  │ • Quality metrics per contact                      │ │   │
 │  │  │ • Connection history                               │ │   │
@@ -71,10 +71,10 @@ We **delegate bootstrap cache management to ant-quic**, adding a thin wrapper th
 ```rust
 // src/bootstrap/manager.rs
 
-use ant_quic::BootstrapCache as AntBootstrapCache;
+use saorsa_transport::BootstrapCache as AntBootstrapCache;
 
 pub struct BootstrapManager {
-    /// Delegated cache (ant-quic handles persistence, merging)
+    /// Delegated cache (saorsa-transport handles persistence, merging)
     cache: Arc<AntBootstrapCache>,
 
     /// Sybil protection: rate limiting per IP/subnet
@@ -106,7 +106,7 @@ impl BootstrapManager {
         rate_limit_config: JoinRateLimiterConfig,
         diversity_config: IPDiversityConfig,
     ) -> Result<Self> {
-        // Create ant-quic cache (handles persistence internally)
+        // Create saorsa-transport cache (handles persistence internally)
         let ant_config = cache_config.to_ant_config()?;
         let cache = AntBootstrapCache::new(ant_config).await?;
 
@@ -137,7 +137,7 @@ impl BootstrapManager {
             }
         }
 
-        // 3. Delegate to ant-quic (handles storage, quality metrics)
+        // 3. Delegate to saorsa-transport (handles storage, quality metrics)
         self.cache.add_contact(addr.into()).await?;
 
         Ok(())
@@ -160,7 +160,7 @@ impl BootstrapManager {
         success: bool,
         latency: Option<Duration>,
     ) {
-        // Delegate to ant-quic
+        // Delegate to saorsa-transport
         self.cache.record_connection(addr.into(), success, latency).await;
     }
 }
@@ -170,11 +170,11 @@ impl BootstrapManager {
 
 | Responsibility | Handler | Rationale |
 |---------------|---------|-----------|
-| Persistent storage | ant-quic | Battle-tested, efficient format |
-| Quality scoring | ant-quic | Complex metrics already implemented |
-| Cache merging | ant-quic | Handles conflicts correctly |
-| Connection history | ant-quic | Tracks success/failure patterns |
-| Stale contact cleanup | ant-quic | Time-based expiration logic |
+| Persistent storage | saorsa-transport | Battle-tested, efficient format |
+| Quality scoring | saorsa-transport | Complex metrics already implemented |
+| Cache merging | saorsa-transport | Handles conflicts correctly |
+| Connection history | saorsa-transport | Tracks success/failure patterns |
+| Stale contact cleanup | saorsa-transport | Time-based expiration logic |
 
 ### What We Add
 
@@ -276,17 +276,17 @@ impl IPDiversityEnforcer {
 
 ### Positive
 
-1. **Reduced maintenance**: ant-quic handles complex cache logic
+1. **Reduced maintenance**: saorsa-transport handles complex cache logic
 2. **Proven reliability**: Cache code battle-tested in MaidSafe networks
 3. **Sybil protection**: Saorsa-specific protections layer on top
 4. **Consistent behavior**: Transport and bootstrap use same peer format
-5. **Automatic updates**: ant-quic improvements benefit us
+5. **Automatic updates**: saorsa-transport improvements benefit us
 
 ### Negative
 
-1. **Version coupling**: Must track ant-quic releases
+1. **Version coupling**: Must track saorsa-transport releases
 2. **Less control**: Cannot modify cache internals directly
-3. **Feature limitations**: Constrained to ant-quic's capabilities
+3. **Feature limitations**: Constrained to saorsa-transport's capabilities
 
 ### Neutral
 
@@ -296,13 +296,13 @@ impl IPDiversityEnforcer {
 ## Migration from Previous Implementation
 
 The previous saorsa-core bootstrap (pre-0.4.0) had:
-- Custom cache format (incompatible with ant-quic)
+- Custom cache format (incompatible with saorsa-transport)
 - Separate merge/discovery modules
 - Duplicated quality metrics
 
 Migration steps:
 1. Remove old `cache.rs`, `merge.rs`, `discovery.rs`
-2. Update `manager.rs` to wrap ant-quic
+2. Update `manager.rs` to wrap saorsa-transport
 3. Keep `contact.rs` for ContactEntry types
 4. Update exports in `lib.rs`
 
@@ -319,9 +319,9 @@ Implement all bootstrap cache logic in saorsa-core.
 - Divergence from upstream fixes
 - Maintenance burden
 
-### Fork ant-quic Cache
+### Fork saorsa-transport Cache
 
-Copy ant-quic cache code and modify.
+Copy saorsa-transport cache code and modify.
 
 **Rejected because**:
 - Loses upstream improvements
@@ -339,7 +339,7 @@ Use a generic caching library.
 
 ## References
 
-- [ant-quic BootstrapCache](https://github.com/maidsafe/ant-quic)
-- [ADR-002: Delegated Transport via ant-quic](./ADR-002-delegated-transport.md)
+- [saorsa-transport BootstrapCache](https://github.com/maidsafe/saorsa-transport)
+- [ADR-002: Delegated Transport via saorsa-transport](./ADR-002-delegated-transport.md)
 - [ADR-009: Sybil Protection Mechanisms](./ADR-009-sybil-protection.md)
 - [Bootstrap Problems in P2P Networks](https://ieeexplore.ieee.org/document/4146944)

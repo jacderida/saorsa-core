@@ -75,7 +75,7 @@ use tokio::task::JoinHandle;
 use super::fitness::{
     FitnessConfig, FitnessMetrics, FitnessMonitor, FitnessVerdict, SharedFitnessMonitor,
 };
-use super::node_identity::{NodeId, NodeIdentity};
+use super::node_identity::{NodeIdentity, PeerId};
 use super::regeneration::{
     RegenerationConfig, RegenerationDecision, RegenerationReason, RegenerationTrigger,
     SharedRegenerationTrigger,
@@ -145,7 +145,7 @@ pub enum IdentitySystemEvent {
         /// Reason for regeneration.
         reason: RegenerationReason,
         /// Old node ID.
-        old_node_id: NodeId,
+        old_peer_id: PeerId,
         /// Target region (if any).
         target: Option<TargetRegion>,
     },
@@ -153,9 +153,9 @@ pub enum IdentitySystemEvent {
     /// Identity was changed (regeneration completed).
     IdentityChanged {
         /// Old node ID.
-        old_node_id: NodeId,
+        old_peer_id: PeerId,
         /// New node ID.
-        new_node_id: NodeId,
+        new_peer_id: PeerId,
         /// Whether it succeeded (was accepted by network).
         succeeded: bool,
     },
@@ -165,7 +165,7 @@ pub enum IdentitySystemEvent {
         /// Reason for restart.
         reason: String,
         /// New identity to use.
-        new_identity: NodeId,
+        new_identity: PeerId,
     },
 
     /// Rejection received from network.
@@ -267,10 +267,9 @@ pub struct RestartManager {
 impl RestartManager {
     /// Create a new restart manager.
     pub async fn new(config: RestartConfig, identity: NodeIdentity) -> Result<Arc<Self>> {
-        let node_id = identity.node_id().clone();
+        let node_id = *identity.peer_id();
 
-        let fitness_monitor =
-            Arc::new(FitnessMonitor::new(config.fitness.clone(), node_id.clone()));
+        let fitness_monitor = Arc::new(FitnessMonitor::new(config.fitness.clone(), node_id));
 
         let regeneration_trigger = Arc::new(RegenerationTrigger::new(config.regeneration.clone()));
 
@@ -298,8 +297,8 @@ impl RestartManager {
     }
 
     /// Get the current node ID.
-    pub async fn current_node_id(&self) -> NodeId {
-        self.current_identity.read().await.node_id().clone()
+    pub async fn current_peer_id(&self) -> PeerId {
+        *self.current_identity.read().await.peer_id()
     }
 
     /// Get the fitness monitor.
@@ -382,7 +381,7 @@ impl RestartManager {
     ///
     /// This generates a new identity targeting better keyspace regions.
     pub async fn regenerate(&self, reason: RegenerationReason) -> Result<NodeIdentity> {
-        let old_node_id = self.current_node_id().await;
+        let old_peer_id = self.current_peer_id().await;
 
         // Get target from persistent state
         let target = self.persistent_state.read().await.last_target.clone();
@@ -392,20 +391,20 @@ impl RestartManager {
             .event_tx
             .send(IdentitySystemEvent::RegenerationTriggered {
                 reason: reason.clone(),
-                old_node_id: old_node_id.clone(),
+                old_peer_id,
                 target: target.clone(),
             });
 
         // Record attempt
         self.regeneration_trigger
-            .record_attempt(old_node_id.clone(), reason);
+            .record_attempt(old_peer_id, reason);
 
         // Generate targeted identity
         let new_identity = self
             .identity_targeter
             .generate_targeted_identity(target.as_ref())?;
 
-        let new_node_id = new_identity.node_id().clone();
+        let new_peer_id = *new_identity.peer_id();
 
         // Export the identity data so we can create a copy for the caller
         let identity_data = new_identity.export();
@@ -418,8 +417,8 @@ impl RestartManager {
 
         // Emit identity changed event (success TBD by network acceptance)
         let _ = self.event_tx.send(IdentitySystemEvent::IdentityChanged {
-            old_node_id,
-            new_node_id: new_node_id.clone(),
+            old_peer_id,
+            new_peer_id,
             succeeded: true, // Will be updated by record_regeneration_result
         });
 
@@ -433,9 +432,9 @@ impl RestartManager {
     }
 
     /// Record the result of a regeneration attempt.
-    pub async fn record_regeneration_result(&self, new_node_id: &NodeId, succeeded: bool) {
+    pub async fn record_regeneration_result(&self, new_peer_id: &PeerId, succeeded: bool) {
         self.regeneration_trigger
-            .record_result(new_node_id.clone(), succeeded);
+            .record_result(*new_peer_id, succeeded);
 
         let mut state = self.persistent_state.write().await;
         if succeeded {
@@ -445,18 +444,17 @@ impl RestartManager {
             state.consecutive_failures += 1;
 
             // Record as rejected for targeting
-            self.identity_targeter
-                .record_rejected_node_id(new_node_id.clone());
+            self.identity_targeter.record_rejected_peer_id(*new_peer_id);
         }
     }
 
     /// Request a full restart with the current identity.
     pub async fn request_restart(&self, reason: impl Into<String>) -> Result<()> {
-        let new_node_id = self.current_node_id().await;
+        let new_peer_id = self.current_peer_id().await;
 
         let _ = self.event_tx.send(IdentitySystemEvent::RestartRequested {
             reason: reason.into(),
-            new_identity: new_node_id,
+            new_identity: new_peer_id,
         });
 
         // Persist state before restart
@@ -620,7 +618,7 @@ impl RestartManager {
         let state = self.persistent_state.read().await;
 
         RestartManagerStatus {
-            node_id: self.current_node_id().await,
+            peer_id: self.current_peer_id().await,
             fitness_verdict: metrics.verdict,
             overall_fitness_score: metrics.overall_score(),
             monitoring_active: self.is_monitoring().await,
@@ -670,7 +668,7 @@ impl Drop for RestartManager {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartManagerStatus {
     /// Current node ID.
-    pub node_id: NodeId,
+    pub peer_id: PeerId,
 
     /// Current fitness verdict.
     pub fitness_verdict: FitnessVerdict,
@@ -853,15 +851,15 @@ mod tests {
     async fn test_regenerate() {
         let config = RestartConfig::default();
         let identity = test_identity();
-        let old_node_id = identity.node_id().clone();
+        let old_node_id = *identity.peer_id();
         let manager = RestartManager::new(config, identity).await.unwrap();
 
         let new_identity = manager.regenerate(RegenerationReason::Manual).await;
         assert!(new_identity.is_ok());
 
         // Node ID should have changed
-        let new_node_id = manager.current_node_id().await;
-        assert_ne!(old_node_id, new_node_id);
+        let new_peer_id = manager.current_peer_id().await;
+        assert_ne!(old_node_id, new_peer_id);
     }
 
     #[tokio::test]
@@ -950,7 +948,7 @@ mod tests {
     #[test]
     fn test_restart_manager_status_is_healthy() {
         let status = RestartManagerStatus {
-            node_id: NodeId([0; 32]),
+            peer_id: PeerId([0; 32]),
             fitness_verdict: FitnessVerdict::Healthy,
             overall_fitness_score: 0.95,
             monitoring_active: true,
@@ -968,7 +966,7 @@ mod tests {
     #[test]
     fn test_restart_manager_status_unhealthy() {
         let status = RestartManagerStatus {
-            node_id: NodeId([0; 32]),
+            peer_id: PeerId([0; 32]),
             fitness_verdict: FitnessVerdict::Unfit,
             overall_fitness_score: 0.3,
             monitoring_active: true,

@@ -261,8 +261,8 @@ pub struct PlatformBinary {
     /// Download URL for the binary.
     pub url: String,
 
-    /// SHA-256 hash of the binary (hex encoded).
-    pub sha256: String,
+    /// BLAKE3 hash of the binary (hex encoded).
+    pub hash: String,
 
     /// ML-DSA-65 signature of the binary (base64).
     pub signature: String,
@@ -276,13 +276,13 @@ impl PlatformBinary {
     #[must_use]
     pub fn new(
         url: impl Into<String>,
-        sha256: impl Into<String>,
+        hash: impl Into<String>,
         signature: impl Into<String>,
         size: u64,
     ) -> Self {
         Self {
             url: url.into(),
-            sha256: sha256.into(),
+            hash: hash.into(),
             signature: signature.into(),
             size,
         }
@@ -309,7 +309,7 @@ mod tests {
                     "binaries": {
                         "linux-x64": {
                             "url": "https://example.com/binary-linux-x64",
-                            "sha256": "abc123",
+                            "hash": "abc123",
                             "signature": "sig123",
                             "size": 10000
                         }
@@ -393,7 +393,7 @@ mod tests {
         let binary = PlatformBinary::new("https://example.com/binary", "abc123", "sig456", 1000);
 
         assert_eq!(binary.url, "https://example.com/binary");
-        assert_eq!(binary.sha256, "abc123");
+        assert_eq!(binary.hash, "abc123");
         assert_eq!(binary.signature, "sig456");
         assert_eq!(binary.size, 1000);
     }

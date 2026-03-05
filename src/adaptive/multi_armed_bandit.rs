@@ -24,6 +24,7 @@
 
 use super::beta_distribution::BetaDistribution;
 use super::*;
+use crate::PeerId;
 use crate::error::ConfigError;
 use crate::{P2PError, Result};
 use async_trait::async_trait;
@@ -41,14 +42,14 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteId {
     /// Node ID of the destination
-    pub node_id: NodeId,
+    pub node_id: PeerId,
     /// Strategy used for routing
     pub strategy: StrategyChoice,
 }
 
 impl RouteId {
     /// Create a new route identifier
-    pub fn new(node_id: NodeId, strategy: StrategyChoice) -> Self {
+    pub fn new(node_id: PeerId, strategy: StrategyChoice) -> Self {
         Self { node_id, strategy }
     }
 }
@@ -190,7 +191,7 @@ impl MultiArmedBandit {
     /// Select the best route for a given destination and content type
     pub async fn select_route(
         &self,
-        destination: &NodeId,
+        destination: &PeerId,
         content_type: ContentType,
         available_strategies: &[StrategyChoice],
     ) -> Result<RouteDecision> {
@@ -207,7 +208,7 @@ impl MultiArmedBandit {
             // Random exploration
             let strategy =
                 available_strategies[rand::random::<usize>() % available_strategies.len()];
-            let route_id = RouteId::new(destination.clone(), strategy);
+            let route_id = RouteId::new(*destination, strategy);
 
             let stats = statistics
                 .entry((route_id.clone(), content_type))
@@ -234,7 +235,7 @@ impl MultiArmedBandit {
         let mut best_stats = RouteStatistics::default();
 
         for strategy in available_strategies {
-            let route_id = RouteId::new(destination.clone(), *strategy);
+            let route_id = RouteId::new(*destination, *strategy);
             let key = (route_id.clone(), content_type);
 
             let stats = statistics.entry(key).or_default();
@@ -478,7 +479,7 @@ impl MultiArmedBandit {
                             let len = b.len().min(32);
                             node_bytes[..len].copy_from_slice(&b[..len]);
                         }
-                        let node = crate::peer_record::UserId::from_bytes(node_bytes);
+                        let node = crate::peer_record::PeerId::from_bytes(node_bytes);
                         let strategy_str = route_id_v
                             .get("strategy")
                             .and_then(|s| s.as_str())
@@ -554,7 +555,7 @@ impl MultiArmedBandit {
         let export_stats: Vec<serde_json::Value> = statistics
             .iter()
             .map(|((rid, ct), st)| {
-                let node_hex = hex::encode(rid.node_id.as_bytes());
+                let node_hex = hex::encode(rid.node_id.to_bytes());
                 serde_json::json!({
                     "route_id": {"node_id": node_hex, "strategy": format!("{:?}", rid.strategy)},
                     "content_type": format!("{:?}", ct),
@@ -597,7 +598,7 @@ pub trait MABRoutingStrategy: Send + Sync {
     /// Select route using MAB optimization
     async fn select_mab_route(
         &self,
-        destination: &NodeId,
+        destination: &PeerId,
         content_type: ContentType,
     ) -> Result<RouteDecision>;
 
@@ -638,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_selection() {
         let mab = create_test_mab().await;
-        let destination = NodeId::from_bytes([1u8; 32]);
+        let destination = PeerId::from_bytes([1u8; 32]);
         let strategies = vec![
             StrategyChoice::Kademlia,
             StrategyChoice::Hyperbolic,
@@ -657,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn test_route_update() {
         let mab = create_test_mab().await;
-        let route_id = RouteId::new(NodeId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
+        let route_id = RouteId::new(PeerId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
 
         // Update with success
         let outcome = Outcome {
@@ -680,12 +681,12 @@ mod tests {
     #[tokio::test]
     async fn test_thompson_sampling_convergence() {
         let mab = create_test_mab().await;
-        let destination = NodeId::from_bytes([1u8; 32]);
+        let destination = PeerId::from_bytes([1u8; 32]);
         let strategies = vec![StrategyChoice::Kademlia, StrategyChoice::Hyperbolic];
 
         // Simulate Kademlia being better (80% success rate)
         for _ in 0..100 {
-            let route_id = RouteId::new(destination.clone(), StrategyChoice::Kademlia);
+            let route_id = RouteId::new(destination, StrategyChoice::Kademlia);
             let success = rand::random::<f64>() < 0.8;
             let outcome = Outcome {
                 success,
@@ -699,7 +700,7 @@ mod tests {
 
         // Simulate Hyperbolic being worse (30% success rate)
         for _ in 0..100 {
-            let route_id = RouteId::new(destination.clone(), StrategyChoice::Hyperbolic);
+            let route_id = RouteId::new(destination, StrategyChoice::Hyperbolic);
             let success = rand::random::<f64>() < 0.3;
             let outcome = Outcome {
                 success,
@@ -743,7 +744,7 @@ mod tests {
         let mab = MultiArmedBandit::new(config.clone()).await.unwrap();
 
         // Add some statistics
-        let route_id = RouteId::new(NodeId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
+        let route_id = RouteId::new(PeerId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
         let outcome = Outcome {
             success: true,
             latency_ms: 50,
@@ -769,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn test_confidence_intervals() {
         let mab = create_test_mab().await;
-        let route_id = RouteId::new(NodeId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
+        let route_id = RouteId::new(PeerId::from_bytes([1u8; 32]), StrategyChoice::Kademlia);
 
         // Initially, confidence interval should be wide (high uncertainty)
         let (lower, upper) = mab

@@ -13,13 +13,13 @@
 
 //! Cryptographic identity system for the adaptive P2P network
 //!
-//! Implements PQC identity using ML-DSA-65 via ant-quic integration.
+//! Implements PQC identity using ML-DSA-65 via saorsa-transport integration.
 
 use super::*;
+use crate::PeerId;
 use crate::identity::node_identity as pqc_identity;
-use crate::quantum_crypto::ant_quic_integration::MlDsaSignature;
+use crate::quantum_crypto::saorsa_transport_integration::MlDsaSignature;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Node identity with cryptographic keys
@@ -34,7 +34,7 @@ pub struct SignedMessage<T: Serialize> {
     /// Message payload
     pub payload: T,
     /// Sender's node ID
-    pub sender_id: NodeId,
+    pub sender_id: PeerId,
     /// Unix timestamp
     pub timestamp: u64,
     /// ML-DSA signature bytes
@@ -54,9 +54,9 @@ impl NodeIdentity {
         Err(AdaptiveNetworkError::Other("unsupported".into()))
     }
 
-    /// Compute node ID from public key (SHA-256 hash)
-    pub fn compute_node_id(_unused: &()) -> NodeId {
-        self::super::NodeId::from_bytes([0u8; 32])
+    /// Compute node ID from public key (BLAKE3 hash)
+    pub fn compute_node_id(_unused: &()) -> PeerId {
+        self::super::PeerId::from_bytes([0u8; 32])
     }
 
     /// Sign a message
@@ -81,15 +81,15 @@ impl NodeIdentity {
             .map_err(|e| AdaptiveNetworkError::Other(format!("{}", e)))?;
         Ok(SignedMessage {
             payload: message.clone(),
-            sender_id: self.inner.to_user_id(),
+            sender_id: self.inner.peer_id().clone(),
             timestamp,
             signature: sig.as_bytes().to_vec(),
         })
     }
 
     /// Get node ID
-    pub fn node_id(&self) -> &NodeId {
-        &self.inner.to_user_id()
+    pub fn node_id(&self) -> &PeerId {
+        &self.inner.peer_id().clone()
     }
 
     /// Get public key
@@ -136,7 +136,7 @@ pub struct StoredIdentity {
     /// Public key bytes
     pub public_key: Vec<u8>,
     /// Node ID
-    pub node_id: NodeId,
+    pub node_id: PeerId,
 }
 
 impl StoredIdentity {
@@ -172,7 +172,7 @@ mod tests {
 
         // Verify node ID matches public key
         let computed_id = NodeIdentity::compute_node_id(&identity.public_key());
-        assert_eq!(&computed_id, identity.node_id());
+        assert_eq!(&computed_id, identity.peer_id());
 
         // PoW removed
     }
@@ -217,7 +217,7 @@ mod tests {
         let restored = stored.to_identity().unwrap();
 
         // Verify they match
-        assert_eq!(identity.node_id(), restored.node_id());
+        assert_eq!(identity.peer_id(), restored.peer_id());
         assert_eq!(
             identity.public_key().to_bytes(),
             restored.public_key().to_bytes()

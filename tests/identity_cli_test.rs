@@ -246,7 +246,7 @@ mod cli_command_tests {
             .unwrap();
 
         // Compare node IDs instead of word addresses (deterministic generation)
-        assert_eq!(id1.node_id(), id2.node_id());
+        assert_eq!(id1.peer_id(), id2.peer_id());
     }
 }
 

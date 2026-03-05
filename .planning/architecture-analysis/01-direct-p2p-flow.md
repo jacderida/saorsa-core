@@ -2,7 +2,7 @@
 
 ## Overview
 
-The direct P2P message flow in saorsa-core follows a 5-layer architecture from RichMessage creation to wire transmission. Messages are serialized three times (JSON for RichMessage→ciphertext, JSON for EncryptedMessage→transport, JSON for Protocol wrapper→wire), encrypted once with ChaCha20Poly1305, and wrapped in a protocol envelope before transmission via ant-quic QUIC streams. Messages that fail direct delivery are queued for retry with a 30-second interval and expire after 7 days.
+The direct P2P message flow in saorsa-core follows a 5-layer architecture from RichMessage creation to wire transmission. Messages are serialized three times (JSON for RichMessage→ciphertext, JSON for EncryptedMessage→transport, JSON for Protocol wrapper→wire), encrypted once with ChaCha20Poly1305, and wrapped in a protocol envelope before transmission via saorsa-transport QUIC streams. Messages that fail direct delivery are queued for retry with a 30-second interval and expire after 7 days.
 
 ## Message Flow Sequence
 
@@ -39,8 +39,8 @@ The direct P2P message flow in saorsa-core follows a 5-layer architecture from R
    └─> Wraps in JSON: {"protocol", "data", "from", "timestamp"}
    └─> Third JSON serialization!
 
-8. ant-quic QUIC Stream Transmission
-   └─> src/transport/ant_quic_adapter.rs:388-409
+8. saorsa-transport QUIC Stream Transmission
+   └─> src/transport/saorsa_transport_adapter.rs:388-409
    └─> Unidirectional QUIC stream
    └─> ML-KEM-768 post-quantum encryption at transport layer
    └─> QUIC framing overhead: ~20-40 bytes per packet
@@ -117,15 +117,15 @@ pub struct EncryptedMessage {
 - **Key Source**: Session key from ML-KEM-768 key exchange
 - **Protects**: RichMessage content and metadata (everything in JSON)
 
-### Boundary 2: Transport Layer PQC Encryption (ant-quic)
-- **Start**: src/transport/ant_quic_adapter.rs:391 (transport.dial())
-- **End**: src/transport/ant_quic_adapter.rs:407 (stream.finish())
+### Boundary 2: Transport Layer PQC Encryption (saorsa-transport)
+- **Start**: src/transport/saorsa_transport_adapter.rs:391 (transport.dial())
+- **End**: src/transport/saorsa_transport_adapter.rs:407 (stream.finish())
 - **Algorithm**: ML-KEM-768 (post-quantum key exchange) + QUIC encryption
 - **Overhead**: ~16 bytes per QUIC packet (built into QUIC)
-- **Key Source**: ant-quic's automatic post-quantum key exchange
+- **Key Source**: saorsa-transport's automatic post-quantum key exchange
 - **Protects**: Entire protocol message (double-encrypted payload at this layer)
 
-**Note**: ant-quic handles encryption transparently via QUIC's built-in encryption, enhanced with post-quantum ML-KEM-768 for key exchange.
+**Note**: saorsa-transport handles encryption transparently via QUIC's built-in encryption, enhanced with post-quantum ML-KEM-768 for key exchange.
 
 ## Packet Format at Each Layer
 
@@ -191,9 +191,9 @@ Total overhead from Layer 2:
 - Total: ~500-900 bytes for typical message
 ```
 
-### Layer 4: QUIC Transport (ant-quic)
+### Layer 4: QUIC Transport (saorsa-transport)
 ```
-[QUIC Stream - src/transport/ant_quic_adapter.rs:395-407]
+[QUIC Stream - src/transport/saorsa_transport_adapter.rs:395-407]
 ├─ QUIC packet header (~20-40 bytes variable)
 │  ├─ Connection ID (0-20 bytes)
 │  ├─ Packet number (1-4 bytes)
@@ -206,7 +206,7 @@ Total overhead from Layer 2:
 └─ Payload (Protocol Message JSON)
 
 Transport: Unidirectional QUIC stream (stream.open_uni())
-Post-quantum: ML-KEM-768 key exchange (handled by ant-quic)
+Post-quantum: ML-KEM-768 key exchange (handled by saorsa-transport)
 Total overhead from Layer 3: +44-64 bytes per packet
 Final wire size: ~550-970 bytes for typical text message
 ```
@@ -285,11 +285,11 @@ struct QueuedMessage {
 - src/network.rs:1665 - Protocol message serialized: `serde_json::to_vec(&message)?`
 - src/network.rs:1629 - Final transmission: `dual_node.send_to_peer_string(peer_id, &_message_data)`
 
-**ant-quic transmission**:
-- src/transport/ant_quic_adapter.rs:391 - Dial peer: `transport.dial(*peer_id, SAORSA_DHT_PROTOCOL)`
-- src/transport/ant_quic_adapter.rs:395-398 - Open unidirectional stream: `conn.open_uni()`
-- src/transport/ant_quic_adapter.rs:401-404 - Write data: `stream.write_all(data)`
-- src/transport/ant_quic_adapter.rs:405-407 - Finalize stream: `stream.finish()`
+**saorsa-transport transmission**:
+- src/transport/saorsa_transport_adapter.rs:391 - Dial peer: `transport.dial(*peer_id, SAORSA_DHT_PROTOCOL)`
+- src/transport/saorsa_transport_adapter.rs:395-398 - Open unidirectional stream: `conn.open_uni()`
+- src/transport/saorsa_transport_adapter.rs:401-404 - Write data: `stream.write_all(data)`
+- src/transport/saorsa_transport_adapter.rs:405-407 - Finalize stream: `stream.finish()`
 
 **Message queueing**:
 - src/messaging/transport.rs:84-89 - Failed delivery triggers queueing

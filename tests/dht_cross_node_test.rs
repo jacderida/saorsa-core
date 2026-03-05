@@ -14,6 +14,7 @@
 use anyhow::Result;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, P2PNode};
 use saorsa_core::transport_handle::{TransportConfig, TransportHandle};
 use std::sync::Arc;
@@ -35,8 +36,8 @@ async fn create_test_dht_config(
     peer_id: &str,
     port: u16,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
+    let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer_id.to_string())
         .listen_port(port)
         .ipv6(false)
         .build()
@@ -44,7 +45,6 @@ async fn create_test_dht_config(
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: peer_id.to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -53,12 +53,13 @@ async fn create_test_dht_config(
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
+            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
         })
         .await?,
     );
 
     let config = DhtNetworkConfig {
-        local_peer_id: peer_id.to_string(),
+        peer_id: peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -195,15 +196,11 @@ async fn test_cross_node_dht_store_retrieve() -> Result<()> {
 async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     // Create DhtNetworkManager (DHT layer)
     // The caller creates a TransportHandle (transport layer) and passes it in
-    let node_config = NodeConfig::builder()
-        .peer_id("architecture_test_node".to_string())
-        .listen_port(0)
-        .ipv6(false)
-        .build()?;
+    let arch_peer = saorsa_core::PeerId::from_name("architecture_test_node");
+    let node_config = NodeConfig::builder().listen_port(0).ipv6(false).build()?;
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig {
-            peer_id: "architecture_test_node".to_string(),
             listen_addr: node_config.listen_addr,
             enable_ipv6: node_config.enable_ipv6,
             connection_timeout: node_config.connection_timeout,
@@ -212,12 +209,13 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
+            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
         })
         .await?,
     );
 
     let dht_config = DhtNetworkConfig {
-        local_peer_id: "architecture_test_node".to_string(),
+        peer_id: arch_peer,
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -264,11 +262,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
 #[tokio::test]
 async fn test_p2p_node_local_dht_only() -> Result<()> {
     // Create P2PNode (transport layer only)
-    let node_config = NodeConfig::builder()
-        .peer_id("local_only_test_node".to_string())
-        .listen_port(0)
-        .ipv6(false)
-        .build()?;
+    let node_config = NodeConfig::builder().listen_port(0).ipv6(false).build()?;
 
     let node = P2PNode::new(node_config).await?;
 

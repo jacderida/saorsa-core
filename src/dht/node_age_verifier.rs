@@ -27,7 +27,7 @@
 //! Sybil attacks more expensive - an attacker must maintain many identities over
 //! time, which is costly and detectable.
 
-use crate::peer_record::UserId as NodeId;
+use crate::peer_record::PeerId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -250,7 +250,7 @@ pub struct NodeAgeVerifier {
     /// Configuration
     config: NodeAgeConfig,
     /// Age records for known nodes
-    records: Arc<RwLock<HashMap<NodeId, NodeAgeRecord>>>,
+    records: Arc<RwLock<HashMap<PeerId, NodeAgeRecord>>>,
 }
 
 impl NodeAgeVerifier {
@@ -268,7 +268,7 @@ impl NodeAgeVerifier {
     }
 
     /// Register a new node or update existing
-    pub fn register_node(&self, node_id: NodeId) -> NodeAgeRecord {
+    pub fn register_node(&self, node_id: PeerId) -> NodeAgeRecord {
         let mut records = self.records.write();
 
         if let Some(record) = records.get_mut(&node_id) {
@@ -293,7 +293,7 @@ impl NodeAgeVerifier {
     }
 
     /// Mark a node as departed
-    pub fn mark_departed(&self, node_id: &NodeId) {
+    pub fn mark_departed(&self, node_id: &PeerId) {
         if let Some(record) = self.records.write().get_mut(node_id) {
             record.mark_departed();
             debug!("Node {:?} marked as departed", node_id);
@@ -301,14 +301,14 @@ impl NodeAgeVerifier {
     }
 
     /// Get age record for a node
-    pub fn get_record(&self, node_id: &NodeId) -> Option<NodeAgeRecord> {
+    pub fn get_record(&self, node_id: &PeerId) -> Option<NodeAgeRecord> {
         self.records.read().get(node_id).cloned()
     }
 
     /// Verify a node meets age requirements for an operation
     pub fn verify_for_operation(
         &self,
-        node_id: &NodeId,
+        node_id: &PeerId,
         operation: OperationType,
     ) -> AgeVerificationResult {
         let records = self.records.read();
@@ -378,38 +378,38 @@ impl NodeAgeVerifier {
     }
 
     /// Get nodes eligible for replication
-    pub fn get_replication_eligible_nodes(&self) -> Vec<NodeId> {
+    pub fn get_replication_eligible_nodes(&self) -> Vec<PeerId> {
         self.records
             .read()
             .iter()
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.min_replication_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
     /// Get nodes eligible for critical operations
-    pub fn get_critical_ops_eligible_nodes(&self) -> Vec<NodeId> {
+    pub fn get_critical_ops_eligible_nodes(&self) -> Vec<PeerId> {
         self.records
             .read()
             .iter()
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.min_critical_ops_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
     /// Get veteran nodes (highest trust)
-    pub fn get_veteran_nodes(&self) -> Vec<NodeId> {
+    pub fn get_veteran_nodes(&self) -> Vec<PeerId> {
         self.records
             .read()
             .iter()
             .filter(|(_, record)| {
                 record.is_active && record.age_secs() >= self.config.veteran_age_secs
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -511,14 +511,12 @@ pub struct NodeAgeStats {
 mod tests {
     use super::*;
 
-    fn create_test_node_id(name: &str) -> NodeId {
-        NodeId {
-            hash: {
-                let mut h = [0u8; 32];
-                h[..name.len().min(32)].copy_from_slice(name.as_bytes());
-                h
-            },
-        }
+    fn create_test_node_id(name: &str) -> PeerId {
+        PeerId::from_bytes({
+            let mut h = [0u8; 32];
+            h[..name.len().min(32)].copy_from_slice(name.as_bytes());
+            h
+        })
     }
 
     #[test]
@@ -561,7 +559,7 @@ mod tests {
         let node_id = create_test_node_id("test_node");
 
         // First registration
-        let record1 = verifier.register_node(node_id.clone());
+        let record1 = verifier.register_node(node_id);
         assert!(record1.is_active);
         assert_eq!(record1.rejoin_count, 0);
 
@@ -576,7 +574,7 @@ mod tests {
         let verifier = NodeAgeVerifier::new();
         let node_id = create_test_node_id("rejoining_node");
 
-        verifier.register_node(node_id.clone());
+        verifier.register_node(node_id);
         verifier.mark_departed(&node_id);
 
         let record = verifier.get_record(&node_id).unwrap();
@@ -593,7 +591,7 @@ mod tests {
         let verifier = NodeAgeVerifier::new();
         let node_id = create_test_node_id("op_test_node");
 
-        verifier.register_node(node_id.clone());
+        verifier.register_node(node_id);
 
         // New node - basic operations should pass
         let result = verifier.verify_for_operation(&node_id, OperationType::BasicRead);
@@ -665,8 +663,8 @@ mod tests {
         let node1 = create_test_node_id("active");
         let node2 = create_test_node_id("inactive");
 
-        verifier.register_node(node1.clone());
-        verifier.register_node(node2.clone());
+        verifier.register_node(node1);
+        verifier.register_node(node2);
         verifier.mark_departed(&node2);
 
         // Clean up records older than 0 seconds (immediate cleanup of inactive)

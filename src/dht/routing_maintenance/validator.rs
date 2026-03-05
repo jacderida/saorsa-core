@@ -8,7 +8,7 @@
 
 use std::time::SystemTime;
 
-use crate::dht::DhtNodeId;
+use crate::PeerId;
 
 use super::config::MaintenanceConfig;
 
@@ -31,7 +31,7 @@ pub enum ValidationFailure {
 #[derive(Debug, Clone)]
 pub struct NodeValidationResult {
     /// The node that was validated
-    pub node_id: DhtNodeId,
+    pub node_id: PeerId,
     /// Number of witnesses confirming validity
     pub confirming_witnesses: usize,
     /// Number of witnesses denying validity
@@ -47,7 +47,7 @@ pub struct NodeValidationResult {
 impl Default for NodeValidationResult {
     fn default() -> Self {
         Self {
-            node_id: DhtNodeId::random(),
+            node_id: PeerId::random(),
             confirming_witnesses: 0,
             denying_witnesses: 0,
             total_witnesses: 0,
@@ -60,7 +60,7 @@ impl Default for NodeValidationResult {
 impl NodeValidationResult {
     /// Create a new validation result
     #[must_use]
-    pub fn new(node_id: DhtNodeId) -> Self {
+    pub fn new(node_id: PeerId) -> Self {
         Self {
             node_id,
             confirming_witnesses: 0,
@@ -127,7 +127,7 @@ impl NodeValidationResult {
 #[derive(Debug, Clone)]
 pub struct WitnessResponse {
     /// The witness who responded
-    pub witness_id: DhtNodeId,
+    pub witness_id: PeerId,
     /// Whether the witness confirms the node is valid
     pub confirms_valid: bool,
     /// Reason if denying validity
@@ -139,7 +139,7 @@ pub struct WitnessResponse {
 impl WitnessResponse {
     /// Create a confirming response
     #[must_use]
-    pub fn confirming(witness_id: DhtNodeId) -> Self {
+    pub fn confirming(witness_id: PeerId) -> Self {
         Self {
             witness_id,
             confirms_valid: true,
@@ -150,7 +150,7 @@ impl WitnessResponse {
 
     /// Create a denying response
     #[must_use]
-    pub fn denying(witness_id: DhtNodeId, reason: ValidationFailure) -> Self {
+    pub fn denying(witness_id: PeerId, reason: ValidationFailure) -> Self {
         Self {
             witness_id,
             confirms_valid: false,
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_record_confirmation() {
-        let mut result = NodeValidationResult::new(DhtNodeId::random());
+        let mut result = NodeValidationResult::new(PeerId::random());
 
         result.record_confirmation();
         assert_eq!(result.confirming_witnesses, 1);
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_record_denial() {
-        let mut result = NodeValidationResult::new(DhtNodeId::random());
+        let mut result = NodeValidationResult::new(PeerId::random());
 
         result.record_denial(ValidationFailure::UnknownNode);
         assert_eq!(result.denying_witnesses, 1);
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_record_no_response() {
-        let mut result = NodeValidationResult::new(DhtNodeId::random());
+        let mut result = NodeValidationResult::new(PeerId::random());
 
         result.record_no_response();
         assert_eq!(result.confirming_witnesses, 0);
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_confirmation_ratio() {
-        let mut result = NodeValidationResult::new(DhtNodeId::random());
+        let mut result = NodeValidationResult::new(PeerId::random());
 
         // No witnesses yet
         assert!((result.confirmation_ratio() - 0.0).abs() < f64::EPSILON);
@@ -331,8 +331,8 @@ mod tests {
 
     #[test]
     fn test_witness_response_confirming() {
-        let witness_id = DhtNodeId::random();
-        let response = WitnessResponse::confirming(witness_id.clone());
+        let witness_id = PeerId::random();
+        let response = WitnessResponse::confirming(witness_id);
 
         assert!(response.confirms_valid);
         assert!(response.failure_reason.is_none());
@@ -341,9 +341,8 @@ mod tests {
 
     #[test]
     fn test_witness_response_denying() {
-        let witness_id = DhtNodeId::random();
-        let response =
-            WitnessResponse::denying(witness_id.clone(), ValidationFailure::MarkedMalicious);
+        let witness_id = PeerId::random();
+        let response = WitnessResponse::denying(witness_id, ValidationFailure::MarkedMalicious);
 
         assert!(!response.confirms_valid);
         assert_eq!(
@@ -368,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_validation_failure_reasons_distinct() {
-        let mut result = NodeValidationResult::new(DhtNodeId::random());
+        let mut result = NodeValidationResult::new(PeerId::random());
 
         result.record_denial(ValidationFailure::UnknownNode);
         result.record_denial(ValidationFailure::Unreachable);
@@ -394,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_is_valid_with_no_witnesses() {
-        let result = NodeValidationResult::new(DhtNodeId::random());
+        let result = NodeValidationResult::new(PeerId::random());
         assert!(!result.is_valid()); // No witnesses = not valid
     }
 }

@@ -5,7 +5,7 @@
 //!
 //! This test validates that the fix for P2P_MESSAGING_STATUS_2025-10-02_FINAL.md is in place:
 //! - P2PNode has active_connections tracking
-//! - is_connection_active() method validates connection state
+//! - is_peer_connected() validates authenticated peer state
 //! - Keepalive task prevents 30-second idle timeout
 //! - send_message() checks connection state before sending
 
@@ -27,7 +27,6 @@ async fn test_connection_lifecycle_infrastructure_exists() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        peer_id: None,
         listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
         listen_addrs: vec![
             "0.0.0.0:0".parse().expect("Invalid address"),
@@ -47,23 +46,22 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("Listen addresses: {:?}", addrs);
 
     // Create a fake peer ID for testing
-    let test_peer_id = "peer_test_12345678".to_string();
+    let test_peer_id = saorsa_core::PeerId::from_bytes([0xAAu8; 32]);
 
-    // Test 1: is_connection_active() exists and returns false for non-existent peer
-    let is_active = node.is_connection_active(&test_peer_id).await;
-    assert!(!is_active, "Non-existent peer should not be active");
-    info!("✓ is_connection_active() method exists and works");
-
-    // Test 2: is_peer_connected() exists and returns false for non-existent peer
+    // Test 1: is_peer_connected() exists and returns false for non-existent peer
     let is_connected = node.is_peer_connected(&test_peer_id).await;
     assert!(!is_connected, "Non-existent peer should not be connected");
     info!("✓ is_peer_connected() method exists and works");
 
-    // Test 3: Verify remove_peer() method exists (even if peer doesn't exist)
-    node.remove_peer(&test_peer_id).await;
-    info!("✓ remove_peer() method exists");
+    // Test 2: connected_peers() returns empty for fresh node
+    let peers = node.connected_peers().await;
+    assert!(
+        peers.is_empty(),
+        "Fresh node should have no connected peers"
+    );
+    info!("✓ connected_peers() returns empty for fresh node");
 
-    // Test 4: send_message() properly handles non-existent peer
+    // Test 3: send_message() properly handles non-existent peer
     let result = node
         .send_message(&test_peer_id, "test", b"test".to_vec())
         .await;
@@ -78,14 +76,13 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("");
     info!("This proves the following fix components are in place:");
     info!("1. active_connections HashSet tracking");
-    info!("2. is_connection_active() validation");
-    info!("3. is_peer_connected() checking");
-    info!("4. remove_peer() cleanup");
-    info!("5. send_message() connection validation");
-    info!("6. Keepalive task (spawned in background)");
+    info!("2. is_peer_connected() validation (app-level peer IDs)");
+    info!("3. connected_peers() returns authenticated peers");
+    info!("4. send_message() connection validation");
+    info!("5. Keepalive task (spawned in background)");
     info!("");
     info!("These components fix the issue from P2P_MESSAGING_STATUS_2025-10-02_FINAL.md");
-    info!("where P2PNode's peers map didn't track when ant-quic connections closed.");
+    info!("where P2PNode's peers map didn't track when saorsa-transport connections closed.");
 }
 
 /// Test that demonstrates the keepalive task is spawned
@@ -103,7 +100,6 @@ async fn test_keepalive_task_initialized() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        peer_id: None,
         listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
         listen_addrs: vec![
             "0.0.0.0:0".parse().expect("Invalid address"),
@@ -116,11 +112,11 @@ async fn test_keepalive_task_initialized() {
     _node.start().await.expect("Failed to start node");
 
     // The keepalive task is spawned in P2PNode::new() and runs in the background
-    // It sends keepalive messages every 15 seconds to prevent the 30-second ant-quic timeout
+    // It sends keepalive messages every 15 seconds to prevent the 30-second saorsa-transport timeout
 
     info!("✓ P2PNode initialized successfully");
     info!("✓ Keepalive task spawned (runs every 15 seconds)");
-    info!("✓ This prevents ant-quic's 30-second max_idle_timeout");
+    info!("✓ This prevents saorsa-transport's 30-second max_idle_timeout");
 
     info!("=== Keepalive task initialization test passed! ===");
 }

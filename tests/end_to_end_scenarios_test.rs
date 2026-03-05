@@ -42,7 +42,6 @@ impl TestUser {
         let listen_addr = "127.0.0.1:0";
         let mut config = NodeConfig::with_listen_addr(listen_addr)?;
         config.bootstrap_peers.clear();
-        config.bootstrap_peers_str.clear();
 
         let peer_id = format!("test_user_{}", username);
         let node = P2PNode::new(config).await?;

@@ -20,6 +20,7 @@
 //! - Enhanced distance calculations
 
 use super::*;
+use crate::PeerId;
 use crate::adaptive::hyperbolic::{RoutingStats, angle_difference};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -82,7 +83,7 @@ pub struct EnhancedHyperbolicSpace {
     previous_coordinate: RwLock<Option<EnhancedHyperbolicCoordinate>>,
 
     /// Neighbor coordinates
-    neighbor_coordinates: Arc<RwLock<HashMap<NodeId, EnhancedHyperbolicCoordinate>>>,
+    neighbor_coordinates: Arc<RwLock<HashMap<PeerId, EnhancedHyperbolicCoordinate>>>,
 
     /// Coordinate adjustment parameters
     adjustment_params: AdjustmentParameters,
@@ -125,7 +126,7 @@ impl Default for AdjustmentParameters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualizationData {
     /// Node positions for visualization
-    pub nodes: HashMap<NodeId, VisualizationNode>,
+    pub nodes: HashMap<PeerId, VisualizationNode>,
     /// Routing paths for visualization
     pub paths: Vec<RoutingPath>,
     /// Network metrics
@@ -134,7 +135,7 @@ pub struct VisualizationData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualizationNode {
-    pub id: NodeId,
+    pub id: PeerId,
     pub coordinate: HyperbolicCoordinate,
     pub label: String,
     pub degree: usize,
@@ -143,9 +144,9 @@ pub struct VisualizationNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingPath {
-    pub source: NodeId,
-    pub target: NodeId,
-    pub hops: Vec<NodeId>,
+    pub source: PeerId,
+    pub target: PeerId,
+    pub hops: Vec<PeerId>,
     pub success: bool,
     pub total_distance: f64,
 }
@@ -225,7 +226,7 @@ impl EnhancedHyperbolicSpace {
     /// Adjust coordinate with hysteresis to prevent oscillation
     pub async fn adjust_coordinate_with_hysteresis(
         &self,
-        neighbor_coords: &[(NodeId, EnhancedHyperbolicCoordinate)],
+        neighbor_coords: &[(PeerId, EnhancedHyperbolicCoordinate)],
     ) {
         let mut my_coord = self.my_coordinate.write().await;
         let mut prev_coord_guard = self.previous_coordinate.write().await;
@@ -303,9 +304,9 @@ impl EnhancedHyperbolicSpace {
         let my_id = generate_local_node_id(); // Placeholder
 
         viz_data.nodes.insert(
-            my_id.clone(),
+            my_id,
             VisualizationNode {
-                id: my_id.clone(),
+                id: my_id,
                 coordinate: HyperbolicCoordinate {
                     r: my_coord.r(),
                     theta: my_coord.theta(),
@@ -319,9 +320,9 @@ impl EnhancedHyperbolicSpace {
         // Add neighbor nodes
         for (node_id, coord) in neighbors.iter() {
             viz_data.nodes.insert(
-                node_id.clone(),
+                *node_id,
                 VisualizationNode {
-                    id: node_id.clone(),
+                    id: *node_id,
                     coordinate: HyperbolicCoordinate {
                         r: coord.r(),
                         theta: coord.theta(),
@@ -426,11 +427,11 @@ fn polar_to_cartesian(r: f64, theta: f64, cx: f64, cy: f64, radius: f64) -> (f64
 }
 
 /// Generate a placeholder local node ID
-fn generate_local_node_id() -> NodeId {
+fn generate_local_node_id() -> PeerId {
     use rand::RngCore;
     let mut hash = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut hash);
-    NodeId::from_bytes(hash)
+    PeerId::from_bytes(hash)
 }
 
 /// Enhanced routing strategy with visualization support
@@ -439,7 +440,7 @@ pub struct EnhancedHyperbolicRoutingStrategy {
     space: Arc<EnhancedHyperbolicSpace>,
 
     /// Local node ID
-    local_id: NodeId,
+    local_id: PeerId,
 
     /// Maximum hops before declaring failure
     max_hops: usize,
@@ -450,7 +451,7 @@ pub struct EnhancedHyperbolicRoutingStrategy {
 
 impl EnhancedHyperbolicRoutingStrategy {
     /// Create a new enhanced routing strategy
-    pub fn new(local_id: NodeId, space: Arc<EnhancedHyperbolicSpace>) -> Self {
+    pub fn new(local_id: PeerId, space: Arc<EnhancedHyperbolicSpace>) -> Self {
         Self {
             space,
             local_id,
@@ -460,7 +461,7 @@ impl EnhancedHyperbolicRoutingStrategy {
     }
 
     /// Find path with visualization support
-    async fn find_enhanced_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn find_enhanced_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         let target_coord = {
             let neighbors = self.space.neighbor_coordinates.read().await;
             neighbors.get(target).cloned()
@@ -476,8 +477,8 @@ impl EnhancedHyperbolicRoutingStrategy {
         };
 
         let mut path = Vec::new();
-        let mut visited = std::collections::HashSet::<NodeId>::new();
-        visited.insert(self.local_id.clone());
+        let mut visited = std::collections::HashSet::<PeerId>::new();
+        visited.insert(self.local_id);
 
         let mut total_distance = 0.0;
         let _start_time = std::time::Instant::now();
@@ -501,7 +502,7 @@ impl EnhancedHyperbolicRoutingStrategy {
                         .partial_cmp(&dist_b)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .map(|(id, coord)| (id.clone(), *coord));
+                .map(|(id, coord)| (*id, *coord));
 
             match next_hop {
                 Some((next_id, next_coord)) => {
@@ -515,8 +516,8 @@ impl EnhancedHyperbolicRoutingStrategy {
                         if self.enable_visualization {
                             let mut viz_data = self.space.visualization_data.write().await;
                             viz_data.paths.push(RoutingPath {
-                                source: self.local_id.clone(),
-                                target: target.clone(),
+                                source: self.local_id,
+                                target: *target,
                                 hops: path.clone(),
                                 success: true,
                                 total_distance,
@@ -526,7 +527,7 @@ impl EnhancedHyperbolicRoutingStrategy {
                         return Ok(path);
                     }
 
-                    path.push(next_id.clone());
+                    path.push(next_id);
                     visited.insert(next_id);
                     total_distance +=
                         EnhancedHyperbolicSpace::distance_fixed(&my_coord, &next_coord);
@@ -536,8 +537,8 @@ impl EnhancedHyperbolicRoutingStrategy {
                     if self.enable_visualization {
                         let mut viz_data = self.space.visualization_data.write().await;
                         viz_data.paths.push(RoutingPath {
-                            source: self.local_id.clone(),
-                            target: target.clone(),
+                            source: self.local_id,
+                            target: *target,
                             hops: path.clone(),
                             success: false,
                             total_distance,
@@ -561,15 +562,15 @@ impl EnhancedHyperbolicRoutingStrategy {
 
 #[async_trait]
 impl RoutingStrategy for EnhancedHyperbolicRoutingStrategy {
-    async fn find_path(&self, target: &NodeId) -> Result<Vec<NodeId>> {
+    async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
         self.find_enhanced_path(target).await
     }
 
-    fn route_score(&self, _neighbor: &NodeId, _target: &NodeId) -> f64 {
+    fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
         0.5
     }
 
-    fn update_metrics(&self, _path: &[NodeId], _success: bool) {
+    fn update_metrics(&self, _path: &[PeerId], _success: bool) {
         // Metrics are updated in find_enhanced_path
     }
 }

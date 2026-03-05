@@ -6,12 +6,12 @@ use saorsa_core::dht::{
     CapacityManager, Dht, DhtTelemetry, OperationType, PutPolicy, TrustWeightedKademlia,
     trust_weighted_kademlia::Outcome,
 };
-use saorsa_core::identity::node_identity::NodeId;
+use saorsa_core::identity::node_identity::PeerId;
 
-fn random_node_id() -> NodeId {
+fn random_node_id() -> PeerId {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    NodeId::from_bytes(bytes)
+    PeerId::from_bytes(bytes)
 }
 use std::time::Duration;
 use tokio::time::timeout;
@@ -55,20 +55,18 @@ async fn test_trust_weighted_routing() {
     let node2 = random_node_id();
     let node3 = random_node_id();
 
-    let dht = TrustWeightedKademlia::new(node1.clone());
+    let dht = TrustWeightedKademlia::new(node1);
 
     // Record good interactions with node2
     for _ in 0..5 {
-        dht.record_interaction(node2.clone(), Outcome::Ok).await;
+        dht.record_interaction(node2, Outcome::Ok).await;
     }
 
     // Record bad interactions with node3
     for _ in 0..3 {
-        dht.record_interaction(node3.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(node3, Outcome::Timeout).await;
     }
-    dht.record_interaction(node3.clone(), Outcome::BadData)
-        .await;
+    dht.record_interaction(node3, Outcome::BadData).await;
 
     // Run EigenTrust computation
     dht.eigen_trust_epoch().await;
@@ -81,7 +79,7 @@ async fn test_trust_weighted_routing() {
 #[tokio::test]
 async fn test_capacity_signaling() {
     let local_peer = random_node_id();
-    let mut capacity_manager = CapacityManager::new(local_peer.clone(), 10_000_000_000);
+    let mut capacity_manager = CapacityManager::new(local_peer, 10_000_000_000);
 
     // Update local capacity
     capacity_manager.update_local_capacity(8_000_000_000).await;
@@ -93,7 +91,7 @@ async fn test_capacity_signaling() {
 
     capacity_manager
         .receive_gossip(saorsa_core::dht::CapacityGossip {
-            peer: peer1.clone(),
+            peer: peer1,
             free_bytes: 5_000_000_000,
             total_bytes: 10_000_000_000,
             epoch: 1,
@@ -102,7 +100,7 @@ async fn test_capacity_signaling() {
 
     capacity_manager
         .receive_gossip(saorsa_core::dht::CapacityGossip {
-            peer: peer2.clone(),
+            peer: peer2,
             free_bytes: 1_000_000_000,
             total_bytes: 5_000_000_000,
             epoch: 1,
@@ -184,7 +182,7 @@ async fn test_lookup_under_churn() {
     // Create initial network of nodes
     for _ in 0..20 {
         let node_id = random_node_id();
-        let dht = TrustWeightedKademlia::new(node_id.clone());
+        let dht = TrustWeightedKademlia::new(node_id);
         nodes.push((node_id, dht));
     }
 
@@ -403,13 +401,13 @@ async fn test_concurrent_operations() {
 /// Test XOR distance calculation
 #[tokio::test]
 async fn test_xor_distance() {
-    let node1 = NodeId::from_bytes([0u8; 32]);
-    let node2 = NodeId::from_bytes([255u8; 32]);
+    let node1 = PeerId::from_bytes([0u8; 32]);
+    let node2 = PeerId::from_bytes([255u8; 32]);
 
     // Create a node that differs only in first byte
     let mut node3_bytes = [0u8; 32];
     node3_bytes[0] = 1;
-    let node3 = NodeId::from_bytes(node3_bytes);
+    let node3 = PeerId::from_bytes(node3_bytes);
 
     let distance1_2 = node1.xor_distance(&node2);
     let distance1_3 = node1.xor_distance(&node3);
@@ -437,7 +435,7 @@ async fn test_trust_weighted_find_closest_nodes() {
     use saorsa_core::dht::trust_weighted_kademlia::Outcome;
 
     let local_id = random_node_id();
-    let dht = TrustWeightedKademlia::new(local_id.clone());
+    let dht = TrustWeightedKademlia::new(local_id);
 
     // Create two nodes that could be at similar distances
     let node1_id = random_node_id();
@@ -445,16 +443,14 @@ async fn test_trust_weighted_find_closest_nodes() {
 
     // Record high trust for node1
     for _ in 0..10 {
-        dht.record_interaction(node1_id.clone(), Outcome::Ok).await;
+        dht.record_interaction(node1_id, Outcome::Ok).await;
     }
 
     // Record low trust for node2
     for _ in 0..5 {
-        dht.record_interaction(node2_id.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(node2_id, Outcome::Timeout).await;
     }
-    dht.record_interaction(node2_id.clone(), Outcome::BadData)
-        .await;
+    dht.record_interaction(node2_id, Outcome::BadData).await;
 
     // Run EigenTrust computation
     dht.eigen_trust_epoch().await;
@@ -472,8 +468,8 @@ async fn test_distance_magnitude_bucketing() {
     let all_zeros = [0u8; 32];
     let all_ones = [255u8; 32];
 
-    let node1 = NodeId::from_bytes(all_zeros);
-    let node2 = NodeId::from_bytes(all_ones);
+    let node1 = PeerId::from_bytes(all_zeros);
+    let node2 = PeerId::from_bytes(all_ones);
 
     let distance = node1.xor_distance(&node2);
 
@@ -485,8 +481,8 @@ async fn test_distance_magnitude_bucketing() {
     let mut node4_bytes = all_zeros;
     node4_bytes[31] = 1; // Only last bit set, 255 leading zeros
 
-    let node3 = NodeId::from_bytes(node3_bytes);
-    let node4 = NodeId::from_bytes(node4_bytes);
+    let node3 = PeerId::from_bytes(node3_bytes);
+    let node4 = PeerId::from_bytes(node4_bytes);
 
     let distance_small = node3.xor_distance(&node4);
     assert_eq!(distance_small[31], 1);
@@ -501,7 +497,7 @@ async fn test_distance_magnitude_bucketing() {
 #[tokio::test]
 async fn test_find_closest_self_lookup() {
     let node_id = random_node_id();
-    let _dht = TrustWeightedKademlia::new(node_id.clone());
+    let _dht = TrustWeightedKademlia::new(node_id);
 
     // Test self-distance
     let self_distance = node_id.xor_distance(&node_id);
@@ -529,22 +525,20 @@ async fn test_distance_overrides_trust() {
 
     let far_node_bytes = [255u8; 32]; // Very far (0 leading zeros)
 
-    let close_node = NodeId::from_bytes(close_node_bytes);
-    let far_node = NodeId::from_bytes(far_node_bytes);
+    let close_node = PeerId::from_bytes(close_node_bytes);
+    let far_node = PeerId::from_bytes(far_node_bytes);
 
     // Give far node maximum trust
     for _ in 0..100 {
-        dht.record_interaction(far_node.clone(), Outcome::Ok).await;
+        dht.record_interaction(far_node, Outcome::Ok).await;
     }
 
     // Give close node minimum trust
     for _ in 0..50 {
-        dht.record_interaction(close_node.clone(), Outcome::Timeout)
-            .await;
+        dht.record_interaction(close_node, Outcome::Timeout).await;
     }
     for _ in 0..50 {
-        dht.record_interaction(close_node.clone(), Outcome::BadData)
-            .await;
+        dht.record_interaction(close_node, Outcome::BadData).await;
     }
 
     dht.eigen_trust_epoch().await;
@@ -573,12 +567,12 @@ async fn test_find_closest_nodes_performance() {
         let mut node_bytes = [0u8; 32];
         node_bytes[0] = i as u8;
         node_bytes[1] = (i >> 8) as u8;
-        let peer = NodeId::from_bytes(node_bytes);
+        let peer = PeerId::from_bytes(node_bytes);
 
         // Vary trust scores
         let outcomes = i % 3;
         for _ in 0..outcomes {
-            dht.record_interaction(peer.clone(), Outcome::Ok).await;
+            dht.record_interaction(peer, Outcome::Ok).await;
         }
     }
 
