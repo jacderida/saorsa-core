@@ -47,7 +47,6 @@ fn create_test_node_config() -> NodeConfig {
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        peer_id: None,
         listen_addr: "127.0.0.1:0"
             .parse()
             .unwrap_or_else(|_| panic!("Test setup error: hardcoded address should parse")),
@@ -73,7 +72,6 @@ fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConf
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        peer_id: None,
         listen_addr: "127.0.0.1:0"
             .parse()
             .unwrap_or_else(|_| panic!("Test setup error: hardcoded address should parse")),

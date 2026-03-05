@@ -27,7 +27,6 @@ async fn test_connection_lifecycle_infrastructure_exists() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        peer_id: None,
         listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
         listen_addrs: vec![
             "0.0.0.0:0".parse().expect("Invalid address"),
@@ -101,7 +100,6 @@ async fn test_keepalive_task_initialized() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        peer_id: None,
         listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
         listen_addrs: vec![
             "0.0.0.0:0".parse().expect("Invalid address"),

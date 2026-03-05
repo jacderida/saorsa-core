@@ -51,7 +51,6 @@ fn key_from_str(s: &str) -> Key {
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer)
         .listen_port(0) // Random port
         .ipv6(false)
         .build()?;

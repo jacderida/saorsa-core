@@ -71,7 +71,6 @@ async fn create_test_dht_config(
     );
 
     let node_config = NodeConfig::builder()
-        .peer_id(saorsa_core::PeerId::from_name(peer_id))
         .listen_port(0) // Random port
         .ipv6(false)
         .build()?;

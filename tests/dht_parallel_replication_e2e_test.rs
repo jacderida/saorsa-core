@@ -39,7 +39,6 @@ async fn create_test_dht_config(
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .peer_id(peer)
         .listen_port(port)
         .ipv6(false)
         .build()
