@@ -1337,6 +1337,14 @@ impl P2PNode {
         self.transport.remove_channel(channel_id).await
     }
 
+    /// Close a channel's QUIC connection and remove it from all tracking maps.
+    ///
+    /// Use when a transport-level connection was established but identity
+    /// exchange failed, so no [`PeerId`] is available for [`disconnect_peer`].
+    pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
+        self.transport.disconnect_channel(channel_id).await;
+    }
+
     /// Check if an authenticated peer is connected (has at least one active channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
         self.transport.is_peer_connected(peer_id).await
@@ -1815,9 +1823,11 @@ impl P2PNode {
                             }
                             Err(e) => {
                                 warn!(
-                                    "Timeout waiting for identity from bootstrap peer {}: {}",
-                                    addr, e
+                                    "Timeout waiting for identity from bootstrap peer {}: {}, \
+                                     closing channel {}",
+                                    addr, e, channel_id
                                 );
+                                self.disconnect_channel(&channel_id).await;
                             }
                         }
                     }

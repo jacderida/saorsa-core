@@ -498,6 +498,20 @@ impl TransportHandle {
         self.peers.write().await.remove(channel_id).is_some()
     }
 
+    /// Close a channel's QUIC connection and remove it from all tracking maps.
+    ///
+    /// Use this when a transport-level connection was established but the
+    /// identity exchange failed, so no [`PeerId`] is available for
+    /// [`disconnect_peer`].
+    pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
+        if let Ok(addr) = channel_id.parse::<SocketAddr>() {
+            self.dual_node.disconnect_peer_by_addr(&addr).await;
+        }
+        self.active_connections.write().await.remove(channel_id);
+        self.remove_channel_mappings(channel_id).await;
+        self.peers.write().await.remove(channel_id);
+    }
+
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
