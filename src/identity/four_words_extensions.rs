@@ -18,9 +18,9 @@ use super::node_identity::PeerId;
 use crate::{P2PError, Result, error::IdentityError};
 
 impl FourWordAddress {
-    /// Create from NodeId (uses facade in four_words.rs)
-    pub fn from_peer_id(peer_id: &PeerId) -> Result<Self> {
-        Ok(super::four_words::FourWordAddress::from_node_id(node_id))
+    /// Create from PeerId (uses facade in four_words.rs)
+    pub fn from_peer_id_ext(peer_id: &PeerId) -> Result<Self> {
+        Ok(super::four_words::FourWordAddress::from_peer_id(peer_id))
     }
 
     /// Parse from string format (alias for parse_str)
@@ -41,8 +41,8 @@ mod tests {
     #[test]
     fn test_four_word_address_format() {
         let peer_id = PeerId([0x42; 32]);
-        let address =
-            FourWordAddress::from_peer_id(&peer_id).expect("Should create address from node ID");
+        let address = FourWordAddress::from_peer_id_ext(&peer_id)
+            .expect("Should create address from peer ID");
 
         // Should have 4 words
         assert_eq!(address.words().len(), 4);

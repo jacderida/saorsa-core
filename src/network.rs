@@ -923,7 +923,8 @@ impl P2PNode {
     }
 
     /// Get the hex-encoded channel ID (QUIC connection identifier).
-    pub fn channel_id(&self) -> Option<String> {
+    #[allow(dead_code)]
+    pub(crate) fn channel_id(&self) -> Option<String> {
         self.transport.channel_id()
     }
 

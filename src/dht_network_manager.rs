@@ -76,23 +76,6 @@ pub struct DHTNode {
     pub address: String,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
-    /// Cached DHT key to avoid repeated BLAKE3 hashing during distance comparisons.
-    ///
-    /// Lifecycle / invariants:
-    /// - This cache is **lazily populated** via `ensure_cached_dht_key` the first time a
-    ///   distance calculation requires it, not eagerly at node creation.
-    /// - The field starts as `None` and may remain `None` until `ensure_cached_dht_key`
-    ///   (or an equivalent helper) is called.
-    /// - The value, once computed, is reused for all subsequent distance calculations and
-    ///   is not expected to change for the lifetime of this `DHTNode`.
-    /// - `#[serde(skip)]` means this cache is not serialized; after deserialization it will
-    ///   again be `None` until `ensure_cached_dht_key` is invoked.
-    ///
-    /// Callers should treat this as an internal implementation detail and rely on
-    /// `ensure_cached_dht_key` (or similar) rather than accessing `cached_dht_key` directly.
-    /// PERF-001: Critical performance optimization - prevents O(N*log(N)*hash_cost) in sorts
-    #[serde(skip)]
-    pub cached_dht_key: Option<DhtKey>,
 }
 
 /// Alias for serialization compatibility
@@ -1019,8 +1002,7 @@ impl DhtNetworkManager {
                                 })
                                 .collect::<Vec<_>>()
                         );
-                        for mut node in nodes {
-                            Self::ensure_cached_dht_key(&mut node);
+                        for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
                                 || queued_peer_ids.contains(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
@@ -1225,7 +1207,6 @@ impl DhtNetworkManager {
                                 address: node.address,
                                 distance: None,
                                 reliability: node.capacity.reliability_score,
-                                cached_dht_key: Some(node.id),
                             });
                         }
                     }
@@ -1258,7 +1239,6 @@ impl DhtNetworkManager {
                     address,
                     distance: Some(peer_id.as_bytes().to_vec()),
                     reliability: peer_info.reliability_score,
-                    cached_dht_key: Some(*peer_id),
                 });
             }
         }
@@ -1374,8 +1354,7 @@ impl DhtNetworkManager {
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
-                        for mut node in nodes {
-                            Self::ensure_cached_dht_key(&mut node);
+                        for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
                                 || queued_peer_ids.contains(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
@@ -1471,12 +1450,10 @@ impl DhtNetworkManager {
     /// Uses cached DHT keys when available, falls back to the peer ID directly
     /// (which is now the same keyspace).
     fn compare_node_distance(a: &DHTNode, b: &DHTNode, key: &Key) -> std::cmp::Ordering {
-        let a_key = a.cached_dht_key.as_ref().cloned().unwrap_or(a.peer_id);
-        let b_key = b.cached_dht_key.as_ref().cloned().unwrap_or(b.peer_id);
         let target_key = DhtKey::from_bytes(*key);
-        a_key
+        a.peer_id
             .distance(&target_key)
-            .cmp(&b_key.distance(&target_key))
+            .cmp(&b.peer_id.distance(&target_key))
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -1504,7 +1481,6 @@ impl DhtNetworkManager {
             address: self.config.node_config.listen_addr.to_string(),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
-            cached_dht_key: Some(self.config.peer_id),
         }
     }
 
@@ -1512,13 +1488,6 @@ impl DhtNetworkManager {
     /// never send RPCs to the local node.
     fn mark_self_queried(&self, queried: &mut HashSet<PeerId>) {
         queried.insert(self.config.peer_id);
-    }
-
-    /// Ensure a DHT node has a cached DHT key available for distance comparisons.
-    fn ensure_cached_dht_key(node: &mut DHTNode) {
-        if node.cached_dht_key.is_none() {
-            node.cached_dht_key = Some(node.peer_id);
-        }
     }
 
     /// Convert peer addresses reported by the transport into multiaddresses the DHT understands.
@@ -2043,7 +2012,6 @@ impl DhtNetworkManager {
                     address: String::new(),
                     distance: Some(dht_key.to_vec()),
                     reliability: 1.0,
-                    cached_dht_key: Some(message.source),
                 };
 
                 // Node will be added to routing table through normal DHT operations
@@ -2712,7 +2680,8 @@ impl DhtNetworkManager {
     ///
     /// This identifies the transport channel, not the peer.
     /// It differs from `peer_id()` which returns the human-readable config name.
-    pub fn channel_id(&self) -> Option<String> {
+    #[allow(dead_code)]
+    pub(crate) fn channel_id(&self) -> Option<String> {
         self.transport.channel_id()
     }
 

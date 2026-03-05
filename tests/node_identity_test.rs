@@ -92,8 +92,8 @@ fn test_persistence() {
 
 #[test]
 fn test_node_id_xor_distance() {
-    let id1 = PeerId([0xFF; 32]);
-    let id2 = PeerId([0x00; 32]);
+    let id1 = PeerId::from_bytes([0xFF; 32]);
+    let id2 = PeerId::from_bytes([0x00; 32]);
 
     let distance = id1.xor_distance(&id2);
 

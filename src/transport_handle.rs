@@ -384,7 +384,7 @@ impl TransportHandle {
     ///
     /// This is the transport-level connection identifier. It differs from
     /// `peer_id()` which is the app-level cryptographic identity.
-    pub fn channel_id(&self) -> Option<String> {
+    pub(crate) fn channel_id(&self) -> Option<String> {
         self.local_addr()
     }
 
@@ -589,7 +589,7 @@ impl TransportHandle {
                         "Detected self-connection to own address {} (channel_id: {}), rejecting",
                         address, connected_peer_id
                     );
-                    self.dual_node.disconnect_ant_peer(&addr).await;
+                    self.dual_node.disconnect_peer_by_addr(&addr).await;
                     return Err(P2PError::Network(NetworkError::InvalidAddress(
                         format!("Cannot connect to self ({})", address).into(),
                     )));
@@ -686,7 +686,7 @@ impl TransportHandle {
         // Close QUIC connections for channels with no remaining peers.
         for channel_id in &orphaned_channels {
             if let Ok(addr) = channel_id.parse::<SocketAddr>() {
-                self.dual_node.disconnect_ant_peer(&addr).await;
+                self.dual_node.disconnect_peer_by_addr(&addr).await;
             }
             self.active_connections.write().await.remove(channel_id);
             if let Some(mut peer_info) = self.peers.write().await.remove(channel_id) {
@@ -796,9 +796,7 @@ impl TransportHandle {
                 format!("Invalid channel ID address: {e}").into(),
             ))
         })?;
-        let send_fut = self
-            .dual_node
-            .send_to_ant_peer_optimized(&addr, &message_data);
+        let send_fut = self.dual_node.send_to_peer_optimized(&addr, &message_data);
         let result = tokio::time::timeout(self.connection_timeout, send_fut)
             .await
             .map_err(|_| {
@@ -836,7 +834,7 @@ impl TransportHandle {
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
-    pub async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
+    pub(crate) async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
         self.channel_to_peers
             .read()
             .await
@@ -1261,6 +1259,7 @@ impl TransportHandle {
         let peers_for_recv = Arc::clone(&self.peers);
         let peer_to_channel = Arc::clone(&self.peer_to_channel);
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
+        let self_peer_id = *self.node_identity.peer_id();
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((from_addr, bytes)) = rx.recv().await {
@@ -1285,7 +1284,10 @@ impl TransportHandle {
                         // If the message was signed, record the app↔channel mapping.
                         // A peer may be reachable over multiple channels simultaneously
                         // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
-                        if let Some(ref app_id) = authenticated_node_id {
+                        // Skip our own identity to avoid self-registration via echoed messages.
+                        if let Some(ref app_id) = authenticated_node_id
+                            && *app_id != self_peer_id
+                        {
                             let mut p2c = peer_to_channel.write().await;
                             let is_new_peer = !p2c.contains_key(app_id);
                             let channels = p2c.entry(*app_id).or_default();
@@ -1534,7 +1536,7 @@ impl TransportHandle {
                                         "Rejecting connection from {} ({}) due to GeoIP policy",
                                         channel_id, remote_address
                                     );
-                                    dual_node.disconnect_ant_peer(&remote_address).await;
+                                    dual_node.disconnect_peer_by_addr(&remote_address).await;
                                     continue;
                                 }
 
@@ -1564,7 +1566,7 @@ impl TransportHandle {
                                 match Self::create_identity_announce_bytes(&node_identity) {
                                     Ok(announce_bytes) => {
                                         if let Err(e) = dual_node
-                                            .send_to_ant_peer_optimized(&remote_address, &announce_bytes)
+                                            .send_to_peer_optimized(&remote_address, &announce_bytes)
                                             .await
                                         {
                                             warn!("Failed to send identity announce to {channel_id}: {e}");
@@ -1659,7 +1661,7 @@ impl TransportHandle {
                     let node = Arc::clone(&dual_node);
                     Some(async move {
                         if let Err(e) = node
-                            .send_to_ant_peer_optimized(&addr, KEEPALIVE_PAYLOAD)
+                            .send_to_peer_optimized(&addr, KEEPALIVE_PAYLOAD)
                             .await
                         {
                             debug!(

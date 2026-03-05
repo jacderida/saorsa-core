@@ -148,7 +148,7 @@ mod four_word_address_tests {
         // #[test]
         fn prop_four_word_roundtrip(node_id_bytes: [u8; 32]) {
             // Test roundtrip: NodeId -> FourWords -> NodeId
-            let node_id = PeerId(node_id_bytes);
+            let node_id = PeerId::from_bytes(node_id_bytes);
             let address = FourWordAddress::from_peer_id(&node_id);
 
             // Verify address format

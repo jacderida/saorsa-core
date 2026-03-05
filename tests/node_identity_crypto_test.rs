@@ -673,8 +673,8 @@ async fn test_identity_edge_cases() -> Result<()> {
     // Test XOR distance edge cases
     let id1_binding = create_test_identity(0);
     let id1 = id1_binding.peer_id();
-    let id_max = PeerId([0xFF; 32]); // All bits set
-    let id_zero = PeerId([0x00; 32]); // All bits clear
+    let id_max = PeerId::from_bytes([0xFF; 32]); // All bits set
+    let id_zero = PeerId::from_bytes([0x00; 32]); // All bits clear
 
     let dist_max = id1.xor_distance(&id_max);
     let dist_zero = id1.xor_distance(&id_zero);

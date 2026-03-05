@@ -325,12 +325,6 @@ pub use crate::placement::{
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
 pub use identity::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 
-/// Transport channel identifier (e.g. a QUIC connection).
-///
-/// Distinct from [`PeerId`]: a channel ID identifies a communication path,
-/// not a peer. In future, multiple peers may share a single channel.
-pub type ChannelId = String;
-
 /// Network address used for peer-to-peer communication
 ///
 /// Supports both traditional IP:port format and human-readable four-word format.

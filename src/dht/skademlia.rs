@@ -1075,7 +1075,16 @@ impl SKademlia {
             .enumerate()
         {
             // Look up the peer's public key from registry
-            let peer_key = PeerId::from_hex(peer_id).unwrap_or_else(|_| PeerId::from_name(peer_id));
+            let peer_key = match PeerId::from_hex(peer_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    debug!(
+                        "Distance proof verification: Invalid hex peer ID '{}' (signature {})",
+                        peer_id, i
+                    );
+                    continue;
+                }
+            };
             let public_key_bytes = match self.peer_public_keys.get(&peer_key) {
                 Some(pk) => pk,
                 None => {

@@ -39,7 +39,7 @@ const SHORT_HEX_BYTES: usize = 8;
 /// Serializes as a hex string (64 characters) in all formats to maintain
 /// wire compatibility with the existing postcard-based `WireMessage` protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PeerId(pub [u8; PEER_ID_BYTE_LEN]);
+pub struct PeerId(pub(crate) [u8; PEER_ID_BYTE_LEN]);
 
 impl Serialize for PeerId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

@@ -545,7 +545,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     ///
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
-    pub async fn send_to_ant_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+    pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         let conn = self
             .transport
             .dial_addr(*addr, SAORSA_DHT_PROTOCOL)
@@ -578,7 +578,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        self.send_to_ant_peer(addr, data).await?;
+        self.send_to_peer_raw(addr, data).await?;
         crate::telemetry::telemetry()
             .record_stream_bandwidth(class, data.len() as u64)
             .await;
@@ -822,7 +822,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Send data to a peer.
     pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        self.send_to_ant_peer(addr, data).await
+        self.send_to_peer_raw(addr, data).await
     }
 
     /// Connect to a peer and return the remote address as a string.
@@ -944,7 +944,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
     /// bidirectional communication. Tries IPv6 first, then IPv4.
-    pub async fn send_to_ant_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+    pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6 {
             info!(
                 "[DUAL SEND] Attempting IPv6 send to {} ({} bytes)",
@@ -990,15 +990,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         ))
     }
 
-    /// Send to a peer using the optimized `P2pEndpoint::send()` path.
-    pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        self.send_to_ant_peer_optimized(addr, data).await
-    }
-
     /// Disconnect a peer, closing the underlying QUIC connection.
     ///
     /// Tries both IPv6 and IPv4 stacks.
-    pub async fn disconnect_ant_peer(&self, addr: &SocketAddr) {
+    pub async fn disconnect_peer_by_addr(&self, addr: &SocketAddr) {
         if let Some(ref v6) = self.v6 {
             v6.disconnect_peer_quic(addr).await;
         }
@@ -1009,7 +1004,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Disconnect a peer by address.
     pub async fn disconnect_peer(&self, addr: &SocketAddr) {
-        self.disconnect_ant_peer(addr).await;
+        self.disconnect_peer_by_addr(addr).await;
     }
 }
 
@@ -1151,23 +1146,23 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     }
 
     /// Send to peer by address; tries IPv6 first, then IPv4.
-    pub async fn send_to_ant_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+    pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6
-            && v6.send_to_ant_peer(addr, data).await.is_ok()
+            && v6.send_to_peer_raw(addr, data).await.is_ok()
         {
             return Ok(());
         }
         if let Some(v4) = &self.v4
-            && v4.send_to_ant_peer(addr, data).await.is_ok()
+            && v4.send_to_peer_raw(addr, data).await.is_ok()
         {
             return Ok(());
         }
-        Err(anyhow::anyhow!("send_to_ant_peer failed on both stacks"))
+        Err(anyhow::anyhow!("send_to_peer_raw failed on both stacks"))
     }
 
     /// Send to peer by address.
     pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        self.send_to_ant_peer(addr, data).await
+        self.send_to_peer_raw(addr, data).await
     }
 
     /// Send to peer with StreamClass
@@ -1177,7 +1172,7 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         data: &[u8],
         class: StreamClass,
     ) -> Result<()> {
-        let res = self.send_to_ant_peer(addr, data).await;
+        let res = self.send_to_peer_raw(addr, data).await;
         if res.is_ok() {
             crate::telemetry::telemetry()
                 .record_stream_bandwidth(class, data.len() as u64)

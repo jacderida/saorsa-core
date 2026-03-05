@@ -286,7 +286,7 @@ impl SybilDetector {
 
     /// Extract ID prefix (first 4 bytes)
     fn id_prefix(peer_id: &PeerId) -> [u8; 4] {
-        let bytes = &peer_id.0;
+        let bytes = peer_id.as_bytes();
         [bytes[0], bytes[1], bytes[2], bytes[3]]
     }
 

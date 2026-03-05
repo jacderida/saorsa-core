@@ -68,7 +68,7 @@ impl NodeIpAddress for Ipv4Addr {
 /// node identities, reducing code duplication while maintaining type safety.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenericIpNodeID<A: NodeIpAddress> {
-    /// Derived node ID (SHA256 of ip_addr + public_key + salt + timestamp)
+    /// Derived node ID (BLAKE3 of ip_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
     /// IP address this node ID is bound to
     pub ip_addr: A,
@@ -210,7 +210,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
 /// IPv6-based node identity that binds node ID to actual network location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPv6NodeID {
-    /// Derived node ID (SHA256 of ipv6_addr + public_key + salt)
+    /// Derived node ID (BLAKE3 of ipv6_addr + public_key + salt)
     pub node_id: Vec<u8>,
     /// IPv6 address this node ID is bound to
     pub ipv6_addr: Ipv6Addr,
@@ -489,7 +489,7 @@ impl IPv6NodeID {
 /// Mirrors IPv6NodeID for security parity on IPv4 networks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPv4NodeID {
-    /// Derived node ID (SHA256 of ipv4_addr + public_key + salt + timestamp)
+    /// Derived node ID (BLAKE3 of ipv4_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
     /// IPv4 address this node ID is bound to
     pub ipv4_addr: Ipv4Addr,
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(node_id.ipv6_addr, ipv6_addr);
         assert_eq!(node_id.public_key.len(), 1952); // ML-DSA-65 public key size
         assert_eq!(node_id.signature.len(), 3309); // ML-DSA-65 signature size
-        assert_eq!(node_id.node_id.len(), 32); // SHA256 output
+        assert_eq!(node_id.node_id.len(), 32); // BLAKE3 output
         assert_eq!(node_id.salt.len(), 16);
         assert!(node_id.timestamp_secs > 0);
 
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(node_id.ipv4_addr, ipv4_addr);
         assert_eq!(node_id.public_key.len(), 1952); // ML-DSA-65 public key size
         assert_eq!(node_id.signature.len(), 3309); // ML-DSA-65 signature size
-        assert_eq!(node_id.node_id.len(), 32); // SHA256 output
+        assert_eq!(node_id.node_id.len(), 32); // BLAKE3 output
         assert_eq!(node_id.salt.len(), 16);
         assert!(node_id.timestamp_secs > 0);
 

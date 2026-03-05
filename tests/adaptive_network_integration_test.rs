@@ -1082,7 +1082,10 @@ async fn test_adaptive_network_resilience() -> anyhow::Result<()> {
         let failed_node = &network.get_nodes()[node_idx];
         failed_nodes.push(*failed_node);
 
-        println!("  Simulating failure of node {:?}", &failed_node.0[..4]);
+        println!(
+            "  Simulating failure of node {:?}",
+            &failed_node.as_bytes()[..4]
+        );
 
         // Update churn predictor with failure
         let mut churn = churn_predictor.lock().await;
@@ -1232,7 +1235,7 @@ async fn test_adaptive_network_resilience() -> anyhow::Result<()> {
         let prediction = churn.predict(failed_node).await;
         println!(
             "Failed node {:?} churn risk: {:.2}%",
-            &failed_node.0[..4],
+            &failed_node.as_bytes()[..4],
             prediction.probability_1h * 100.0
         );
         assert!(
