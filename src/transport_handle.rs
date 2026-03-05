@@ -715,8 +715,9 @@ impl TransportHandle {
 impl TransportHandle {
     /// Send a message to an authenticated peer (raw, no trust reporting).
     ///
-    /// Resolves the app-level [`PeerId`] to a transport channel via the
-    /// `peer_to_channel` mapping and sends over that channel.
+    /// Resolves the app-level [`PeerId`] to transport channels via the
+    /// `peer_to_channel` mapping and tries each channel until one succeeds.
+    /// Dead channels are pruned during the attempt loop.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
@@ -724,17 +725,43 @@ impl TransportHandle {
         data: Vec<u8>,
     ) -> Result<()> {
         let peer_hex = peer_id.to_hex();
-        let channel = {
-            self.peer_to_channel
-                .read()
+        let channels: Vec<String> = self
+            .peer_to_channel
+            .read()
+            .await
+            .get(peer_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+
+        if channels.is_empty() {
+            return Err(P2PError::Network(NetworkError::PeerNotFound(
+                peer_hex.into(),
+            )));
+        }
+
+        let mut last_err = None;
+        for channel_id in &channels {
+            match self
+                .send_on_channel(channel_id, protocol, data.clone())
                 .await
-                .get(peer_id)
-                .and_then(|channels| channels.iter().next().cloned())
-        };
-        let channel_id = channel.ok_or_else(|| {
-            P2PError::Network(NetworkError::PeerNotFound(peer_hex.clone().into()))
-        })?;
-        self.send_on_channel(&channel_id, protocol, data).await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        peer = %peer_hex,
+                        channel = %channel_id,
+                        error = %e,
+                        "Channel send failed, removing and trying next",
+                    );
+                    self.remove_channel(channel_id).await;
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // All channels exhausted — return the last error.
+        Err(last_err
+            .unwrap_or_else(|| P2PError::Network(NetworkError::PeerNotFound(peer_hex.into()))))
     }
 
     /// Send a message on a specific transport channel (raw, no trust reporting).
@@ -1103,8 +1130,9 @@ impl TransportHandle {
     /// Publish a message to all connected peers on the given topic.
     ///
     /// De-duplicates by app-level peer: when a peer has multiple channels,
-    /// the message is sent on only one channel. Unauthenticated channels
-    /// (not yet mapped to an app-level peer) are also included once each.
+    /// tries each channel until one succeeds (fallback on failure).
+    /// Unauthenticated channels (not yet mapped to an app-level peer) are
+    /// also included once each.
     pub async fn publish(&self, topic: &str, data: &[u8]) -> Result<()> {
         info!(
             "Publishing message to topic: {} ({} bytes)",
@@ -1112,43 +1140,58 @@ impl TransportHandle {
             data.len()
         );
 
-        // Collect one channel per authenticated app-level peer.
-        let mut target_channels: Vec<String> = Vec::new();
+        // Collect all channels grouped by authenticated app-level peer,
+        // plus any unauthenticated channels.
+        let mut peer_channel_groups: Vec<Vec<String>> = Vec::new();
         let mut mapped_channels: HashSet<String> = HashSet::new();
         {
             let p2c = self.peer_to_channel.read().await;
             for channels in p2c.values() {
-                if let Some(ch) = channels.iter().next() {
-                    mapped_channels.insert(ch.clone());
-                    target_channels.push(ch.clone());
+                let chs: Vec<String> = channels.iter().cloned().collect();
+                mapped_channels.extend(chs.iter().cloned());
+                if !chs.is_empty() {
+                    peer_channel_groups.push(chs);
                 }
             }
         }
 
-        // Include unauthenticated channels that aren't mapped to any peer.
+        // Include unauthenticated channels (single-channel groups, no fallback).
         {
             let peers_guard = self.peers.read().await;
             for channel_id in peers_guard.keys() {
                 if !mapped_channels.contains(channel_id) {
-                    target_channels.push(channel_id.clone());
+                    peer_channel_groups.push(vec![channel_id.clone()]);
                 }
             }
         }
 
-        if target_channels.is_empty() {
+        if peer_channel_groups.is_empty() {
             debug!("No peers connected, message will only be sent to local subscribers");
         } else {
             let mut send_count = 0;
-            let total = target_channels.len();
-            for channel_id in &target_channels {
-                match self.send_on_channel(channel_id, topic, data.to_vec()).await {
-                    Ok(()) => {
-                        send_count += 1;
-                        debug!("Sent message to channel: {}", channel_id);
+            let total = peer_channel_groups.len();
+            for channels in &peer_channel_groups {
+                let mut sent = false;
+                for channel_id in channels {
+                    match self.send_on_channel(channel_id, topic, data.to_vec()).await {
+                        Ok(()) => {
+                            send_count += 1;
+                            debug!("Published message via channel: {}", channel_id);
+                            sent = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                channel = %channel_id,
+                                error = %e,
+                                "Publish channel failed, removing and trying next",
+                            );
+                            self.remove_channel(channel_id).await;
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to send message to channel {}: {}", channel_id, e);
-                    }
+                }
+                if !sent {
+                    warn!("All channels exhausted for one peer during publish");
                 }
             }
             info!(
