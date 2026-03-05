@@ -594,10 +594,12 @@ impl TransportHandle {
             Ok(Ok(addr)) => {
                 let connected_peer_id = addr.to_string();
 
-                // Prevent self-connections by comparing transport-level addresses.
-                let is_self = self
-                    .channel_id()
-                    .is_some_and(|local| local == connected_peer_id);
+                // Prevent self-connections by comparing against all listen
+                // addresses (dual-stack nodes may have both IPv4 and IPv6).
+                let is_self = {
+                    let addrs = self.listen_addrs.read().await;
+                    addrs.iter().any(|a| a.to_string() == connected_peer_id)
+                };
                 if is_self {
                     warn!(
                         "Detected self-connection to own address {} (channel_id: {}), rejecting",
