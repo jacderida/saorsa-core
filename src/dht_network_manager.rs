@@ -1123,34 +1123,8 @@ impl DhtNetworkManager {
 
     /// Leave the DHT network gracefully
     async fn leave_network(&self) -> Result<()> {
-        info!("Leaving DHT network...");
-
-        let leave_operation = DhtNetworkOperation::Leave;
-        let connected_peers: Vec<PeerId> = {
-            let peers = self.dht_peers.read().await;
-            peers.keys().cloned().collect()
-        };
-
-        // Send leave messages to all connected peers
-        for peer_id in connected_peers {
-            match self
-                .send_dht_request(&peer_id, leave_operation.clone())
-                .await
-            {
-                Ok(_) => {
-                    debug!("Sent leave message to peer: {}", peer_id.to_hex());
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to send leave message to {}: {}",
-                        peer_id.to_hex(),
-                        e
-                    );
-                }
-            }
-        }
-
-        info!("DHT network leave completed");
+        // No-op: peers detect disconnection via transport-level connection loss.
+        // Explicit leave messages added latency to shutdown without meaningful benefit.
         Ok(())
     }
 
