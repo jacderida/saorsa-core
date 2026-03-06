@@ -68,9 +68,36 @@ pub(crate) struct WireMessage {
 /// Payload bytes used for keepalive messages to prevent connection timeouts.
 pub(crate) const KEEPALIVE_PAYLOAD: &[u8] = b"keepalive";
 
+/// Operating mode of a P2P node.
+///
+/// Determines the default user agent and DHT participation behavior.
+/// `Node` peers participate in the DHT routing table; `Client` peers
+/// are treated as ephemeral and excluded from routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NodeMode {
+    /// Full DHT-participant node that stores data and routes messages.
+    #[default]
+    Node,
+    /// Ephemeral client that connects to perform operations without joining the DHT.
+    Client,
+}
+
+/// Returns the default user agent string for the given mode.
+///
+/// - `Node` → `"node/<saorsa-core-version>"`
+/// - `Client` → `"client/<saorsa-core-version>"`
+pub fn user_agent_for_mode(mode: NodeMode) -> String {
+    let prefix = match mode {
+        NodeMode::Node => "node",
+        NodeMode::Client => "client",
+    };
+    format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Default user agent for full DHT-participant nodes.
+#[deprecated(note = "Use `user_agent_for_mode(NodeMode::Node)` instead")]
 pub fn default_node_user_agent() -> String {
-    format!("node/{}", env!("CARGO_PKG_VERSION"))
+    user_agent_for_mode(NodeMode::Node)
 }
 
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
@@ -178,16 +205,20 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub node_identity: Option<Arc<NodeIdentity>>,
 
-    /// User agent string sent during identity exchange.
+    /// Operating mode of this node.
     ///
-    /// Convention: `"node/<version>"` for full DHT participants,
-    /// `"client/<version>"` or `"<app>/<version>"` for ephemeral clients.
-    /// Peers with a `"node/"` prefix are added to DHT routing tables;
-    /// all others are treated as ephemeral and excluded.
+    /// Determines the default user agent and DHT participation:
+    /// - `Node` → user agent `"node/<version>"`, added to DHT routing tables.
+    /// - `Client` → user agent `"client/<version>"`, treated as ephemeral.
+    #[serde(default)]
+    pub mode: NodeMode,
+
+    /// Optional custom user agent override.
     ///
-    /// Defaults to `"node/<crate_version>"`.
-    #[serde(default = "default_node_user_agent")]
-    pub user_agent: String,
+    /// When `Some`, this value is used instead of the mode-derived default.
+    /// When `None`, the user agent is derived from [`NodeConfig::mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_user_agent: Option<String>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -262,6 +293,16 @@ fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<std::net::SocketAddr
 }
 
 impl NodeConfig {
+    /// Returns the effective user agent string.
+    ///
+    /// If a custom user agent was set, returns that. Otherwise, derives
+    /// the user agent from the node's [`NodeMode`].
+    pub fn user_agent(&self) -> String {
+        self.custom_user_agent
+            .clone()
+            .unwrap_or_else(|| user_agent_for_mode(self.mode))
+    }
+
     /// Create a new NodeConfig with default values
     ///
     /// # Errors
@@ -293,7 +334,8 @@ impl NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
-            user_agent: default_node_user_agent(),
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         })
     }
 
@@ -320,6 +362,8 @@ pub struct NodeConfigBuilder {
     security_config: Option<SecurityConfig>,
     production_config: Option<ProductionConfig>,
     max_message_size: Option<usize>,
+    mode: NodeMode,
+    custom_user_agent: Option<String>,
 }
 
 impl NodeConfigBuilder {
@@ -385,6 +429,18 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the operating mode (Node or Client).
+    pub fn mode(mut self, mode: NodeMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set a custom user agent string, overriding the mode-derived default.
+    pub fn custom_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.custom_user_agent = Some(user_agent.into());
+        self
+    }
+
     /// Build the NodeConfig
     ///
     /// # Errors
@@ -427,7 +483,8 @@ impl NodeConfigBuilder {
                 .max_message_size
                 .or(base_config.transport.max_message_size),
             node_identity: None,
-            user_agent: default_node_user_agent(),
+            mode: self.mode,
+            custom_user_agent: self.custom_user_agent,
         })
     }
 }
@@ -459,7 +516,8 @@ impl Default for NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
-            user_agent: default_node_user_agent(),
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         }
     }
 }
@@ -513,7 +571,8 @@ impl NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
-            user_agent: default_node_user_agent(),
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         };
 
         // Add IPv6 listen address if enabled
@@ -866,7 +925,7 @@ impl P2PNode {
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: config.max_message_size,
             node_identity: node_identity.clone(),
-            user_agent: config.user_agent.clone(),
+            user_agent: config.user_agent(),
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -1981,12 +2040,17 @@ impl NodeBuilder {
         self
     }
 
-    /// Set the user agent string for this node.
+    /// Set the operating mode (Node or Client).
     ///
-    /// Convention: `"node/<version>"` for full DHT participants,
-    /// `"client/<version>"` or `"<app>/<version>"` for ephemeral clients.
+    /// This determines the default user agent and DHT participation.
+    pub fn with_mode(mut self, mode: NodeMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    /// Set a custom user agent string, overriding the mode-derived default.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
-        self.config.user_agent = user_agent.into();
+        self.config.custom_user_agent = Some(user_agent.into());
         self
     }
 
@@ -2143,7 +2207,8 @@ mod tests {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
             node_identity: None,
-            user_agent: default_node_user_agent(),
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         }
     }
 

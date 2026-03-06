@@ -2227,7 +2227,7 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
-        let default_ua = crate::network::default_node_user_agent();
+        let default_ua = crate::network::user_agent_for_mode(crate::network::NodeMode::Node);
         for peer_id in connected {
             self.handle_peer_connected(peer_id, &default_ua).await;
         }

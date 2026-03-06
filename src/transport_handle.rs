@@ -366,7 +366,7 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: identity,
-            user_agent: crate::network::default_node_user_agent(),
+            user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
         })

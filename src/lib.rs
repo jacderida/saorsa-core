@@ -197,9 +197,11 @@ pub use monotonic_counter::{
     BatchUpdateRequest, BatchUpdateResult, CounterStats, MonotonicCounterSystem, PeerCounter,
     SequenceValidationResult,
 };
+#[allow(deprecated)]
+pub use network::default_node_user_agent;
 pub use network::{
-    ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, P2PEvent, P2PNode, PeerInfo,
-    PeerResponse, default_node_user_agent, is_dht_participant,
+    ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
+    PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
 };
 pub use transport_handle::TransportHandle;
 // Trust system exports for saorsa-node integration
