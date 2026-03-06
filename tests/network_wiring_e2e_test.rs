@@ -337,21 +337,21 @@ async fn test_bidirectional_message_exchange() {
 
     // Wait for auto identity announce to authenticate node1 on node2
     let peer1_peer_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node2 did not receive PeerConnected event from Node1"),
     };
 
     // Wait for auto identity announce to authenticate node2 on node1
     let peer2_peer_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node1 did not receive PeerConnected event from Node2"),
     };
 
@@ -782,12 +782,12 @@ async fn test_event_subscription_sanity() {
 
     // Should receive PeerConnected event on node2 from auto identity announce
     let event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await;
 
     assert!(
-        matches!(event, Some(P2PEvent::PeerConnected(_))),
+        matches!(event, Some(P2PEvent::PeerConnected(..))),
         "Should receive PeerConnected event when authenticated peer sends a message"
     );
 
@@ -829,20 +829,20 @@ async fn test_simple_ping_pong() {
 
     // Wait for auto identity announce to authenticate both sides
     let peer1_peer_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node2 did not receive PeerConnected event"),
     };
 
     let peer2_peer_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node1 did not receive PeerConnected event"),
     };
 
@@ -1123,12 +1123,12 @@ async fn test_peer_events_sequence() {
 
     // Wait for PeerConnected event on node2
     let connected_event = wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await;
 
     assert!(
-        matches!(connected_event, Some(P2PEvent::PeerConnected(_))),
+        matches!(connected_event, Some(P2PEvent::PeerConnected(..))),
         "Should receive PeerConnected event"
     );
     info!("Received PeerConnected event");
@@ -1596,20 +1596,20 @@ async fn test_concurrent_message_flood() {
 
     // Wait for auto identity announce to authenticate both sides
     let peer1_peer_id = match wait_for_event(&mut events2, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node2 did not receive PeerConnected"),
     };
 
     let peer2_peer_id = match wait_for_event(&mut events1, EVENT_TIMEOUT, |event| {
-        matches!(event, P2PEvent::PeerConnected(_))
+        matches!(event, P2PEvent::PeerConnected(..))
     })
     .await
     {
-        Some(P2PEvent::PeerConnected(id)) => id,
+        Some(P2PEvent::PeerConnected(id, _)) => id,
         _ => panic!("Node1 did not receive PeerConnected"),
     };
 

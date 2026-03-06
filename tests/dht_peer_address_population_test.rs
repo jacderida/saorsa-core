@@ -86,6 +86,7 @@ async fn create_test_dht_config(
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
             node_identity: identity.clone(),
+            user_agent: saorsa_core::default_node_user_agent(),
         })
         .await?,
     );

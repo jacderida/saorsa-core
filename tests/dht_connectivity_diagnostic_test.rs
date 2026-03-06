@@ -36,6 +36,7 @@ async fn create_node_with_transport(
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
             node_identity: Arc::new(NodeIdentity::generate().unwrap()),
+            user_agent: saorsa_core::default_node_user_agent(),
         })
         .await?,
     );

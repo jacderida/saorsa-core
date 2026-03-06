@@ -21,6 +21,7 @@
 use crate::{
     Multiaddr, P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
+    dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
     error::{DhtError, NetworkError},
@@ -2252,8 +2253,9 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
+        let default_ua = crate::network::default_node_user_agent();
         for peer_id in connected {
-            self.handle_peer_connected(peer_id).await;
+            self.handle_peer_connected(peer_id, &default_ua).await;
         }
     }
 
@@ -2262,9 +2264,12 @@ impl DhtNetworkManager {
     /// The `node_id` is the authenticated app-level [`PeerId`] — no
     /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
     /// only fires after identity verification.
-    async fn handle_peer_connected(&self, node_id: PeerId) {
+    async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
-        info!("DHT peer connected: app_id={}", app_peer_id_hex);
+        info!(
+            "DHT peer connected: app_id={}, user_agent={}",
+            app_peer_id_hex, user_agent
+        );
         let dht_key = *node_id.as_bytes();
 
         // peer_info() resolves app-level IDs internally via peer_to_channel
@@ -2324,10 +2329,15 @@ impl DhtNetworkManager {
             return;
         }
 
-        // Add to DHT routing table.
-        {
-            use crate::dht::core_engine::{NodeCapacity, NodeInfo};
-
+        // Only add full nodes to the DHT routing table. Ephemeral clients
+        // (user_agent not starting with "node/") are excluded to prevent stale
+        // addresses from polluting peer discovery after the client disconnects.
+        if !crate::network::is_dht_participant(user_agent) {
+            info!(
+                "Skipping DHT routing table for ephemeral peer {} (user_agent={})",
+                app_peer_id_hex, user_agent
+            );
+        } else {
             let node_info = NodeInfo {
                 id: node_id,
                 address: address_str,
@@ -2371,8 +2381,8 @@ impl DhtNetworkManager {
                     recv = events.recv() => {
                         match recv {
                             Ok(event) => match event {
-                                crate::network::P2PEvent::PeerConnected(peer_id) => {
-                                    self_arc.handle_peer_connected(peer_id).await;
+                                crate::network::P2PEvent::PeerConnected(peer_id, ref user_agent) => {
+                                    self_arc.handle_peer_connected(peer_id, user_agent).await;
                                 }
                                 crate::network::P2PEvent::PeerDisconnected(peer_id) => {
                                     // peer_id IS the authenticated app-level PeerId.

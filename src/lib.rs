@@ -199,7 +199,7 @@ pub use monotonic_counter::{
 };
 pub use network::{
     ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, P2PEvent, P2PNode, PeerInfo,
-    PeerResponse,
+    PeerResponse, default_node_user_agent, is_dht_participant,
 };
 pub use transport_handle::TransportHandle;
 // Trust system exports for saorsa-node integration

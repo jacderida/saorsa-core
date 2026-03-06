@@ -99,6 +99,8 @@ pub struct TransportConfig {
     /// Cryptographic node identity (ML-DSA-65). The canonical peer ID is
     /// derived from this identity's public key hash.
     pub node_identity: Arc<NodeIdentity>,
+    /// User agent string identifying this node's software.
+    pub user_agent: String,
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -129,6 +131,8 @@ pub struct TransportHandle {
     listener_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Cryptographic node identity for signing outgoing messages.
     node_identity: Arc<NodeIdentity>,
+    /// User agent string included in every outgoing wire message.
+    user_agent: String,
     /// Maps app-level [`PeerId`] → set of channel IDs (QUIC, Bluetooth, …).
     ///
     /// A single peer may communicate over multiple channels simultaneously.
@@ -223,6 +227,7 @@ impl TransportHandle {
             let p2c = Arc::clone(&peer_to_channel);
             let c2p = Arc::clone(&channel_to_peers);
             let identity_clone = config.node_identity.clone();
+            let user_agent_clone = config.user_agent.clone();
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -236,6 +241,7 @@ impl TransportHandle {
                     p2c,
                     c2p,
                     identity_clone,
+                    user_agent_clone,
                 )
                 .await;
             });
@@ -296,6 +302,7 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: config.node_identity,
+            user_agent: config.user_agent,
             peer_to_channel,
             channel_to_peers,
         })
@@ -359,6 +366,7 @@ impl TransportHandle {
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: identity,
+            user_agent: crate::network::default_node_user_agent(),
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -1065,6 +1073,7 @@ impl TransportHandle {
             data,
             from: *self.node_identity.peer_id(),
             timestamp: Self::current_timestamp_secs()?,
+            user_agent: self.user_agent.clone(),
             public_key: Vec::new(),
             signature: Vec::new(),
         };
@@ -1079,12 +1088,16 @@ impl TransportHandle {
     /// Used by the lifecycle monitor to send an announce immediately after a
     /// transport connection is established, before the full `TransportHandle`
     /// is available in that context.
-    fn create_identity_announce_bytes(identity: &NodeIdentity) -> Result<Vec<u8>> {
+    fn create_identity_announce_bytes(
+        identity: &NodeIdentity,
+        user_agent: &str,
+    ) -> Result<Vec<u8>> {
         let mut message = WireMessage {
             protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
             data: vec![],
             from: *identity.peer_id(),
             timestamp: Self::current_timestamp_secs()?,
+            user_agent: user_agent.to_owned(),
             public_key: Vec::new(),
             signature: Vec::new(),
         };
@@ -1112,6 +1125,7 @@ impl TransportHandle {
             &message.data,
             &message.from,
             message.timestamp,
+            &message.user_agent,
         )?;
         let sig = identity.sign(&signable).map_err(|e| {
             P2PError::Network(NetworkError::ProtocolError(
@@ -1138,8 +1152,9 @@ impl TransportHandle {
         data: &[u8],
         from: &PeerId,
         timestamp: u64,
+        user_agent: &str,
     ) -> Result<Vec<u8>> {
-        postcard::to_stdvec(&(protocol, data, from, timestamp)).map_err(|e| {
+        postcard::to_stdvec(&(protocol, data, from, timestamp, user_agent)).map_err(|e| {
             P2PError::Network(NetworkError::ProtocolError(
                 format!("Failed to serialize signable bytes: {e}").into(),
             ))
@@ -1354,6 +1369,7 @@ impl TransportHandle {
                     Some(ParsedMessage {
                         event,
                         authenticated_node_id,
+                        user_agent: peer_user_agent,
                     }) => {
                         // If the message was signed, record the app↔channel mapping.
                         // A peer may be reachable over multiple channels simultaneously
@@ -1378,7 +1394,10 @@ impl TransportHandle {
                             drop(p2c);
 
                             if is_new_peer {
-                                broadcast_event(&event_tx, P2PEvent::PeerConnected(*app_id));
+                                broadcast_event(
+                                    &event_tx,
+                                    P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
+                                );
                             }
                         }
 
@@ -1569,6 +1588,7 @@ impl TransportHandle {
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
         channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
         node_identity: Arc<NodeIdentity>,
+        user_agent: String,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1637,7 +1657,7 @@ impl TransportHandle {
                                 }
 
                                 // Send identity announce so the remote peer can authenticate us.
-                                match Self::create_identity_announce_bytes(&node_identity) {
+                                match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
                                     Ok(announce_bytes) => {
                                         if let Err(e) = dual_node
                                             .send_to_peer_optimized(&remote_address, &announce_bytes)
