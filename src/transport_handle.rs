@@ -139,6 +139,11 @@ pub struct TransportHandle {
     peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
     /// Reverse index: channel ID → set of app-level [`PeerId`]s on that channel.
     channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+    /// Maps app-level [`PeerId`] → user agent string received during authentication.
+    ///
+    /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
+    /// up a peer's mode without re-receiving the `PeerConnected` event.
+    peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
 }
 
 // ============================================================================
@@ -216,6 +221,8 @@ impl TransportHandle {
 
         let peer_to_channel = Arc::new(RwLock::new(HashMap::new()));
         let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
+        let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
@@ -226,6 +233,7 @@ impl TransportHandle {
             let shutdown_token = shutdown.clone();
             let p2c = Arc::clone(&peer_to_channel);
             let c2p = Arc::clone(&channel_to_peers);
+            let pua = Arc::clone(&peer_user_agents);
             let identity_clone = config.node_identity.clone();
             let user_agent_clone = config.user_agent.clone();
 
@@ -240,6 +248,7 @@ impl TransportHandle {
                     shutdown_token,
                     p2c,
                     c2p,
+                    pua,
                     identity_clone,
                     user_agent_clone,
                 )
@@ -267,6 +276,7 @@ impl TransportHandle {
             let token = shutdown.clone();
             let p2c = Arc::clone(&peer_to_channel);
             let c2p = Arc::clone(&channel_to_peers);
+            let pua = Arc::clone(&peer_user_agents);
 
             let handle = tokio::spawn(async move {
                 Self::periodic_maintenance_task(
@@ -277,6 +287,7 @@ impl TransportHandle {
                     token,
                     p2c,
                     c2p,
+                    pua,
                 )
                 .await;
             });
@@ -305,6 +316,7 @@ impl TransportHandle {
             user_agent: config.user_agent,
             peer_to_channel,
             channel_to_peers,
+            peer_user_agents,
         })
     }
 
@@ -369,6 +381,7 @@ impl TransportHandle {
             user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -433,6 +446,11 @@ impl TransportHandle {
     /// Get count of authenticated app-level peers.
     pub async fn peer_count(&self) -> usize {
         self.peer_to_channel.read().await.len()
+    }
+
+    /// Get the user agent string for a connected peer, if known.
+    pub async fn peer_user_agent(&self, peer_id: &PeerId) -> Option<String> {
+        self.peer_user_agents.read().await.get(peer_id).cloned()
     }
 
     /// Get all active transport-level channel IDs (internal bookkeeping).
@@ -548,6 +566,7 @@ impl TransportHandle {
             channel_id,
             &self.peer_to_channel,
             &self.channel_to_peers,
+            &self.peer_user_agents,
             &self.event_tx,
         )
         .await;
@@ -559,6 +578,7 @@ impl TransportHandle {
         channel_id: &str,
         peer_to_channel: &RwLock<HashMap<PeerId, HashSet<String>>>,
         channel_to_peers: &RwLock<HashMap<String, HashSet<PeerId>>>,
+        peer_user_agents: &RwLock<HashMap<PeerId, String>>,
         event_tx: &broadcast::Sender<P2PEvent>,
     ) {
         let mut p2c = peer_to_channel.write().await;
@@ -569,6 +589,7 @@ impl TransportHandle {
                     channels.remove(channel_id);
                     if channels.is_empty() {
                         p2c.remove(app_peer);
+                        peer_user_agents.write().await.remove(app_peer);
                         let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
                     }
                 }
@@ -712,6 +733,7 @@ impl TransportHandle {
             orphaned
         };
 
+        self.peer_user_agents.write().await.remove(peer_id);
         let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
 
         // Close QUIC connections for channels with no remaining peers.
@@ -1348,6 +1370,7 @@ impl TransportHandle {
         let peers_for_recv = Arc::clone(&self.peers);
         let peer_to_channel = Arc::clone(&self.peer_to_channel);
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
+        let peer_user_agents = Arc::clone(&self.peer_user_agents);
         let self_peer_id = *self.node_identity.peer_id();
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
@@ -1394,6 +1417,10 @@ impl TransportHandle {
                             drop(p2c);
 
                             if is_new_peer {
+                                peer_user_agents
+                                    .write()
+                                    .await
+                                    .insert(*app_id, peer_user_agent.clone());
                                 broadcast_event(
                                     &event_tx,
                                     P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
@@ -1587,6 +1614,7 @@ impl TransportHandle {
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
         channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
     ) {
@@ -1690,6 +1718,7 @@ impl TransportHandle {
                                     &channel_id,
                                     &peer_to_channel,
                                     &channel_to_peers,
+                                    &peer_user_agents,
                                     &event_tx,
                                 ).await;
                             }
@@ -1783,6 +1812,7 @@ impl TransportHandle {
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
         channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
     ) {
         let cleanup_threshold = stale_threshold * CLEANUP_THRESHOLD_MULTIPLIER;
         let mut interval = tokio::time::interval(Duration::from_millis(MAINTENANCE_INTERVAL_MS));
@@ -1826,6 +1856,7 @@ impl TransportHandle {
                     peer_id,
                     &peer_to_channel,
                     &channel_to_peers,
+                    &peer_user_agents,
                     &event_tx,
                 )
                 .await;

@@ -2217,6 +2217,11 @@ impl DhtNetworkManager {
     }
 
     /// Reconcile already-connected peers into DHT bookkeeping/routing.
+    ///
+    /// Looks up each peer's actual user agent from the transport layer.
+    /// Peers whose user agent is not yet known (e.g. identity announce still
+    /// in flight) are skipped — they will be handled by the normal
+    /// `PeerConnected` event path once authentication completes.
     async fn reconcile_connected_peers(&self) {
         let connected = self.transport.connected_peers().await;
         if connected.is_empty() {
@@ -2227,9 +2232,23 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
-        let default_ua = crate::network::user_agent_for_mode(crate::network::NodeMode::Node);
+        let mut skipped = 0u32;
         for peer_id in connected {
-            self.handle_peer_connected(peer_id, &default_ua).await;
+            if let Some(ua) = self.transport.peer_user_agent(&peer_id).await {
+                self.handle_peer_connected(peer_id, &ua).await;
+            } else {
+                skipped += 1;
+                debug!(
+                    "Skipping reconciliation for peer {} — user agent not yet known",
+                    peer_id.to_hex()
+                );
+            }
+        }
+        if skipped > 0 {
+            info!(
+                "Skipped {} peers during reconciliation (user agent unknown, will arrive via PeerConnected)",
+                skipped
+            );
         }
     }
 
