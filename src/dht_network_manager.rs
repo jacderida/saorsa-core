@@ -2674,6 +2674,20 @@ impl DhtNetworkManager {
         0
     }
 
+    /// Check whether a peer is present in the DHT routing table.
+    ///
+    /// This queries the core Kademlia routing table, *not* the broader
+    /// `dht_peers` bookkeeping map. Only peers that passed the
+    /// `is_dht_participant` gate are added to the routing table.
+    pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
+        let key = DhtKey::from_bytes(*peer_id.as_bytes());
+        let dht_guard = self.dht.read().await;
+        match dht_guard.find_nodes(&key, 1).await {
+            Ok(nodes) => nodes.iter().any(|n| n.id == *peer_id),
+            Err(_) => false,
+        }
+    }
+
     /// Get this node's peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.config.peer_id
