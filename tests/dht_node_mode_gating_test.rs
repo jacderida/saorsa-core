@@ -50,7 +50,7 @@ fn test_config(mode: NodeMode) -> NodeConfig {
     }
 }
 
-/// Wait for a `PeerConnected` event from a specific peer.
+/// Wait for the next `PeerConnected` event from any peer.
 async fn wait_for_peer_connected(
     rx: &mut broadcast::Receiver<P2PEvent>,
     timeout_duration: Duration,
