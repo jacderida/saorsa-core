@@ -21,6 +21,7 @@
 use crate::{
     Multiaddr, P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
+    dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
     error::{DhtError, NetworkError},
@@ -1122,34 +1123,8 @@ impl DhtNetworkManager {
 
     /// Leave the DHT network gracefully
     async fn leave_network(&self) -> Result<()> {
-        info!("Leaving DHT network...");
-
-        let leave_operation = DhtNetworkOperation::Leave;
-        let connected_peers: Vec<PeerId> = {
-            let peers = self.dht_peers.read().await;
-            peers.keys().cloned().collect()
-        };
-
-        // Send leave messages to all connected peers
-        for peer_id in connected_peers {
-            match self
-                .send_dht_request(&peer_id, leave_operation.clone())
-                .await
-            {
-                Ok(_) => {
-                    debug!("Sent leave message to peer: {}", peer_id.to_hex());
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to send leave message to {}: {}",
-                        peer_id.to_hex(),
-                        e
-                    );
-                }
-            }
-        }
-
-        info!("DHT network leave completed");
+        // No-op: peers detect disconnection via transport-level connection loss.
+        // Explicit leave messages added latency to shutdown without meaningful benefit.
         Ok(())
     }
 
@@ -2242,6 +2217,11 @@ impl DhtNetworkManager {
     }
 
     /// Reconcile already-connected peers into DHT bookkeeping/routing.
+    ///
+    /// Looks up each peer's actual user agent from the transport layer.
+    /// Peers whose user agent is not yet known (e.g. identity announce still
+    /// in flight) are skipped — they will be handled by the normal
+    /// `PeerConnected` event path once authentication completes.
     async fn reconcile_connected_peers(&self) {
         let connected = self.transport.connected_peers().await;
         if connected.is_empty() {
@@ -2252,8 +2232,23 @@ impl DhtNetworkManager {
             "Reconciling {} already-connected peers for DHT state",
             connected.len()
         );
+        let mut skipped = 0u32;
         for peer_id in connected {
-            self.handle_peer_connected(peer_id).await;
+            if let Some(ua) = self.transport.peer_user_agent(&peer_id).await {
+                self.handle_peer_connected(peer_id, &ua).await;
+            } else {
+                skipped += 1;
+                debug!(
+                    "Skipping reconciliation for peer {} — user agent not yet known",
+                    peer_id.to_hex()
+                );
+            }
+        }
+        if skipped > 0 {
+            info!(
+                "Skipped {} peers during reconciliation (user agent unknown, will arrive via PeerConnected)",
+                skipped
+            );
         }
     }
 
@@ -2262,9 +2257,12 @@ impl DhtNetworkManager {
     /// The `node_id` is the authenticated app-level [`PeerId`] — no
     /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
     /// only fires after identity verification.
-    async fn handle_peer_connected(&self, node_id: PeerId) {
+    async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
-        info!("DHT peer connected: app_id={}", app_peer_id_hex);
+        info!(
+            "DHT peer connected: app_id={}, user_agent={}",
+            app_peer_id_hex, user_agent
+        );
         let dht_key = *node_id.as_bytes();
 
         // peer_info() resolves app-level IDs internally via peer_to_channel
@@ -2324,10 +2322,15 @@ impl DhtNetworkManager {
             return;
         }
 
-        // Add to DHT routing table.
-        {
-            use crate::dht::core_engine::{NodeCapacity, NodeInfo};
-
+        // Only add full nodes to the DHT routing table. Ephemeral clients
+        // (user_agent not starting with "node/") are excluded to prevent stale
+        // addresses from polluting peer discovery after the client disconnects.
+        if !crate::network::is_dht_participant(user_agent) {
+            info!(
+                "Skipping DHT routing table for ephemeral peer {} (user_agent={})",
+                app_peer_id_hex, user_agent
+            );
+        } else {
             let node_info = NodeInfo {
                 id: node_id,
                 address: address_str,
@@ -2371,8 +2374,8 @@ impl DhtNetworkManager {
                     recv = events.recv() => {
                         match recv {
                             Ok(event) => match event {
-                                crate::network::P2PEvent::PeerConnected(peer_id) => {
-                                    self_arc.handle_peer_connected(peer_id).await;
+                                crate::network::P2PEvent::PeerConnected(peer_id, ref user_agent) => {
+                                    self_arc.handle_peer_connected(peer_id, user_agent).await;
                                 }
                                 crate::network::P2PEvent::PeerDisconnected(peer_id) => {
                                     // peer_id IS the authenticated app-level PeerId.
@@ -2669,6 +2672,20 @@ impl DhtNetworkManager {
         // let stats = dht_guard.stats().await;
         // stats.total_nodes
         0
+    }
+
+    /// Check whether a peer is present in the DHT routing table.
+    ///
+    /// This queries the core Kademlia routing table, *not* the broader
+    /// `dht_peers` bookkeeping map. Only peers that passed the
+    /// `is_dht_participant` gate are added to the routing table.
+    pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
+        let key = DhtKey::from_bytes(*peer_id.as_bytes());
+        let dht_guard = self.dht.read().await;
+        match dht_guard.find_nodes(&key, 1).await {
+            Ok(nodes) => nodes.iter().any(|n| n.id == *peer_id),
+            Err(_) => false,
+        }
     }
 
     /// Get this node's peer ID.

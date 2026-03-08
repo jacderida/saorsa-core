@@ -39,9 +39,7 @@ use tracing::{debug, info, warn};
 
 /// Wire protocol message format for P2P communication.
 ///
-/// Serialized with bincode for compact binary encoding.
-/// Replaces the previous JSON format for better performance
-/// and smaller wire size.
+/// Serialized with postcard for compact binary encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WireMessage {
     /// Protocol/topic identifier
@@ -52,6 +50,13 @@ pub(crate) struct WireMessage {
     pub(crate) from: PeerId,
     /// Unix timestamp in seconds
     pub(crate) timestamp: u64,
+    /// User agent string identifying the sender's software.
+    ///
+    /// Convention: `"node/<version>"` for full DHT participants,
+    /// `"client/<version>"` or `"<app>/<version>"` for ephemeral clients.
+    /// Included in the signed bytes — tamper-proof.
+    #[serde(default)]
+    pub(crate) user_agent: String,
     /// Sender's ML-DSA-65 public key (1952 bytes). Empty if unsigned.
     #[serde(default)]
     pub(crate) public_key: Vec<u8>,
@@ -62,6 +67,43 @@ pub(crate) struct WireMessage {
 
 /// Payload bytes used for keepalive messages to prevent connection timeouts.
 pub(crate) const KEEPALIVE_PAYLOAD: &[u8] = b"keepalive";
+
+/// Operating mode of a P2P node.
+///
+/// Determines the default user agent and DHT participation behavior.
+/// `Node` peers participate in the DHT routing table; `Client` peers
+/// are treated as ephemeral and excluded from routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NodeMode {
+    /// Full DHT-participant node that stores data and routes messages.
+    #[default]
+    Node,
+    /// Ephemeral client that connects to perform operations without joining the DHT.
+    Client,
+}
+
+/// Returns the default user agent string for the given mode.
+///
+/// - `Node` → `"node/<saorsa-core-version>"`
+/// - `Client` → `"client/<saorsa-core-version>"`
+pub fn user_agent_for_mode(mode: NodeMode) -> String {
+    let prefix = match mode {
+        NodeMode::Node => "node",
+        NodeMode::Client => "client",
+    };
+    format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Default user agent for full DHT-participant nodes.
+#[deprecated(note = "Use `user_agent_for_mode(NodeMode::Node)` instead")]
+pub fn default_node_user_agent() -> String {
+    user_agent_for_mode(NodeMode::Node)
+}
+
+/// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
+pub fn is_dht_participant(user_agent: &str) -> bool {
+    user_agent.starts_with("node/")
+}
 
 /// Capacity of the internal channel used by the message receiving system.
 pub(crate) const MESSAGE_RECV_CHANNEL_CAPACITY: usize = 256;
@@ -162,6 +204,21 @@ pub struct NodeConfig {
     /// and incoming signed messages are verified at the transport layer.
     #[serde(skip)]
     pub node_identity: Option<Arc<NodeIdentity>>,
+
+    /// Operating mode of this node.
+    ///
+    /// Determines the default user agent and DHT participation:
+    /// - `Node` → user agent `"node/<version>"`, added to DHT routing tables.
+    /// - `Client` → user agent `"client/<version>"`, treated as ephemeral.
+    #[serde(default)]
+    pub mode: NodeMode,
+
+    /// Optional custom user agent override.
+    ///
+    /// When `Some`, this value is used instead of the mode-derived default.
+    /// When `None`, the user agent is derived from [`NodeConfig::mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_user_agent: Option<String>,
 }
 
 /// Default stale peer threshold (60 seconds)
@@ -236,6 +293,16 @@ fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<std::net::SocketAddr
 }
 
 impl NodeConfig {
+    /// Returns the effective user agent string.
+    ///
+    /// If a custom user agent was set, returns that. Otherwise, derives
+    /// the user agent from the node's [`NodeMode`].
+    pub fn user_agent(&self) -> String {
+        self.custom_user_agent
+            .clone()
+            .unwrap_or_else(|| user_agent_for_mode(self.mode))
+    }
+
     /// Create a new NodeConfig with default values
     ///
     /// # Errors
@@ -267,6 +334,8 @@ impl NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         })
     }
 
@@ -293,6 +362,8 @@ pub struct NodeConfigBuilder {
     security_config: Option<SecurityConfig>,
     production_config: Option<ProductionConfig>,
     max_message_size: Option<usize>,
+    mode: NodeMode,
+    custom_user_agent: Option<String>,
 }
 
 impl NodeConfigBuilder {
@@ -358,6 +429,18 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the operating mode (Node or Client).
+    pub fn mode(mut self, mode: NodeMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set a custom user agent string, overriding the mode-derived default.
+    pub fn custom_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.custom_user_agent = Some(user_agent.into());
+        self
+    }
+
     /// Build the NodeConfig
     ///
     /// # Errors
@@ -400,6 +483,8 @@ impl NodeConfigBuilder {
                 .max_message_size
                 .or(base_config.transport.max_message_size),
             node_identity: None,
+            mode: self.mode,
+            custom_user_agent: self.custom_user_agent,
         })
     }
 }
@@ -431,6 +516,8 @@ impl Default for NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         }
     }
 }
@@ -484,6 +571,8 @@ impl NodeConfig {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         };
 
         // Add IPv6 listen address if enabled
@@ -657,7 +746,8 @@ pub enum P2PEvent {
         data: Vec<u8>,
     },
     /// An authenticated peer has connected (first signed message verified on any channel).
-    PeerConnected(PeerId),
+    /// The `user_agent` identifies the remote software (e.g. `"node/0.12.1"`, `"client/1.0"`).
+    PeerConnected(PeerId, String),
     /// An authenticated peer has fully disconnected (all channels closed).
     PeerDisconnected(PeerId),
 }
@@ -835,6 +925,7 @@ impl P2PNode {
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: config.max_message_size,
             node_identity: node_identity.clone(),
+            user_agent: config.user_agent(),
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -1434,6 +1525,8 @@ pub(crate) struct ParsedMessage {
     pub(crate) event: P2PEvent,
     /// If the message was signed and verified, the authenticated app-level [`PeerId`].
     pub(crate) authenticated_node_id: Option<PeerId>,
+    /// The sender's user agent string from the wire message.
+    pub(crate) user_agent: String,
 }
 
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
@@ -1505,6 +1598,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
             data: message.data,
         },
         authenticated_node_id,
+        user_agent: message.user_agent,
     })
 }
 
@@ -1533,6 +1627,7 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId
         &message.data as &[u8],
         &message.from,
         message.timestamp,
+        &message.user_agent,
     ))
     .map_err(|e| format!("failed to serialize signable bytes: {e}"))?;
 
@@ -1945,7 +2040,19 @@ impl NodeBuilder {
         self
     }
 
-    // MCP removed: builder methods deleted
+    /// Set the operating mode (Node or Client).
+    ///
+    /// This determines the default user agent and DHT participation.
+    pub fn with_mode(mut self, mode: NodeMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    /// Set a custom user agent string, overriding the mode-derived default.
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.config.custom_user_agent = Some(user_agent.into());
+        self
+    }
 
     /// Set connection timeout
     pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
@@ -2100,6 +2207,8 @@ mod tests {
             stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
             node_identity: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
         }
     }
 
@@ -2340,7 +2449,7 @@ mod tests {
         let event = timeout(Duration::from_secs(2), async {
             loop {
                 match events.recv().await {
-                    Ok(P2PEvent::PeerConnected(id)) => return Ok(id),
+                    Ok(P2PEvent::PeerConnected(id, _)) => return Ok(id),
                     Ok(P2PEvent::Message { .. }) => continue, // skip messages
                     Ok(_) => continue,
                     Err(e) => return Err(e),
@@ -2974,6 +3083,7 @@ mod tests {
             data,
             from: PeerId::from_name(from),
             timestamp,
+            user_agent: String::new(),
             public_key: Vec::new(),
             signature: Vec::new(),
         };
@@ -3064,9 +3174,12 @@ mod tests {
         // The `from` field must match the PeerId derived from the public key.
         let from = *identity.peer_id();
         let timestamp = current_timestamp();
+        let user_agent = "test/1.0";
 
         // Compute signable bytes the same way create_protocol_message does
-        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp, user_agent))
+                .unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         let msg = WireMessage {
@@ -3074,6 +3187,7 @@ mod tests {
             data: data.clone(),
             from,
             timestamp,
+            user_agent: user_agent.to_string(),
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
         };
@@ -3107,9 +3221,12 @@ mod tests {
         let data: Vec<u8> = vec![1, 2, 3];
         let from = *identity.peer_id();
         let timestamp = current_timestamp();
+        let user_agent = "test/1.0";
 
         // Sign correct signable bytes
-        let signable = postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp)).unwrap();
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp, user_agent))
+                .unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         // Tamper with the data (signature was over [1,2,3], not [99,99,99])
@@ -3118,6 +3235,7 @@ mod tests {
             data: vec![99, 99, 99],
             from,
             timestamp,
+            user_agent: user_agent.to_string(),
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
         };
@@ -3137,9 +3255,11 @@ mod tests {
         // Use a `from` field that does NOT match the public key's PeerId.
         let fake_from = PeerId::from_bytes([0xDE; 32]);
         let timestamp = current_timestamp();
+        let user_agent = "test/1.0";
 
         let signable =
-            postcard::to_stdvec(&(protocol, data.as_slice(), &fake_from, timestamp)).unwrap();
+            postcard::to_stdvec(&(protocol, data.as_slice(), &fake_from, timestamp, user_agent))
+                .unwrap();
         let sig = identity.sign(&signable).expect("signing should succeed");
 
         let msg = WireMessage {
@@ -3147,6 +3267,7 @@ mod tests {
             data,
             from: fake_from,
             timestamp,
+            user_agent: user_agent.to_string(),
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: sig.as_bytes().to_vec(),
         };

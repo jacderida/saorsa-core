@@ -86,6 +86,7 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
             node_identity: Arc::new(NodeIdentity::generate().unwrap()),
+            user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
         })
         .await?,
     );
