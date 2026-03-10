@@ -181,25 +181,23 @@ impl KademliaRoutingTable {
 
         let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
 
-        // Collect from target bucket first, then expand outwards
-        for offset in 0..256 {
-            // Check bucket above target (or at target when offset == 0)
-            let bucket_above = target_bucket.saturating_add(offset).min(255);
-            for node in self.buckets[bucket_above].get_nodes() {
+        // Visit buckets in order of proximity to target, each exactly once.
+        // Uses checked arithmetic so indices that would exceed [0, 255] are
+        // skipped rather than clamped, preventing duplicate bucket visits.
+        let bucket_iter = std::iter::once(target_bucket).chain(
+            (1..KADEMLIA_BUCKET_COUNT).flat_map(move |offset| {
+                let above = target_bucket
+                    .checked_add(offset)
+                    .filter(|&b| b < KADEMLIA_BUCKET_COUNT);
+                let below = target_bucket.checked_sub(offset);
+                above.into_iter().chain(below)
+            }),
+        );
+
+        for bucket_idx in bucket_iter {
+            for node in self.buckets[bucket_idx].get_nodes() {
                 let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
                 candidates.push((node.clone(), distance));
-            }
-
-            // Check bucket below target (skip when offset == 0 to avoid duplicate)
-            if offset > 0 {
-                let bucket_below = target_bucket.saturating_sub(offset);
-                // Only check if it's a different bucket (saturating_sub may equal target_bucket)
-                if bucket_below != bucket_above {
-                    for node in self.buckets[bucket_below].get_nodes() {
-                        let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
-                        candidates.push((node.clone(), distance));
-                    }
-                }
             }
 
             // Early exit: if we have enough candidates, we can stop expanding

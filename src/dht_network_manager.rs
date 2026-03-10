@@ -1200,8 +1200,9 @@ impl DhtNetworkManager {
         let initial = self.find_closest_nodes_local(key, count).await;
         let mut candidates: VecDeque<DHTNode> = VecDeque::new();
         for node in initial {
-            queued_peer_ids.insert(node.peer_id);
-            candidates.push_back(node);
+            if queued_peer_ids.insert(node.peer_id) {
+                candidates.push_back(node);
+            }
         }
         let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
 
@@ -1320,8 +1321,9 @@ impl DhtNetworkManager {
                 }
             }
 
-            // Sort and truncate once per iteration instead of per result
+            // Sort, deduplicate, and truncate once per iteration instead of per result
             best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+            best_nodes.dedup_by(|a, b| a.peer_id == b.peer_id);
             best_nodes.truncate(count);
 
             if !found_new_closer {
@@ -1345,6 +1347,7 @@ impl DhtNetworkManager {
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        best_nodes.dedup_by(|a, b| a.peer_id == b.peer_id);
         best_nodes.truncate(count);
 
         info!(
