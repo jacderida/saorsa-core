@@ -184,19 +184,25 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
-        let actual_addr = transport.endpoint().local_addr().unwrap_or(bind_addr);
+        let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Transport endpoint has no local address — bind to {bind_addr} may have failed"
+            )
+        })?;
 
         Self::with_transport(Arc::new(transport), actual_addr).await
     }
 
     /// Create a new P2P network node with custom P2pConfig
-    pub async fn new_with_config(bind_addr: SocketAddr, config: P2pConfig) -> Result<Self> {
+    pub async fn new_with_config(_bind_addr: SocketAddr, config: P2pConfig) -> Result<Self> {
         let transport = P2pLinkTransport::new(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
 
         // Get the actual bound address from the endpoint
-        let actual_addr = transport.endpoint().local_addr().unwrap_or(bind_addr);
+        let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
+            anyhow::anyhow!("Transport endpoint has no local address — bind may have failed")
+        })?;
 
         Self::with_transport(Arc::new(transport), actual_addr).await
     }

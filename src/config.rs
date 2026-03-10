@@ -76,6 +76,8 @@ pub struct NetworkConfig {
     pub connection_timeout: u64,
     /// Keepalive interval in seconds
     pub keepalive_interval: u64,
+    /// Allow loopback addresses (for devnet/testnet)
+    pub allow_loopback: bool,
 }
 
 /// Security configuration
@@ -193,6 +195,7 @@ impl Default for NetworkConfig {
             max_connections: 10000,
             connection_timeout: 30,
             keepalive_interval: 60,
+            allow_loopback: false,
         }
     }
 }

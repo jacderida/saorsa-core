@@ -132,8 +132,7 @@ impl TransportHandle {
     ///
     /// This performs the transport-level initialization that was previously
     /// embedded in `P2PNode::new()`: dual-stack QUIC binding, rate limiter,
-    /// GeoIP provider, and background tasks (connection monitor, keepalive,
-    /// periodic maintenance).
+    /// GeoIP provider, and a background connection lifecycle monitor.
     pub async fn new(config: TransportConfig) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
 

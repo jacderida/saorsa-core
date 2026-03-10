@@ -546,12 +546,7 @@ impl NodeConfig {
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
             max_connections: config.network.max_connections,
             max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig {
-                k_value: 20,
-                alpha_value: 3,
-                record_ttl: Duration::from_secs(3600),
-                refresh_interval: Duration::from_secs(900),
-            },
+            dht_config: DHTConfig::default(),
             security_config: SecurityConfig {
                 enable_noise: true,
                 enable_tls: true,
@@ -576,7 +571,7 @@ impl NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
-            allow_loopback: false,
+            allow_loopback: config.network.allow_loopback,
         };
 
         // Add IPv6 listen address if enabled
@@ -2076,6 +2071,15 @@ impl NodeBuilder {
     /// Configure production settings
     pub fn with_production_config(mut self, production_config: ProductionConfig) -> Self {
         self.config.production_config = Some(production_config);
+        self
+    }
+
+    /// Allow loopback addresses in the transport layer.
+    ///
+    /// Enable for devnet/testnet modes where multiple nodes run on the same
+    /// machine. Default: `false`.
+    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
+        self.config.allow_loopback = allow;
         self
     }
 
