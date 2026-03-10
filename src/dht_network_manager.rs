@@ -1856,23 +1856,6 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Handle incoming DHT network response (for real network integration)
-    pub async fn handle_network_response(
-        &self,
-        message_id: &str,
-        _response: DhtNetworkResult,
-    ) -> Result<()> {
-        // Store the response for the waiting request
-        // In a real implementation, this would use a proper response queue/store
-
-        debug!("Received DHT network response for message: {}", message_id);
-
-        // For now, we'll complete the operation immediately
-        // This method would be called by the network layer when a response is received
-
-        Ok(())
-    }
-
     /// Handle incoming DHT message
     pub async fn handle_dht_message(
         &self,
@@ -1898,7 +1881,7 @@ impl DhtNetworkManager {
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
 
-        info!(
+        debug!(
             "[STEP 3] {}: Received {:?} from {} (msg_id: {})",
             self.config.peer_id.to_hex(),
             message.message_type,
@@ -1911,14 +1894,14 @@ impl DhtNetworkManager {
 
         match message.message_type {
             DhtMessageType::Request => {
-                info!(
+                debug!(
                     "[STEP 3a] {}: Processing {:?} request from {}",
                     self.config.peer_id.to_hex(),
                     message.payload,
                     sender
                 );
-                let result = self.handle_dht_request(&message).await?;
-                info!(
+                let result = self.handle_dht_request(&message, sender).await?;
+                debug!(
                     "[STEP 4] {}: Sending response {:?} back to {} (msg_id: {})",
                     self.config.peer_id.to_hex(),
                     std::mem::discriminant(&result),
@@ -1931,7 +1914,7 @@ impl DhtNetworkManager {
                 })?))
             }
             DhtMessageType::Response => {
-                info!(
+                debug!(
                     "[STEP 5] {}: Received response from {} (msg_id: {})",
                     self.config.peer_id.to_hex(),
                     sender,
@@ -1951,8 +1934,16 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Handle DHT request message
-    async fn handle_dht_request(&self, message: &DhtNetworkMessage) -> Result<DhtNetworkResult> {
+    /// Handle DHT request message.
+    ///
+    /// `authenticated_sender` is the transport-authenticated peer ID, used
+    /// instead of the self-reported `message.source` for any security-sensitive
+    /// decisions (e.g. filtering nodes in lookup responses).
+    async fn handle_dht_request(
+        &self,
+        message: &DhtNetworkMessage,
+        authenticated_sender: &PeerId,
+    ) -> Result<DhtNetworkResult> {
         match &message.payload {
             DhtNetworkOperation::Put { key, value } => {
                 trace!(
@@ -1971,44 +1962,37 @@ impl DhtNetworkManager {
                 })
             }
             DhtNetworkOperation::Get { key } => {
-                info!("Handling GET request for key: {}", hex::encode(key));
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::Get)
+                debug!("Handling GET request for key: {}", hex::encode(key));
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::Get)
                     .await
             }
             DhtNetworkOperation::FindNode { key } => {
-                info!("Handling FIND_NODE request for key: {}", hex::encode(key));
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::FindNode)
+                debug!("Handling FIND_NODE request for key: {}", hex::encode(key));
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::FindNode)
                     .await
             }
             DhtNetworkOperation::FindValue { key } => {
-                info!(
+                debug!(
                     "[STEP 3b] {}: Handling FIND_VALUE for key {}",
                     self.config.peer_id.to_hex(),
                     hex::encode(key)
                 );
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::FindValue)
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::FindValue)
                     .await
             }
             DhtNetworkOperation::Ping => {
-                info!("Handling PING request from: {}", message.source);
+                debug!("Handling PING request from: {}", authenticated_sender);
                 Ok(DhtNetworkResult::PongReceived {
                     responder: self.config.peer_id,
                     latency: Duration::from_millis(0), // Local response
                 })
             }
             DhtNetworkOperation::Join => {
-                info!("Handling JOIN request from: {}", message.source);
-                // Add the joining node to our routing table
-                let dht_key = *message.source.as_bytes();
-                let _node = DHTNode {
-                    peer_id: message.source,
-                    address: String::new(),
-                    distance: Some(dht_key.to_vec()),
-                    reliability: 1.0,
-                };
+                debug!("Handling JOIN request from: {}", authenticated_sender);
+                let dht_key = *authenticated_sender.as_bytes();
 
                 // Node will be added to routing table through normal DHT operations
-                debug!("Node {} joined the network", message.source);
+                debug!("Node {} joined the network", authenticated_sender);
 
                 Ok(DhtNetworkResult::JoinSuccess {
                     assigned_key: dht_key,
@@ -2016,7 +2000,7 @@ impl DhtNetworkManager {
                 })
             }
             DhtNetworkOperation::Leave => {
-                info!("Handling LEAVE request from: {}", message.source);
+                debug!("Handling LEAVE request from: {}", authenticated_sender);
                 // Remove the leaving node from our routing table
                 // TODO: Implement node removal from DHT routing table
                 // let dht_guard = self.dht.write().await;
@@ -2103,13 +2087,14 @@ impl DhtNetworkManager {
 
             // Take the sender out of the context (can only send once)
             if let Some(tx) = context.response_tx.take() {
-                info!(
+                debug!(
                     "[STEP 5a] {}: Delivering response for msg_id {} to waiting request",
                     self.config.peer_id.to_hex(),
                     message_id
                 );
-                // Send response - if receiver dropped (timeout), log it
-                if tx.send((message.source, result)).is_err() {
+                // Send the transport-authenticated sender identity, not the
+                // self-reported message.source which could be spoofed.
+                if tx.send((sender_app_id, result)).is_err() {
                     warn!(
                         "[STEP 5a FAILED] {}: Response channel closed for msg_id {} (receiver timed out)",
                         self.config.peer_id.to_hex(),
@@ -2599,12 +2584,8 @@ impl DhtNetworkManager {
     /// Only peers that passed the `is_dht_participant` gate are added
     /// to the routing table.
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
-        let key = DhtKey::from_bytes(*peer_id.as_bytes());
         let dht_guard = self.dht.read().await;
-        match dht_guard.find_nodes(&key, 1).await {
-            Ok(nodes) => nodes.iter().any(|n| n.id == *peer_id),
-            Err(_) => false,
-        }
+        dht_guard.get_node_address(peer_id).await.is_some()
     }
 
     /// Get this node's peer ID.
@@ -2649,11 +2630,7 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Get a value from local storage only (no network query)
-    ///
-    /// Returns the value if it exists in local storage, None otherwise.
-    /// Unlike `get()`, this does NOT query remote nodes.
-    /// Connect to a specific peer by address
+    /// Connect to a specific peer by address.
     ///
     /// This is useful for manually building network topology in tests.
     pub async fn connect_to_peer(&self, address: &str) -> Result<String> {
