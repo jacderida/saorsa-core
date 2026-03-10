@@ -15,12 +15,12 @@ use crate::dht::routing_maintenance::{
 };
 use crate::dht::trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
 use crate::network::NetworkSender;
-use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
+use crate::security::IPDiversityConfig;
 use anyhow::{Context, Result, anyhow};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -243,6 +243,16 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].find_node(node_id)
     }
 
+    /// Total number of nodes across all buckets.
+    fn node_count(&self) -> usize {
+        self.buckets.iter().map(|b| b.get_nodes().len()).sum()
+    }
+
+    /// Iterate over every node in the routing table.
+    fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
+        self.buckets.iter().flat_map(|b| b.get_nodes().iter())
+    }
+
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
         let distance = xor_distance_bytes(self.node_id.to_bytes(), node_id.to_bytes());
 
@@ -424,36 +434,44 @@ impl LoadBalancer {
     }
 }
 
-/// Geographic diversity enforcer for routing table
-/// Limits the number of nodes from any single region to prevent geographic concentration attacks
-struct GeographicDiversityEnforcer {
-    region_counts: HashMap<GeographicRegion, usize>,
-    max_per_region: usize,
-}
+// ---------------------------------------------------------------------------
+// Address parsing and subnet masking helpers for diversity checks
+// ---------------------------------------------------------------------------
 
-impl GeographicDiversityEnforcer {
-    fn new(max_per_region: usize) -> Self {
-        Self {
-            region_counts: HashMap::new(),
-            max_per_region,
-        }
-    }
-
-    fn can_accept(&self, region: GeographicRegion) -> bool {
-        let count = self.region_counts.get(&region).copied().unwrap_or(0);
-        count < self.max_per_region
-    }
-
-    fn add(&mut self, region: GeographicRegion) {
-        *self.region_counts.entry(region).or_insert(0) += 1;
-    }
-
-    fn _remove(&mut self, region: GeographicRegion) {
-        if let Some(count) = self.region_counts.get_mut(&region) {
-            *count = count.saturating_sub(1);
-        }
+/// Parse an IP address from a node address string ("ip:port" or bare "ip").
+fn parse_ip(address: &str) -> Option<IpAddr> {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        Some(socket.ip())
+    } else {
+        address.parse::<IpAddr>().ok()
     }
 }
+
+/// Zero out the host bits of an IPv4 address beyond `prefix_len`.
+fn mask_ipv4(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let bits = u32::from(addr);
+    let mask = if prefix_len >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    Ipv4Addr::from(bits & mask)
+}
+
+/// Zero out the host bits of an IPv6 address beyond `prefix_len`.
+fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let bits = u128::from(addr);
+    let mask = if prefix_len >= 128 {
+        u128::MAX
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    Ipv6Addr::from(bits & mask)
+}
+
+/// Default maximum nodes per geographic region. Matches
+/// `GeographicRoutingConfig::max_nodes_per_region` default.
+const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 
 /// DHT query timeout duration
 const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -518,9 +536,13 @@ pub struct DhtCoreEngine {
     security_metrics: Arc<SecurityMetricsCollector>,
     bucket_refresh_manager: Arc<RwLock<BucketRefreshManager>>,
     close_group_validator: Arc<RwLock<CloseGroupValidator>>,
-    ip_diversity_enforcer: Arc<RwLock<IPDiversityEnforcer>>,
     eviction_manager: Arc<RwLock<EvictionManager>>,
-    geographic_diversity_enforcer: Arc<RwLock<GeographicDiversityEnforcer>>,
+
+    /// IP diversity limits — checked against the live routing table on each
+    /// `add_node` call rather than maintained as incremental counters.
+    ip_diversity_config: IPDiversityConfig,
+    /// Maximum nodes per geographic region.
+    geo_max_per_region: usize,
 
     // Network query components
     /// Transport handle for sending messages to remote peers
@@ -570,17 +592,9 @@ impl DhtCoreEngine {
         bucket_refresh_manager.set_validator(close_group_validator.clone());
         let bucket_refresh_manager = Arc::new(RwLock::new(bucket_refresh_manager));
 
-        let ip_diversity_enforcer = Arc::new(RwLock::new(IPDiversityEnforcer::new(
-            IPDiversityConfig::default(),
-        )));
-
         let eviction_manager = Arc::new(RwLock::new(EvictionManager::new(
             MaintenanceConfig::default(),
         )));
-
-        // Geographic diversity: limit to 50 nodes per region (matches GeographicRoutingConfig default)
-        let geographic_diversity_enforcer =
-            Arc::new(RwLock::new(GeographicDiversityEnforcer::new(50)));
 
         Ok(Self {
             node_id,
@@ -591,9 +605,9 @@ impl DhtCoreEngine {
             security_metrics,
             bucket_refresh_manager,
             close_group_validator,
-            ip_diversity_enforcer,
             eviction_manager,
-            geographic_diversity_enforcer,
+            ip_diversity_config: IPDiversityConfig::default(),
+            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
             transport: None,
             pending_requests: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(MAX_PENDING_DHT_REQUESTS)
@@ -1328,24 +1342,14 @@ impl DhtCoreEngine {
         self.close_group_validator.clone()
     }
 
-    /// Add a node to the DHT with security checks
+    /// Add a node to the DHT with security checks.
+    ///
+    /// Diversity limits (IP subnet and geographic region) are derived from the
+    /// live routing table contents on every call, so counts are always accurate
+    /// regardless of evictions, reconnections, or address changes.
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
-        // Fast path: if already in the routing table, update address and
-        // liveness without re-running security checks. This avoids
-        // double-counting in the IP diversity and geographic diversity
-        // enforcers when a peer reconnects.
-        {
-            let routing = self.routing_table.read().await;
-            if routing.find_node_by_id(&node.id).is_some() {
-                drop(routing);
-                let mut routing = self.routing_table.write().await;
-                return routing.add_node(node);
-            }
-        }
-
         // 1. Security Check: Close Group Validator
         {
-            // Active validation query
             let validator = self.close_group_validator.read().await;
             if !validator.validate(&node.id) {
                 tracing::warn!("Node failed close group validation: {:?}", node.id);
@@ -1353,77 +1357,174 @@ impl DhtCoreEngine {
             }
         }
 
-        // 2. Security Check: IP Diversity (both IPv4 and IPv6)
-        {
-            // Parse IP address from node.address string
-            // address comes as "ip:port" or just "ip"
-            let ip_addr: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
-                Some(socket.ip())
-            } else {
-                node.address.parse::<IpAddr>().ok()
-            };
+        // Parse candidate IP once for the diversity checks below.
+        let candidate_ip: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
+            Some(socket.ip())
+        } else {
+            node.address.parse::<IpAddr>().ok()
+        };
 
-            if let Some(ip) = ip_addr {
-                let mut enforcer = self.ip_diversity_enforcer.write().await;
-                match enforcer.analyze_unified(ip) {
-                    Ok(analysis) => {
-                        if !enforcer.can_accept_unified(&analysis) {
-                            tracing::warn!("Node rejected due to IP diversity limits: {:?}", ip);
-                            return Err(anyhow::anyhow!(
-                                "IP diversity limits exceeded for address {ip}"
-                            ));
-                        }
-                        // Record valid node - propagate error as this is a critical security operation
-                        enforcer.add_unified(&analysis).map_err(|e| {
-                            tracing::error!(
-                                "Failed to record node IP for diversity tracking: {:?}",
-                                e
-                            );
-                            anyhow::anyhow!("IP diversity tracking failed: {e:?}")
-                        })?;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Could not analyze IP {:?}: {:?}", ip, e);
-                        // Continue without IP diversity check if analysis fails
-                    }
-                }
-            }
+        // 2. Security Check: IP + Geographic Diversity
+        //
+        // Counts are derived from the routing table in a single pass.
+        // Nodes already present (reconnecting with the same ID) are
+        // excluded from the count so they can update their address
+        // without inflating limits.
+        if let Some(ip) = candidate_ip {
+            let routing = self.routing_table.read().await;
+            self.check_diversity(&routing, &node.id, ip)?;
         }
 
-        // 3. Security Check: Geographic Diversity
-        {
-            // Parse IP address from node.address string (reuse parsed IP from above)
-            let ip_addr: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
-                Some(socket.ip())
-            } else {
-                node.address.parse::<IpAddr>().ok()
-            };
-
-            if let Some(ip) = ip_addr {
-                let region = GeographicRegion::from_ip(ip);
-                let mut enforcer = self.geographic_diversity_enforcer.write().await;
-                if !enforcer.can_accept(region) {
-                    tracing::warn!(
-                        "Node rejected due to geographic diversity limits: {:?} in region {:?}",
-                        ip,
-                        region
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Geographic diversity limits exceeded for region {region:?} (IP: {ip})"
-                    ));
-                }
-                enforcer.add(region);
-            }
-        }
-
-        // 4. Add to routing table
+        // 3. Add to routing table (KBucket::add_node handles the
+        //    existing-node-update case via its dedup early-return).
         let mut routing = self.routing_table.write().await;
         routing.add_node(node)?;
 
-        // 5. Update Metrics
-        // (Placeholder: Add metric for new node joining if available)
+        Ok(())
+    }
+
+    /// Check IP subnet and geographic diversity against the live routing table.
+    ///
+    /// Single pass over all nodes — each node's address is parsed once.
+    /// `candidate_id` is excluded from counting so that a reconnecting node
+    /// doesn't block itself.
+    fn check_diversity(
+        &self,
+        routing: &KademliaRoutingTable,
+        candidate_id: &PeerId,
+        candidate_ip: IpAddr,
+    ) -> Result<()> {
+        let candidate_region = GeographicRegion::from_ip(candidate_ip);
+        let mut region_count: usize = 0;
+
+        match candidate_ip {
+            IpAddr::V4(v4) => {
+                let candidate_24 = mask_ipv4(v4, 24);
+                let candidate_16 = mask_ipv4(v4, 16);
+
+                let mut count_32: usize = 0;
+                let mut count_24: usize = 0;
+                let mut count_16: usize = 0;
+
+                for node in routing.iter_nodes() {
+                    if node.id == *candidate_id {
+                        continue;
+                    }
+                    let Some(existing_ip) = parse_ip(&node.address) else {
+                        continue;
+                    };
+                    if GeographicRegion::from_ip(existing_ip) == candidate_region {
+                        region_count += 1;
+                    }
+                    if let IpAddr::V4(existing_v4) = existing_ip {
+                        if existing_v4 == v4 {
+                            count_32 += 1;
+                        }
+                        if mask_ipv4(existing_v4, 24) == candidate_24 {
+                            count_24 += 1;
+                        }
+                        if mask_ipv4(existing_v4, 16) == candidate_16 {
+                            count_16 += 1;
+                        }
+                    }
+                }
+
+                let network_size = routing.node_count();
+                let per_ip = self.dynamic_per_ip_limit(network_size);
+                let limit_24 =
+                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_24, per_ip * 3);
+                let limit_16 =
+                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_16, per_ip * 10);
+
+                if count_32 >= per_ip {
+                    return Err(anyhow!(
+                        "IP diversity: /32 limit ({per_ip}) exceeded for {v4}"
+                    ));
+                }
+                if count_24 >= limit_24 {
+                    return Err(anyhow!(
+                        "IP diversity: /24 limit ({limit_24}) exceeded for {candidate_24}"
+                    ));
+                }
+                if count_16 >= limit_16 {
+                    return Err(anyhow!(
+                        "IP diversity: /16 limit ({limit_16}) exceeded for {candidate_16}"
+                    ));
+                }
+            }
+            IpAddr::V6(v6) => {
+                let candidate_64 = mask_ipv6(v6, 64);
+                let candidate_48 = mask_ipv6(v6, 48);
+                let candidate_32 = mask_ipv6(v6, 32);
+
+                let mut count_64: usize = 0;
+                let mut count_48: usize = 0;
+                let mut count_32: usize = 0;
+
+                for node in routing.iter_nodes() {
+                    if node.id == *candidate_id {
+                        continue;
+                    }
+                    let Some(existing_ip) = parse_ip(&node.address) else {
+                        continue;
+                    };
+                    if GeographicRegion::from_ip(existing_ip) == candidate_region {
+                        region_count += 1;
+                    }
+                    if let IpAddr::V6(existing_v6) = existing_ip {
+                        if mask_ipv6(existing_v6, 64) == candidate_64 {
+                            count_64 += 1;
+                        }
+                        if mask_ipv6(existing_v6, 48) == candidate_48 {
+                            count_48 += 1;
+                        }
+                        if mask_ipv6(existing_v6, 32) == candidate_32 {
+                            count_32 += 1;
+                        }
+                    }
+                }
+
+                let cfg = &self.ip_diversity_config;
+                if count_64 >= cfg.max_nodes_per_64 {
+                    return Err(anyhow!(
+                        "IP diversity: /64 limit ({}) exceeded",
+                        cfg.max_nodes_per_64
+                    ));
+                }
+                if count_48 >= cfg.max_nodes_per_48 {
+                    return Err(anyhow!(
+                        "IP diversity: /48 limit ({}) exceeded",
+                        cfg.max_nodes_per_48
+                    ));
+                }
+                if count_32 >= cfg.max_nodes_per_32 {
+                    return Err(anyhow!(
+                        "IP diversity: /32 limit ({}) exceeded",
+                        cfg.max_nodes_per_32
+                    ));
+                }
+            }
+        }
+
+        if region_count >= self.geo_max_per_region {
+            return Err(anyhow!(
+                "Geographic diversity: region {candidate_region:?} limit ({}) exceeded",
+                self.geo_max_per_region
+            ));
+        }
 
         Ok(())
+    }
+
+    /// Dynamic per-IP limit: `min(cap, floor(network_size * fraction))`,
+    /// clamped to at least 1.
+    fn dynamic_per_ip_limit(&self, network_size: usize) -> usize {
+        let fraction =
+            (network_size as f64 * self.ip_diversity_config.max_network_fraction).floor() as usize;
+        std::cmp::min(
+            self.ip_diversity_config.max_per_ip_cap,
+            std::cmp::max(1, fraction),
+        )
     }
 }
 
@@ -1442,12 +1543,9 @@ impl std::fmt::Debug for DhtCoreEngine {
                 &"Arc<RwLock<BucketRefreshManager>>",
             )
             .field("close_group_validator", &"Arc<RwLock<CloseGroupValidator>>")
-            .field("ip_diversity_enforcer", &"Arc<RwLock<IPDiversityEnforcer>>")
             .field("eviction_manager", &"Arc<RwLock<EvictionManager>>")
-            .field(
-                "geographic_diversity_enforcer",
-                &"Arc<RwLock<GeographicDiversityEnforcer>>",
-            )
+            .field("ip_diversity_config", &self.ip_diversity_config)
+            .field("geo_max_per_region", &self.geo_max_per_region)
             .finish()
     }
 }

@@ -30,10 +30,7 @@ async fn test_ip_diversity_enforcement_ipv6() -> anyhow::Result<()> {
     let result = engine.add_node(node2).await;
     assert!(result.is_err());
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("IP diversity limits exceeded"),
+        result.unwrap_err().to_string().contains("IP diversity:"),
         "Error should indicate IP diversity limits"
     );
 
@@ -64,10 +61,7 @@ async fn test_ip_diversity_enforcement_ipv4() -> anyhow::Result<()> {
     let result = engine.add_node(node2).await;
     assert!(result.is_err());
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("IP diversity limits exceeded"),
+        result.unwrap_err().to_string().contains("IP diversity:"),
         "Error should indicate IP diversity limits"
     );
 
@@ -114,10 +108,7 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
     let result = engine.add_node(node4).await;
     assert!(result.is_err());
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("IP diversity limits exceeded"),
+        result.unwrap_err().to_string().contains("IP diversity:"),
         "Error should indicate IP diversity limits"
     );
 
