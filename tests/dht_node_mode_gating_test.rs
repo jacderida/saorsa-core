@@ -157,16 +157,15 @@ async fn test_node_mode_dht_routing_table_gating() {
         "Client-mode peer should NOT be present in the DHT routing table"
     );
 
-    // Both should still be tracked in the broader dht_peers bookkeeping.
+    // Both should still be tracked as connected via the transport layer.
     let connected = dht.get_connected_peers().await;
-    let connected_ids: Vec<_> = connected.iter().map(|p| p.peer_id).collect();
     assert!(
-        connected_ids.contains(&node_peer_id),
-        "Node peer should be in connected DHT peers"
+        connected.contains(&node_peer_id),
+        "Node peer should be in connected peers"
     );
     assert!(
-        connected_ids.contains(&client_peer_id),
-        "Client peer should be in connected DHT peers"
+        connected.contains(&client_peer_id),
+        "Client peer should be in connected peers"
     );
 
     info!("=== PASS: Node-mode DHT routing table gating ===");

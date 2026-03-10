@@ -311,16 +311,16 @@ async fn step6_cross_node_replication() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Check connected peers before put (these are DHT peers, not just network connections)
+    // Check connected peers before put
     let peers1 = manager1.get_connected_peers().await;
     let peers2 = manager2.get_connected_peers().await;
-    println!("  Manager1 DHT peers: {}", peers1.len());
+    println!("  Manager1 connected peers: {}", peers1.len());
     for p in &peers1 {
-        println!("    - {} (connected: {})", p.peer_id, p.is_connected);
+        println!("    - {}", p.to_hex());
     }
-    println!("  Manager2 DHT peers: {}", peers2.len());
+    println!("  Manager2 connected peers: {}", peers2.len());
     for p in &peers2 {
-        println!("    - {} (connected: {})", p.peer_id, p.is_connected);
+        println!("    - {}", p.to_hex());
     }
 
     // Store on manager1

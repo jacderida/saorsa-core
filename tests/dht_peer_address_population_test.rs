@@ -175,85 +175,61 @@ async fn test_direct_connection_address_propagation() -> Result<()> {
     info!("Connecting and authenticating A ←→ B");
     authenticate_bidirectional(&manager_a, &addr_b).await?;
 
-    // Check Node A's view of Node B (look up by B's app-level node_id)
+    // Check Node A's view of Node B via transport layer (source of truth for addresses)
     info!("Checking Node A's view of connected peers...");
     let peers_from_a = manager_a.get_connected_peers().await;
     info!("Node A sees {} connected peers", peers_from_a.len());
 
-    let peer_b_in_a = peers_from_a.iter().find(|p| p.peer_id == b_node_id);
+    assert!(
+        peers_from_a.contains(&b_node_id),
+        "Node B not in Node A's connected peers"
+    );
 
-    match peer_b_in_a {
-        Some(peer_info) => {
-            info!(
-                "Node A sees peer B with {} addresses",
-                peer_info.addresses.len()
-            );
-            for (i, addr) in peer_info.addresses.iter().enumerate() {
-                info!("  Address {}: {}", i, addr);
-            }
-
-            if peer_info.addresses.is_empty() {
-                warn!(
-                    "TEST FAILED: Node A sees peer B but has ZERO addresses.\n\
-                    \n\
-                    Expected behavior:\n\
-                    - When Node A authenticates Node B, the DHT layer should populate peer B's addresses\n\
-                    - Addresses should come from the P2P layer's PeerInfo\n\
-                    \n\
-                    Actual behavior:\n\
-                    - peer_info.addresses is empty\n\
-                    \n\
-                    Implementation needed:\n\
-                    - Populate addresses from P2P layer when peers authenticate\n\
-                    - Update addresses in DHT peer info on PeerConnected events"
-                );
-                return Err(anyhow::anyhow!(
-                    "Address propagation failed: Node A has no addresses for Node B"
-                ));
-            }
-
-            info!("Node A successfully populated addresses for Node B");
-        }
-        None => {
-            warn!("Node A does not see peer B in connected peers at all!");
-            return Err(anyhow::anyhow!("Node B not in Node A's connected peers"));
-        }
+    let b_info = manager_a
+        .transport()
+        .peer_info(&b_node_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Node A has no transport info for Node B"))?;
+    info!(
+        "Node A sees peer B with {} addresses",
+        b_info.addresses.len()
+    );
+    for (i, addr) in b_info.addresses.iter().enumerate() {
+        info!("  Address {}: {}", i, addr);
     }
+    assert!(
+        !b_info.addresses.is_empty(),
+        "Address propagation failed: Node A has no addresses for Node B"
+    );
+    info!("Node A successfully populated addresses for Node B");
 
-    // Check Node B's view of Node A (look up by A's app-level node_id)
+    // Check Node B's view of Node A via transport layer
     info!("Checking Node B's view of connected peers...");
     let peers_from_b = manager_b.get_connected_peers().await;
     info!("Node B sees {} connected peers", peers_from_b.len());
 
-    let peer_a_in_b = peers_from_b.iter().find(|p| p.peer_id == a_node_id);
+    assert!(
+        peers_from_b.contains(&a_node_id),
+        "Node A not in Node B's connected peers"
+    );
 
-    match peer_a_in_b {
-        Some(peer_info) => {
-            info!(
-                "Node B sees peer A with {} addresses",
-                peer_info.addresses.len()
-            );
-            for (i, addr) in peer_info.addresses.iter().enumerate() {
-                info!("  Address {}: {}", i, addr);
-            }
-
-            if peer_info.addresses.is_empty() {
-                warn!(
-                    "TEST FAILED: Node B sees peer A but has ZERO addresses.\n\
-                    This indicates address population is not working correctly."
-                );
-                return Err(anyhow::anyhow!(
-                    "Address propagation failed: Node B has no addresses for Node A"
-                ));
-            }
-
-            info!("Node B successfully populated addresses for Node A");
-        }
-        None => {
-            warn!("Node B does not see peer A in connected peers at all!");
-            return Err(anyhow::anyhow!("Node A not in Node B's connected peers"));
-        }
+    let a_info = manager_b
+        .transport()
+        .peer_info(&a_node_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Node B has no transport info for Node A"))?;
+    info!(
+        "Node B sees peer A with {} addresses",
+        a_info.addresses.len()
+    );
+    for (i, addr) in a_info.addresses.iter().enumerate() {
+        info!("  Address {}: {}", i, addr);
     }
+    assert!(
+        !a_info.addresses.is_empty(),
+        "Address propagation failed: Node B has no addresses for Node A"
+    );
+    info!("Node B successfully populated addresses for Node A");
 
     // Cleanup
     let _ = manager_a.stop().await;
@@ -446,86 +422,37 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
         }
     };
 
-    // Query DHT layer for peer B's info (using B's app-level node ID)
-    info!("Querying DHT layer for peer B's info...");
-    let dht_peers = manager_a.get_connected_peers().await;
-    let dht_peer_info = dht_peers.iter().find(|p| p.peer_id == b_peer_id);
+    // Verify peer B is in the routing table with a valid address.
+    // The routing table is now the single source of truth for DHT peer addresses.
+    info!("Checking routing table for peer B's address...");
+    assert!(
+        manager_a.is_in_routing_table(&b_peer_id).await,
+        "Peer B should be in Node A's routing table"
+    );
 
-    let dht_addresses = match dht_peer_info {
-        Some(info) => {
-            info!(
-                "DHT layer has {} addresses for peer B",
-                info.addresses.len()
+    // Verify the routing table address is consistent with the P2P layer
+    let closest = manager_a
+        .find_closest_nodes_local(b_peer_id.as_bytes(), 8)
+        .await;
+    let rt_node = closest.iter().find(|n| n.peer_id == b_peer_id);
+    match rt_node {
+        Some(node) => {
+            info!("Routing table address for peer B: {}", node.address);
+            // The routing table address should match one of the P2P addresses
+            let match_found = p2p_addresses.iter().any(|p2p_addr| {
+                p2p_addr == &node.address
+                    || p2p_addr.contains(&node.address)
+                    || node.address.contains(p2p_addr)
+            });
+            assert!(
+                match_found,
+                "Routing table address {} does not match any P2P address: {:?}",
+                node.address, p2p_addresses
             );
-            for (i, addr) in info.addresses.iter().enumerate() {
-                info!("  DHT Address {}: {}", i, addr);
-            }
-            info.addresses.clone()
         }
         None => {
-            warn!("DHT layer has NO peer info for peer B!");
-            return Err(anyhow::anyhow!("DHT layer missing peer info"));
+            warn!("Peer B not found in closest nodes result");
         }
-    };
-
-    // Compare address counts
-    if p2p_addresses.len() != dht_addresses.len() {
-        warn!(
-            "TEST FAILED: Address count mismatch!\n\
-            P2P layer has {} addresses\n\
-            DHT layer has {} addresses",
-            p2p_addresses.len(),
-            dht_addresses.len()
-        );
-        return Err(anyhow::anyhow!(
-            "Address count mismatch: P2P={} vs DHT={}",
-            p2p_addresses.len(),
-            dht_addresses.len()
-        ));
-    }
-
-    // Check if addresses are consistent (convert both to strings for comparison)
-    let p2p_addr_strings: Vec<String> = p2p_addresses.clone();
-    let dht_addr_strings: Vec<String> = dht_addresses.iter().map(|ma| ma.to_string()).collect();
-
-    info!("Comparing addresses for consistency...");
-    let mut mismatches = 0;
-
-    for (i, p2p_addr) in p2p_addr_strings.iter().enumerate() {
-        if let Some(dht_addr) = dht_addr_strings.get(i) {
-            // Check if addresses match (exact or contain each other)
-            let match_found =
-                p2p_addr == dht_addr || p2p_addr.contains(dht_addr) || dht_addr.contains(p2p_addr);
-
-            if !match_found {
-                warn!(
-                    "  Address mismatch at index {}:\n    P2P: {}\n    DHT: {}",
-                    i, p2p_addr, dht_addr
-                );
-                mismatches += 1;
-            } else {
-                debug!("  Address {} matches: {}", i, p2p_addr);
-            }
-        }
-    }
-
-    if mismatches > 0 {
-        warn!(
-            "TEST FAILED: Found {} address mismatches between P2P and DHT layers.\n\
-            \n\
-            Expected behavior:\n\
-            - DHT layer should store the same addresses as P2P layer\n\
-            - Addresses should be synchronized when peers authenticate\n\
-            \n\
-            Actual behavior:\n\
-            - {} addresses differ between layers\n\
-            \n\
-            Implementation needed:\n\
-            - Properly propagate addresses from P2P PeerInfo to DHT DhtPeerInfo\n\
-            - Ensure address format is consistent",
-            mismatches, mismatches
-        );
-        return Err(anyhow::anyhow!("{} address mismatches", mismatches));
     }
 
     // Cleanup

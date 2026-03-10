@@ -87,6 +87,16 @@ impl KBucket {
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+        // If the node is already in this bucket, update its address and move to
+        // tail (most-recently-seen) per standard Kademlia protocol.
+        if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
+            self.nodes[pos].address = node.address;
+            self.nodes[pos].last_seen = node.last_seen;
+            let existing = self.nodes.remove(pos);
+            self.nodes.push(existing);
+            return Ok(());
+        }
+
         if self.nodes.len() < self.max_size {
             self.nodes.push(node);
             Ok(())
@@ -118,6 +128,10 @@ impl KBucket {
 
     fn get_nodes(&self) -> &[NodeInfo] {
         &self.nodes
+    }
+
+    fn find_node(&self, node_id: &PeerId) -> Option<&NodeInfo> {
+        self.nodes.iter().find(|n| &n.id == node_id)
     }
 }
 
@@ -218,6 +232,12 @@ impl KademliaRoutingTable {
         }
 
         255 // Same key as node
+    }
+
+    /// Look up a node by its exact peer ID. O(K) scan of the target bucket.
+    fn find_node_by_id(&self, node_id: &PeerId) -> Option<&NodeInfo> {
+        let bucket_index = self.get_bucket_index(node_id);
+        self.buckets[bucket_index].find_node(node_id)
     }
 
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
@@ -1177,6 +1197,15 @@ impl DhtCoreEngine {
         Ok(())
     }
 
+    /// Look up a node's address from the routing table by peer ID.
+    ///
+    /// Returns the stored address if the peer is in the routing table,
+    /// `None` otherwise. O(K) scan of the target k-bucket.
+    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<String> {
+        let routing = self.routing_table.read().await;
+        routing.find_node_by_id(peer_id).map(|n| n.address.clone())
+    }
+
     /// Record a successful interaction with a peer by updating its `last_seen`
     /// timestamp and moving it to the tail of its k-bucket (most recently seen).
     ///
@@ -1295,6 +1324,19 @@ impl DhtCoreEngine {
 
     /// Add a node to the DHT with security checks
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+        // Fast path: if already in the routing table, update address and
+        // liveness without re-running security checks. This avoids
+        // double-counting in the IP diversity and geographic diversity
+        // enforcers when a peer reconnects.
+        {
+            let routing = self.routing_table.read().await;
+            if routing.find_node_by_id(&node.id).is_some() {
+                drop(routing);
+                let mut routing = self.routing_table.write().await;
+                return routing.add_node(node);
+            }
+        }
+
         // 1. Security Check: Close Group Validator
         {
             // Active validation query
