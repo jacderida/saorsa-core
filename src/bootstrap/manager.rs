@@ -93,6 +93,8 @@ pub struct BootstrapConfig {
     pub rate_limit: JoinRateLimiterConfig,
     /// IP diversity configuration
     pub diversity: IPDiversityConfig,
+    /// Minimum number of peers required before saving cache to disk
+    pub min_peers_to_save: usize,
 }
 
 impl Default for BootstrapConfig {
@@ -103,6 +105,7 @@ impl Default for BootstrapConfig {
             epsilon: 0.1,
             rate_limit: JoinRateLimiterConfig::default(),
             diversity: IPDiversityConfig::default(),
+            min_peers_to_save: 10,
         }
     }
 }
@@ -131,6 +134,7 @@ impl BootstrapManager {
             .cache_dir(&config.cache_dir)
             .max_peers(config.max_peers)
             .epsilon(config.epsilon)
+            .min_peers_to_save(config.min_peers_to_save)
             .build();
 
         let cache = AntBootstrapCache::open(ant_config).await.map_err(|e| {
@@ -163,6 +167,7 @@ impl BootstrapManager {
             epsilon: 0.1, // Default exploration rate
             rate_limit: rate_limit_config,
             diversity: diversity_config,
+            min_peers_to_save: 10,
         };
         Self::with_config(config).await
     }
@@ -455,6 +460,7 @@ mod tests {
             epsilon: 0.0, // Pure exploitation for predictable tests
             rate_limit: JoinRateLimiterConfig::default(),
             diversity: IPDiversityConfig::default(),
+            min_peers_to_save: 1,
         }
     }
 
@@ -633,6 +639,7 @@ mod tests {
                 epsilon: 0.0,
                 rate_limit: JoinRateLimiterConfig::default(),
                 diversity: IPDiversityConfig::default(),
+                min_peers_to_save: 1,
             };
             let manager = BootstrapManager::with_config(config).await.unwrap();
             let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
@@ -657,6 +664,7 @@ mod tests {
                 epsilon: 0.0,
                 rate_limit: JoinRateLimiterConfig::default(),
                 diversity: IPDiversityConfig::default(),
+                min_peers_to_save: 1,
             };
             let manager = BootstrapManager::with_config(config).await.unwrap();
             let count = manager.peer_count().await;
@@ -707,6 +715,7 @@ mod tests {
                 global_burst_size: 10,
             },
             diversity: diversity_config,
+            min_peers_to_save: 1,
         };
 
         let manager = BootstrapManager::with_config(config).await.unwrap();
@@ -732,5 +741,78 @@ mod tests {
             result.unwrap_err(),
             P2PError::Bootstrap(BootstrapError::RateLimited(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_save_succeeds_above_min_peers_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BootstrapConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            max_peers: 100,
+            epsilon: 0.0,
+            rate_limit: JoinRateLimiterConfig::default(),
+            diversity: IPDiversityConfig::default(),
+            min_peers_to_save: 3,
+        };
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        // Add 4 peers (above threshold of 3)
+        for i in 0..4 {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            manager.add_peer_trusted(&addr, vec![addr]).await;
+        }
+
+        assert_eq!(manager.peer_count().await, 4);
+
+        // Save should succeed and write a cache file
+        let result = manager.save().await;
+        assert!(result.is_ok(), "Save should succeed above threshold");
+
+        // Verify cache file was written
+        let cache_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !cache_files.is_empty(),
+            "Cache file should exist after save above threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_skipped_below_min_peers_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BootstrapConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            max_peers: 100,
+            epsilon: 0.0,
+            rate_limit: JoinRateLimiterConfig::default(),
+            diversity: IPDiversityConfig::default(),
+            min_peers_to_save: 10, // default threshold
+        };
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        // Add 5 peers (below threshold of 10)
+        for i in 0..5 {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            manager.add_peer_trusted(&addr, vec![addr]).await;
+        }
+
+        assert_eq!(manager.peer_count().await, 5);
+
+        // Save should return Ok but skip writing (below threshold)
+        let result = manager.save().await;
+        assert!(result.is_ok(), "Save should not error below threshold");
+
+        // Verify no cache file was written (only the directory itself exists)
+        let cache_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .collect();
+        assert!(
+            cache_files.is_empty(),
+            "No cache file should be written below threshold"
+        );
     }
 }
