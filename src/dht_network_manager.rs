@@ -70,6 +70,10 @@ const DEFAULT_PEER_LATENCY: Duration = Duration::from_millis(50);
 /// Initial reliability score for newly discovered peers.
 const INITIAL_PEER_RELIABILITY: f64 = 1.0;
 
+/// Maximum time to wait for the identity-exchange handshake after dialling
+/// a peer. The actual timeout is `min(request_timeout, this)`.
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// DHT node representation for network operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DHTNode {
@@ -1192,13 +1196,11 @@ impl DhtNetworkManager {
             }
         }
 
-        // 2. Add connected peers
+        // 2. Add known peers (including disconnected — closest-key lookups
+        //    must not filter by connection status)
         {
             let peers = self.dht_peers.read().await;
             for (peer_id, peer_info) in peers.iter() {
-                if !peer_info.is_connected {
-                    continue;
-                }
                 if self.is_local_peer_id(peer_id) {
                     continue;
                 }
@@ -1676,15 +1678,51 @@ impl DhtNetworkManager {
             ops.insert(message_id.clone(), operation_context);
         }
 
-        // Send message via network layer
+        // Send message via network layer, reconnecting on demand if needed.
         let peer_hex = peer_id.to_hex();
+        let local_hex = self.config.peer_id.to_hex();
         info!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
-            self.config.peer_id.to_hex(),
-            peer_hex,
-            message.payload,
-            message_id
+            local_hex, peer_hex, message.payload, message_id
         );
+
+        // Ensure we have an open channel to the peer before sending.
+        // A fresh dial establishes a QUIC connection but the app-level
+        // `peer_to_channel` mapping is only populated after the asynchronous
+        // identity-exchange handshake completes. Without waiting, the
+        // subsequent `send_message` would fail with `PeerNotFound`.
+        if !self.transport.is_peer_connected(peer_id).await
+            && let Some(address) = self.peer_address_for_dial(peer_id).await
+        {
+            info!(
+                "[STEP 1b] {} -> {}: No open channel, dialling {}",
+                local_hex, peer_hex, address
+            );
+            if let Some(channel_id) = self.dial_candidate(peer_id, &address).await {
+                let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
+                match self
+                    .transport
+                    .wait_for_peer_identity(&channel_id, identity_timeout)
+                    .await
+                {
+                    Ok(authenticated) => {
+                        debug!(
+                            "[STEP 1b] {} -> {}: identity confirmed ({})",
+                            local_hex,
+                            peer_hex,
+                            authenticated.to_hex()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[STEP 1b] {} -> {}: identity exchange did not complete: {}",
+                            local_hex, peer_hex, e
+                        );
+                    }
+                }
+            }
+        }
+
         let result = match self
             .transport
             .send_message(peer_id, "/dht/1.0.0", message_data)
@@ -1693,8 +1731,7 @@ impl DhtNetworkManager {
             Ok(_) => {
                 info!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
-                    self.config.peer_id.to_hex(),
-                    peer_hex
+                    local_hex, peer_hex
                 );
 
                 // Wait for response via oneshot channel with timeout
@@ -1702,15 +1739,13 @@ impl DhtNetworkManager {
                 match &result {
                     Ok(r) => info!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
-                        self.config.peer_id.to_hex(),
+                        local_hex,
                         peer_hex,
                         std::mem::discriminant(r)
                     ),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
-                        self.config.peer_id.to_hex(),
-                        peer_hex,
-                        e
+                        local_hex, peer_hex, e
                     ),
                 }
                 result
@@ -1760,16 +1795,23 @@ impl DhtNetworkManager {
     /// All iterative lookups share the same saorsa-transport connection pool, so reusing the node's
     /// connection timeout keeps behavior consistent with the transport while still letting
     /// us parallelize lookups safely.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &str) {
+    ///
+    /// Returns the transport channel ID on a successful QUIC connection, or
+    /// `None` when the dial fails or is skipped. Callers that need to send
+    /// messages immediately should pass the channel ID to
+    /// [`TransportHandle::wait_for_peer_identity`] before sending, because
+    /// the app-level `peer_to_channel` mapping is only populated after the
+    /// asynchronous identity-exchange handshake completes.
+    async fn dial_candidate(&self, peer_id: &PeerId, address: &str) -> Option<String> {
         let peer_hex = peer_id.to_hex();
         if address.is_empty() {
             debug!("dial_candidate: peer {} missing address", peer_hex);
-            return;
+            return None;
         }
 
         if self.transport.is_peer_connected(peer_id).await {
             debug!("dial_candidate: peer {} already connected", peer_hex);
-            return;
+            return None;
         }
 
         let socket_addr = address.split(" (").next().unwrap_or(address);
@@ -1781,30 +1823,49 @@ impl DhtNetworkManager {
                 "dial_candidate: rejecting unspecified address for {}: {}",
                 peer_hex, socket_addr
             );
-            return;
+            return None;
         }
         let dial_timeout = self
             .transport
             .connection_timeout()
             .min(self.config.request_timeout);
         match tokio::time::timeout(dial_timeout, self.transport.connect_peer(socket_addr)).await {
-            Ok(Ok(_)) => debug!(
-                "dial_candidate: connected to {} at {}",
-                peer_hex, socket_addr
-            ),
+            Ok(Ok(channel_id)) => {
+                debug!(
+                    "dial_candidate: connected to {} at {} (channel {})",
+                    peer_hex, socket_addr, channel_id
+                );
+                Some(channel_id)
+            }
             Ok(Err(e)) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {}: {}",
                     peer_hex, socket_addr, e
-                )
+                );
+                None
             }
             Err(_) => {
                 debug!(
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
                     peer_hex, socket_addr, dial_timeout
-                )
+                );
+                None
             }
         }
+    }
+
+    /// Look up a connectable address string for `peer_id` from the DHT peer table.
+    ///
+    /// Returns the first known address stripped to `ip:port` form (the
+    /// `NetworkAddress` display format may include a four-word suffix).
+    /// Returns `None` when the peer is unknown or has no addresses.
+    async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<String> {
+        let peers = self.dht_peers.read().await;
+        let info = peers.get(peer_id)?;
+        let addr = info.addresses.first()?;
+        let full = addr.to_string();
+        // Strip optional four-word suffix: "1.2.3.4:9000 (word-word-word-word)"
+        Some(full.split(" (").next().unwrap_or(&full).to_string())
     }
 
     /// Wait for DHT network response via oneshot channel with timeout
@@ -2209,10 +2270,23 @@ impl DhtNetworkManager {
             peer_info.addresses = addresses;
         }
 
+        // Drop the dht_peers lock before acquiring the routing table lock to
+        // avoid potential lock-ordering issues.
+        let addr_count = peer_info.addresses.len();
+        drop(peers);
+
+        // Standard Kademlia: any successful message exchange proves liveness.
+        // Update the routing table's last_seen and move the node to the tail of
+        // its k-bucket (most recently seen position).
+        let dht = self.dht.read().await;
+        if dht.touch_node(&app_peer_id).await {
+            trace!("Touched routing table entry for {}", app_peer_id.to_hex());
+        }
+
         debug!(
             "Updated peer info for {} with {} addresses",
             app_peer_id.to_hex(),
-            peer_info.addresses.len()
+            addr_count
         );
     }
 
@@ -2551,19 +2625,11 @@ impl DhtNetworkManager {
                             Ok(())
                         }
                         MaintenanceTask::LivenessCheck => {
-                            debug!("Running LivenessCheck maintenance task");
-                            // Check liveness of nodes in routing table
-                            let peers = dht_peers.read().await;
-                            let stale_count = peers
-                                .values()
-                                .filter(|p| p.last_seen.elapsed() > Duration::from_secs(300))
-                                .count();
-                            if stale_count > 0 {
-                                debug!(
-                                    "Found {} stale peers that need liveness check",
-                                    stale_count
-                                );
-                            }
+                            // Standard Kademlia: nodes prove liveness through
+                            // actual traffic (implicit liveness via touch_node).
+                            // Dead nodes are discovered when real operations
+                            // fail — no proactive pinging needed.
+                            debug!("LivenessCheck: relying on implicit liveness");
                             Ok(())
                         }
                         MaintenanceTask::EvictionEvaluation => {

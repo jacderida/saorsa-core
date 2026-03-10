@@ -103,6 +103,19 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
+    /// Update `last_seen` for a node and move it to the tail of the bucket
+    /// (most recently seen), per standard Kademlia protocol.
+    fn touch_node(&mut self, node_id: &PeerId) -> bool {
+        if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
+            self.nodes[pos].last_seen = SystemTime::now();
+            let node = self.nodes.remove(pos);
+            self.nodes.push(node);
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_nodes(&self) -> &[NodeInfo] {
         &self.nodes
     }
@@ -137,6 +150,13 @@ impl KademliaRoutingTable {
     fn remove_node(&mut self, node_id: &PeerId) {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].remove_node(node_id);
+    }
+
+    /// Update `last_seen` for a node and move it to the tail of its k-bucket.
+    /// Returns `true` if the node was found and touched.
+    fn touch_node(&mut self, node_id: &PeerId) -> bool {
+        let bucket_index = self.get_bucket_index(node_id);
+        self.buckets[bucket_index].touch_node(node_id)
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
@@ -1155,6 +1175,16 @@ impl DhtCoreEngine {
         store.metadata.clear();
 
         Ok(())
+    }
+
+    /// Record a successful interaction with a peer by updating its `last_seen`
+    /// timestamp and moving it to the tail of its k-bucket (most recently seen).
+    ///
+    /// Standard Kademlia: any successful RPC implicitly proves liveness, so the
+    /// routing table should reflect this without requiring dedicated pings.
+    pub async fn touch_node(&self, node_id: &PeerId) -> bool {
+        let mut routing = self.routing_table.write().await;
+        routing.touch_node(node_id)
     }
 
     /// Handle node failure

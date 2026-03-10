@@ -20,8 +20,8 @@ const MAX_CONNECTIONS: usize = 100;
 /// Connection idle timeout
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Keep-alive interval
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Interval between connection maintenance sweeps
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Message batch window
 const _BATCH_WINDOW: Duration = Duration::from_millis(10);
@@ -662,27 +662,15 @@ impl NetworkIntegrationLayer {
         Ok(discovered)
     }
 
-    /// Maintain connections and perform housekeeping
+    /// Maintain connections by cleaning up idle ones periodically.
+    ///
+    /// Liveness verification of routing table peers is handled by the
+    /// `LivenessCheck` maintenance task in `DhtNetworkManager`, which sends
+    /// targeted pings only to stale nodes rather than blanket-pinging everyone.
     pub async fn maintain_connections(&self) -> Result<()> {
         loop {
-            // Cleanup idle connections
             self.connection_pool.cleanup_idle_connections().await;
-
-            // Send keepalive pings
-            let peers = self.peer_manager.get_peers(10).await;
-            for peer in peers {
-                let message = DhtMessage::Ping {
-                    timestamp: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    sender_info: peer.clone(),
-                };
-
-                let _ = self.send_message(peer.id, message).await;
-            }
-
-            sleep(KEEPALIVE_INTERVAL).await;
+            sleep(MAINTENANCE_INTERVAL).await;
         }
     }
 }

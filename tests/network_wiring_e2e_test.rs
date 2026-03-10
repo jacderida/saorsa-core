@@ -35,8 +35,7 @@ const STALE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval when busy-waiting for state changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Short stale-peer threshold used for fast disconnect detection in tests.
-const SHORT_STALE_THRESHOLD: Duration = Duration::from_secs(2);
-/// Timeout for PeerDisconnected events (stale threshold + buffer).
+/// Timeout for PeerDisconnected events.
 const DISCONNECT_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Helper to create a test node configuration with unique port.
@@ -59,32 +58,6 @@ fn create_test_node_config() -> NodeConfig {
             }),
         ],
         bootstrap_peers: vec![],
-        node_identity: Some(identity),
-        ..Default::default()
-    }
-}
-
-/// Create a test config with a short stale peer threshold for faster tests.
-///
-/// Includes a generated `node_identity` so that messages are signed and
-/// `PeerConnected`/`PeerDisconnected` events fire on authentication.
-fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConfig {
-    let identity =
-        Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
-    NodeConfig {
-        listen_addr: "127.0.0.1:0"
-            .parse()
-            .unwrap_or_else(|_| panic!("Test setup error: hardcoded address should parse")),
-        listen_addrs: vec![
-            "127.0.0.1:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv4 address should parse")
-            }),
-            "[::]:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv6 address should parse")
-            }),
-        ],
-        bootstrap_peers: vec![],
-        stale_peer_threshold: threshold,
         node_identity: Some(identity),
         ..Default::default()
     }
@@ -472,8 +445,7 @@ async fn test_stale_peer_removal() {
 
     info!("=== TEST: Stale Peer Removal ===");
 
-    // Use short stale threshold (5 seconds) for faster testing
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(5));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1103,9 +1075,8 @@ async fn test_peer_events_sequence() {
 
     info!("=== TEST: Peer Events Sequence ===");
 
-    // Use short threshold on node2 for faster disconnect detection
     let config1 = create_test_node_config();
-    let config2 = create_test_node_config_with_stale_threshold(SHORT_STALE_THRESHOLD);
+    let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
     node1.start().await.expect("Failed to start node1");
@@ -1136,7 +1107,7 @@ async fn test_peer_events_sequence() {
     // Drop node1 to simulate disconnect
     drop(node1);
 
-    // Wait for PeerDisconnected event on node2 (with short stale threshold + buffer)
+    // Wait for PeerDisconnected event on node2
     let disconnected_event = wait_for_event(&mut events2, DISCONNECT_EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerDisconnected(_))
     })
@@ -1303,8 +1274,7 @@ async fn test_no_duplicate_disconnect_events() {
 
     info!("=== TEST: No Duplicate Disconnect Events ===");
 
-    // Use short stale threshold
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(2));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1368,13 +1338,7 @@ async fn test_peer_cleanup_timing() {
 
     info!("=== TEST: Peer Cleanup Timing ===");
 
-    // 2 second stale threshold means:
-    // - Peer becomes stale after 2s of no activity
-    // - BUG: After marking disconnected, last_seen is reset, so cleanup takes another 4s (2x threshold)
-    // - EXPECTED: Peer should be gone from peers map within ~6s (2s stale + 4s cleanup)
-    // - WITH BUG: Peer takes up to 8s (2s + 2s + 4s due to double threshold)
-    let stale_threshold = Duration::from_secs(2);
-    let config1 = create_test_node_config_with_stale_threshold(stale_threshold);
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1412,8 +1376,6 @@ async fn test_peer_cleanup_timing() {
 
     assert!(was_removed, "Peer should be removed from tracking");
 
-    // Expected timing: stale_threshold + cleanup_threshold (2x stale) + margin
-    // With 2s stale threshold, cleanup threshold is 4s, so expect removal within ~8s
     // Add generous margin for CI timing variations
     let expected_max = Duration::from_secs(10);
     info!(
@@ -1820,7 +1782,7 @@ async fn test_late_event_subscription() {
 
 /// TEST 3.1: Zero Threshold Configuration
 ///
-/// Set stale_peer_threshold = 0 and verify behavior.
+/// Verify basic connection behavior with default configuration.
 #[tokio::test]
 async fn test_zero_stale_threshold() {
     let _ = tracing_subscriber::fmt()
@@ -1830,8 +1792,7 @@ async fn test_zero_stale_threshold() {
 
     info!("=== TEST: Zero Stale Threshold ===");
 
-    // Use 0ms threshold - should handle gracefully
-    let config1 = create_test_node_config_with_stale_threshold(Duration::ZERO);
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1842,36 +1803,31 @@ async fn test_zero_stale_threshold() {
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Need address").to_string();
 
-    // Connection might succeed or fail immediately - both are valid
     let peer2_peer_id = *node2.peer_id();
     match node1.connect_peer(&addr2).await {
         Ok(channel_id) => {
-            info!("Connection succeeded with zero threshold");
+            info!("Connection succeeded");
 
-            // Wait briefly for identity exchange (may not complete with zero threshold)
+            // Wait briefly for identity exchange
             let identified = node1
                 .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
                 .await;
 
             if identified.is_ok() {
-                // Try to send a message quickly
                 let send_result = node1
                     .send_message(&peer2_peer_id, "messaging", b"quick".to_vec())
                     .await;
 
                 match send_result {
-                    Ok(()) => info!("Message sent with zero threshold"),
-                    Err(e) => info!("Message failed (acceptable with zero threshold): {e}"),
+                    Ok(()) => info!("Message sent successfully"),
+                    Err(e) => info!("Message failed: {e}"),
                 }
             } else {
-                info!("Identity exchange didn't complete with zero threshold (acceptable)");
+                info!("Identity exchange didn't complete");
             }
         }
         Err(e) => {
-            info!(
-                "Connection rejected with zero threshold (acceptable): {}",
-                e
-            );
+            info!("Connection rejected: {}", e);
         }
     }
 
@@ -1881,8 +1837,7 @@ async fn test_zero_stale_threshold() {
 
 /// TEST 3.2: Short Threshold
 ///
-/// Set 1 second threshold (short but realistic for testing).
-/// Verifies connections work with short stale thresholds.
+/// Verifies connections work with default configuration.
 #[tokio::test]
 async fn test_short_stale_threshold() {
     let _ = tracing_subscriber::fmt()
@@ -1892,8 +1847,7 @@ async fn test_short_stale_threshold() {
 
     info!("=== TEST: Short Stale Threshold ===");
 
-    // Use 1 second threshold - short but realistic
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(1));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1905,11 +1859,11 @@ async fn test_short_stale_threshold() {
 
     let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    // Send a message - should work with 1s threshold
+    // Send a message
     node1
         .send_message(&peer2_id, "messaging", b"quick_msg".to_vec())
         .await
-        .expect("Should be able to send with short threshold");
+        .expect("Should be able to send message");
 
     let received = wait_for_event(
         &mut events2,
@@ -1920,7 +1874,7 @@ async fn test_short_stale_threshold() {
 
     assert!(
         matches!(received, Some(P2PEvent::Message { .. })),
-        "Should receive message even with short stale threshold"
+        "Should receive message"
     );
 
     info!("=== TEST PASSED: Short Stale Threshold ===");

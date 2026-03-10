@@ -58,7 +58,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
@@ -223,26 +223,14 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// P2pEndpoint's send() method which corresponds with recv() for proper
     /// bidirectional communication.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        info!(
-            "[QUIC SEND] Calling endpoint().send() to {} ({} bytes)",
+        trace!(
+            "[QUIC SEND] endpoint().send() to {} ({} bytes)",
             addr,
             data.len()
         );
         let result = self.transport.endpoint().send(addr, data).await;
-        match &result {
-            Ok(()) => {
-                info!(
-                    "[QUIC SEND] endpoint().send() returned Ok to {} ({} bytes)",
-                    addr,
-                    data.len()
-                );
-            }
-            Err(e) => {
-                info!(
-                    "[QUIC SEND] endpoint().send() returned Err to {}: {}",
-                    addr, e
-                );
-            }
+        if let Err(ref e) = result {
+            debug!("[QUIC SEND] send failed to {}: {}", addr, e);
         }
         result.map_err(|e| anyhow::anyhow!("Send failed: {e}"))
     }
@@ -946,42 +934,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// bidirectional communication. Tries IPv6 first, then IPv4.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6 {
-            info!(
-                "[DUAL SEND] Attempting IPv6 send to {} ({} bytes)",
-                addr,
-                data.len()
-            );
             match v6.send_to_peer_optimized(addr, data).await {
-                Ok(()) => {
-                    info!(
-                        "[DUAL SEND] IPv6 send SUCCESS to {} ({} bytes)",
-                        addr,
-                        data.len()
-                    );
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(e) => {
-                    info!("[DUAL SEND] IPv6 send FAILED to {}: {}", addr, e);
+                    trace!(
+                        "[DUAL SEND] IPv6 failed to {}, falling back to IPv4: {}",
+                        addr, e
+                    );
                 }
             }
         }
         if let Some(v4) = &self.v4 {
-            info!(
-                "[DUAL SEND] Attempting IPv4 send to {} ({} bytes)",
-                addr,
-                data.len()
-            );
             match v4.send_to_peer_optimized(addr, data).await {
-                Ok(()) => {
-                    info!(
-                        "[DUAL SEND] IPv4 send SUCCESS to {} ({} bytes)",
-                        addr,
-                        data.len()
-                    );
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(e) => {
-                    info!("[DUAL SEND] IPv4 send FAILED to {}: {}", addr, e);
+                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, e);
                 }
             }
         }

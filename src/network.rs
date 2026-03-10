@@ -65,9 +65,6 @@ pub(crate) struct WireMessage {
     pub(crate) signature: Vec<u8>,
 }
 
-/// Payload bytes used for keepalive messages to prevent connection timeouts.
-pub(crate) const KEEPALIVE_PAYLOAD: &[u8] = b"keepalive";
-
 /// Operating mode of a P2P node.
 ///
 /// Determines the default user agent and DHT participation behavior.
@@ -119,9 +116,6 @@ const DEFAULT_LISTEN_PORT: u16 = 9000;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
-
-/// Interval for the P2PNode run loop's maintenance tick.
-const RUN_LOOP_TICK_INTERVAL_MS: u64 = 100;
 
 /// Quality score for successful bootstrap connections.
 const BOOTSTRAP_QUALITY_SCORE_SUCCESS: f64 = 0.8;
@@ -187,11 +181,6 @@ pub struct NodeConfig {
     /// other diversity-enforcing subsystems. If `None`, defaults are used.
     pub diversity_config: Option<crate::security::IPDiversityConfig>,
 
-    /// Stale peer threshold - peers with no activity for this duration are considered stale.
-    /// Defaults to 60 seconds. Can be reduced for testing purposes.
-    #[serde(default = "default_stale_peer_threshold")]
-    pub stale_peer_threshold: Duration,
-
     /// Optional override for the maximum application-layer message size.
     ///
     /// When `None`, the underlying saorsa-transport default is used.
@@ -219,11 +208,6 @@ pub struct NodeConfig {
     /// When `None`, the user agent is derived from [`NodeConfig::mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
-}
-
-/// Default stale peer threshold (60 seconds)
-fn default_stale_peer_threshold() -> Duration {
-    Duration::from_secs(60)
 }
 
 /// DHT-specific configuration
@@ -331,7 +315,6 @@ impl NodeConfig {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
@@ -478,7 +461,6 @@ impl NodeConfigBuilder {
             production_config: self.production_config,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: self
                 .max_message_size
                 .or(base_config.transport.max_message_size),
@@ -513,7 +495,6 @@ impl Default for NodeConfig {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
@@ -568,7 +549,6 @@ impl NodeConfig {
             }),
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
@@ -919,7 +899,6 @@ impl P2PNode {
             listen_addr: config.listen_addr,
             enable_ipv6: config.enable_ipv6,
             connection_timeout: config.connection_timeout,
-            stale_peer_threshold: config.stale_peer_threshold,
             max_connections: config.max_connections,
             production_config: config.production_config.clone(),
             event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
@@ -1332,20 +1311,9 @@ impl P2PNode {
 
         info!("P2P node running...");
 
-        let mut interval = tokio::time::interval(Duration::from_millis(RUN_LOOP_TICK_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Main event loop
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    self.transport.maintenance_tick().await?;
-                }
-                () = self.shutdown.cancelled() => {
-                    break;
-                }
-            }
-        }
+        // Block until shutdown is signalled. All background work (connection
+        // lifecycle, DHT maintenance, EigenTrust) runs in dedicated tasks.
+        self.shutdown.cancelled().await;
 
         info!("P2P node stopped");
         Ok(())
@@ -2204,7 +2172,6 @@ mod tests {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
             node_identity: None,
             mode: NodeMode::default(),
