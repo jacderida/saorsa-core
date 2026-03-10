@@ -1415,23 +1415,22 @@ impl DhtNetworkManager {
             .collect()
     }
 
-    /// Convert a human friendly socket string (possibly with a four-word suffix) into a Multiaddr.
+    /// Convert a human-friendly socket string into a Multiaddr.
     fn multiaddr_from_address(address: &str) -> Option<Multiaddr> {
-        let clean_addr = address.split(" (").next().unwrap_or(address);
-        match clean_addr.parse::<SocketAddr>() {
+        match address.parse::<SocketAddr>() {
             Ok(socket_addr) => {
                 let ip = socket_addr.ip();
                 if ip.is_unspecified() {
-                    warn!("Rejecting unspecified address: {clean_addr}");
+                    warn!("Rejecting unspecified address: {address}");
                     return None;
                 }
                 if ip.is_loopback() {
-                    trace!("Accepting loopback address (local/test): {clean_addr}");
+                    trace!("Accepting loopback address (local/test): {address}");
                 }
                 Self::socket_addr_to_multiaddr(&socket_addr)
             }
             Err(e) => {
-                warn!("Failed to parse '{clean_addr}' as SocketAddr: {e}");
+                warn!("Failed to parse '{address}' as SocketAddr: {e}");
                 None
             }
         }
@@ -1763,14 +1762,13 @@ impl DhtNetworkManager {
             return None;
         }
 
-        let socket_addr = address.split(" (").next().unwrap_or(address);
         // Validate address before attempting connection
-        if let Ok(parsed) = socket_addr.parse::<SocketAddr>()
+        if let Ok(parsed) = address.parse::<SocketAddr>()
             && parsed.ip().is_unspecified()
         {
             debug!(
                 "dial_candidate: rejecting unspecified address for {}: {}",
-                peer_hex, socket_addr
+                peer_hex, address
             );
             return None;
         }
@@ -1778,25 +1776,25 @@ impl DhtNetworkManager {
             .transport
             .connection_timeout()
             .min(self.config.request_timeout);
-        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(socket_addr)).await {
+        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(address)).await {
             Ok(Ok(channel_id)) => {
                 debug!(
                     "dial_candidate: connected to {} at {} (channel {})",
-                    peer_hex, socket_addr, channel_id
+                    peer_hex, address, channel_id
                 );
                 Some(channel_id)
             }
             Ok(Err(e)) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {}: {}",
-                    peer_hex, socket_addr, e
+                    peer_hex, address, e
                 );
                 None
             }
             Err(_) => {
                 debug!(
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
-                    peer_hex, socket_addr, dial_timeout
+                    peer_hex, address, dial_timeout
                 );
                 None
             }
@@ -1811,16 +1809,14 @@ impl DhtNetworkManager {
     async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<String> {
         // 1. Routing table — contains addresses for validated DHT participants
         if let Some(address) = self.dht.read().await.get_node_address(peer_id).await {
-            let clean = address.split(" (").next().unwrap_or(&address);
-            return Some(clean.to_string());
+            return Some(address);
         }
 
         // 2. Transport layer — for connected peers not yet in the routing table
         if let Some(info) = self.transport.peer_info(peer_id).await
             && let Some(addr) = info.addresses.first()
         {
-            let clean = addr.split(" (").next().unwrap_or(addr);
-            return Some(clean.to_string());
+            return Some(addr.clone());
         }
 
         None
@@ -2211,11 +2207,7 @@ impl DhtNetworkManager {
             .transport
             .peer_info(&app_peer_id)
             .await
-            .and_then(|info| info.addresses.first().cloned())
-            .map(|full| {
-                // Strip optional four-word suffix: "1.2.3.4:9000 (word-word-word-word)"
-                full.split(" (").next().unwrap_or(&full).to_string()
-            });
+            .and_then(|info| info.addresses.first().cloned());
 
         let dht = self.dht.read().await;
         if dht
@@ -2512,23 +2504,6 @@ impl DhtNetworkManager {
                             debug!("Running BucketRefresh maintenance task");
                             // Refresh k-buckets by looking up random IDs in each bucket
                             // This helps discover new nodes and keep routing table fresh
-                            Ok(())
-                        }
-                        MaintenanceTask::LivenessCheck => {
-                            // Standard Kademlia: nodes prove liveness through
-                            // actual traffic (implicit liveness via touch_node).
-                            // Dead nodes are discovered when real operations
-                            // fail — no proactive pinging needed.
-                            debug!("LivenessCheck: relying on implicit liveness");
-                            Ok(())
-                        }
-                        MaintenanceTask::EvictionEvaluation => {
-                            debug!("Running EvictionEvaluation maintenance task");
-                            // Evaluate nodes for eviction based on:
-                            // - Response rate
-                            // - Trust scores (via EigenTrust engine)
-                            // - Consecutive failures
-                            // TODO: Integrate with EigenTrust engine for trust-based eviction
                             Ok(())
                         }
                         MaintenanceTask::CloseGroupValidation => {

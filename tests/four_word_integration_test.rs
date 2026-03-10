@@ -99,13 +99,11 @@ fn test_four_word_display() {
     let addr = NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
     let display = format!("{}", addr);
 
-    // Should include the socket address
-    assert!(display.contains("192.168.1.1:9000"));
+    // Display shows only the socket address (no four-word suffix).
+    assert_eq!(display, "192.168.1.1:9000");
 
-    // If four-words are available, should include them too
-    if let Some(four_words) = addr.four_words() {
-        assert!(display.contains(four_words));
-    }
+    // Four-word encoding is still accessible via the dedicated accessor.
+    assert!(addr.four_words().is_some());
 }
 
 #[test]

@@ -87,13 +87,11 @@ impl KBucket {
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
-        // If the node is already in this bucket, update its address and move to
+        // If the node is already in this bucket, replace it fully and move to
         // tail (most-recently-seen) per standard Kademlia protocol.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
-            self.nodes[pos].address = node.address;
-            self.nodes[pos].last_seen = node.last_seen;
-            let existing = self.nodes.remove(pos);
-            self.nodes.push(existing);
+            self.nodes.remove(pos);
+            self.nodes.push(node);
             return Ok(());
         }
 
@@ -1363,11 +1361,7 @@ impl DhtCoreEngine {
         }
 
         // Parse candidate IP once for the diversity checks below.
-        let candidate_ip: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
-            Some(socket.ip())
-        } else {
-            node.address.parse::<IpAddr>().ok()
-        };
+        let candidate_ip = parse_ip(&node.address);
 
         // 2. Security Check: IP + Geographic Diversity
         //
@@ -1414,11 +1408,13 @@ impl DhtCoreEngine {
                 let candidate_24 = mask_ipv4(v4, 24);
                 let candidate_16 = mask_ipv4(v4, 16);
 
-                let mut count_32: usize = 0;
+                let mut count_exact: usize = 0;
                 let mut count_24: usize = 0;
                 let mut count_16: usize = 0;
+                let mut network_size: usize = 0;
 
                 for node in routing.iter_nodes() {
+                    network_size += 1;
                     if node.id == *candidate_id {
                         continue;
                     }
@@ -1433,7 +1429,7 @@ impl DhtCoreEngine {
                     }
                     if let IpAddr::V4(existing_v4) = existing_ip {
                         if existing_v4 == v4 {
-                            count_32 += 1;
+                            count_exact += 1;
                         }
                         if mask_ipv4(existing_v4, 24) == candidate_24 {
                             count_24 += 1;
@@ -1444,16 +1440,17 @@ impl DhtCoreEngine {
                     }
                 }
 
-                let network_size = routing.node_count();
                 let per_ip = self.dynamic_per_ip_limit(network_size);
+                let limit_32 =
+                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_32, per_ip);
                 let limit_24 =
                     std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_24, per_ip * 3);
                 let limit_16 =
                     std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_16, per_ip * 10);
 
-                if count_32 >= per_ip {
+                if count_exact >= limit_32 {
                     return Err(anyhow!(
-                        "IP diversity: /32 limit ({per_ip}) exceeded for {v4}"
+                        "IP diversity: /32 limit ({limit_32}) exceeded for {v4}"
                     ));
                 }
                 if count_24 >= limit_24 {

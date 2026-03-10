@@ -140,11 +140,7 @@ impl NetworkAddress {
 
 impl Display for NetworkAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref words) = self.four_words {
-            write!(f, "{} ({})", self.socket_addr, words)
-        } else {
-            write!(f, "{}", self.socket_addr)
-        }
+        write!(f, "{}", self.socket_addr)
     }
 }
 

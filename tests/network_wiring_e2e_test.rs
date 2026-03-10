@@ -30,11 +30,10 @@ use tracing::{debug, info, warn};
 
 /// Timeout for waiting for a single event (PeerConnected, etc.).
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Maximum time to wait for stale peer cleanup after a disconnect.
+/// Maximum time to wait for peer cleanup after a disconnect.
 const STALE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval when busy-waiting for state changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Short stale-peer threshold used for fast disconnect detection in tests.
 /// Timeout for PeerDisconnected events.
 const DISCONNECT_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
 

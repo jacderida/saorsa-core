@@ -6,7 +6,6 @@
 //! This test validates that the fix for P2P_MESSAGING_STATUS_2025-10-02_FINAL.md is in place:
 //! - P2PNode has active_connections tracking
 //! - is_peer_connected() validates authenticated peer state
-//! - Keepalive task prevents 30-second idle timeout
 //! - send_message() checks connection state before sending
 
 use saorsa_core::network::{NodeConfig, P2PNode};
@@ -79,44 +78,7 @@ async fn test_connection_lifecycle_infrastructure_exists() {
     info!("2. is_peer_connected() validation (app-level peer IDs)");
     info!("3. connected_peers() returns authenticated peers");
     info!("4. send_message() connection validation");
-    info!("5. Keepalive task (spawned in background)");
     info!("");
     info!("These components fix the issue from P2P_MESSAGING_STATUS_2025-10-02_FINAL.md");
     info!("where P2PNode's peers map didn't track when saorsa-transport connections closed.");
-}
-
-/// Test that demonstrates the keepalive task is spawned
-///
-/// The keepalive task runs in the background to prevent 30-second idle timeouts.
-/// This test proves it's initialized even though we can't easily test its behavior.
-#[tokio::test]
-async fn test_keepalive_task_initialized() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("debug")
-        .with_test_writer()
-        .try_init();
-
-    info!("=== Testing keepalive task initialization ===");
-
-    // Create a P2P node with OS-assigned ports (port 0)
-    let config = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
-        listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
-        ],
-        ..Default::default()
-    };
-
-    let _node = P2PNode::new(config).await.expect("Failed to create node");
-    _node.start().await.expect("Failed to start node");
-
-    // The keepalive task is spawned in P2PNode::new() and runs in the background
-    // It sends keepalive messages every 15 seconds to prevent the 30-second saorsa-transport timeout
-
-    info!("✓ P2PNode initialized successfully");
-    info!("✓ Keepalive task spawned (runs every 15 seconds)");
-    info!("✓ This prevents saorsa-transport's 30-second max_idle_timeout");
-
-    info!("=== Keepalive task initialization test passed! ===");
 }

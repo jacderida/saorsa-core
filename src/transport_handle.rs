@@ -54,13 +54,6 @@ const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
 /// Filtered from P2PEvent::Message emission — not visible to applications.
 const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
 
-/// Update a channel's `last_seen` timestamp on incoming data.
-async fn touch_channel_last_seen(peers: &RwLock<HashMap<String, PeerInfo>>, channel_id: &str) {
-    if let Some(peer_info) = peers.write().await.get_mut(channel_id) {
-        peer_info.last_seen = Instant::now();
-    }
-}
-
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
     /// Primary listen address.
@@ -689,9 +682,7 @@ impl TransportHandle {
                 }
             }
             self.active_connections.write().await.remove(channel_id);
-            if let Some(mut peer_info) = self.peers.write().await.remove(channel_id) {
-                peer_info.status = ConnectionStatus::Disconnected;
-            }
+            self.peers.write().await.remove(channel_id);
         }
 
         info!("Disconnected from peer: {}", peer_id);
@@ -1306,7 +1297,6 @@ impl TransportHandle {
 
         let event_tx = self.event_tx.clone();
         let active_requests = Arc::clone(&self.active_requests);
-        let peers_for_recv = Arc::clone(&self.peers);
         let peer_to_channel = Arc::clone(&self.peer_to_channel);
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
@@ -1316,8 +1306,6 @@ impl TransportHandle {
             while let Some((from_addr, bytes)) = rx.recv().await {
                 let channel_id = from_addr.to_string();
                 trace!("Received {} bytes from channel {}", bytes.len(), channel_id);
-
-                touch_channel_last_seen(&peers_for_recv, &channel_id).await;
 
                 match parse_protocol_message(&bytes, &channel_id) {
                     Some(ParsedMessage {

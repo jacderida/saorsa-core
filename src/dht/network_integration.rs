@@ -664,9 +664,8 @@ impl NetworkIntegrationLayer {
 
     /// Maintain connections by cleaning up idle ones periodically.
     ///
-    /// Liveness verification of routing table peers is handled by the
-    /// `LivenessCheck` maintenance task in `DhtNetworkManager`, which sends
-    /// targeted pings only to stale nodes rather than blanket-pinging everyone.
+    /// Liveness verification relies on implicit Kademlia liveness: any
+    /// successful RPC proves a peer is alive via `touch_node()`.
     pub async fn maintain_connections(&self) -> Result<()> {
         loop {
             self.connection_pool.cleanup_idle_connections().await;
