@@ -36,6 +36,7 @@ async fn create_node_with_transport(
             max_message_size: node_config.max_message_size,
             node_identity: Arc::new(NodeIdentity::generate().unwrap()),
             user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
+            allow_loopback: true,
         })
         .await?,
     );

@@ -79,6 +79,8 @@ pub struct TransportConfig {
     pub node_identity: Arc<NodeIdentity>,
     /// User agent string identifying this node's software.
     pub user_agent: String,
+    /// Allow loopback addresses in the transport layer.
+    pub allow_loopback: bool,
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -165,11 +167,12 @@ impl TransportHandle {
         };
 
         let dual_node = Arc::new(
-            DualStackNetworkNode::new_with_max_connections(
+            DualStackNetworkNode::new_with_options(
                 v6_opt,
                 v4_opt,
                 config.max_connections,
                 config.max_message_size,
+                config.allow_loopback,
             )
             .await
             .map_err(|e| {

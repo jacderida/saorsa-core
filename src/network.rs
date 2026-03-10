@@ -208,6 +208,16 @@ pub struct NodeConfig {
     /// When `None`, the user agent is derived from [`NodeConfig::mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
+
+    /// Allow loopback addresses (127.0.0.1, ::1) in the transport layer.
+    ///
+    /// In production, loopback addresses are rejected because they are not
+    /// routable. Enable this for local devnets and testnets where all nodes
+    /// run on the same machine.
+    ///
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_loopback: bool,
 }
 
 /// DHT-specific configuration
@@ -319,6 +329,7 @@ impl NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: false,
         })
     }
 
@@ -467,6 +478,7 @@ impl NodeConfigBuilder {
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
+            allow_loopback: false,
         })
     }
 }
@@ -499,6 +511,7 @@ impl Default for NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: false,
         }
     }
 }
@@ -553,6 +566,7 @@ impl NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: false,
         };
 
         // Add IPv6 listen address if enabled
@@ -905,6 +919,7 @@ impl P2PNode {
             max_message_size: config.max_message_size,
             node_identity: node_identity.clone(),
             user_agent: config.user_agent(),
+            allow_loopback: config.allow_loopback,
         };
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
@@ -2176,6 +2191,7 @@ mod tests {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: true,
         }
     }
 

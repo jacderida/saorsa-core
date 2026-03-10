@@ -62,7 +62,7 @@ use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
-    LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId,
+    LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId,
 };
 
 // Import saorsa-transport types for SharedTransport integration
@@ -150,6 +150,17 @@ impl P2PNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_options(bind_addr, max_connections, max_msg_size, false).await
+    }
+
+    /// Create a new P2P network node with full control over connection
+    /// limits, message size, and loopback address acceptance.
+    pub async fn new_with_options(
+        bind_addr: SocketAddr,
+        max_connections: usize,
+        max_msg_size: Option<usize>,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
             .max_connections(max_connections)
@@ -157,6 +168,12 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
         if let Some(max_msg_size) = max_msg_size {
             builder = builder.max_message_size(max_msg_size);
+        }
+        if allow_loopback {
+            builder = builder.nat(NatConfig {
+                allow_loopback: true,
+                ..NatConfig::default()
+            });
         }
         let config = builder
             .build()
@@ -909,18 +926,40 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false).await
+    }
+
+    /// Create dual nodes with full control over connection limits, message
+    /// size, and loopback address acceptance.
+    pub async fn new_with_options(
+        v6_addr: Option<SocketAddr>,
+        v4_addr: Option<SocketAddr>,
+        max_connections: usize,
+        max_msg_size: Option<usize>,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let v6 = if let Some(addr) = v6_addr {
             Some(
-                P2PNetworkNode::new_with_max_connections(addr, max_connections, max_msg_size)
-                    .await?,
+                P2PNetworkNode::new_with_options(
+                    addr,
+                    max_connections,
+                    max_msg_size,
+                    allow_loopback,
+                )
+                .await?,
             )
         } else {
             None
         };
         let v4 = if let Some(addr) = v4_addr {
             Some(
-                P2PNetworkNode::new_with_max_connections(addr, max_connections, max_msg_size)
-                    .await?,
+                P2PNetworkNode::new_with_options(
+                    addr,
+                    max_connections,
+                    max_msg_size,
+                    allow_loopback,
+                )
+                .await?,
             )
         } else {
             None

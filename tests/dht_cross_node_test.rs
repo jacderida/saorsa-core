@@ -54,6 +54,7 @@ async fn create_test_dht_config(
             max_message_size: node_config.max_message_size,
             node_identity: Arc::new(NodeIdentity::generate().unwrap()),
             user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
+            allow_loopback: true,
         })
         .await?,
     );
@@ -210,6 +211,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
             max_message_size: node_config.max_message_size,
             node_identity: Arc::new(NodeIdentity::generate().unwrap()),
             user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
+            allow_loopback: true,
         })
         .await?,
     );

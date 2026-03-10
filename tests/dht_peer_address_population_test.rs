@@ -86,6 +86,7 @@ async fn create_test_dht_config(
             max_message_size: node_config.max_message_size,
             node_identity: identity.clone(),
             user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
+            allow_loopback: true,
         })
         .await?,
     );
