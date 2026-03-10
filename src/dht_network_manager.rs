@@ -364,9 +364,9 @@ pub struct DhtNetworkStats {
     pub bytes_sent: u64,
     /// Total bytes received
     pub bytes_received: u64,
-    /// Connected DHT peers
+    /// Connected transport peers (all authenticated peers, including Client-mode)
     pub connected_peers: usize,
-    /// Routing table size
+    /// DHT routing table size (Node-mode peers only)
     pub routing_table_size: usize,
 }
 
@@ -2577,10 +2577,12 @@ impl DhtNetworkManager {
 
                 // Update stats periodically
                 let connected_peers = transport.peer_count().await;
+                let routing_table_size = dht.read().await.routing_table_size().await;
 
                 {
                     let mut stats_guard = stats.write().await;
                     stats_guard.connected_peers = connected_peers;
+                    stats_guard.routing_table_size = routing_table_size;
                 }
             }
         });
@@ -2609,13 +2611,9 @@ impl DhtNetworkManager {
         self.transport.connected_peers().await
     }
 
-    /// Get DHT routing table size
+    /// Get DHT routing table size (Node-mode peers only).
     pub async fn get_routing_table_size(&self) -> usize {
-        // TODO: Implement DHT stats
-        // let dht_guard = self.dht.read().await;
-        // let stats = dht_guard.stats().await;
-        // stats.total_nodes
-        0
+        self.dht.read().await.routing_table_size().await
     }
 
     /// Check whether a peer is present in the DHT routing table.

@@ -244,7 +244,7 @@ impl KademliaRoutingTable {
     }
 
     /// Total number of nodes across all buckets.
-    fn node_count(&self) -> usize {
+    pub fn node_count(&self) -> usize {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
@@ -635,6 +635,11 @@ impl DhtCoreEngine {
     #[must_use]
     pub fn node_id(&self) -> &PeerId {
         &self.node_id
+    }
+
+    /// Number of peers currently in the routing table.
+    pub async fn routing_table_size(&self) -> usize {
+        self.routing_table.read().await.node_count()
     }
 
     // ===== Trust-weighted peer selection methods =====
@@ -1394,6 +1399,13 @@ impl DhtCoreEngine {
         candidate_id: &PeerId,
         candidate_ip: IpAddr,
     ) -> Result<()> {
+        // Loopback addresses (127.0.0.0/8, ::1) are used in tests and local
+        // development where many nodes share the same IP.  Diversity limits
+        // don't apply to them.
+        if candidate_ip.is_loopback() {
+            return Ok(());
+        }
+
         let candidate_region = GeographicRegion::from_ip(candidate_ip);
         let mut region_count: usize = 0;
 
@@ -1413,6 +1425,9 @@ impl DhtCoreEngine {
                     let Some(existing_ip) = parse_ip(&node.address) else {
                         continue;
                     };
+                    if existing_ip.is_loopback() {
+                        continue;
+                    }
                     if GeographicRegion::from_ip(existing_ip) == candidate_region {
                         region_count += 1;
                     }
@@ -1468,6 +1483,9 @@ impl DhtCoreEngine {
                     let Some(existing_ip) = parse_ip(&node.address) else {
                         continue;
                     };
+                    if existing_ip.is_loopback() {
+                        continue;
+                    }
                     if GeographicRegion::from_ip(existing_ip) == candidate_region {
                         region_count += 1;
                     }

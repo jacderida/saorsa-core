@@ -663,6 +663,13 @@ impl IPDiversityEnforcer {
 
     /// Check if a new node can be accepted based on IP diversity constraints
     pub fn can_accept_node(&self, ip_analysis: &IPAnalysis) -> bool {
+        // Loopback addresses are used in tests / local development — always accept.
+        // The only IPv6 loopback (::1) masks to ::0 at every prefix length, so
+        // subnet_64 will be unspecified.  No routable address has a /64 of ::.
+        if ip_analysis.subnet_64.is_loopback() || ip_analysis.subnet_64.is_unspecified() {
+            return true;
+        }
+
         // Determine limits based on hosting provider status
         let (limit_64, limit_48, limit_32, limit_asn) =
             if ip_analysis.is_hosting_provider || ip_analysis.is_vpn_provider {
@@ -974,6 +981,11 @@ impl IPDiversityEnforcer {
 
     /// Check if an IPv4 node can be accepted based on diversity constraints
     fn can_accept_ipv4(&self, analysis: &IPv4Analysis) -> bool {
+        // Loopback addresses are used in tests / local development — always accept.
+        if analysis.ip_addr.is_loopback() {
+            return true;
+        }
+
         // Get dynamic per-IP limit
         let per_ip_limit = self.get_per_ip_limit();
 
