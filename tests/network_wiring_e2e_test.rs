@@ -396,14 +396,10 @@ async fn test_periodic_tasks_updates_last_seen() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    // Connect
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    // Connect and obtain the real authenticated PeerId
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
     // Get initial peer info to check last_seen
-    // NOTE: This requires exposing peer info - we may need to add a method
     let is_connected_before = node1.is_peer_connected(&peer2_id).await;
     assert!(is_connected_before, "Peer should be connected initially");
 
@@ -450,11 +446,8 @@ async fn test_disconnected_peer_removal() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    // Connect — auto identity announce handles authentication
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    // Connect and obtain the real authenticated PeerId
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
     assert!(node1.is_peer_connected(&peer2_id).await);
     info!("Initial connection established");
@@ -1342,10 +1335,7 @@ async fn test_peer_cleanup_timing() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
     assert!(
         node1.is_peer_connected(&peer2_id).await,

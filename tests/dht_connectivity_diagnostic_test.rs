@@ -166,6 +166,7 @@ async fn step3_two_managers() -> Result<()> {
 
 /// Step 4: Can two managers connect?
 #[tokio::test]
+#[ignore = "diagnostic-only: returns Ok regardless of outcome"]
 async fn step4_connect_managers() -> Result<()> {
     println!("STEP 4: Connecting two managers...");
 
@@ -273,6 +274,7 @@ async fn step5_local_put_get() -> Result<()> {
 
 /// Step 6: Cross-node replication test
 #[tokio::test]
+#[ignore = "diagnostic-only: returns Ok regardless of outcome"]
 async fn step6_cross_node_replication() -> Result<()> {
     println!("STEP 6: Cross-node replication test...");
 

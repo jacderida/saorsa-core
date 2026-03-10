@@ -114,23 +114,29 @@ async fn test_node_mode_dht_routing_table_gating() {
 
     // --- Connect both peers to the observer --------------------------------
     connect_and_wait(&node_peer, &observer).await;
-    let node_connected = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
-        .await
-        .expect("observer should receive PeerConnected for node peer");
-
     connect_and_wait(&client_peer, &observer).await;
-    let client_connected = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
-        .await
-        .expect("observer should receive PeerConnected for client peer");
 
-    // Verify user agents carried in the events.
-    let (node_peer_id, node_ua) = match node_connected {
+    // Collect both PeerConnected events (order may vary due to scheduling).
+    let event1 = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
+        .await
+        .expect("observer should receive first PeerConnected event");
+    let event2 = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
+        .await
+        .expect("observer should receive second PeerConnected event");
+
+    // Extract (PeerId, user_agent) from each event.
+    let extract = |e: P2PEvent| match e {
         P2PEvent::PeerConnected(id, ua) => (id, ua),
         _ => panic!("unexpected event variant"),
     };
-    let (client_peer_id, client_ua) = match client_connected {
-        P2PEvent::PeerConnected(id, ua) => (id, ua),
-        _ => panic!("unexpected event variant"),
+    let (id1, ua1) = extract(event1);
+    let (id2, ua2) = extract(event2);
+
+    // Assign based on user agent prefix, not arrival order.
+    let (node_peer_id, node_ua, client_peer_id, client_ua) = if ua1.starts_with("node/") {
+        (id1, ua1, id2, ua2)
+    } else {
+        (id2, ua2, id1, ua1)
     };
 
     assert!(

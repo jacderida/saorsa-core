@@ -452,7 +452,9 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
             );
         }
         None => {
-            warn!("Peer B not found in closest nodes result");
+            panic!(
+                "Peer B not found in closest nodes result — address consistency cannot be verified"
+            );
         }
     }
 
