@@ -399,28 +399,42 @@ async fn test_periodic_tasks_updates_last_seen() {
     // Connect and obtain the real authenticated PeerId
     let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    // Get initial peer info to check last_seen
-    let is_connected_before = node1.is_peer_connected(&peer2_id).await;
-    assert!(is_connected_before, "Peer should be connected initially");
+    // Verify the peer is connected initially
+    assert!(
+        node1.is_peer_connected(&peer2_id).await,
+        "Peer should be connected initially"
+    );
 
-    // Start periodic tasks (if not already running via start())
-    // Wait for some periodic task cycles
-    info!("Waiting for periodic tasks to run...");
+    // Wait for a period of inactivity. With keepalive removed, the
+    // connection should still survive via the transport-layer idle timeout
+    // (which is longer than this sleep).
+    info!("Waiting 2s to verify connection survives inactivity...");
     sleep(Duration::from_secs(2)).await;
 
-    // Verify peer is still tracked and last_seen was updated
-    let is_connected_after = node1.is_peer_connected(&peer2_id).await;
-    let is_active = node1.is_peer_connected(&peer2_id).await;
-
-    info!(
-        "After 2s: connected={}, active={}",
-        is_connected_after, is_active
-    );
-
+    // Verify the peer is still connected after the idle period
     assert!(
-        is_connected_after && is_active,
-        "Peer should still be connected and active after periodic tasks"
+        node1.is_peer_connected(&peer2_id).await,
+        "Peer should still be connected after 2s of inactivity"
     );
+
+    // Send a message to prove the connection is still functional
+    let mut events2 = node2.subscribe_events();
+    node1
+        .send_message(&peer2_id, "liveness", b"ping".to_vec())
+        .await
+        .expect("send_message should succeed after idle period");
+
+    let received = timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let Ok(P2PEvent::Message { data, .. }) = events2.recv().await {
+                return data;
+            }
+        }
+    })
+    .await
+    .expect("node2 should receive message after idle period");
+
+    assert_eq!(received, b"ping", "message content should match");
 
     info!("=== TEST PASSED: Periodic Tasks Update Last Seen ===");
 }
@@ -1786,38 +1800,36 @@ async fn test_default_config_connection() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    let peer2_peer_id = *node2.peer_id();
-    match node1.connect_peer(&addr2).await {
-        Ok(channel_id) => {
-            info!("Connection succeeded");
+    // Verify the connection is active
+    assert!(
+        node1.is_peer_connected(&peer2_id).await,
+        "node1 should see peer2 as connected"
+    );
 
-            // Wait briefly for identity exchange
-            let identified = node1
-                .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
-                .await;
+    // Verify bidirectional message exchange
+    let mut events2 = node2.subscribe_events();
+    node1
+        .send_message(&peer2_id, "messaging", b"hello".to_vec())
+        .await
+        .expect("send_message should succeed");
 
-            if identified.is_ok() {
-                let send_result = node1
-                    .send_message(&peer2_peer_id, "messaging", b"quick".to_vec())
-                    .await;
-
-                match send_result {
-                    Ok(()) => info!("Message sent successfully"),
-                    Err(e) => info!("Message failed: {e}"),
-                }
-            } else {
-                info!("Identity exchange didn't complete");
+    let received = timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let Ok(P2PEvent::Message { data, .. }) = events2.recv().await {
+                return data;
             }
         }
-        Err(e) => {
-            info!("Connection rejected: {}", e);
-        }
-    }
+    })
+    .await
+    .expect("node2 should receive the message within timeout");
 
-    // Node should not have panicked or hung
+    assert_eq!(
+        received, b"hello",
+        "received message should match sent data"
+    );
+
     info!("=== TEST PASSED: Default Config Connection ===");
 }
 

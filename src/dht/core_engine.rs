@@ -273,19 +273,7 @@ impl KademliaRoutingTable {
     }
 
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
-        let distance = xor_distance_bytes(self.node_id.to_bytes(), node_id.to_bytes());
-
-        // Find first bit that differs
-        for i in 0..256 {
-            let byte_index = i / 8;
-            let bit_index = 7 - (i % 8);
-
-            if (distance[byte_index] >> bit_index) & 1 == 1 {
-                return i;
-            }
-        }
-
-        255 // Same node
+        self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
 }
 
@@ -417,13 +405,20 @@ impl LoadBalancer {
 // Address parsing and subnet masking helpers for diversity checks
 // ---------------------------------------------------------------------------
 
-/// Parse an IP address from a node address string ("ip:port" or bare "ip").
-fn parse_ip(address: &str) -> Option<IpAddr> {
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        Some(socket.ip())
-    } else {
-        address.parse::<IpAddr>().ok()
-    }
+/// Accumulator for IPv4 subnet match counts during diversity scan.
+#[derive(Default)]
+struct Ipv4SubnetCounts {
+    exact: usize,
+    slash_24: usize,
+    slash_16: usize,
+}
+
+/// Accumulator for IPv6 subnet match counts during diversity scan.
+#[derive(Default)]
+struct Ipv6SubnetCounts {
+    slash_64: usize,
+    slash_48: usize,
+    slash_32: usize,
 }
 
 /// Zero out the host bits of an IPv4 address beyond `prefix_len`.
@@ -868,6 +863,11 @@ impl DhtCoreEngine {
     ///
     /// # Errors
     /// Returns an error if the value exceeds `MAX_DHT_VALUE_SIZE` (512 bytes).
+    ///
+    /// **Note:** When the local node is not among the selected storage targets,
+    /// the receipt will have `success: false` and an empty `stored_at` list
+    /// because network store-forwarding is not yet implemented.  Callers
+    /// should check [`StoreReceipt::is_successful`] and handle this case.
     pub async fn store(&mut self, key: &DhtKey, value: Vec<u8>) -> Result<StoreReceipt> {
         // Security: Reject oversized values to prevent memory exhaustion
         if value.len() > MAX_DHT_VALUE_SIZE {
@@ -1368,7 +1368,15 @@ impl DhtCoreEngine {
         }
 
         // Parse candidate IP once for the diversity checks below.
-        let candidate_ip = parse_ip(&node.address);
+        // Reject nodes with unparseable addresses — allowing them through
+        // would bypass all IP/geographic diversity enforcement.
+        let candidate_ip = node.ip().ok_or_else(|| {
+            anyhow!(
+                "Rejecting node {:?}: address {:?} is not a valid IP",
+                node.id,
+                node.address
+            )
+        })?;
 
         // 2. Security Check: IP + Geographic Diversity
         //
@@ -1380,9 +1388,7 @@ impl DhtCoreEngine {
         //    check and the insertion to avoid a TOCTOU race where touch_node
         //    could change an address between a read-lock check and the write.
         let mut routing = self.routing_table.write().await;
-        if let Some(ip) = candidate_ip {
-            self.check_diversity(&routing, &node.id, ip)?;
-        }
+        self.check_diversity(&routing, &node.id, candidate_ip)?;
         routing.add_node(node)?;
 
         Ok(())
@@ -1392,7 +1398,9 @@ impl DhtCoreEngine {
     ///
     /// Single pass over all nodes — each node's address is parsed once.
     /// `candidate_id` is excluded from counting so that a reconnecting node
-    /// doesn't block itself.
+    /// doesn't block itself.  Loopback nodes are excluded from both
+    /// `network_size` and subnet/region counts so they don't inflate the
+    /// dynamic per-IP limit in devnet environments.
     fn check_diversity(
         &self,
         routing: &KademliaRoutingTable,
@@ -1408,118 +1416,105 @@ impl DhtCoreEngine {
 
         let candidate_region = GeographicRegion::from_ip(candidate_ip);
         let mut region_count: usize = 0;
+        let mut network_size: usize = 0;
 
-        match candidate_ip {
-            IpAddr::V4(v4) => {
-                let candidate_24 = mask_ipv4(v4, 24);
-                let candidate_16 = mask_ipv4(v4, 16);
+        // Protocol-specific subnet accumulators
+        let mut v4_counts = Ipv4SubnetCounts::default();
+        let mut v6_counts = Ipv6SubnetCounts::default();
 
-                let mut count_exact: usize = 0;
-                let mut count_24: usize = 0;
-                let mut count_16: usize = 0;
-                let mut network_size: usize = 0;
+        // Precompute candidate subnet masks
+        let v4_masks = match candidate_ip {
+            IpAddr::V4(v4) => Some((v4, mask_ipv4(v4, 24), mask_ipv4(v4, 16))),
+            _ => None,
+        };
+        let v6_masks = match candidate_ip {
+            IpAddr::V6(v6) => Some((mask_ipv6(v6, 64), mask_ipv6(v6, 48), mask_ipv6(v6, 32))),
+            _ => None,
+        };
 
-                for node in routing.iter_nodes() {
-                    if node.id == *candidate_id {
-                        continue;
+        for node in routing.iter_nodes() {
+            if node.id == *candidate_id {
+                continue;
+            }
+            let Some(existing_ip) = node.ip() else {
+                continue;
+            };
+            // Loopback nodes don't contribute to network_size or any counts
+            if existing_ip.is_loopback() {
+                continue;
+            }
+            network_size += 1;
+            if GeographicRegion::from_ip(existing_ip) == candidate_region {
+                region_count += 1;
+            }
+            // Count subnet matches for the candidate's address family
+            match (existing_ip, v4_masks, v6_masks) {
+                (IpAddr::V4(existing_v4), Some((v4, cand_24, cand_16)), _) => {
+                    if existing_v4 == v4 {
+                        v4_counts.exact += 1;
                     }
-                    let Some(existing_ip) = node.ip() else {
-                        continue;
-                    };
-                    network_size += 1;
-                    if existing_ip.is_loopback() {
-                        continue;
+                    if mask_ipv4(existing_v4, 24) == cand_24 {
+                        v4_counts.slash_24 += 1;
                     }
-                    if GeographicRegion::from_ip(existing_ip) == candidate_region {
-                        region_count += 1;
-                    }
-                    if let IpAddr::V4(existing_v4) = existing_ip {
-                        if existing_v4 == v4 {
-                            count_exact += 1;
-                        }
-                        if mask_ipv4(existing_v4, 24) == candidate_24 {
-                            count_24 += 1;
-                        }
-                        if mask_ipv4(existing_v4, 16) == candidate_16 {
-                            count_16 += 1;
-                        }
+                    if mask_ipv4(existing_v4, 16) == cand_16 {
+                        v4_counts.slash_16 += 1;
                     }
                 }
+                (IpAddr::V6(existing_v6), _, Some((cand_64, cand_48, cand_32))) => {
+                    if mask_ipv6(existing_v6, 64) == cand_64 {
+                        v6_counts.slash_64 += 1;
+                    }
+                    if mask_ipv6(existing_v6, 48) == cand_48 {
+                        v6_counts.slash_48 += 1;
+                    }
+                    if mask_ipv6(existing_v6, 32) == cand_32 {
+                        v6_counts.slash_32 += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
 
-                let per_ip = self.dynamic_per_ip_limit(network_size);
-                let limit_32 =
-                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_32, per_ip);
-                let limit_24 =
-                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_24, per_ip * 3);
-                let limit_16 =
-                    std::cmp::min(self.ip_diversity_config.max_nodes_per_ipv4_16, per_ip * 10);
+        // Enforce subnet limits
+        let per_ip = self.dynamic_per_ip_limit(network_size);
+        match candidate_ip {
+            IpAddr::V4(v4) => {
+                let cfg = &self.ip_diversity_config;
+                let limit_32 = std::cmp::min(cfg.max_nodes_per_ipv4_32, per_ip);
+                let limit_24 = std::cmp::min(cfg.max_nodes_per_ipv4_24, per_ip * 3);
+                let limit_16 = std::cmp::min(cfg.max_nodes_per_ipv4_16, per_ip * 10);
 
-                if count_exact >= limit_32 {
+                if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
                         "IP diversity: /32 limit ({limit_32}) exceeded for {v4}"
                     ));
                 }
-                if count_24 >= limit_24 {
+                if v4_counts.slash_24 >= limit_24 {
+                    let cand_24 = mask_ipv4(v4, 24);
                     return Err(anyhow!(
-                        "IP diversity: /24 limit ({limit_24}) exceeded for {candidate_24}"
+                        "IP diversity: /24 limit ({limit_24}) exceeded for {cand_24}"
                     ));
                 }
-                if count_16 >= limit_16 {
+                if v4_counts.slash_16 >= limit_16 {
+                    let cand_16 = mask_ipv4(v4, 16);
                     return Err(anyhow!(
-                        "IP diversity: /16 limit ({limit_16}) exceeded for {candidate_16}"
+                        "IP diversity: /16 limit ({limit_16}) exceeded for {cand_16}"
                     ));
                 }
             }
-            IpAddr::V6(v6) => {
-                let candidate_64 = mask_ipv6(v6, 64);
-                let candidate_48 = mask_ipv6(v6, 48);
-                let candidate_32 = mask_ipv6(v6, 32);
-
-                let mut count_64: usize = 0;
-                let mut count_48: usize = 0;
-                let mut count_32: usize = 0;
-                let mut network_size: usize = 0;
-
-                for node in routing.iter_nodes() {
-                    if node.id == *candidate_id {
-                        continue;
-                    }
-                    let Some(existing_ip) = node.ip() else {
-                        continue;
-                    };
-                    network_size += 1;
-                    if existing_ip.is_loopback() {
-                        continue;
-                    }
-                    if GeographicRegion::from_ip(existing_ip) == candidate_region {
-                        region_count += 1;
-                    }
-                    if let IpAddr::V6(existing_v6) = existing_ip {
-                        if mask_ipv6(existing_v6, 64) == candidate_64 {
-                            count_64 += 1;
-                        }
-                        if mask_ipv6(existing_v6, 48) == candidate_48 {
-                            count_48 += 1;
-                        }
-                        if mask_ipv6(existing_v6, 32) == candidate_32 {
-                            count_32 += 1;
-                        }
-                    }
-                }
-
-                let per_ip = self.dynamic_per_ip_limit(network_size);
+            IpAddr::V6(_) => {
                 let cfg = &self.ip_diversity_config;
                 let limit_64 = std::cmp::min(cfg.max_nodes_per_64, per_ip * 3);
                 let limit_48 = std::cmp::min(cfg.max_nodes_per_48, per_ip * 10);
                 let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * 30);
 
-                if count_64 >= limit_64 {
+                if v6_counts.slash_64 >= limit_64 {
                     return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));
                 }
-                if count_48 >= limit_48 {
+                if v6_counts.slash_48 >= limit_48 {
                     return Err(anyhow!("IP diversity: /48 limit ({limit_48}) exceeded"));
                 }
-                if count_32 >= limit_32 {
+                if v6_counts.slash_32 >= limit_32 {
                     return Err(anyhow!("IP diversity: /32 limit ({limit_32}) exceeded"));
                 }
             }
@@ -1536,7 +1531,8 @@ impl DhtCoreEngine {
     }
 
     /// Dynamic per-IP limit: `min(cap, floor(network_size * fraction))`,
-    /// clamped to at least 1.
+    /// clamped to at least 1.  `network_size` excludes loopback nodes so
+    /// devnet environments don't inflate the limit for non-loopback IPs.
     fn dynamic_per_ip_limit(&self, network_size: usize) -> usize {
         let fraction =
             (network_size as f64 * self.ip_diversity_config.max_network_fraction).floor() as usize;
