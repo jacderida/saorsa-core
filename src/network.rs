@@ -358,6 +358,7 @@ pub struct NodeConfigBuilder {
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
+    allow_loopback: bool,
 }
 
 impl NodeConfigBuilder {
@@ -435,6 +436,15 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Allow loopback addresses in the transport layer.
+    ///
+    /// Enable for devnet/testnet modes where multiple nodes run on the same
+    /// machine. Default: `false`.
+    pub fn allow_loopback(mut self, allow: bool) -> Self {
+        self.allow_loopback = allow;
+        self
+    }
+
     /// Build the NodeConfig
     ///
     /// # Errors
@@ -478,7 +488,7 @@ impl NodeConfigBuilder {
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
-            allow_loopback: false,
+            allow_loopback: self.allow_loopback,
         })
     }
 }

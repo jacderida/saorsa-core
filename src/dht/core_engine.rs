@@ -1367,14 +1367,13 @@ impl DhtCoreEngine {
         // Nodes already present (reconnecting with the same ID) are
         // excluded from the count so they can update their address
         // without inflating limits.
+        // 3. Add to routing table — single write lock for both the diversity
+        //    check and the insertion to avoid a TOCTOU race where touch_node
+        //    could change an address between a read-lock check and the write.
+        let mut routing = self.routing_table.write().await;
         if let Some(ip) = candidate_ip {
-            let routing = self.routing_table.read().await;
             self.check_diversity(&routing, &node.id, ip)?;
         }
-
-        // 3. Add to routing table (KBucket::add_node handles the
-        //    existing-node-update case via its dedup early-return).
-        let mut routing = self.routing_table.write().await;
         routing.add_node(node)?;
 
         Ok(())
@@ -1412,10 +1411,10 @@ impl DhtCoreEngine {
                 let mut network_size: usize = 0;
 
                 for node in routing.iter_nodes() {
-                    network_size += 1;
                     if node.id == *candidate_id {
                         continue;
                     }
+                    network_size += 1;
                     let Some(existing_ip) = parse_ip(&node.address) else {
                         continue;
                     };
@@ -1566,6 +1565,7 @@ impl std::fmt::Debug for DhtCoreEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn test_basic_store_retrieve() -> Result<()> {
@@ -1589,5 +1589,204 @@ mod tests {
 
         let distance = key1.distance(&key2);
         assert_eq!(distance, [255u8; 32]);
+    }
+
+    /// Helper: create a NodeInfo with a deterministic PeerId derived from a
+    /// single byte.  Keeps tests concise.
+    fn make_node(byte: u8, address: &str) -> NodeInfo {
+        NodeInfo {
+            id: PeerId::from_bytes([byte; 32]),
+            address: address.to_string(),
+            last_seen: SystemTime::now(),
+            capacity: NodeCapacity::default(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KBucket::touch_node tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_touch_node_updates_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        // Touch with a new address
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
+        assert!(found);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, "5.6.7.8:9000");
+    }
+
+    #[test]
+    fn test_touch_node_none_preserves_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        assert!(found);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, "1.2.3.4:9000");
+    }
+
+    #[test]
+    fn test_touch_node_moves_to_tail() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+        bucket.add_node(make_node(2, "2.2.2.2:9000")).unwrap();
+        bucket.add_node(make_node(3, "3.3.3.3:9000")).unwrap();
+
+        // Touch the first node — it should move to the tail
+        bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        let ids: Vec<u8> = bucket
+            .get_nodes()
+            .iter()
+            .map(|n| n.id.to_bytes()[0])
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_touch_node_missing_returns_false() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+
+        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some("9.9.9.9:9000"));
+        assert!(!found);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_closest_nodes tests — boundary bucket indices
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_closest_nodes_no_duplicates_at_bucket_zero() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Insert nodes that land in different buckets.  XOR with [0;32]
+        // means the bucket index is the leading-bit position of the node id.
+        // Byte 0 = 0x80 → bucket 0, byte 0 = 0x40 → bucket 1, etc.
+        let mut id_bytes = [0u8; 32];
+        id_bytes[0] = 0x80; // bucket 0
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.1:9000".to_string(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        id_bytes = [0u8; 32];
+        id_bytes[0] = 0x40; // bucket 1
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.2:9000".to_string(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        // Search for a key that targets bucket 0
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = 0x80;
+        let key = DhtKey::from_bytes(key_bytes);
+        let results = table.find_closest_nodes(&key, 8);
+
+        // Verify no duplicates by collecting IDs into a set
+        let mut seen = HashSet::new();
+        for node in &results {
+            assert!(seen.insert(node.id), "Duplicate node {:?}", node.id);
+        }
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_find_closest_nodes_no_duplicates_at_bucket_255() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Bucket 255 requires the differing bit at position 255 (last bit
+        // of last byte).  XOR distance with [0;32] is the id itself, so we
+        // need id where only the very last bit is set.
+        let mut id_bytes = [0u8; 32];
+        id_bytes[31] = 0x01; // bucket 255
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.1:9000".to_string(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        id_bytes = [0u8; 32];
+        id_bytes[31] = 0x02; // bucket 254
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.2:9000".to_string(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = 0x01;
+        let key = DhtKey::from_bytes(key_bytes);
+        let results = table.find_closest_nodes(&key, 8);
+
+        let mut seen = HashSet::new();
+        for node in &results {
+            assert!(seen.insert(node.id), "Duplicate node {:?}", node.id);
+        }
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_find_closest_nodes_returns_sorted_by_distance() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Insert 5 nodes at varying distances
+        for i in 0..5u8 {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[0] = 0x80 >> i; // buckets 0,1,2,3,4
+            table
+                .add_node(NodeInfo {
+                    id: PeerId::from_bytes(id_bytes),
+                    address: format!("10.0.0.{}:9000", i + 1),
+                    last_seen: SystemTime::now(),
+                    capacity: NodeCapacity::default(),
+                })
+                .unwrap();
+        }
+
+        let key = DhtKey::from_bytes([0u8; 32]);
+        let results = table.find_closest_nodes(&key, 3);
+
+        assert_eq!(results.len(), 3);
+        // Results should be sorted by XOR distance to key
+        for window in results.windows(2) {
+            let d0 = xor_distance_bytes(window[0].id.to_bytes(), key.as_bytes());
+            let d1 = xor_distance_bytes(window[1].id.to_bytes(), key.as_bytes());
+            assert!(d0 <= d1, "Results not sorted by distance");
+        }
+    }
+
+    #[test]
+    fn test_find_closest_nodes_empty_table() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let table = KademliaRoutingTable::new(local_id, 8);
+
+        let key = DhtKey::from_bytes([42u8; 32]);
+        let results = table.find_closest_nodes(&key, 8);
+        assert!(results.is_empty());
     }
 }

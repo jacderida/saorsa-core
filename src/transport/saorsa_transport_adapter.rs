@@ -209,6 +209,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
         bind_addr: SocketAddr,
         net_config: &crate::transport::NetworkConfig,
         max_msg_size: Option<usize>,
+        allow_loopback: bool,
     ) -> Result<Self> {
         // Build P2pConfig based on NetworkConfig
         let mut builder = P2pConfig::builder()
@@ -220,9 +221,17 @@ impl P2PNetworkNode<P2pLinkTransport> {
             builder = builder.max_message_size(max_msg_size);
         }
 
-        // Apply NAT traversal settings if present
-        if let Some(ref nat_config) = net_config.to_ant_config() {
-            builder = builder.nat(nat_config.clone());
+        // Apply NAT traversal settings if present, merging allow_loopback.
+        if let Some(mut nat_config) = net_config.to_ant_config() {
+            if allow_loopback {
+                nat_config.allow_loopback = true;
+            }
+            builder = builder.nat(nat_config);
+        } else if allow_loopback {
+            builder = builder.nat(NatConfig {
+                allow_loopback: true,
+                ..NatConfig::default()
+            });
         }
 
         let config = builder

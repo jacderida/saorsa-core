@@ -621,6 +621,7 @@ mod tests {
 
     fn create_test_ip_analysis() -> IPAnalysis {
         IPAnalysis {
+            is_loopback: false,
             subnet_64: Ipv6Addr::from_str("::ffff:192.168.0.0").unwrap(),
             subnet_48: Ipv6Addr::from_str("::ffff:192.168.0.0").unwrap(),
             subnet_32: Ipv6Addr::from_str("::ffff:192.0.0.0").unwrap(),

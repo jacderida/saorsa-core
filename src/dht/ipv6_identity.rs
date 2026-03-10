@@ -617,6 +617,7 @@ mod tests {
 
     fn create_test_ip_analysis() -> IPAnalysis {
         IPAnalysis {
+            is_loopback: false,
             subnet_64: Ipv6Addr::from_str("2001:db8::").unwrap(),
             subnet_48: Ipv6Addr::from_str("2001:db8::").unwrap(),
             subnet_32: Ipv6Addr::from_str("2001:db8::").unwrap(),

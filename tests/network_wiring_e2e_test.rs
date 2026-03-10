@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 /// Timeout for waiting for a single event (PeerConnected, etc.).
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum time to wait for peer cleanup after a disconnect.
-const STALE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval when busy-waiting for state changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Timeout for PeerDisconnected events.
@@ -429,20 +429,18 @@ async fn test_periodic_tasks_updates_last_seen() {
     info!("=== TEST PASSED: Periodic Tasks Update Last Seen ===");
 }
 
-/// TEST 2.2: Stale peers are detected and removed
+/// TEST 2.2: Disconnected peers are detected and removed
 ///
-/// This test verifies that periodic_tasks() detects stale peers (no activity
-/// for longer than the configured threshold) and removes them from tracking.
-///
-/// Uses a short 5-second threshold for faster testing.
+/// This test verifies that when a peer drops, the transport layer detects the
+/// disconnect (via QUIC idle timeout) and removes the peer from tracking.
 #[tokio::test]
-async fn test_stale_peer_removal() {
+async fn test_disconnected_peer_removal() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("debug")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Stale Peer Removal ===");
+    info!("=== TEST: Disconnected Peer Removal ===");
 
     let config1 = create_test_node_config();
     let config2 = create_test_node_config();
@@ -464,27 +462,26 @@ async fn test_stale_peer_removal() {
     // Simulate network partition by dropping node2
     drop(node2);
 
-    // Wait for stale detection (5s threshold + buffer)
-    info!("Waiting for stale detection (5s threshold)...");
+    // Wait for QUIC idle timeout to detect the disconnect.
+    info!("Waiting for disconnect detection...");
 
-    // periodic_tasks() runs every 100ms and will detect stale peers
     // Wait up to 10 seconds for the peer to be cleaned up
-    let deadline = tokio::time::Instant::now() + STALE_CLEANUP_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + DISCONNECT_CLEANUP_TIMEOUT;
     loop {
         if !node1.is_peer_connected(&peer2_id).await {
-            info!("Stale peer {} detected and removed", peer2_id);
+            info!("Disconnected peer {} detected and removed", peer2_id);
             break;
         }
         if tokio::time::Instant::now() > deadline {
             panic!(
-                "FAIL: Stale peer should be removed from peers map.\n\
-                periodic_tasks() should detect unresponsive peers and remove them."
+                "FAIL: Disconnected peer should be removed from peers map.\n\
+                Transport layer should detect the QUIC disconnect and remove the peer."
             );
         }
         sleep(POLL_INTERVAL).await;
     }
 
-    info!("=== TEST PASSED: Stale Peer Removal ===");
+    info!("=== TEST PASSED: Disconnected Peer Removal ===");
 }
 
 /// TEST 2.3: Heartbeat/ping keeps connection alive
@@ -1779,17 +1776,17 @@ async fn test_late_event_subscription() {
 // PHASE 3: Boundary Tests
 // =============================================================================
 
-/// TEST 3.1: Zero Threshold Configuration
+/// TEST 3.1: Default Configuration Connection
 ///
 /// Verify basic connection behavior with default configuration.
 #[tokio::test]
-async fn test_zero_stale_threshold() {
+async fn test_default_config_connection() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Zero Stale Threshold ===");
+    info!("=== TEST: Default Config Connection ===");
 
     let config1 = create_test_node_config();
     let config2 = create_test_node_config();
@@ -1831,20 +1828,20 @@ async fn test_zero_stale_threshold() {
     }
 
     // Node should not have panicked or hung
-    info!("=== TEST PASSED: Zero Stale Threshold ===");
+    info!("=== TEST PASSED: Default Config Connection ===");
 }
 
-/// TEST 3.2: Short Threshold
+/// TEST 3.2: Quick Message Exchange
 ///
-/// Verifies connections work with default configuration.
+/// Verifies connection and message exchange with default configuration.
 #[tokio::test]
-async fn test_short_stale_threshold() {
+async fn test_quick_message_exchange() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Short Stale Threshold ===");
+    info!("=== TEST: Quick Message Exchange ===");
 
     let config1 = create_test_node_config();
     let config2 = create_test_node_config();
@@ -1876,7 +1873,7 @@ async fn test_short_stale_threshold() {
         "Should receive message"
     );
 
-    info!("=== TEST PASSED: Short Stale Threshold ===");
+    info!("=== TEST PASSED: Quick Message Exchange ===");
 }
 
 /// TEST 3.3: Many Peers Performance

@@ -261,6 +261,10 @@ pub struct IPDiversityConfig {
 /// Analysis of an IPv6 address for diversity enforcement
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IPAnalysis {
+    /// Whether the original address is a loopback address (::1 or
+    /// an IPv4-mapped loopback like ::ffff:127.0.0.1).
+    #[serde(default)]
+    pub is_loopback: bool,
     /// /64 subnet (host allocation)
     pub subnet_64: Ipv6Addr,
     /// /48 subnet (site allocation)
@@ -649,7 +653,14 @@ impl IPDiversityEnforcer {
         // Default reputation for new IPs
         let reputation_score = 0.5;
 
+        // Detect loopback: native ::1 or IPv4-mapped 127.0.0.0/8.
+        let is_loopback = ipv6_addr.is_loopback()
+            || ipv6_addr
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback());
+
         Ok(IPAnalysis {
+            is_loopback,
             subnet_64,
             subnet_48,
             subnet_32,
@@ -664,9 +675,7 @@ impl IPDiversityEnforcer {
     /// Check if a new node can be accepted based on IP diversity constraints
     pub fn can_accept_node(&self, ip_analysis: &IPAnalysis) -> bool {
         // Loopback addresses are used in tests / local development — always accept.
-        // The only IPv6 loopback (::1) masks to ::0 at every prefix length, so
-        // subnet_64 will be unspecified.  No routable address has a /64 of ::.
-        if ip_analysis.subnet_64.is_loopback() || ip_analysis.subnet_64.is_unspecified() {
+        if ip_analysis.is_loopback {
             return true;
         }
 
@@ -1968,6 +1977,7 @@ mod tests {
     #[test]
     fn test_ip_analysis_structure() {
         let analysis = IPAnalysis {
+            is_loopback: false,
             subnet_64: Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1234, 0, 0, 0, 0),
             subnet_48: Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0, 0, 0, 0, 0),
             subnet_32: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
