@@ -54,6 +54,27 @@ pub struct NodeInfo {
     pub capacity: NodeCapacity,
 }
 
+impl NodeInfo {
+    /// Parse the address string into a [`SocketAddr`].
+    ///
+    /// Returns `None` if the address is a bare IP without port or otherwise
+    /// cannot be parsed.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.address.parse::<SocketAddr>().ok()
+    }
+
+    /// Extract the IP address from the stored address string.
+    ///
+    /// Handles both `"ip:port"` and bare `"ip"` formats.
+    pub fn ip(&self) -> Option<IpAddr> {
+        if let Ok(sa) = self.address.parse::<SocketAddr>() {
+            Some(sa.ip())
+        } else {
+            self.address.parse::<IpAddr>().ok()
+        }
+    }
+}
+
 /// Node capacity metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapacity {
@@ -116,7 +137,9 @@ impl KBucket {
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
-            if let Some(addr) = address {
+            if let Some(addr) = address
+                && !addr.is_empty()
+            {
                 self.nodes[pos].address = addr.to_string();
             }
             let node = self.nodes.remove(pos);
@@ -307,8 +330,6 @@ struct DataStore {
 struct DataMetadata {
     _size: usize,
     _stored_at: SystemTime,
-    access_count: u64,
-    last_accessed: SystemTime,
 }
 
 impl DataStore {
@@ -323,26 +344,15 @@ impl DataStore {
         let metadata = DataMetadata {
             _size: value.len(),
             _stored_at: SystemTime::now(),
-            access_count: 0,
-            last_accessed: SystemTime::now(),
         };
 
         self.data.insert(key, value);
         self.metadata.insert(key, metadata);
     }
 
-    fn get(&mut self, key: &DhtKey) -> Option<Vec<u8>> {
-        if let Some(metadata) = self.metadata.get_mut(key) {
-            metadata.access_count += 1;
-            metadata.last_accessed = SystemTime::now();
-        }
-
+    /// Look up a value without updating access metadata (read-only).
+    fn get(&self, key: &DhtKey) -> Option<Vec<u8>> {
         self.data.get(key).cloned()
-    }
-
-    fn _remove(&mut self, key: &DhtKey) -> Option<Vec<u8>> {
-        self.metadata.remove(key);
-        self.data.remove(key)
     }
 }
 
@@ -361,23 +371,6 @@ impl ReplicationManager {
             _pending_repairs: Vec::new(),
         }
     }
-
-    fn _required_replicas(&self) -> usize {
-        match self._consistency_level {
-            ConsistencyLevel::One => 1,
-            // Quorum requires strict majority for Byzantine fault tolerance: floor(n/2) + 1
-            // For K=8, this gives 5 (tolerates 3 failures). This is intentionally stricter
-            // than simple majority (div_ceil which gives 4) to ensure BFT guarantees.
-            ConsistencyLevel::Quorum => (self._replication_factor / 2) + 1,
-            ConsistencyLevel::All => self._replication_factor,
-        }
-    }
-
-    fn _schedule_repair(&mut self, key: DhtKey) {
-        if !self._pending_repairs.contains(&key) {
-            self._pending_repairs.push(key);
-        }
-    }
 }
 
 /// Load balancer for intelligent data distribution
@@ -392,10 +385,6 @@ impl LoadBalancer {
             node_loads: HashMap::new(),
             _rebalance_threshold: 0.8,
         }
-    }
-
-    fn _update_load(&mut self, node_id: PeerId, load: LoadMetric) {
-        self.node_loads.insert(node_id, load);
     }
 
     fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<PeerId> {
@@ -421,12 +410,6 @@ impl LoadBalancer {
         sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         sorted.into_iter().take(count).map(|(id, _)| id).collect()
-    }
-
-    fn _should_rebalance(&self) -> bool {
-        self.node_loads
-            .values()
-            .any(|load| load.storage_used_percent > self._rebalance_threshold)
     }
 }
 
@@ -580,10 +563,8 @@ impl DhtCoreEngine {
             validator_config.clone(),
         )));
 
-        let mut bucket_refresh_manager = BucketRefreshManager::new_with_validation(
-            node_id,
-            CloseGroupValidatorConfig::default(),
-        );
+        let mut bucket_refresh_manager =
+            BucketRefreshManager::new_with_validation(node_id, validator_config.clone());
         // Link validator to refresh manager
         bucket_refresh_manager.set_validator(close_group_validator.clone());
         let bucket_refresh_manager = Arc::new(RwLock::new(bucket_refresh_manager));
@@ -732,6 +713,7 @@ impl DhtCoreEngine {
 
     /// Start background maintenance tasks for security and health
     pub fn start_maintenance_tasks(&self) {
+        let routing_table = self.routing_table.clone();
         let refresh_manager = self.bucket_refresh_manager.clone();
         let eviction_manager = self.eviction_manager.clone();
         let close_group_validator = self.close_group_validator.clone();
@@ -851,15 +833,18 @@ impl DhtCoreEngine {
                     }
                 }
 
-                // 2. Active Eviction Enforcement
+                // 2. Active Eviction Enforcement — remove candidates from both
+                //    the eviction tracker and the routing table.
                 {
                     let mut eviction_mgr = eviction_manager.write().await;
                     let candidates = eviction_mgr.get_eviction_candidates();
-                    for (node_id, reason) in candidates {
-                        tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
-                        // Remove from eviction tracking (routing table removal
-                        // would be triggered by the caller or a separate mechanism)
-                        eviction_mgr.remove_node(&node_id);
+                    if !candidates.is_empty() {
+                        let mut routing = routing_table.write().await;
+                        for (node_id, reason) in candidates {
+                            tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
+                            routing.remove_node(&node_id);
+                            eviction_mgr.remove_node(&node_id);
+                        }
                     }
                 }
 
@@ -921,11 +906,14 @@ impl DhtCoreEngine {
             });
         }
 
+        // TODO: send data to selected_nodes via transport when network
+        //       store-forwarding is implemented.  Until then, the receipt
+        //       must not claim success for a remote store that never happened.
         Ok(StoreReceipt {
             key: *key,
-            stored_at: selected_nodes,
+            stored_at: Vec::new(),
             timestamp: SystemTime::now(),
-            success: true,
+            success: false,
         })
     }
 
@@ -934,9 +922,9 @@ impl DhtCoreEngine {
     /// First checks local storage. If not found locally and a transport is configured,
     /// queries the K closest nodes in parallel and returns the first successful response.
     pub async fn retrieve(&self, key: &DhtKey) -> Result<Option<Vec<u8>>> {
-        // Step 1: Check local store first
+        // Step 1: Check local store first (read-only lock)
         {
-            let mut store = self.data_store.write().await;
+            let store = self.data_store.read().await;
             if let Some(value) = store.get(key) {
                 tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found in local store");
                 return Ok(Some(value));
@@ -1116,7 +1104,7 @@ impl DhtCoreEngine {
     /// Processes the request and returns a response wrapper ready to be sent back.
     pub async fn handle_request(&self, request_wrapper: DhtRequestWrapper) -> DhtResponseWrapper {
         let response = match request_wrapper.message {
-            DhtMessage::Retrieve { ref key, .. } => match self.data_store.write().await.get(key) {
+            DhtMessage::Retrieve { ref key, .. } => match self.data_store.read().await.get(key) {
                 Some(value) => DhtResponse::RetrieveReply { value: Some(value) },
                 None => DhtResponse::RetrieveReply { value: None },
             },
@@ -1154,7 +1142,7 @@ impl DhtCoreEngine {
                 }
             }
             DhtMessage::FindValue { ref key } => {
-                let value = self.data_store.write().await.get(key);
+                let value = self.data_store.read().await.get(key);
                 if value.is_some() {
                     DhtResponse::FindValueReply {
                         value,
@@ -1168,10 +1156,15 @@ impl DhtCoreEngine {
             }
             DhtMessage::Ping {
                 timestamp,
-                sender_info,
+                sender_info: _,
             } => DhtResponse::Pong {
                 timestamp,
-                node_info: sender_info,
+                node_info: NodeInfo {
+                    id: self.node_id,
+                    address: String::new(),
+                    last_seen: SystemTime::now(),
+                    capacity: NodeCapacity::default(),
+                },
             },
             _ => DhtResponse::Error {
                 code: crate::dht::network_integration::ErrorCode::InvalidMessage,
@@ -1192,12 +1185,28 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Join the DHT network
+    /// Join the DHT network.
+    ///
+    /// Bootstrap nodes go through the same close-group validation and
+    /// IP/geographic diversity checks as every other `add_node` call, so a
+    /// compromised bootstrap list cannot bypass security invariants.
+    ///
+    /// Returns an error if the list is non-empty but *every* node fails
+    /// validation (the caller would be left with an empty routing table).
     pub async fn join_network(&mut self, bootstrap_nodes: Vec<NodeInfo>) -> Result<()> {
-        let mut routing = self.routing_table.write().await;
-
+        let total = bootstrap_nodes.len();
+        let mut added: usize = 0;
         for node in bootstrap_nodes {
-            routing.add_node(node)?;
+            match self.add_node(node).await {
+                Ok(()) => added += 1,
+                Err(e) => tracing::warn!("Skipping bootstrap node that failed validation: {e}"),
+            }
+        }
+
+        if total > 0 && added == 0 {
+            return Err(anyhow!(
+                "All {total} bootstrap nodes failed validation — cannot join network"
+            ));
         }
 
         Ok(())
@@ -1414,10 +1423,10 @@ impl DhtCoreEngine {
                     if node.id == *candidate_id {
                         continue;
                     }
-                    network_size += 1;
-                    let Some(existing_ip) = parse_ip(&node.address) else {
+                    let Some(existing_ip) = node.ip() else {
                         continue;
                     };
+                    network_size += 1;
                     if existing_ip.is_loopback() {
                         continue;
                     }
@@ -1469,14 +1478,16 @@ impl DhtCoreEngine {
                 let mut count_64: usize = 0;
                 let mut count_48: usize = 0;
                 let mut count_32: usize = 0;
+                let mut network_size: usize = 0;
 
                 for node in routing.iter_nodes() {
                     if node.id == *candidate_id {
                         continue;
                     }
-                    let Some(existing_ip) = parse_ip(&node.address) else {
+                    let Some(existing_ip) = node.ip() else {
                         continue;
                     };
+                    network_size += 1;
                     if existing_ip.is_loopback() {
                         continue;
                     }
@@ -1496,24 +1507,20 @@ impl DhtCoreEngine {
                     }
                 }
 
+                let per_ip = self.dynamic_per_ip_limit(network_size);
                 let cfg = &self.ip_diversity_config;
-                if count_64 >= cfg.max_nodes_per_64 {
-                    return Err(anyhow!(
-                        "IP diversity: /64 limit ({}) exceeded",
-                        cfg.max_nodes_per_64
-                    ));
+                let limit_64 = std::cmp::min(cfg.max_nodes_per_64, per_ip * 3);
+                let limit_48 = std::cmp::min(cfg.max_nodes_per_48, per_ip * 10);
+                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * 30);
+
+                if count_64 >= limit_64 {
+                    return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));
                 }
-                if count_48 >= cfg.max_nodes_per_48 {
-                    return Err(anyhow!(
-                        "IP diversity: /48 limit ({}) exceeded",
-                        cfg.max_nodes_per_48
-                    ));
+                if count_48 >= limit_48 {
+                    return Err(anyhow!("IP diversity: /48 limit ({limit_48}) exceeded"));
                 }
-                if count_32 >= cfg.max_nodes_per_32 {
-                    return Err(anyhow!(
-                        "IP diversity: /32 limit ({}) exceeded",
-                        cfg.max_nodes_per_32
-                    ));
+                if count_32 >= limit_32 {
+                    return Err(anyhow!("IP diversity: /32 limit ({limit_32}) exceeded"));
                 }
             }
         }
@@ -1647,6 +1654,19 @@ mod tests {
             .map(|n| n.id.to_bytes()[0])
             .collect();
         assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_touch_node_empty_string_preserves_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        // Touch with an empty string should NOT overwrite the valid address
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
+        assert!(found);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, "1.2.3.4:9000");
     }
 
     #[test]

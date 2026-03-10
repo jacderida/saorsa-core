@@ -226,12 +226,19 @@ impl DhtStreamHandler {
 
             DhtMessage::Ping {
                 timestamp,
-                sender_info,
+                sender_info: _,
             } => {
-                debug!(from = ?sender_info.id, "DHT ping received");
+                let engine = self.dht_engine.read().await;
+                let local_id = *engine.node_id();
+                debug!("DHT ping received, responding with local node {local_id}");
                 Ok(DhtResponse::Pong {
                     timestamp,
-                    node_info: sender_info,
+                    node_info: crate::dht::core_engine::NodeInfo {
+                        id: local_id,
+                        address: String::new(),
+                        last_seen: std::time::SystemTime::now(),
+                        capacity: crate::dht::core_engine::NodeCapacity::default(),
+                    },
                 })
             }
 

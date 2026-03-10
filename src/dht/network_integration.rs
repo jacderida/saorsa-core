@@ -485,11 +485,20 @@ impl DhtProtocolHandler {
 
             DhtMessage::Ping {
                 timestamp,
-                sender_info,
-            } => Ok(DhtResponse::Pong {
-                timestamp,
-                node_info: sender_info,
-            }),
+                sender_info: _,
+            } => {
+                let engine = self.dht_engine.read().await;
+                let local_id = *engine.node_id();
+                Ok(DhtResponse::Pong {
+                    timestamp,
+                    node_info: NodeInfo {
+                        id: local_id,
+                        address: String::new(),
+                        last_seen: SystemTime::now(),
+                        capacity: NodeCapacity::default(),
+                    },
+                })
+            }
 
             _ => Ok(DhtResponse::Error {
                 code: ErrorCode::InvalidMessage,
