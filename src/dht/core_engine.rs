@@ -113,11 +113,14 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
-    /// Update `last_seen` for a node and move it to the tail of the bucket
-    /// (most recently seen), per standard Kademlia protocol.
-    fn touch_node(&mut self, node_id: &PeerId) -> bool {
+    /// Update `last_seen` (and optionally the address) for a node, then move
+    /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
+            if let Some(addr) = address {
+                self.nodes[pos].address = addr.to_string();
+            }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
             true
@@ -166,11 +169,11 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].remove_node(node_id);
     }
 
-    /// Update `last_seen` for a node and move it to the tail of its k-bucket.
-    /// Returns `true` if the node was found and touched.
-    fn touch_node(&mut self, node_id: &PeerId) -> bool {
+    /// Update `last_seen` (and optionally address) for a node and move it to
+    /// the tail of its k-bucket. Returns `true` if the node was found.
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
         let bucket_index = self.get_bucket_index(node_id);
-        self.buckets[bucket_index].touch_node(node_id)
+        self.buckets[bucket_index].touch_node(node_id, address)
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
@@ -1207,13 +1210,16 @@ impl DhtCoreEngine {
     }
 
     /// Record a successful interaction with a peer by updating its `last_seen`
-    /// timestamp and moving it to the tail of its k-bucket (most recently seen).
+    /// timestamp (and optionally its address) and moving it to the tail of its
+    /// k-bucket (most recently seen).
     ///
     /// Standard Kademlia: any successful RPC implicitly proves liveness, so the
     /// routing table should reflect this without requiring dedicated pings.
-    pub async fn touch_node(&self, node_id: &PeerId) -> bool {
+    /// Passing the current address ensures stale addresses are replaced when a
+    /// peer reconnects from a different endpoint.
+    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&str>) -> bool {
         let mut routing = self.routing_table.write().await;
-        routing.touch_node(node_id)
+        routing.touch_node(node_id, address)
     }
 
     /// Handle node failure

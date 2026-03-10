@@ -2189,10 +2189,13 @@ impl DhtNetworkManager {
         })
     }
 
-    /// Update routing-table liveness for a peer on successful message exchange.
+    /// Update routing-table liveness (and address) for a peer on successful
+    /// message exchange.
     ///
     /// Standard Kademlia: any successful RPC proves liveness. We touch the
-    /// routing table entry to move it to the tail of its k-bucket.
+    /// routing table entry to move it to the tail of its k-bucket and refresh
+    /// the stored address so that `FindNode` responses stay current when a peer
+    /// reconnects from a different endpoint.
     async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
@@ -2202,8 +2205,23 @@ impl DhtNetworkManager {
             return;
         };
 
+        // Resolve current address from the transport layer so the routing
+        // table stays up-to-date when a peer reconnects from a new endpoint.
+        let current_address = self
+            .transport
+            .peer_info(&app_peer_id)
+            .await
+            .and_then(|info| info.addresses.first().cloned())
+            .map(|full| {
+                // Strip optional four-word suffix: "1.2.3.4:9000 (word-word-word-word)"
+                full.split(" (").next().unwrap_or(&full).to_string()
+            });
+
         let dht = self.dht.read().await;
-        if dht.touch_node(&app_peer_id).await {
+        if dht
+            .touch_node(&app_peer_id, current_address.as_deref())
+            .await
+        {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
     }
