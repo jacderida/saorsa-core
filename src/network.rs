@@ -329,7 +329,7 @@ impl NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
-            allow_loopback: false,
+            allow_loopback: config.network.allow_loopback,
         })
     }
 
@@ -358,7 +358,7 @@ pub struct NodeConfigBuilder {
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
-    allow_loopback: bool,
+    allow_loopback: Option<bool>,
 }
 
 impl NodeConfigBuilder {
@@ -441,7 +441,7 @@ impl NodeConfigBuilder {
     /// Enable for devnet/testnet modes where multiple nodes run on the same
     /// machine. Default: `false`.
     pub fn allow_loopback(mut self, allow: bool) -> Self {
-        self.allow_loopback = allow;
+        self.allow_loopback = Some(allow);
         self
     }
 
@@ -488,7 +488,9 @@ impl NodeConfigBuilder {
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
-            allow_loopback: self.allow_loopback,
+            allow_loopback: self
+                .allow_loopback
+                .unwrap_or(base_config.network.allow_loopback),
         })
     }
 }
@@ -521,7 +523,7 @@ impl Default for NodeConfig {
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
-            allow_loopback: false,
+            allow_loopback: config.network.allow_loopback,
         }
     }
 }
@@ -890,17 +892,10 @@ impl P2PNode {
 
         // Initialize bootstrap cache manager
         let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let mut diversity_config = config.diversity_config.clone().unwrap_or_default();
-        // Propagate the node-level allow_loopback flag into diversity enforcement
-        // so that loopback bypass in IP diversity checks stays consistent with
-        // the transport-layer setting.
-        if config.allow_loopback {
-            diversity_config.allow_loopback = true;
-        }
         let bootstrap_manager = match BootstrapManager::with_full_config(
             cache_config,
             crate::rate_limit::JoinRateLimiterConfig::default(),
-            diversity_config,
+            &config,
         )
         .await
         {
@@ -920,18 +915,11 @@ impl P2PNode {
         let trust_engine = Some(trust_engine);
 
         // Build transport handle with all transport-level concerns
-        let transport_config = crate::transport_handle::TransportConfig {
-            listen_addr: config.listen_addr,
-            enable_ipv6: config.enable_ipv6,
-            connection_timeout: config.connection_timeout,
-            max_connections: config.max_connections,
-            production_config: config.production_config.clone(),
-            event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_message_size: config.max_message_size,
-            node_identity: node_identity.clone(),
-            user_agent: config.user_agent(),
-            allow_loopback: config.allow_loopback,
-        };
+        let transport_config = crate::transport_handle::TransportConfig::from_node_config(
+            &config,
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            node_identity.clone(),
+        );
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
 
@@ -2124,10 +2112,6 @@ mod diversity_tests {
     use crate::security::IPDiversityConfig;
 
     async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
-        let mut diversity_config = config.diversity_config.clone().unwrap_or_default();
-        if config.allow_loopback {
-            diversity_config.allow_loopback = true;
-        }
         // Use a temp dir to avoid conflicts with cached files from old format
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let mut cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
@@ -2136,7 +2120,7 @@ mod diversity_tests {
         BootstrapManager::with_full_config(
             cache_config,
             crate::rate_limit::JoinRateLimiterConfig::default(),
-            diversity_config,
+            config,
         )
         .await
         .expect("bootstrap manager")

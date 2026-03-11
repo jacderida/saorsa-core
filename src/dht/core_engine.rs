@@ -522,6 +522,12 @@ pub struct DhtCoreEngine {
     /// IP diversity limits — checked against the live routing table on each
     /// `add_node` call rather than maintained as incremental counters.
     ip_diversity_config: IPDiversityConfig,
+    /// Allow loopback addresses in the routing table.
+    ///
+    /// Single source of truth: propagated from `NodeConfig.allow_loopback` at
+    /// construction, kept separate from `IPDiversityConfig` to prevent
+    /// duplication and drift.
+    allow_loopback: bool,
     /// Maximum nodes per geographic region.
     geo_max_per_region: usize,
 
@@ -555,6 +561,14 @@ impl DhtCoreEngine {
     /// Override the IP diversity configuration.
     pub fn set_ip_diversity_config(&mut self, config: IPDiversityConfig) {
         self.ip_diversity_config = config;
+    }
+
+    /// Set whether loopback addresses are allowed in the routing table.
+    ///
+    /// This is the single authority for loopback gating in the DHT core;
+    /// it should be set from `NodeConfig.allow_loopback` at construction.
+    pub fn set_allow_loopback(&mut self, allow: bool) {
+        self.allow_loopback = allow;
     }
 
     /// Create new DHT engine with specified validation mode
@@ -591,6 +605,7 @@ impl DhtCoreEngine {
             close_group_validator,
             eviction_manager,
             ip_diversity_config: IPDiversityConfig::default(),
+            allow_loopback: false,
             geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
             transport: None,
             pending_requests: Arc::new(RwLock::new(LruCache::new(
@@ -1392,7 +1407,7 @@ impl DhtCoreEngine {
     /// Single pass over all nodes — each node's address is parsed once.
     /// `candidate_id` is excluded from counting so that a reconnecting node
     /// doesn't block itself.  Loopback candidates are only accepted when
-    /// `ip_diversity_config.allow_loopback` is `true`; otherwise they are
+    /// `self.allow_loopback` is `true`; otherwise they are
     /// rejected outright.  Existing loopback nodes in the table are always
     /// excluded from `network_size` and subnet/region counts so they don't
     /// inflate the dynamic per-IP limit in devnet environments.
@@ -1409,7 +1424,7 @@ impl DhtCoreEngine {
         // rejected outright — a peer advertising 127.0.0.1/::1 should never
         // enter the routing table.
         if candidate_ip.is_loopback() {
-            if self.ip_diversity_config.allow_loopback {
+            if self.allow_loopback {
                 return Ok(());
             }
             return Err(anyhow!(
@@ -1823,8 +1838,8 @@ mod tests {
     #[tokio::test]
     async fn test_loopback_rejected_when_allow_loopback_false() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
-        // Default config has allow_loopback = false
-        assert!(!dht.ip_diversity_config.allow_loopback);
+        // Default has allow_loopback = false
+        assert!(!dht.allow_loopback);
 
         let loopback_node = make_node(1, "127.0.0.1:9000");
         let result = dht.add_node(loopback_node).await;
@@ -1839,7 +1854,7 @@ mod tests {
     #[tokio::test]
     async fn test_loopback_v6_rejected_when_allow_loopback_false() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
-        assert!(!dht.ip_diversity_config.allow_loopback);
+        assert!(!dht.allow_loopback);
 
         let loopback_node = make_node(2, "[::1]:9000");
         let result = dht.add_node(loopback_node).await;
@@ -1854,9 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn test_loopback_accepted_when_allow_loopback_true() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
-        let mut config = IPDiversityConfig::default();
-        config.allow_loopback = true;
-        dht.set_ip_diversity_config(config);
+        dht.set_allow_loopback(true);
 
         let loopback_node = make_node(1, "127.0.0.1:9000");
         let result = dht.add_node(loopback_node).await;
@@ -1867,7 +1880,7 @@ mod tests {
     async fn test_non_loopback_unaffected_by_allow_loopback_flag() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         // allow_loopback = false should not affect normal addresses
-        assert!(!dht.ip_diversity_config.allow_loopback);
+        assert!(!dht.allow_loopback);
 
         let normal_node = make_node(1, "10.0.0.1:9000");
         let result = dht.add_node(normal_node).await;

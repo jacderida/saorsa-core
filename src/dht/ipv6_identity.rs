@@ -168,7 +168,21 @@ impl Default for IPv6DHTConfig {
 impl IPv6DHTIdentityManager {
     /// Create a new IPv6 DHT identity manager
     pub fn new(config: IPv6DHTConfig) -> Self {
-        let ip_enforcer = IPDiversityEnforcer::new(config.diversity_config.clone());
+        Self::with_loopback(config, false)
+    }
+
+    /// Create a new IPv6 DHT identity manager using the node's canonical
+    /// loopback policy.
+    pub fn from_node_config(
+        config: IPv6DHTConfig,
+        node_config: &crate::network::NodeConfig,
+    ) -> Self {
+        Self::with_loopback(config, node_config.allow_loopback)
+    }
+
+    fn with_loopback(config: IPv6DHTConfig, allow_loopback: bool) -> Self {
+        let ip_enforcer =
+            IPDiversityEnforcer::with_loopback(config.diversity_config.clone(), allow_loopback);
 
         Self {
             config,

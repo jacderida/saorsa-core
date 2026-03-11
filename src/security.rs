@@ -263,12 +263,6 @@ pub struct IPDiversityConfig {
     pub enable_geolocation_check: bool,
     /// Minimum number of different countries required
     pub min_geographic_diversity: usize,
-    /// Allow loopback addresses to bypass diversity checks (default: false).
-    ///
-    /// When `true`, loopback addresses (127.0.0.1, ::1) are unconditionally
-    /// accepted.  When `false`, loopback addresses are rejected like any other
-    /// address that fails diversity constraints.
-    pub allow_loopback: bool,
 }
 
 /// Analysis of an IPv6 address for diversity enforcement
@@ -367,8 +361,6 @@ impl Default for IPDiversityConfig {
             max_nodes_per_asn: 20,
             enable_geolocation_check: true,
             min_geographic_diversity: 3,
-            // Loopback — disabled by default for production safety
-            allow_loopback: false,
         }
     }
 }
@@ -402,7 +394,6 @@ impl IPDiversityConfig {
             max_nodes_per_asn: 5000, // Allow many nodes from same ASN (e.g., Digital Ocean)
             enable_geolocation_check: false, // Disable geo checks for testing
             min_geographic_diversity: 1, // Single region is acceptable for testing
-            allow_loopback: true,    // Testnet needs loopback for local multi-node setups
         }
     }
 
@@ -428,7 +419,6 @@ impl IPDiversityConfig {
             max_nodes_per_asn: usize::MAX,
             enable_geolocation_check: false,
             min_geographic_diversity: 0,
-            allow_loopback: true, // Permissive config allows loopback
         }
     }
 
@@ -599,6 +589,12 @@ impl IPv4NodeID {
 #[derive(Debug)]
 pub struct IPDiversityEnforcer {
     config: IPDiversityConfig,
+    /// Allow loopback addresses (127.0.0.1, ::1) to bypass diversity checks.
+    ///
+    /// This flag is intentionally separate from `IPDiversityConfig` so that it
+    /// has a single source of truth in the owning component (`NodeConfig`,
+    /// `BootstrapManager`, etc.) rather than being copied into every config.
+    allow_loopback: bool,
     // IPv6 tracking (LRU caches with max 50k entries to prevent memory DoS)
     subnet_64_counts: LruCache<Ipv6Addr, usize>,
     subnet_48_counts: LruCache<Ipv6Addr, usize>,
@@ -616,11 +612,20 @@ pub struct IPDiversityEnforcer {
 }
 
 impl IPDiversityEnforcer {
-    /// Create a new IP diversity enforcer
+    /// Create a new IP diversity enforcer with loopback disabled.
     pub fn new(config: IPDiversityConfig) -> Self {
+        Self::with_loopback(config, false)
+    }
+
+    /// Create a new IP diversity enforcer with explicit loopback setting.
+    ///
+    /// `allow_loopback` should come from the single source of truth
+    /// (e.g. `NodeConfig.allow_loopback`), not from the diversity config.
+    pub fn with_loopback(config: IPDiversityConfig, allow_loopback: bool) -> Self {
         let cache_size = NonZeroUsize::new(MAX_SUBNET_TRACKING).unwrap_or(NonZeroUsize::MIN);
         Self {
             config,
+            allow_loopback,
             // IPv6 (LRU caches with bounded size)
             subnet_64_counts: LruCache::new(cache_size),
             subnet_48_counts: LruCache::new(cache_size),
@@ -692,7 +697,7 @@ impl IPDiversityEnforcer {
     /// Check if a new node can be accepted based on IP diversity constraints
     pub fn can_accept_node(&self, ip_analysis: &IPAnalysis) -> bool {
         // Loopback addresses bypass diversity checks only when explicitly allowed.
-        if ip_analysis.is_loopback && self.config.allow_loopback {
+        if ip_analysis.is_loopback && self.allow_loopback {
             return true;
         }
 
@@ -1008,7 +1013,7 @@ impl IPDiversityEnforcer {
     /// Check if an IPv4 node can be accepted based on diversity constraints
     fn can_accept_ipv4(&self, analysis: &IPv4Analysis) -> bool {
         // Loopback addresses bypass diversity checks only when explicitly allowed.
-        if analysis.ip_addr.is_loopback() && self.config.allow_loopback {
+        if analysis.ip_addr.is_loopback() && self.allow_loopback {
             return true;
         }
 
@@ -1390,8 +1395,6 @@ mod tests {
             max_nodes_per_asn: 20,
             enable_geolocation_check: true,
             min_geographic_diversity: 3,
-            // Tests use loopback
-            allow_loopback: true,
         }
     }
 
@@ -1623,7 +1626,7 @@ mod tests {
     #[test]
     fn test_ip_diversity_enforcer_creation() {
         let config = create_test_diversity_config();
-        let enforcer = IPDiversityEnforcer::new(config.clone());
+        let enforcer = IPDiversityEnforcer::with_loopback(config.clone(), true);
 
         assert_eq!(enforcer.config.max_nodes_per_64, config.max_nodes_per_64);
         assert_eq!(enforcer.subnet_64_counts.len(), 0);

@@ -190,8 +190,8 @@ pub fn home_cache_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::NodeConfig;
     use crate::rate_limit::JoinRateLimiterConfig;
-    use crate::security::IPDiversityConfig;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -202,11 +202,12 @@ mod tests {
             max_contacts: 1000,
             ..CacheConfig::default()
         };
+        let node_config = NodeConfig::default();
 
         let manager = BootstrapManager::with_full_config(
             config,
             JoinRateLimiterConfig::default(),
-            IPDiversityConfig::default(),
+            &node_config,
         )
         .await;
         assert!(manager.is_ok());

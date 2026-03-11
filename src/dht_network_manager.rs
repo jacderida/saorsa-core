@@ -372,7 +372,7 @@ enum LookupRequestKind {
 }
 
 impl DhtNetworkManager {
-    fn init_dht_core(local_peer_id: &PeerId) -> Result<Arc<RwLock<DhtCoreEngine>>> {
+    fn init_dht_core(local_peer_id: &PeerId) -> Result<DhtCoreEngine> {
         // Use LogOnly mode so nodes can join the routing table without prior validation.
         // Strict mode rejects every unknown node, making it impossible to bootstrap a
         // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
@@ -382,7 +382,7 @@ impl DhtNetworkManager {
         )
             .map_err(|e| P2PError::Dht(DhtError::StorageFailed(e.to_string().into())))?;
         dht_instance.start_maintenance_tasks();
-        Ok(Arc::new(RwLock::new(dht_instance)))
+        Ok(dht_instance)
     }
 
     fn new_from_components(
@@ -390,24 +390,19 @@ impl DhtNetworkManager {
         trust_engine: Option<Arc<EigenTrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let dht = Self::init_dht_core(&config.peer_id)?;
+        let mut dht_instance = Self::init_dht_core(&config.peer_id)?;
 
         // Propagate IP diversity settings from the node config into the DHT
-        // core engine so loopback/diversity overrides take effect on routing
-        // table insertion, not just bootstrap discovery.
+        // core engine so diversity overrides take effect on routing table
+        // insertion, not just bootstrap discovery.
         if let Some(diversity) = &config.node_config.diversity_config {
-            let mut dht_guard = dht.blocking_write();
-            let mut div_cfg = diversity.clone();
-            if config.node_config.allow_loopback {
-                div_cfg.allow_loopback = true;
-            }
-            dht_guard.set_ip_diversity_config(div_cfg);
-        } else if config.node_config.allow_loopback {
-            let mut dht_guard = dht.blocking_write();
-            let mut div_cfg = crate::security::IPDiversityConfig::default();
-            div_cfg.allow_loopback = true;
-            dht_guard.set_ip_diversity_config(div_cfg);
+            dht_instance.set_ip_diversity_config(diversity.clone());
         }
+        // allow_loopback is set separately — NodeConfig.allow_loopback is the
+        // single source of truth; it is NOT part of IPDiversityConfig.
+        dht_instance.set_allow_loopback(config.node_config.allow_loopback);
+
+        let dht = Arc::new(RwLock::new(dht_instance));
 
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
         let maintenance_config = MaintenanceConfig::from(&config.dht_config);
@@ -567,6 +562,24 @@ impl DhtNetworkManager {
                 "DHT config peer_id ({}) differs from transport peer_id ({}); using config value",
                 config.peer_id.to_hex(),
                 transport_app_peer_id.to_hex()
+            );
+        }
+
+        // Reconcile loopback settings: the transport is already running, so if
+        // it admits loopback peers the DHT must also accept them.  When only the
+        // transport flag is set, propagate it into NodeConfig so the DHT core's
+        // diversity check stays consistent.
+        let transport_loopback = transport.allow_loopback();
+        if transport_loopback && !config.node_config.allow_loopback {
+            warn!(
+                "TransportConfig.allow_loopback=true but NodeConfig.allow_loopback=false; \
+                 syncing NodeConfig to match transport (single source of truth)"
+            );
+            config.node_config.allow_loopback = true;
+        } else if !transport_loopback && config.node_config.allow_loopback {
+            warn!(
+                "NodeConfig.allow_loopback=true but TransportConfig.allow_loopback=false; \
+                 transport will reject loopback connections before the DHT sees them"
             );
         }
 

@@ -22,22 +22,16 @@ async fn create_node_with_transport(
     let node_config = NodeConfig::builder()
         .listen_port(0)
         .ipv6(false)
+        .allow_loopback(true)
         .build()
         .expect("Failed to build NodeConfig");
 
     let transport = Arc::new(
-        TransportHandle::new(TransportConfig {
-            listen_addr: node_config.listen_addr,
-            enable_ipv6: node_config.enable_ipv6,
-            connection_timeout: node_config.connection_timeout,
-            max_connections: node_config.max_connections,
-            production_config: node_config.production_config.clone(),
-            event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_message_size: node_config.max_message_size,
-            node_identity: identity.clone(),
-            user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
-            allow_loopback: true,
-        })
+        TransportHandle::new(TransportConfig::from_node_config(
+            &node_config,
+            saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            identity.clone(),
+        ))
         .await?,
     );
 

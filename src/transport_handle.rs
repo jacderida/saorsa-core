@@ -83,6 +83,28 @@ pub struct TransportConfig {
     pub allow_loopback: bool,
 }
 
+impl TransportConfig {
+    /// Build transport config directly from the node's canonical config.
+    pub fn from_node_config(
+        config: &crate::network::NodeConfig,
+        event_channel_capacity: usize,
+        node_identity: Arc<NodeIdentity>,
+    ) -> Self {
+        Self {
+            listen_addr: config.listen_addr,
+            enable_ipv6: config.enable_ipv6,
+            connection_timeout: config.connection_timeout,
+            max_connections: config.max_connections,
+            production_config: config.production_config.clone(),
+            event_channel_capacity,
+            max_message_size: config.max_message_size,
+            node_identity,
+            user_agent: config.user_agent(),
+            allow_loopback: config.allow_loopback,
+        }
+    }
+}
+
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
 /// message I/O, and network events.
 ///
@@ -121,6 +143,12 @@ pub struct TransportHandle {
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
     /// up a peer's mode without re-receiving the `PeerConnected` event.
     peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Whether the transport was configured to accept loopback addresses.
+    ///
+    /// Stored so that [`DhtNetworkManager`] can reconcile its own diversity
+    /// config against the transport — avoiding the case where transport admits
+    /// a loopback peer that the DHT subsequently rejects.
+    allow_loopback: bool,
 }
 
 // ============================================================================
@@ -254,6 +282,7 @@ impl TransportHandle {
             peer_to_channel,
             channel_to_peers,
             peer_user_agents,
+            allow_loopback: config.allow_loopback,
         })
     }
 
@@ -316,6 +345,10 @@ impl TransportHandle {
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
+            // Test constructor uses DualStackNetworkNode::new() which defaults
+            // loopback to false; callers that need loopback must use the full
+            // TransportConfig-based constructor.
+            allow_loopback: false,
         })
     }
 }
@@ -333,6 +366,11 @@ impl TransportHandle {
     /// Get the cryptographic node identity.
     pub fn node_identity(&self) -> &Arc<NodeIdentity> {
         &self.node_identity
+    }
+
+    /// Whether this transport was configured to accept loopback addresses.
+    pub fn allow_loopback(&self) -> bool {
+        self.allow_loopback
     }
 
     /// Get the channel ID (local listen address as a string).
