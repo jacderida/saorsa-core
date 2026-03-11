@@ -890,7 +890,13 @@ impl P2PNode {
 
         // Initialize bootstrap cache manager
         let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let diversity_config = config.diversity_config.clone().unwrap_or_default();
+        let mut diversity_config = config.diversity_config.clone().unwrap_or_default();
+        // Propagate the node-level allow_loopback flag into diversity enforcement
+        // so that loopback bypass in IP diversity checks stays consistent with
+        // the transport-layer setting.
+        if config.allow_loopback {
+            diversity_config.allow_loopback = true;
+        }
         let bootstrap_manager = match BootstrapManager::with_full_config(
             cache_config,
             crate::rate_limit::JoinRateLimiterConfig::default(),
@@ -2118,7 +2124,10 @@ mod diversity_tests {
     use crate::security::IPDiversityConfig;
 
     async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
-        let diversity_config = config.diversity_config.clone().unwrap_or_default();
+        let mut diversity_config = config.diversity_config.clone().unwrap_or_default();
+        if config.allow_loopback {
+            diversity_config.allow_loopback = true;
+        }
         // Use a temp dir to avoid conflicts with cached files from old format
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let mut cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();

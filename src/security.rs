@@ -256,6 +256,12 @@ pub struct IPDiversityConfig {
     pub enable_geolocation_check: bool,
     /// Minimum number of different countries required
     pub min_geographic_diversity: usize,
+    /// Allow loopback addresses to bypass diversity checks (default: false).
+    ///
+    /// When `true`, loopback addresses (127.0.0.1, ::1) are unconditionally
+    /// accepted.  When `false`, loopback addresses are rejected like any other
+    /// address that fails diversity constraints.
+    pub allow_loopback: bool,
 }
 
 /// Analysis of an IPv6 address for diversity enforcement
@@ -354,6 +360,8 @@ impl Default for IPDiversityConfig {
             max_nodes_per_asn: 20,
             enable_geolocation_check: true,
             min_geographic_diversity: 3,
+            // Loopback — disabled by default for production safety
+            allow_loopback: false,
         }
     }
 }
@@ -387,6 +395,7 @@ impl IPDiversityConfig {
             max_nodes_per_asn: 5000, // Allow many nodes from same ASN (e.g., Digital Ocean)
             enable_geolocation_check: false, // Disable geo checks for testing
             min_geographic_diversity: 1, // Single region is acceptable for testing
+            allow_loopback: true,    // Testnet needs loopback for local multi-node setups
         }
     }
 
@@ -412,6 +421,7 @@ impl IPDiversityConfig {
             max_nodes_per_asn: usize::MAX,
             enable_geolocation_check: false,
             min_geographic_diversity: 0,
+            allow_loopback: true, // Permissive config allows loopback
         }
     }
 
@@ -674,8 +684,8 @@ impl IPDiversityEnforcer {
 
     /// Check if a new node can be accepted based on IP diversity constraints
     pub fn can_accept_node(&self, ip_analysis: &IPAnalysis) -> bool {
-        // Loopback addresses are used in tests / local development — always accept.
-        if ip_analysis.is_loopback {
+        // Loopback addresses bypass diversity checks only when explicitly allowed.
+        if ip_analysis.is_loopback && self.config.allow_loopback {
             return true;
         }
 
@@ -990,8 +1000,8 @@ impl IPDiversityEnforcer {
 
     /// Check if an IPv4 node can be accepted based on diversity constraints
     fn can_accept_ipv4(&self, analysis: &IPv4Analysis) -> bool {
-        // Loopback addresses are used in tests / local development — always accept.
-        if analysis.ip_addr.is_loopback() {
+        // Loopback addresses bypass diversity checks only when explicitly allowed.
+        if analysis.ip_addr.is_loopback() && self.config.allow_loopback {
             return true;
         }
 
@@ -1364,6 +1374,8 @@ mod tests {
             max_nodes_per_asn: 20,
             enable_geolocation_check: true,
             min_geographic_diversity: 3,
+            // Tests use loopback
+            allow_loopback: true,
         }
     }
 

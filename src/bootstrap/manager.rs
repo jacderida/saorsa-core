@@ -693,6 +693,7 @@ mod tests {
             max_nodes_per_asn: 1000,
             enable_geolocation_check: false,
             min_geographic_diversity: 0,
+            allow_loopback: true, // Test uses loopback addresses
         };
 
         let config = BootstrapConfig {

@@ -2170,13 +2170,11 @@ impl DhtNetworkManager {
             .transport
             .peer_info(&app_peer_id)
             .await
-            .and_then(|info| info.addresses.first().cloned());
+            .and_then(|info| Self::first_valid_address(&info.addresses));
 
+        let addr_string = current_address.map(|a| a.to_string());
         let dht = self.dht.read().await;
-        if dht
-            .touch_node(&app_peer_id, current_address.as_deref())
-            .await
-        {
+        if dht.touch_node(&app_peer_id, addr_string.as_deref()).await {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
     }
