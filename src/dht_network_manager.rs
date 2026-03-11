@@ -25,7 +25,7 @@ use crate::{
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
-    error::{DhtError, NetworkError},
+    error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -1625,6 +1625,20 @@ impl DhtNetworkManager {
                     .await
                 {
                     Ok(authenticated) => {
+                        if &authenticated != peer_id {
+                            warn!(
+                                "[STEP 1b] {} -> {}: identity MISMATCH — dialled {} but authenticated as {}. \
+                                 Routing table entry may be stale.",
+                                local_hex,
+                                peer_hex,
+                                address,
+                                authenticated.to_hex()
+                            );
+                            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
+                                expected: peer_hex.into(),
+                                actual: authenticated.to_hex().into(),
+                            }));
+                        }
                         debug!(
                             "[STEP 1b] {} -> {}: identity confirmed ({})",
                             local_hex,

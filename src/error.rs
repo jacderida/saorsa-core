@@ -297,6 +297,12 @@ pub enum IdentityError {
     #[error("Permission denied")]
     PermissionDenied,
 
+    #[error("Identity mismatch: expected {expected} but peer authenticated as {actual}")]
+    IdentityMismatch {
+        expected: Cow<'static, str>,
+        actual: Cow<'static, str>,
+    },
+
     #[error("Invalid peer ID: {0}")]
     InvalidPeerId(Cow<'static, str>),
 
