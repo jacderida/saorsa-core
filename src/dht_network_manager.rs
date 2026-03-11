@@ -1635,6 +1635,9 @@ impl DhtNetworkManager {
                                 address,
                                 authenticated.to_hex()
                             );
+                            if let Ok(mut ops) = self.active_operations.lock() {
+                                ops.remove(&message_id);
+                            }
                             return Err(P2PError::Identity(IdentityError::IdentityMismatch {
                                 expected: peer_hex.into(),
                                 actual: authenticated.to_hex().into(),
@@ -1649,11 +1652,29 @@ impl DhtNetworkManager {
                     }
                     Err(e) => {
                         warn!(
-                            "[STEP 1b] {} -> {}: identity exchange did not complete: {}",
+                            "[STEP 1b] {} -> {}: identity exchange failed, disconnecting channel: {}",
                             local_hex, peer_hex, e
                         );
+                        self.transport.disconnect_channel(&channel_id).await;
+                        if let Ok(mut ops) = self.active_operations.lock() {
+                            ops.remove(&message_id);
+                        }
+                        return Err(P2PError::Network(NetworkError::ProtocolError(
+                            format!("identity exchange with {} failed: {}", peer_hex, e).into(),
+                        )));
                     }
                 }
+            } else {
+                warn!(
+                    "[STEP 1b] {} -> {}: dial failed to {}",
+                    local_hex, peer_hex, address
+                );
+                if let Ok(mut ops) = self.active_operations.lock() {
+                    ops.remove(&message_id);
+                }
+                return Err(P2PError::Network(NetworkError::PeerNotFound(
+                    format!("failed to dial {} at {}", peer_hex, address).into(),
+                )));
             }
         }
 
