@@ -235,7 +235,7 @@ impl DhtStreamHandler {
                     timestamp,
                     node_info: crate::dht::core_engine::NodeInfo {
                         id: local_id,
-                        address: String::new(),
+                        address: crate::address::NetworkAddress::unspecified(),
                         last_seen: std::time::SystemTime::now(),
                         capacity: crate::dht::core_engine::NodeCapacity::default(),
                     },

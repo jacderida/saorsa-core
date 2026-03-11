@@ -4,6 +4,7 @@
 
 use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
+use crate::address::NetworkAddress;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::metrics::SecurityMetricsCollector;
 use crate::dht::network_integration::{DhtMessage, DhtResponse};
@@ -45,33 +46,34 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Node information for routing
+/// Node information for routing.
+///
+/// The `address` field stores a typed [`NetworkAddress`] that is always valid.
+/// For wire-protocol compatibility it serializes as a plain `"ip:port"` string
+/// and deserializes from both `"ip:port"` and Multiaddr formats like
+/// `/ip4/1.2.3.4/udp/9000`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
-    pub address: String,
+    #[serde(with = "crate::address::serde_as_string")]
+    pub address: NetworkAddress,
     pub last_seen: SystemTime,
     pub capacity: NodeCapacity,
 }
 
 impl NodeInfo {
-    /// Parse the address string into a [`SocketAddr`].
-    ///
-    /// Returns `None` if the address is a bare IP without port or otherwise
-    /// cannot be parsed.
-    pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.address.parse::<SocketAddr>().ok()
+    /// Get the socket address. Always succeeds because `NetworkAddress`
+    /// guarantees a valid `SocketAddr`.
+    #[must_use]
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.address.socket_addr()
     }
 
-    /// Extract the IP address from the stored address string.
-    ///
-    /// Handles both `"ip:port"` and bare `"ip"` formats.
-    pub fn ip(&self) -> Option<IpAddr> {
-        if let Ok(sa) = self.address.parse::<SocketAddr>() {
-            Some(sa.ip())
-        } else {
-            self.address.parse::<IpAddr>().ok()
-        }
+    /// Get the IP address. Always succeeds because `NetworkAddress`
+    /// guarantees a valid IP.
+    #[must_use]
+    pub fn ip(&self) -> IpAddr {
+        self.address.ip()
     }
 }
 
@@ -134,13 +136,18 @@ impl KBucket {
 
     /// Update `last_seen` (and optionally the address) for a node, then move
     /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
+    ///
+    /// The `address` parameter accepts a string in either `"ip:port"` or
+    /// Multiaddr format.  Invalid strings are silently ignored — the existing
+    /// address is preserved.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
             if let Some(addr) = address
                 && !addr.is_empty()
+                && let Ok(parsed) = addr.parse::<NetworkAddress>()
             {
-                self.nodes[pos].address = addr.to_string();
+                self.nodes[pos].address = parsed;
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
@@ -1161,7 +1168,7 @@ impl DhtCoreEngine {
                 timestamp,
                 node_info: NodeInfo {
                     id: self.node_id,
-                    address: String::new(),
+                    address: NetworkAddress::unspecified(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 },
@@ -1228,7 +1235,7 @@ impl DhtCoreEngine {
     ///
     /// Returns the stored address if the peer is in the routing table,
     /// `None` otherwise. O(K) scan of the target k-bucket.
-    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<String> {
+    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<NetworkAddress> {
         let routing = self.routing_table.read().await;
         routing.find_node_by_id(peer_id).map(|n| n.address.clone())
     }
@@ -1367,16 +1374,8 @@ impl DhtCoreEngine {
             }
         }
 
-        // Parse candidate IP once for the diversity checks below.
-        // Reject nodes with unparseable addresses — allowing them through
-        // would bypass all IP/geographic diversity enforcement.
-        let candidate_ip = node.ip().ok_or_else(|| {
-            anyhow!(
-                "Rejecting node {:?}: address {:?} is not a valid IP",
-                node.id,
-                node.address
-            )
-        })?;
+        // NetworkAddress guarantees a valid IP — no parsing can fail.
+        let candidate_ip = node.ip();
 
         // 2. Security Check: IP + Geographic Diversity
         //
@@ -1436,9 +1435,7 @@ impl DhtCoreEngine {
             if node.id == *candidate_id {
                 continue;
             }
-            let Some(existing_ip) = node.ip() else {
-                continue;
-            };
+            let existing_ip = node.ip();
             // Loopback nodes don't contribute to network_size or any counts
             if existing_ip.is_loopback() {
                 continue;
@@ -1599,7 +1596,7 @@ mod tests {
     fn make_node(byte: u8, address: &str) -> NodeInfo {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
-            address: address.to_string(),
+            address: address.parse::<NetworkAddress>().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }
@@ -1619,7 +1616,8 @@ mod tests {
         // Touch with a new address
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
         assert!(found);
-        assert_eq!(bucket.get_nodes().last().unwrap().address, "5.6.7.8:9000");
+        let expected: NetworkAddress = "5.6.7.8:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
     #[test]
@@ -1631,7 +1629,8 @@ mod tests {
 
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
-        assert_eq!(bucket.get_nodes().last().unwrap().address, "1.2.3.4:9000");
+        let expected: NetworkAddress = "1.2.3.4:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
     #[test]
@@ -1662,7 +1661,8 @@ mod tests {
         // Touch with an empty string should NOT overwrite the valid address
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
         assert!(found);
-        assert_eq!(bucket.get_nodes().last().unwrap().address, "1.2.3.4:9000");
+        let expected: NetworkAddress = "1.2.3.4:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
     #[test]
@@ -1692,7 +1692,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".to_string(),
+                address: "10.0.0.1:9000".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1703,7 +1703,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".to_string(),
+                address: "10.0.0.2:9000".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1736,7 +1736,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".to_string(),
+                address: "10.0.0.1:9000".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1747,7 +1747,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".to_string(),
+                address: "10.0.0.2:9000".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1777,7 +1777,7 @@ mod tests {
             table
                 .add_node(NodeInfo {
                     id: PeerId::from_bytes(id_bytes),
-                    address: format!("10.0.0.{}:9000", i + 1),
+                    address: format!("10.0.0.{}:9000", i + 1).parse().unwrap(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 })

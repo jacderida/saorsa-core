@@ -120,6 +120,15 @@ impl NetworkAddress {
         self.socket_addr.is_ipv6()
     }
 
+    /// Create an unspecified placeholder address (`0.0.0.0:0`).
+    ///
+    /// Used when a real address is not yet known (e.g. Pong responses
+    /// where the local listen address is not available).
+    #[must_use]
+    pub fn unspecified() -> Self {
+        Self::new(SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
     /// Check if this is a loopback address
     pub fn is_loopback(&self) -> bool {
         self.socket_addr.ip().is_loopback()
@@ -153,12 +162,16 @@ impl FromStr for NetworkAddress {
             return Ok(Self::new(socket_addr));
         }
 
-        // Basic Multiaddr support: /ip4/<ip>/tcp/<port> or /ip6/<ip>/tcp/<port>
+        // Basic Multiaddr support: /ip4/<ip>/<proto>/<port> or /ip6/<ip>/<proto>/<port>
+        // Supported protocols: tcp, udp, quic (all resolve to a SocketAddr)
         if s.starts_with("/ip4/") || s.starts_with("/ip6/") {
             let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
-            // Expect: ["ip4"|"ip6", ip, "tcp", port]
+            // Expect: ["ip4"|"ip6", ip, "tcp"|"udp"|"quic", port]
             #[allow(clippy::collapsible_if)]
-            if parts.len() >= 4 && (parts[0] == "ip4" || parts[0] == "ip6") && parts[2] == "tcp" {
+            if parts.len() >= 4
+                && (parts[0] == "ip4" || parts[0] == "ip6")
+                && matches!(parts[2], "tcp" | "udp" | "quic")
+            {
                 if let Ok(port) = parts[3].parse::<u16>() {
                     // Parse IP
                     let ip_str = parts[1];
@@ -298,6 +311,26 @@ impl Display for AddressBook {
     }
 }
 
+/// Serde helpers for serializing `NetworkAddress` as a plain string.
+///
+/// Use with `#[serde(with = "crate::address::serde_as_string")]` on fields
+/// of type `NetworkAddress` to maintain wire-protocol compatibility with
+/// code that expects a plain `"ip:port"` string.
+pub mod serde_as_string {
+    use super::NetworkAddress;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(addr: &NetworkAddress, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&addr.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NetworkAddress, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<NetworkAddress>()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +389,60 @@ mod tests {
         let addr = NetworkAddress::from_ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 8080);
         assert!(addr.is_ipv6());
         assert!(addr.is_loopback());
+    }
+
+    #[test]
+    fn test_multiaddr_tcp_parsing() {
+        let addr = "/ip4/192.168.1.1/tcp/9000"
+            .parse::<NetworkAddress>()
+            .unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn test_multiaddr_udp_parsing() {
+        let addr = "/ip4/127.0.0.1/udp/10000"
+            .parse::<NetworkAddress>()
+            .unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(addr.port(), 10000);
+    }
+
+    #[test]
+    fn test_multiaddr_quic_parsing() {
+        let addr = "/ip4/10.0.0.1/quic/9000".parse::<NetworkAddress>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn test_multiaddr_ipv6_udp_parsing() {
+        let addr = "/ip6/::1/udp/8080".parse::<NetworkAddress>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(addr.port(), 8080);
+        assert!(addr.is_loopback());
+    }
+
+    #[test]
+    fn test_serde_as_string_roundtrip() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            #[serde(with = "super::serde_as_string")]
+            addr: NetworkAddress,
+        }
+
+        let original = Wrapper {
+            addr: NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("192.168.1.1:9000"));
+
+        let recovered: Wrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.addr.ip(), original.addr.ip());
+        assert_eq!(recovered.addr.port(), original.addr.port());
     }
 }

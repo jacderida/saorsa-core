@@ -601,7 +601,7 @@ impl AdaptiveDHT {
                     .into_iter()
                     .map(|node| CandidateNode {
                         peer_id: node.id,
-                        address: node.address,
+                        address: node.address.to_string(),
                         reliability: node.capacity.reliability_score,
                     })
                     .collect())
@@ -614,7 +614,7 @@ impl AdaptiveDHT {
                         .into_iter()
                         .map(|node| CandidateNode {
                             peer_id: node.peer_id,
-                            address: node.address,
+                            address: node.address.to_string(),
                             reliability: node.reliability,
                         })
                         .collect()

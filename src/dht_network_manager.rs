@@ -19,8 +19,9 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Multiaddr, P2PError, PeerId, Result,
+    P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
+    address::NetworkAddress,
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
@@ -29,7 +30,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -68,11 +68,16 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 /// a peer. The actual timeout is `min(request_timeout, this)`.
 const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// DHT node representation for network operations
+/// DHT node representation for network operations.
+///
+/// The `address` field stores a typed [`NetworkAddress`] for consistent
+/// Multiaddr support.  Serializes as a plain `"ip:port"` string for
+/// wire-protocol compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DHTNode {
     pub peer_id: PeerId,
-    pub address: String,
+    #[serde(with = "crate::address::serde_as_string")]
+    pub address: NetworkAddress,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
 }
@@ -105,7 +110,7 @@ pub struct BootstrapNode {
     /// Node's peer ID
     pub peer_id: PeerId,
     /// Network addresses
-    pub addresses: Vec<Multiaddr>,
+    pub addresses: Vec<NetworkAddress>,
     /// Known DHT key (optional)
     pub dht_key: Option<Key>,
 }
@@ -606,7 +611,8 @@ impl DhtNetworkManager {
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        self.dial_candidate(&node.peer_id, &node.address).await;
+                        let addr_str = node.address.to_string();
+                        self.dial_candidate(&node.peer_id, &addr_str).await;
                         discovered += 1;
                     }
                 }
@@ -713,7 +719,7 @@ impl DhtNetworkManager {
         // Create parallel replication requests
         let replication_futures = closest_nodes.iter().map(|node| {
             let peer_id = node.peer_id;
-            let address = node.address.clone();
+            let address = node.address.to_string();
             let op = operation.clone();
             async move {
                 debug!("Sending PUT to peer: {}", peer_id.to_hex());
@@ -923,7 +929,7 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = node.address.clone();
+                    let address = node.address.to_string();
                     let op = DhtNetworkOperation::FindValue { key: *key };
                     async move {
                         self.dial_candidate(&peer_id, &address).await;
@@ -1247,7 +1253,7 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = node.address.clone();
+                    let address = node.address.to_string();
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         self.dial_candidate(&peer_id, &address).await;
@@ -1398,7 +1404,7 @@ impl DhtNetworkManager {
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
             peer_id: self.config.peer_id,
-            address: self.config.node_config.listen_addr.to_string(),
+            address: NetworkAddress::from(self.config.node_config.listen_addr),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1410,58 +1416,31 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Convert peer addresses reported by the transport into multiaddresses the DHT understands.
-    fn parse_peer_addresses(addresses: &[String]) -> Vec<Multiaddr> {
-        addresses
-            .iter()
-            .filter_map(|addr| Self::multiaddr_from_address(addr))
-            .collect()
-    }
-
-    /// Convert a human-friendly socket string into a Multiaddr.
-    fn multiaddr_from_address(address: &str) -> Option<Multiaddr> {
-        match address.parse::<SocketAddr>() {
-            Ok(socket_addr) => {
-                let ip = socket_addr.ip();
-                if ip.is_unspecified() {
-                    warn!("Rejecting unspecified address: {address}");
-                    return None;
+    /// Parse the first valid address from a list of transport-reported address
+    /// strings into a [`NetworkAddress`].
+    ///
+    /// Accepts both `"ip:port"` and Multiaddr formats (e.g.
+    /// `/ip4/1.2.3.4/udp/9000`).  Unspecified (`0.0.0.0`) addresses are
+    /// rejected.  Loopback addresses are accepted for local/test use.
+    fn first_valid_address(addresses: &[String]) -> Option<NetworkAddress> {
+        for addr_str in addresses {
+            match addr_str.parse::<NetworkAddress>() {
+                Ok(addr) => {
+                    if addr.ip().is_unspecified() {
+                        warn!("Rejecting unspecified address: {addr_str}");
+                        continue;
+                    }
+                    if addr.is_loopback() {
+                        trace!("Accepting loopback address (local/test): {addr_str}");
+                    }
+                    return Some(addr);
                 }
-                if ip.is_loopback() {
-                    trace!("Accepting loopback address (local/test): {address}");
+                Err(e) => {
+                    warn!("Failed to parse address '{addr_str}': {e}");
                 }
-                Self::socket_addr_to_multiaddr(&socket_addr)
-            }
-            Err(e) => {
-                warn!("Failed to parse '{address}' as SocketAddr: {e}");
-                None
             }
         }
-    }
-
-    /// Render a SocketAddr as a Multiaddr, preserving IPv4/IPv6 protocol tags.
-    fn socket_addr_to_multiaddr(socket_addr: &SocketAddr) -> Option<Multiaddr> {
-        let ip_protocol = if socket_addr.ip().is_ipv4() {
-            "ip4"
-        } else {
-            "ip6"
-        };
-        let multiaddr_string = format!(
-            "/{}/{}/tcp/{}",
-            ip_protocol,
-            socket_addr.ip(),
-            socket_addr.port()
-        );
-        match multiaddr_string.parse::<Multiaddr>() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                warn!(
-                    "Failed to convert socket address {} to multiaddr: {}",
-                    socket_addr, e
-                );
-                None
-            }
-        }
+        None
     }
 
     /// Process replication results from parallel PUT requests.
@@ -1765,8 +1744,9 @@ impl DhtNetworkManager {
             return None;
         }
 
-        // Validate address before attempting connection
-        if let Ok(parsed) = address.parse::<SocketAddr>()
+        // Parse via NetworkAddress to support both "ip:port" and Multiaddr formats.
+        // Reject unspecified addresses before attempting the connection.
+        if let Ok(parsed) = address.parse::<NetworkAddress>()
             && parsed.ip().is_unspecified()
         {
             debug!(
@@ -1810,9 +1790,9 @@ impl DhtNetworkManager {
     /// addresses), then falls back to the transport layer for connected peers.
     /// Returns `None` when the peer is unknown or has no addresses.
     async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<String> {
-        // 1. Routing table — contains addresses for validated DHT participants
+        // 1. Routing table — contains validated NetworkAddress entries
         if let Some(address) = self.dht.read().await.get_node_address(peer_id).await {
-            return Some(address);
+            return Some(address.to_string());
         }
 
         // 2. Transport layer — for connected peers not yet in the routing table
@@ -2255,24 +2235,23 @@ impl DhtNetworkManager {
         );
         let dht_key = *node_id.as_bytes();
 
-        // peer_info() resolves app-level IDs internally via peer_to_channel
-        let addresses = if let Some(info) = self.transport.peer_info(&node_id).await {
-            Self::parse_peer_addresses(&info.addresses)
+        // peer_info() resolves app-level IDs internally via peer_to_channel.
+        // Parse the first valid address directly into a NetworkAddress — this
+        // handles both "ip:port" and Multiaddr formats consistently.
+        let address = if let Some(info) = self.transport.peer_info(&node_id).await {
+            Self::first_valid_address(&info.addresses)
         } else {
             warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
-            Vec::new()
+            None
         };
 
-        // Skip peers with no addresses - they cannot be used for DHT routing.
-        let address_str = match addresses.first() {
-            Some(addr) => addr.to_string(),
-            None => {
-                warn!(
-                    "Peer {} has no addresses, skipping DHT routing table addition",
-                    app_peer_id_hex
-                );
-                return;
-            }
+        // Skip peers with no addresses — they cannot be used for DHT routing.
+        let Some(address) = address else {
+            warn!(
+                "Peer {} has no valid addresses, skipping DHT routing table addition",
+                app_peer_id_hex
+            );
+            return;
         };
 
         // Only add full nodes to the DHT routing table. Ephemeral clients
@@ -2286,7 +2265,7 @@ impl DhtNetworkManager {
         } else {
             let node_info = NodeInfo {
                 id: node_id,
-                address: address_str,
+                address,
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             };

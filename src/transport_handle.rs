@@ -538,6 +538,9 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Connect to a peer at the given address.
+    ///
+    /// Accepts both `"ip:port"` and Multiaddr formats (e.g.
+    /// `/ip4/1.2.3.4/udp/9000`).
     pub async fn connect_peer(&self, address: &str) -> Result<String> {
         // Check production limits if resource manager is enabled
         let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
@@ -546,11 +549,15 @@ impl TransportHandle {
             None
         };
 
-        let socket_addr: SocketAddr = address.parse().map_err(|e| {
-            P2PError::Network(NetworkError::InvalidAddress(
-                format!("{}: {}", address, e).into(),
-            ))
-        })?;
+        // Parse via NetworkAddress for consistent Multiaddr support
+        let socket_addr: SocketAddr = address
+            .parse::<NetworkAddress>()
+            .map(|na| na.socket_addr())
+            .map_err(|e| {
+                P2PError::Network(NetworkError::InvalidAddress(
+                    format!("{}: {}", address, e).into(),
+                ))
+            })?;
 
         let normalized_addr = normalize_wildcard_to_loopback(socket_addr);
         let addr_list = vec![normalized_addr];

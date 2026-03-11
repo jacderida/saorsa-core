@@ -493,7 +493,7 @@ impl DhtProtocolHandler {
                     timestamp,
                     node_info: NodeInfo {
                         id: local_id,
-                        address: String::new(),
+                        address: crate::address::NetworkAddress::unspecified(),
                         last_seen: SystemTime::now(),
                         capacity: NodeCapacity::default(),
                     },
@@ -555,7 +555,7 @@ impl NetworkIntegrationLayer {
         // Get peer info
         let peers = self.peer_manager.known_peers.read().await;
         let peer_info = peers.get(target).ok_or_else(|| anyhow!("Unknown peer"))?;
-        let address = peer_info.node_info.address.clone();
+        let address = peer_info.node_info.address.to_string();
         drop(peers);
 
         // Get connection
@@ -734,7 +734,7 @@ mod tests {
                 timestamp: 0,
                 node_info: NodeInfo {
                     id: PeerId::from_bytes([42u8; 32]),
-                    address: "mock".to_string(),
+                    address: "127.0.0.1:0".parse().unwrap(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 },
@@ -791,7 +791,7 @@ mod tests {
             timestamp: 0,
             sender_info: NodeInfo {
                 id: node_id,
-                address: "test".to_string(),
+                address: "127.0.0.1:0".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             },
@@ -812,7 +812,7 @@ mod tests {
 
         let node_info = NodeInfo {
             id: PeerId::from_bytes([42u8; 32]),
-            address: "test".to_string(),
+            address: "127.0.0.1:0".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };
@@ -838,7 +838,7 @@ mod tests {
         let target = PeerId::from_bytes([42u8; 32]);
         let peer_info = NodeInfo {
             id: target,
-            address: "mock://test".to_string(),
+            address: "127.0.0.1:0".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };
