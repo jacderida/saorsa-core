@@ -1466,9 +1466,15 @@ impl DhtCoreEngine {
         match candidate_ip {
             IpAddr::V4(v4) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_32 = std::cmp::min(cfg.max_nodes_per_ipv4_32, per_ip);
-                let limit_24 = std::cmp::min(cfg.max_nodes_per_ipv4_24, per_ip * 3);
-                let limit_16 = std::cmp::min(cfg.max_nodes_per_ipv4_16, per_ip * 10);
+                let limit_32 = cfg
+                    .max_nodes_per_ipv4_32
+                    .map_or(per_ip, |cap| cap.min(per_ip));
+                let limit_24 = cfg
+                    .max_nodes_per_ipv4_24
+                    .map_or(per_ip * 3, |cap| cap.min(per_ip * 3));
+                let limit_16 = cfg
+                    .max_nodes_per_ipv4_16
+                    .map_or(per_ip * 10, |cap| cap.min(per_ip * 10));
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(

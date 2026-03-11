@@ -235,13 +235,20 @@ pub struct IPDiversityConfig {
     /// Maximum nodes per /32 region (default: 10)
     pub max_nodes_per_32: usize,
 
-    // === IPv4 subnet limits (new) ===
-    /// Maximum nodes per single IPv4 address (/32) - dynamic by default
-    pub max_nodes_per_ipv4_32: usize,
-    /// Maximum nodes per /24 subnet (Class C) - default: 3x per-IP
-    pub max_nodes_per_ipv4_24: usize,
-    /// Maximum nodes per /16 subnet (Class B) - default: 10x per-IP
-    pub max_nodes_per_ipv4_16: usize,
+    // === IPv4 subnet limits ===
+    /// Optional hard cap on nodes per single IPv4 address (/32).
+    /// When `None` (default), the dynamic per-IP limit is used alone.
+    /// When `Some(n)`, the effective limit is `min(n, dynamic_per_ip)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes_per_ipv4_32: Option<usize>,
+    /// Optional hard cap on nodes per /24 subnet (Class C).
+    /// When `None` (default), `dynamic_per_ip * 3` is used alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes_per_ipv4_24: Option<usize>,
+    /// Optional hard cap on nodes per /16 subnet (Class B).
+    /// When `None` (default), `dynamic_per_ip * 10` is used alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes_per_ipv4_16: Option<usize>,
 
     // === Network-relative limits (new) ===
     /// Absolute maximum nodes allowed per single IP (default: 50)
@@ -349,10 +356,10 @@ impl Default for IPDiversityConfig {
             max_nodes_per_64: 1,
             max_nodes_per_48: 3,
             max_nodes_per_32: 10,
-            // IPv4 limits (defaults based on network-relative formula)
-            max_nodes_per_ipv4_32: 1,  // Will be dynamically adjusted
-            max_nodes_per_ipv4_24: 3,  // 3x per-IP limit
-            max_nodes_per_ipv4_16: 10, // 10x per-IP limit
+            // IPv4 limits — None = purely dynamic (no static cap)
+            max_nodes_per_ipv4_32: None,
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             // Network-relative limits
             max_per_ip_cap: 50,          // Hard cap of 50 nodes per IP
             max_network_fraction: 0.005, // 0.5% of network max
@@ -384,10 +391,10 @@ impl IPDiversityConfig {
             max_nodes_per_64: 100,  // Allow many nodes per /64 subnet
             max_nodes_per_48: 500,  // Allow many nodes per /48 allocation
             max_nodes_per_32: 1000, // Allow many nodes per /32 region
-            // IPv4 relaxed limits
-            max_nodes_per_ipv4_32: 100,  // Allow many nodes per IPv4
-            max_nodes_per_ipv4_24: 500,  // Allow many nodes per /24
-            max_nodes_per_ipv4_16: 1000, // Allow many nodes per /16
+            // IPv4 — no static caps for testnet (dynamic limits suffice)
+            max_nodes_per_ipv4_32: None,
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             // Network-relative limits (relaxed for testnet)
             max_per_ip_cap: 100,       // Higher cap for testing
             max_network_fraction: 0.1, // Allow 10% of network from one IP (relaxed from 0.5%)
@@ -410,10 +417,10 @@ impl IPDiversityConfig {
             max_nodes_per_64: usize::MAX,
             max_nodes_per_48: usize::MAX,
             max_nodes_per_32: usize::MAX,
-            // IPv4 - effectively disabled
-            max_nodes_per_ipv4_32: usize::MAX,
-            max_nodes_per_ipv4_24: usize::MAX,
-            max_nodes_per_ipv4_16: usize::MAX,
+            // IPv4 — no static caps
+            max_nodes_per_ipv4_32: None,
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             // Network-relative - effectively disabled
             max_per_ip_cap: usize::MAX,
             max_network_fraction: 1.0, // Allow 100% of network
@@ -1009,9 +1016,18 @@ impl IPDiversityEnforcer {
         let per_ip_limit = self.get_per_ip_limit();
 
         // Determine multipliers for subnet limits
-        let limit_32 = per_ip_limit;
-        let limit_24 = std::cmp::min(self.config.max_nodes_per_ipv4_24, per_ip_limit * 3);
-        let limit_16 = std::cmp::min(self.config.max_nodes_per_ipv4_16, per_ip_limit * 10);
+        let limit_32 = self
+            .config
+            .max_nodes_per_ipv4_32
+            .map_or(per_ip_limit, |cap| cap.min(per_ip_limit));
+        let limit_24 = self
+            .config
+            .max_nodes_per_ipv4_24
+            .map_or(per_ip_limit * 3, |cap| cap.min(per_ip_limit * 3));
+        let limit_16 = self
+            .config
+            .max_nodes_per_ipv4_16
+            .map_or(per_ip_limit * 10, |cap| cap.min(per_ip_limit * 10));
 
         // Apply stricter limits for hosting/VPN providers
         let (limit_32, limit_24, limit_16) =
@@ -1363,10 +1379,10 @@ mod tests {
             max_nodes_per_64: 1,
             max_nodes_per_48: 3,
             max_nodes_per_32: 10,
-            // IPv4 limits
-            max_nodes_per_ipv4_32: 1,
-            max_nodes_per_ipv4_24: 3,
-            max_nodes_per_ipv4_16: 10,
+            // IPv4 limits — None = purely dynamic
+            max_nodes_per_ipv4_32: None,
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             // Network-relative limits
             max_per_ip_cap: 50,
             max_network_fraction: 0.005,

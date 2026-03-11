@@ -685,9 +685,9 @@ mod tests {
             max_nodes_per_64: 100,
             max_nodes_per_48: 100,
             max_nodes_per_32: 100,
-            max_nodes_per_ipv4_32: 100, // Allow many per IP for rate limit test
-            max_nodes_per_ipv4_24: 100,
-            max_nodes_per_ipv4_16: 100,
+            max_nodes_per_ipv4_32: None, // No static cap for rate limit test
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             max_per_ip_cap: 100,
             max_network_fraction: 1.0,
             max_nodes_per_asn: 1000,
