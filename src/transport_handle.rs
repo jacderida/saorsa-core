@@ -17,7 +17,7 @@
 //! message I/O, events) extracted from [`P2PNode`] to enable sharing between
 //! `P2PNode` and [`DhtNetworkManager`] without coupling to the full node.
 
-use crate::NetworkAddress;
+use crate::Multiaddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
@@ -549,9 +549,9 @@ impl TransportHandle {
             None
         };
 
-        // Parse via NetworkAddress for consistent Multiaddr support
+        // Parse via Multiaddr for consistent Multiaddr support
         let socket_addr: SocketAddr = address
-            .parse::<NetworkAddress>()
+            .parse::<Multiaddr>()
             .map(|na| na.socket_addr())
             .map_err(|e| {
                 P2PError::Network(NetworkError::InvalidAddress(
@@ -1273,7 +1273,7 @@ impl TransportHandle {
                 }
 
                 let channel_id = remote_sock.to_string();
-                let remote_addr = NetworkAddress::from(remote_sock);
+                let remote_addr = Multiaddr::from(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
                 register_new_channel(&peers, &channel_id, &remote_addr).await;

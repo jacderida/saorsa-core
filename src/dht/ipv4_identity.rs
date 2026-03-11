@@ -605,9 +605,10 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_dht_node(_peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
+        let port = 8080u16 + id_bytes[0] as u16;
         DHTNode {
             id: PeerId::from_bytes(id_bytes),
-            address: "192.168.1.100:8080".parse().unwrap(),
+            address: format!("192.168.1.100:{port}").parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }

@@ -95,9 +95,9 @@ impl GeographicNetworkIntegration {
         region
     }
 
-    /// Extract IP address from multiaddr (NetworkAddress)
+    /// Extract IP address from multiaddr
     fn extract_ip_from_multiaddr(&self, address: &Multiaddr) -> Option<IpAddr> {
-        // NetworkAddress directly contains the IP address
+        // Multiaddr directly contains the IP address
         Some(address.ip())
     }
 

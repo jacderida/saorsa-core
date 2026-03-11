@@ -41,7 +41,7 @@ async fn test_security_manager_validate_join() -> anyhow::Result<()> {
     let desc = NodeDescriptor {
         id: saorsa_core::identity::node_identity::peer_id_from_public_key(identity.public_key()),
         public_key: identity.public_key().clone(),
-        addresses: vec!["127.0.0.1:0".to_string()],
+        addresses: vec!["127.0.0.1:0".parse().unwrap()],
         hyperbolic: None,
         som_position: None,
         trust: 0.5,

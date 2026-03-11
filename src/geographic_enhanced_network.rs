@@ -360,7 +360,7 @@ pub mod integration_helpers {
 
     /// Extract peer ID from address (helper function)
     pub fn extract_peer_id_from_address(address: &Multiaddr) -> String {
-        // Reconstruct a multiaddr-like string from NetworkAddress
+        // Reconstruct a multiaddr-like string from Multiaddr
         let ip = address.ip();
         let port = address.port();
         match ip {

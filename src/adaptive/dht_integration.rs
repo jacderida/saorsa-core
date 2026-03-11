@@ -19,19 +19,19 @@
 
 use super::som::NodeFeatures;
 use super::*;
+use crate::P2PNode;
 use crate::PeerId;
+use crate::address::Multiaddr;
 use crate::dht::geographic_network_integration::GeographicNetworkIntegration;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::{DHT, DHTConfig, DhtKey, Key as DhtKeyBytes};
 use crate::dht_network_manager::{
     DhtNetworkConfig, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
 };
-use crate::{Multiaddr, P2PNode};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -244,7 +244,7 @@ struct ScoredCandidate {
 #[derive(Debug, Clone)]
 struct CandidateNode {
     peer_id: PeerId,
-    address: String,
+    address: Multiaddr,
     reliability: f64,
 }
 
@@ -472,7 +472,7 @@ impl AdaptiveDHT {
 
         for candidate in candidates {
             let node_id = &candidate.peer_id;
-            let address = Multiaddr::from_str(&candidate.address).ok();
+            let address = Some(candidate.address.clone());
             let region = self.detect_region(&address).await;
             let trust = self.trust_provider.get_trust(node_id).clamp(0.0, 1.0);
             if trust < self.config.min_trust_threshold {
@@ -601,7 +601,7 @@ impl AdaptiveDHT {
                     .into_iter()
                     .map(|node| CandidateNode {
                         peer_id: node.id,
-                        address: node.address.to_string(),
+                        address: node.address,
                         reliability: node.capacity.reliability_score,
                     })
                     .collect())
@@ -614,7 +614,7 @@ impl AdaptiveDHT {
                         .into_iter()
                         .map(|node| CandidateNode {
                             peer_id: node.peer_id,
-                            address: node.address.to_string(),
+                            address: node.address,
                             reliability: node.reliability,
                         })
                         .collect()
@@ -821,10 +821,7 @@ impl AdaptiveDHT {
                 NodeDescriptor {
                     id: node_id,
                     public_key: public_key.clone(),
-                    addresses: candidate
-                        .address
-                        .map(|addr| vec![addr.to_string()])
-                        .unwrap_or_default(),
+                    addresses: candidate.address.into_iter().collect(),
                     hyperbolic: Some(Self::derive_hyperbolic_coordinate(&node_id)),
                     som_position: Some([
                         candidate.scores.som,
@@ -847,15 +844,7 @@ impl AdaptiveDHT {
 
     /// Update routing table with new node information
     pub async fn update_routing(&self, node: NodeDescriptor) -> Result<()> {
-        let _peer_id = node.id.to_string();
-
-        let addresses: Vec<Multiaddr> = node
-            .addresses
-            .iter()
-            .filter_map(|a| Multiaddr::from_str(a).ok())
-            .collect();
-
-        if addresses.is_empty() {
+        if node.addresses.is_empty() {
             return Err(AdaptiveNetworkError::Other(
                 "No valid addresses".to_string(),
             ));

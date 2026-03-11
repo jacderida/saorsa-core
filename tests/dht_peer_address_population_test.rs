@@ -313,7 +313,7 @@ async fn test_find_closest_nodes_returns_addresses() -> Result<()> {
         debug!("  reliability: {}", node.reliability);
 
         let addr_str = node.address.to_string();
-        if addr_str.is_empty() || addr_str == "0.0.0.0:0" {
+        if addr_str == "0.0.0.0:0" {
             warn!("  Node {} has EMPTY address field", i);
             nodes_without_addresses += 1;
         } else {

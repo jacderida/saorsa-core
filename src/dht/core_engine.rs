@@ -4,7 +4,7 @@
 
 use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
-use crate::address::NetworkAddress;
+use crate::address::Multiaddr;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::metrics::SecurityMetricsCollector;
 use crate::dht::network_integration::{DhtMessage, DhtResponse};
@@ -48,7 +48,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 
 /// Node information for routing.
 ///
-/// The `address` field stores a typed [`NetworkAddress`] that is always valid.
+/// The `address` field stores a typed [`Multiaddr`] that is always valid.
 /// For wire-protocol compatibility it serializes as a plain `"ip:port"` string
 /// and deserializes from both `"ip:port"` and Multiaddr formats like
 /// `/ip4/1.2.3.4/udp/9000`.
@@ -56,20 +56,20 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 pub struct NodeInfo {
     pub id: PeerId,
     #[serde(with = "crate::address::serde_as_string")]
-    pub address: NetworkAddress,
+    pub address: Multiaddr,
     pub last_seen: SystemTime,
     pub capacity: NodeCapacity,
 }
 
 impl NodeInfo {
-    /// Get the socket address. Always succeeds because `NetworkAddress`
+    /// Get the socket address. Always succeeds because `Multiaddr`
     /// guarantees a valid `SocketAddr`.
     #[must_use]
     pub fn socket_addr(&self) -> SocketAddr {
         self.address.socket_addr()
     }
 
-    /// Get the IP address. Always succeeds because `NetworkAddress`
+    /// Get the IP address. Always succeeds because `Multiaddr`
     /// guarantees a valid IP.
     #[must_use]
     pub fn ip(&self) -> IpAddr {
@@ -145,7 +145,7 @@ impl KBucket {
             self.nodes[pos].last_seen = SystemTime::now();
             if let Some(addr) = address
                 && !addr.is_empty()
-                && let Ok(parsed) = addr.parse::<NetworkAddress>()
+                && let Ok(parsed) = addr.parse::<Multiaddr>()
             {
                 self.nodes[pos].address = parsed;
             }
@@ -1224,7 +1224,7 @@ impl DhtCoreEngine {
     ///
     /// Returns the stored address if the peer is in the routing table,
     /// `None` otherwise. O(K) scan of the target k-bucket.
-    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<NetworkAddress> {
+    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<Multiaddr> {
         let routing = self.routing_table.read().await;
         routing.find_node_by_id(peer_id).map(|n| n.address.clone())
     }
@@ -1363,7 +1363,7 @@ impl DhtCoreEngine {
             }
         }
 
-        // NetworkAddress guarantees a valid IP — no parsing can fail.
+        // Multiaddr guarantees a valid IP — no parsing can fail.
         let candidate_ip = node.ip();
 
         // 2. Security Check: IP + Geographic Diversity
@@ -1585,7 +1585,7 @@ mod tests {
     fn make_node(byte: u8, address: &str) -> NodeInfo {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
-            address: address.parse::<NetworkAddress>().unwrap(),
+            address: address.parse::<Multiaddr>().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }
@@ -1605,7 +1605,7 @@ mod tests {
         // Touch with a new address
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
         assert!(found);
-        let expected: NetworkAddress = "5.6.7.8:9000".parse().unwrap();
+        let expected: Multiaddr = "5.6.7.8:9000".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
@@ -1618,7 +1618,7 @@ mod tests {
 
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
-        let expected: NetworkAddress = "1.2.3.4:9000".parse().unwrap();
+        let expected: Multiaddr = "1.2.3.4:9000".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
@@ -1650,7 +1650,7 @@ mod tests {
         // Touch with an empty string should NOT overwrite the valid address
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
         assert!(found);
-        let expected: NetworkAddress = "1.2.3.4:9000".parse().unwrap();
+        let expected: Multiaddr = "1.2.3.4:9000".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 

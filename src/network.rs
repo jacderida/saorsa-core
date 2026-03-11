@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
-use crate::NetworkAddress;
+use crate::Multiaddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
@@ -2149,7 +2149,7 @@ mod diversity_tests {
 pub(crate) async fn register_new_channel(
     peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
     channel_id: &str,
-    remote_addr: &NetworkAddress,
+    remote_addr: &Multiaddr,
 ) {
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {

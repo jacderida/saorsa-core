@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     let new_node = NodeDescriptor {
         id: PeerId::from_bytes([1u8; 32]),
         public_key: MlDsaPublicKey::from_bytes(&[0u8; 1952]).unwrap(),
-        addresses: vec!["192.168.1.10:8000".to_string()],
+        addresses: vec!["192.168.1.10:8000".parse().unwrap()],
         hyperbolic: None,
         som_position: None,
         trust: 0.5,

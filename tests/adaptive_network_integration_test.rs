@@ -730,7 +730,7 @@ async fn test_security_monitoring() -> anyhow::Result<()> {
     let node_descriptor = saorsa_core::adaptive::NodeDescriptor {
         id: *bad_node,
         public_key: MlDsaPublicKey::from_bytes(&[0u8; 1952]).unwrap(),
-        addresses: vec!["127.0.0.1:8080".to_string()],
+        addresses: vec!["127.0.0.1:8080".parse().unwrap()],
         hyperbolic: None,
         som_position: None,
         trust: 0.1,

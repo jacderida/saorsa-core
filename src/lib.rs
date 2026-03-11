@@ -32,12 +32,12 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use saorsa_core::{P2PNode, NodeConfig, NetworkAddress};
+//! use saorsa_core::{P2PNode, NodeConfig, Multiaddr};
 //! use std::str::FromStr;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let addr = "127.0.0.1:9000".parse::<NetworkAddress>()?;
+//!     let addr = "127.0.0.1:9000".parse::<Multiaddr>()?;
 //!     let node = P2PNode::builder()
 //!         .listen_on(addr)
 //!         .with_mcp_server()
@@ -165,7 +165,7 @@ pub mod placement;
 pub mod upgrade;
 
 // Re-export main types
-pub use address::{AddressBook, NetworkAddress};
+pub use address::{AddressBook, Multiaddr};
 pub use identity::FourWordAddress;
 
 // New spec-compliant API exports
@@ -326,11 +326,6 @@ pub use crate::placement::{
 
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
 pub use identity::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
-
-/// Network address used for peer-to-peer communication
-///
-/// Supports both traditional IP:port format and human-readable four-word format.
-pub type Multiaddr = NetworkAddress;
 
 /// Saorsa Core version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
