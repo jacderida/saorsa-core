@@ -16,9 +16,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 async fn create_node_with_transport(
-    peer_id: &str,
+    _name: &str,
 ) -> saorsa_core::Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::PeerId::from_name(peer_id);
+    let identity = Arc::new(NodeIdentity::generate().unwrap());
     let node_config = NodeConfig::builder()
         .listen_port(0)
         .ipv6(false)
@@ -34,7 +34,7 @@ async fn create_node_with_transport(
             production_config: node_config.production_config.clone(),
             event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
             max_message_size: node_config.max_message_size,
-            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
+            node_identity: identity.clone(),
             user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
             allow_loopback: true,
         })
@@ -42,7 +42,7 @@ async fn create_node_with_transport(
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer,
+        peer_id: *identity.peer_id(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),

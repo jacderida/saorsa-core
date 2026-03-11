@@ -375,18 +375,19 @@ async fn test_bidirectional_message_exchange() {
 // SPRINT 2: Peer Health Checks and Heartbeat
 // =============================================================================
 
-/// TEST 2.1: Periodic tasks update peer last_seen timestamps
+/// TEST 2.1: Connection survives idle period
 ///
-/// EXPECTED INITIAL STATE: FAIL
-/// - periodic_tasks() is currently an empty stub
+/// Verifies that an established connection remains alive after a period of
+/// inactivity (relying on QUIC transport-layer idle timeout), and that
+/// messages can still be exchanged afterwards.
 #[tokio::test]
-async fn test_periodic_tasks_updates_last_seen() {
+async fn test_connection_survives_idle_period() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("debug")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Periodic Tasks Update Last Seen ===");
+    info!("=== TEST: Connection Survives Idle Period ===");
 
     let config1 = create_test_node_config();
     let config2 = create_test_node_config();
@@ -436,7 +437,7 @@ async fn test_periodic_tasks_updates_last_seen() {
 
     assert_eq!(received, b"ping", "message content should match");
 
-    info!("=== TEST PASSED: Periodic Tasks Update Last Seen ===");
+    info!("=== TEST PASSED: Connection Survives Idle Period ===");
 }
 
 /// TEST 2.2: Disconnected peers are detected and removed

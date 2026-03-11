@@ -594,14 +594,15 @@ impl DhtNetworkManager {
     /// of new peers discovered.
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
-        let mut discovered = 0;
+        let mut seen = HashSet::new();
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        self.dial_candidate(&node.peer_id, &node.address).await;
-                        discovered += 1;
+                        if seen.insert(node.peer_id) {
+                            self.dial_candidate(&node.peer_id, &node.address).await;
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -610,7 +611,7 @@ impl DhtNetworkManager {
                 }
             }
         }
-        Ok(discovered)
+        Ok(seen.len())
     }
 
     /// Stop the DHT network manager.
@@ -1979,7 +1980,7 @@ impl DhtNetworkManager {
                 // Remove the leaving node from our routing table
                 // TODO: Implement node removal from DHT routing table
                 // let dht_guard = self.dht.write().await;
-                // if let Err(e) = dht_guard.remove_node(&message.source).await {
+                // if let Err(e) = dht_guard.remove_node(authenticated_sender).await {
                 //     warn!("Failed to remove leaving node from routing table: {}", e);
                 // }
                 Ok(DhtNetworkResult::LeaveSuccess)
@@ -2114,7 +2115,18 @@ impl DhtNetworkManager {
             },
             DhtNetworkResult::GetSuccess { key, .. } => DhtNetworkOperation::Get { key: *key },
             DhtNetworkResult::GetNotFound { key, .. } => DhtNetworkOperation::Get { key: *key },
-            DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
+            DhtNetworkResult::NodesFound { key, .. } => {
+                // Preserve the original operation type — NodesFound can be a
+                // response to FindNode, Get, or FindValue when the value is
+                // not found locally.
+                match &request.payload {
+                    DhtNetworkOperation::Get { .. } => DhtNetworkOperation::Get { key: *key },
+                    DhtNetworkOperation::FindValue { .. } => {
+                        DhtNetworkOperation::FindValue { key: *key }
+                    }
+                    _ => DhtNetworkOperation::FindNode { key: *key },
+                }
+            }
             DhtNetworkResult::ValueFound { key, .. } => {
                 DhtNetworkOperation::FindValue { key: *key }
             }

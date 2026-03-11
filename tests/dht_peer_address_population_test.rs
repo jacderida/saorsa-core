@@ -64,7 +64,7 @@ fn key_from_str(s: &str) -> Key {
 /// Returns the transport handle, config, and the generated node identity (needed for
 /// determining the app-level peer ID that other nodes will see after authentication).
 async fn create_test_dht_config(
-    peer_id: &str,
+    _name: &str,
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig, Arc<NodeIdentity>)> {
     let identity = Arc::new(
         NodeIdentity::generate().map_err(|e| anyhow::anyhow!("identity generation failed: {e}"))?,
@@ -92,7 +92,7 @@ async fn create_test_dht_config(
     );
 
     let config = DhtNetworkConfig {
-        peer_id: saorsa_core::PeerId::from_name(peer_id),
+        peer_id: *identity.peer_id(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(10),
