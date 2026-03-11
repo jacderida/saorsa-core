@@ -1323,7 +1323,7 @@ impl DhtNetworkManager {
 
             // Sort, deduplicate, and truncate once per iteration instead of per result
             best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-            best_nodes.dedup_by(|a, b| a.peer_id == b.peer_id);
+            best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
             if !found_new_closer {
@@ -1347,7 +1347,7 @@ impl DhtNetworkManager {
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-        best_nodes.dedup_by(|a, b| a.peer_id == b.peer_id);
+        best_nodes.dedup_by_key(|n| n.peer_id);
         best_nodes.truncate(count);
 
         info!(
