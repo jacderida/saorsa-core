@@ -59,7 +59,6 @@ pub enum DhtMessage {
     // Network Management
     Ping {
         timestamp: u64,
-        sender_info: NodeInfo,
     },
     Join {
         node_info: NodeInfo,
@@ -106,7 +105,6 @@ pub enum DhtResponse {
     // Management Responses
     Pong {
         timestamp: u64,
-        node_info: NodeInfo,
     },
     JoinAck {
         routing_info: RoutingInfo,
@@ -483,22 +481,7 @@ impl DhtProtocolHandler {
                 })
             }
 
-            DhtMessage::Ping {
-                timestamp,
-                sender_info: _,
-            } => {
-                let engine = self.dht_engine.read().await;
-                let local_id = *engine.node_id();
-                Ok(DhtResponse::Pong {
-                    timestamp,
-                    node_info: NodeInfo {
-                        id: local_id,
-                        address: crate::address::NetworkAddress::unspecified(),
-                        last_seen: SystemTime::now(),
-                        capacity: NodeCapacity::default(),
-                    },
-                })
-            }
+            DhtMessage::Ping { timestamp } => Ok(DhtResponse::Pong { timestamp }),
 
             _ => Ok(DhtResponse::Error {
                 code: ErrorCode::InvalidMessage,
@@ -730,15 +713,7 @@ mod tests {
         }
 
         async fn receive(&mut self) -> Result<Vec<u8>> {
-            let response = DhtResponse::Pong {
-                timestamp: 0,
-                node_info: NodeInfo {
-                    id: PeerId::from_bytes([42u8; 32]),
-                    address: "127.0.0.1:0".parse().unwrap(),
-                    last_seen: SystemTime::now(),
-                    capacity: NodeCapacity::default(),
-                },
-            };
+            let response = DhtResponse::Pong { timestamp: 0 };
             Ok(postcard::to_stdvec(&response)?)
         }
 
@@ -787,15 +762,7 @@ mod tests {
         let router = MessageRouter::new();
         let node_id = PeerId::from_bytes([42u8; 32]);
 
-        let message = DhtMessage::Ping {
-            timestamp: 0,
-            sender_info: NodeInfo {
-                id: node_id,
-                address: "127.0.0.1:0".parse().unwrap(),
-                last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
-            },
-        };
+        let message = DhtMessage::Ping { timestamp: 0 };
 
         router.queue_message(node_id, message.clone(), true).await;
         router.queue_message(node_id, message.clone(), false).await;
@@ -845,10 +812,7 @@ mod tests {
 
         network.peer_manager.add_peer(peer_info.clone()).await;
 
-        let message = DhtMessage::Ping {
-            timestamp: 0,
-            sender_info: peer_info,
-        };
+        let message = DhtMessage::Ping { timestamp: 0 };
 
         let response = network.send_message(target, message).await?;
 

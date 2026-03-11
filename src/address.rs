@@ -120,15 +120,6 @@ impl NetworkAddress {
         self.socket_addr.is_ipv6()
     }
 
-    /// Create an unspecified placeholder address (`0.0.0.0:0`).
-    ///
-    /// Used when a real address is not yet known (e.g. Pong responses
-    /// where the local listen address is not available).
-    #[must_use]
-    pub fn unspecified() -> Self {
-        Self::new(SocketAddr::from(([0, 0, 0, 0], 0)))
-    }
-
     /// Check if this is a loopback address
     pub fn is_loopback(&self) -> bool {
         self.socket_addr.ip().is_loopback()

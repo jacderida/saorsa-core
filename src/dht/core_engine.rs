@@ -1161,18 +1161,7 @@ impl DhtCoreEngine {
                     DhtResponse::FindValueReply { value: None, nodes }
                 }
             }
-            DhtMessage::Ping {
-                timestamp,
-                sender_info: _,
-            } => DhtResponse::Pong {
-                timestamp,
-                node_info: NodeInfo {
-                    id: self.node_id,
-                    address: NetworkAddress::unspecified(),
-                    last_seen: SystemTime::now(),
-                    capacity: NodeCapacity::default(),
-                },
-            },
+            DhtMessage::Ping { timestamp } => DhtResponse::Pong { timestamp },
             _ => DhtResponse::Error {
                 code: crate::dht::network_integration::ErrorCode::InvalidMessage,
                 message: "Unsupported message type".to_string(),
