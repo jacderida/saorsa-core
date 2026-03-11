@@ -392,6 +392,23 @@ impl DhtNetworkManager {
     ) -> Result<Self> {
         let dht = Self::init_dht_core(&config.peer_id)?;
 
+        // Propagate IP diversity settings from the node config into the DHT
+        // core engine so loopback/diversity overrides take effect on routing
+        // table insertion, not just bootstrap discovery.
+        if let Some(diversity) = &config.node_config.diversity_config {
+            let mut dht_guard = dht.blocking_write();
+            let mut div_cfg = diversity.clone();
+            if config.node_config.allow_loopback {
+                div_cfg.allow_loopback = true;
+            }
+            dht_guard.set_ip_diversity_config(div_cfg);
+        } else if config.node_config.allow_loopback {
+            let mut dht_guard = dht.blocking_write();
+            let mut div_cfg = crate::security::IPDiversityConfig::default();
+            div_cfg.allow_loopback = true;
+            dht_guard.set_ip_diversity_config(div_cfg);
+        }
+
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
         let maintenance_config = MaintenanceConfig::from(&config.dht_config);
         let maintenance_scheduler =

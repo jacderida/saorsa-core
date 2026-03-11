@@ -552,8 +552,7 @@ impl DhtCoreEngine {
         Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly)
     }
 
-    /// Override the IP diversity configuration (test-only).
-    #[cfg(test)]
+    /// Override the IP diversity configuration.
     pub fn set_ip_diversity_config(&mut self, config: IPDiversityConfig) {
         self.ip_diversity_config = config;
     }
