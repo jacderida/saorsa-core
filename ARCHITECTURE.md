@@ -3,7 +3,7 @@
 This repository is a Rust library crate that provides a modular, post‑quantum secure P2P foundation. It favors clear boundaries, strict linting (no panics in lib code), and testable components.
 
 ## Goals & Scope
-- Reliable QUIC transport, DHT routing, dual‑stack endpoints (IPv6 + IPv4), and human‑readable endpoint encoding.
+- Reliable QUIC transport, DHT routing, and dual‑stack endpoints (IPv6 + IPv4).
 - Strong security defaults using saorsa‑pqc, safe memory, and validation.
 - Extensible higher‑level applications live above this crate (saorsa-node).
 
@@ -51,10 +51,6 @@ tokio::spawn(async move {
     }
 });
 ```
-
-## Notes
-- Four‑word encoding/decoding is handled by the `four-word-networking` crate and is used only for network endpoints.
-- IPv4+port encodes to 4 words; decoding returns both IP and port. IPv6 word count is decided by the crate.
 
 ## Concurrency & Errors
 - Async with `tokio`; prefer `Send + Sync` types and bounded channels where applicable.

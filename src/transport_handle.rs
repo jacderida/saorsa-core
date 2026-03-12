@@ -574,7 +574,7 @@ impl TransportHandle {
         // Parse via Multiaddr for consistent Multiaddr support
         let socket_addr: SocketAddr = address
             .parse::<Multiaddr>()
-            .map(|na| na.socket_addr())
+            .map(|na| na.socket_addr)
             .map_err(|e| {
                 P2PError::Network(NetworkError::InvalidAddress(
                     format!("{}: {}", address, e).into(),

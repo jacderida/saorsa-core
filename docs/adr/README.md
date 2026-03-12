@@ -21,11 +21,10 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | [ADR-002](./ADR-002-delegated-transport.md) | Delegated Transport via saorsa-transport | Accepted | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
 | [ADR-003](./ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | Accepted | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
 
-### Identity & Addressing
+### Identity
 
 | ADR | Title | Status | Summary |
 |-----|-------|--------|---------|
-| [ADR-004](./ADR-004-four-word-addresses.md) | Four-Word Human-Readable Addresses | Accepted | Human-friendly addressing via word encoding |
 | [ADR-012](./ADR-012-identity-without-pow.md) | Identity without Proof-of-Work | Accepted | Pure cryptographic identity using ML-DSA |
 
 ### Security & Trust

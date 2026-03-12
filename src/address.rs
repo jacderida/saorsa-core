@@ -66,11 +66,6 @@ impl Multiaddr {
         self.socket_addr.port()
     }
 
-    /// Get the socket address
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.socket_addr
-    }
-
     /// Check if this is an IPv4 address
     pub fn is_ipv4(&self) -> bool {
         self.socket_addr.is_ipv4()

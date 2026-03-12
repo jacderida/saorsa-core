@@ -66,7 +66,7 @@ impl NodeInfo {
     /// guarantees a valid `SocketAddr`.
     #[must_use]
     pub fn socket_addr(&self) -> SocketAddr {
-        self.address.socket_addr()
+        self.address.socket_addr
     }
 
     /// Get the IP address. Always succeeds because `Multiaddr`

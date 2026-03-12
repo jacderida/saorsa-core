@@ -1805,7 +1805,7 @@ impl P2PNode {
                 self.config.bootstrap_peers.len()
             );
             for multiaddr in &self.config.bootstrap_peers {
-                let socket_addr = multiaddr.socket_addr();
+                let socket_addr = multiaddr.socket_addr;
                 seen_addresses.insert(socket_addr);
                 // Use a zero sentinel PeerId — the real identity comes
                 // from wait_for_peer_identity() after connecting.
