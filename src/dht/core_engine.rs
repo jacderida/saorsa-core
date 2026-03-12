@@ -524,9 +524,9 @@ pub struct DhtCoreEngine {
     ip_diversity_config: IPDiversityConfig,
     /// Allow loopback addresses in the routing table.
     ///
-    /// Single source of truth: propagated from `NodeConfig.allow_loopback` at
-    /// construction, kept separate from `IPDiversityConfig` to prevent
-    /// duplication and drift.
+    /// Set once at construction from `NodeConfig.allow_loopback` and never
+    /// mutated — `NodeConfig` is the single source of truth. Kept separate
+    /// from `IPDiversityConfig` to prevent duplication and drift.
     allow_loopback: bool,
     /// Maximum nodes per geographic region.
     geo_max_per_region: usize,
@@ -549,13 +549,13 @@ pub struct DhtCoreEngine {
 impl DhtCoreEngine {
     /// Create new DHT engine with specified node ID
     pub fn new(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict)
+        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict, false)
     }
 
     /// Create new DHT engine for testing (permissive validation)
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly)
+        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly, false)
     }
 
     /// Override the IP diversity configuration.
@@ -564,9 +564,8 @@ impl DhtCoreEngine {
     }
 
     /// Set whether loopback addresses are allowed in the routing table.
-    ///
-    /// This is the single authority for loopback gating in the DHT core;
-    /// it should be set from `NodeConfig.allow_loopback` at construction.
+    /// Only available in test builds — production code sets this at construction.
+    #[cfg(test)]
     pub fn set_allow_loopback(&mut self, allow: bool) {
         self.allow_loopback = allow;
     }
@@ -575,6 +574,7 @@ impl DhtCoreEngine {
     pub(crate) fn new_with_validation_mode(
         node_id: PeerId,
         enforcement_mode: CloseGroupEnforcementMode,
+        allow_loopback: bool,
     ) -> Result<Self> {
         // Initialize security components
         let security_metrics = Arc::new(SecurityMetricsCollector::new());
@@ -605,7 +605,7 @@ impl DhtCoreEngine {
             close_group_validator,
             eviction_manager,
             ip_diversity_config: IPDiversityConfig::default(),
-            allow_loopback: false,
+            allow_loopback,
             geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
             transport: None,
             pending_requests: Arc::new(RwLock::new(LruCache::new(
