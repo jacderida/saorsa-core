@@ -165,7 +165,7 @@ pub mod placement;
 pub mod upgrade;
 
 // Re-export main types
-pub use address::{AddressBook, MultiAddr, Transport};
+pub use address::{AddressBook, MultiAddr, TransportAddr};
 
 // New spec-compliant API exports
 pub use auth::{

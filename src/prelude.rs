@@ -30,7 +30,7 @@
 pub use crate::error::{P2PError, P2pResult as Result};
 
 /// Network address types
-pub use crate::address::{AddressBook, MultiAddr, Transport};
+pub use crate::address::{AddressBook, MultiAddr, TransportAddr};
 
 // ============================================================================
 // Network & Node Types

@@ -14,7 +14,8 @@
 //! # Address Types
 //!
 //! Composable, self-describing multi-transport address type for the Saorsa P2P
-//! network.
+//! network. Wraps [`saorsa_transport::TransportAddr`] with an optional
+//! [`PeerId`] suffix.
 //!
 //! ## Canonical string format
 //!
@@ -23,11 +24,11 @@
 //! /ip6/<ipv6>/udp/<port>/quic[/p2p/<peer-id>]
 //! /ip4/<ipv4>/tcp/<port>[/p2p/<peer-id>]
 //! /ip6/<ipv6>/tcp/<port>[/p2p/<peer-id>]
+//! /ip4/<ipv4>/udp/<port>[/p2p/<peer-id>]
 //! /bt/<AA:BB:CC:DD:EE:FF>/rfcomm/<channel>[/p2p/<peer-id>]
 //! /ble/<AA:BB:CC:DD:EE:FF>/l2cap/<psm>[/p2p/<peer-id>]
 //! /lora/<hex-dev-addr>/<freq-hz>[/p2p/<peer-id>]
 //! /lorawan/<hex-dev-eui>[/p2p/<peer-id>]
-//! /p2p/<peer-id>
 //! ```
 
 use std::fmt::{self, Display};
@@ -37,87 +38,42 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+pub use saorsa_transport::transport::TransportAddr;
+
 use crate::identity::peer_id::PeerId;
-
-/// Transport protocol and its addressing parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Transport {
-    /// QUIC over UDP (primary Saorsa transport).
-    Quic(SocketAddr),
-    /// Plain TCP.
-    Tcp(SocketAddr),
-    /// Classic Bluetooth RFCOMM.
-    Bluetooth {
-        /// 6-byte MAC address.
-        mac: [u8; 6],
-        /// RFCOMM channel number.
-        channel: u8,
-    },
-    /// Bluetooth Low Energy L2CAP.
-    Ble {
-        /// 6-byte MAC address.
-        mac: [u8; 6],
-        /// Protocol/Service Multiplexer.
-        psm: u16,
-    },
-    /// LoRa point-to-point.
-    LoRa {
-        /// 4-byte device address.
-        dev_addr: u32,
-        /// Frequency in Hz.
-        freq_hz: u32,
-    },
-    /// LoRaWAN (network-managed).
-    LoRaWan {
-        /// 8-byte Device EUI.
-        dev_eui: u64,
-    },
-}
-
-impl Transport {
-    /// Human-readable transport kind for logging / metrics.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Transport::Quic(_) => "quic",
-            Transport::Tcp(_) => "tcp",
-            Transport::Bluetooth { .. } => "bluetooth",
-            Transport::Ble { .. } => "ble",
-            Transport::LoRa { .. } => "lora",
-            Transport::LoRaWan { .. } => "lorawan",
-        }
-    }
-}
 
 /// Composable, self-describing network address with an optional [`PeerId`]
 /// suffix.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Wraps a [`TransportAddr`] (which describes *how* to reach a network
+/// endpoint) with an optional peer identity (which describes *who* is behind
+/// it).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiAddr {
-    transport: Transport,
+    transport: TransportAddr,
     peer_id: Option<PeerId>,
 }
 
 impl MultiAddr {
-    /// Create a `MultiAddr` from a [`Transport`].
+    /// Create a `MultiAddr` from a [`TransportAddr`].
     #[must_use]
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(transport: TransportAddr) -> Self {
         Self {
             transport,
             peer_id: None,
         }
     }
 
-    /// Shorthand for `Transport::Quic`.
+    /// Shorthand for `TransportAddr::Quic`.
     #[must_use]
     pub fn quic(addr: SocketAddr) -> Self {
-        Self::new(Transport::Quic(addr))
+        Self::new(TransportAddr::Quic(addr))
     }
 
-    /// Shorthand for `Transport::Tcp`.
+    /// Shorthand for `TransportAddr::Tcp`.
     #[must_use]
     pub fn tcp(addr: SocketAddr) -> Self {
-        Self::new(Transport::Tcp(addr))
+        Self::new(TransportAddr::Tcp(addr))
     }
 
     /// Builder: attach a [`PeerId`] to this address.
@@ -149,9 +105,9 @@ impl MultiAddr {
     // Accessors
     // -----------------------------------------------------------------------
 
-    /// The underlying transport.
+    /// The underlying transport address.
     #[must_use]
-    pub fn transport(&self) -> &Transport {
+    pub fn transport(&self) -> &TransportAddr {
         &self.transport
     }
 
@@ -161,14 +117,11 @@ impl MultiAddr {
         self.peer_id.as_ref()
     }
 
-    /// Returns the socket address for IP-based transports (`Quic`, `Tcp`),
-    /// `None` for non-IP transports.
+    /// Returns the socket address for IP-based transports (`Quic`, `Tcp`,
+    /// `Udp`), `None` for non-IP transports.
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        match &self.transport {
-            Transport::Quic(a) | Transport::Tcp(a) => Some(*a),
-            _ => None,
-        }
+        self.transport.as_socket_addr()
     }
 
     /// Returns the IP address for IP-based transports, `None` otherwise.
@@ -213,41 +166,12 @@ impl MultiAddr {
 }
 
 // ---------------------------------------------------------------------------
-// Display — canonical `/`-delimited format
+// Display — delegates transport part to TransportAddr, appends /p2p/ suffix
 // ---------------------------------------------------------------------------
 
 impl Display for MultiAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.transport {
-            Transport::Quic(addr) => match addr.ip() {
-                IpAddr::V4(ip) => write!(f, "/ip4/{}/udp/{}/quic", ip, addr.port())?,
-                IpAddr::V6(ip) => write!(f, "/ip6/{}/udp/{}/quic", ip, addr.port())?,
-            },
-            Transport::Tcp(addr) => match addr.ip() {
-                IpAddr::V4(ip) => write!(f, "/ip4/{}/tcp/{}", ip, addr.port())?,
-                IpAddr::V6(ip) => write!(f, "/ip6/{}/tcp/{}", ip, addr.port())?,
-            },
-            Transport::Bluetooth { mac, channel } => {
-                write!(
-                    f,
-                    "/bt/{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}/rfcomm/{}",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], channel
-                )?;
-            }
-            Transport::Ble { mac, psm } => {
-                write!(
-                    f,
-                    "/ble/{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}/l2cap/{}",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], psm
-                )?;
-            }
-            Transport::LoRa { dev_addr, freq_hz } => {
-                write!(f, "/lora/{:08x}/{}", dev_addr, freq_hz)?;
-            }
-            Transport::LoRaWan { dev_eui } => {
-                write!(f, "/lorawan/{:016x}", dev_eui)?;
-            }
-        }
+        write!(f, "{}", self.transport)?;
         if let Some(pid) = &self.peer_id {
             write!(f, "/p2p/{}", pid.to_hex())?;
         }
@@ -256,205 +180,81 @@ impl Display for MultiAddr {
 }
 
 // ---------------------------------------------------------------------------
-// FromStr — canonical format only
+// FromStr — strips /p2p/ suffix, delegates transport parsing to TransportAddr
 // ---------------------------------------------------------------------------
 
 impl FromStr for MultiAddr {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.is_empty() {
-            return Err(anyhow!("Invalid address format: {}", s));
+        if s.is_empty() {
+            return Err(anyhow!("Invalid address format: empty string"));
         }
 
-        // Peer-only: /p2p/<hex>
-        if parts[0] == "p2p" {
-            // Peer-only addresses aren't routable without a transport layer.
-            return Err(anyhow!(
-                "Peer-only addresses (/p2p/<id>) are not yet supported as standalone MultiAddr"
-            ));
-        }
+        // Look for /p2p/ suffix (find last occurrence to be safe).
+        if let Some(p2p_idx) = s.rfind("/p2p/") {
+            let transport_part = &s[..p2p_idx];
+            let peer_hex = &s[p2p_idx + 5..]; // skip "/p2p/"
 
-        // IP-based formats
-        if parts[0] == "ip4" || parts[0] == "ip6" {
-            return parse_ip_addr(&parts, s);
-        }
-
-        // Bluetooth: /bt/<MAC>/rfcomm/<channel>
-        if parts[0] == "bt" {
-            return parse_bluetooth(&parts, s);
-        }
-
-        // BLE: /ble/<MAC>/l2cap/<psm>
-        if parts[0] == "ble" {
-            return parse_ble(&parts, s);
-        }
-
-        // LoRa: /lora/<dev-addr>/<freq-hz>
-        if parts[0] == "lora" {
-            return parse_lora(&parts, s);
-        }
-
-        // LoRaWAN: /lorawan/<dev-eui>
-        if parts[0] == "lorawan" {
-            return parse_lorawan(&parts, s);
-        }
-
-        Err(anyhow!("Invalid address format: {}", s))
-    }
-}
-
-/// Parse `/ip4/...` or `/ip6/...` addresses.
-fn parse_ip_addr(parts: &[&str], original: &str) -> Result<MultiAddr> {
-    // Minimum: ["ip4", ip, proto, port] or ["ip4", ip, "udp", port, "quic"]
-    if parts.len() < 4 {
-        return Err(anyhow!("Invalid IP address format: {}", original));
-    }
-
-    let ip: IpAddr = parts[1]
-        .parse()
-        .map_err(|_| anyhow!("Invalid IP address: {}", parts[1]))?;
-
-    // Validate ip4/ip6 matches actual address type
-    match (parts[0], &ip) {
-        ("ip4", IpAddr::V4(_)) | ("ip6", IpAddr::V6(_)) => {}
-        _ => return Err(anyhow!("IP version mismatch in: {}", original)),
-    }
-
-    let proto = parts[2];
-    let (transport, peer_start) = match proto {
-        "tcp" => {
-            let port: u16 = parts[3]
-                .parse()
-                .map_err(|_| anyhow!("Invalid port: {}", parts[3]))?;
-            (Transport::Tcp(SocketAddr::new(ip, port)), 4)
-        }
-        "udp" => {
-            let port: u16 = parts[3]
-                .parse()
-                .map_err(|_| anyhow!("Invalid port: {}", parts[3]))?;
-            // Must be followed by "quic"
-            if parts.len() < 5 || parts[4] != "quic" {
+            // Reject standalone /p2p/<id> with no transport.
+            if transport_part.is_empty() {
                 return Err(anyhow!(
-                    "UDP addresses must include /quic suffix: {}",
-                    original
+                    "Peer-only addresses (/p2p/<id>) are not yet supported as standalone MultiAddr"
                 ));
             }
-            (Transport::Quic(SocketAddr::new(ip, port)), 5)
+
+            // Reject trailing garbage after peer ID.
+            if peer_hex.contains('/') {
+                return Err(anyhow!(
+                    "Unexpected trailing components after peer ID in: {}",
+                    s
+                ));
+            }
+
+            let transport = transport_part
+                .parse::<TransportAddr>()
+                .map_err(|e| anyhow!("Invalid transport address: {}", e))?;
+            let peer_id = PeerId::from_hex(peer_hex)
+                .map_err(|e| anyhow!("Invalid peer ID in address: {}", e))?;
+
+            Ok(MultiAddr {
+                transport,
+                peer_id: Some(peer_id),
+            })
+        } else {
+            // No /p2p/ suffix — pure transport address.
+            let transport = s
+                .parse::<TransportAddr>()
+                .map_err(|e| anyhow!("Invalid address: {}", e))?;
+
+            Ok(MultiAddr {
+                transport,
+                peer_id: None,
+            })
         }
-        _ => {
-            return Err(anyhow!(
-                "Unsupported IP protocol '{}' in: {}",
-                proto,
-                original
-            ));
-        }
-    };
-
-    let peer_id = parse_optional_peer_id(parts, peer_start)?;
-    Ok(MultiAddr { transport, peer_id })
-}
-
-/// Parse `/bt/<MAC>/rfcomm/<channel>`.
-fn parse_bluetooth(parts: &[&str], original: &str) -> Result<MultiAddr> {
-    if parts.len() < 4 || parts[2] != "rfcomm" {
-        return Err(anyhow!("Invalid Bluetooth address: {}", original));
-    }
-    let mac = parse_mac(parts[1])?;
-    let channel: u8 = parts[3]
-        .parse()
-        .map_err(|_| anyhow!("Invalid RFCOMM channel: {}", parts[3]))?;
-    let peer_id = parse_optional_peer_id(parts, 4)?;
-    Ok(MultiAddr {
-        transport: Transport::Bluetooth { mac, channel },
-        peer_id,
-    })
-}
-
-/// Parse `/ble/<MAC>/l2cap/<psm>`.
-fn parse_ble(parts: &[&str], original: &str) -> Result<MultiAddr> {
-    if parts.len() < 4 || parts[2] != "l2cap" {
-        return Err(anyhow!("Invalid BLE address: {}", original));
-    }
-    let mac = parse_mac(parts[1])?;
-    let psm: u16 = parts[3]
-        .parse()
-        .map_err(|_| anyhow!("Invalid L2CAP PSM: {}", parts[3]))?;
-    let peer_id = parse_optional_peer_id(parts, 4)?;
-    Ok(MultiAddr {
-        transport: Transport::Ble { mac, psm },
-        peer_id,
-    })
-}
-
-/// Parse `/lora/<hex-dev-addr>/<freq-hz>`.
-fn parse_lora(parts: &[&str], original: &str) -> Result<MultiAddr> {
-    if parts.len() < 3 {
-        return Err(anyhow!("Invalid LoRa address: {}", original));
-    }
-    let dev_addr = u32::from_str_radix(parts[1], 16)
-        .map_err(|_| anyhow!("Invalid LoRa dev_addr hex: {}", parts[1]))?;
-    let freq_hz: u32 = parts[2]
-        .parse()
-        .map_err(|_| anyhow!("Invalid LoRa freq_hz: {}", parts[2]))?;
-    let peer_id = parse_optional_peer_id(parts, 3)?;
-    Ok(MultiAddr {
-        transport: Transport::LoRa { dev_addr, freq_hz },
-        peer_id,
-    })
-}
-
-/// Parse `/lorawan/<hex-dev-eui>`.
-fn parse_lorawan(parts: &[&str], original: &str) -> Result<MultiAddr> {
-    if parts.len() < 2 {
-        return Err(anyhow!("Invalid LoRaWAN address: {}", original));
-    }
-    let dev_eui = u64::from_str_radix(parts[1], 16)
-        .map_err(|_| anyhow!("Invalid LoRaWAN dev_eui hex: {}", parts[1]))?;
-    let peer_id = parse_optional_peer_id(parts, 2)?;
-    Ok(MultiAddr {
-        transport: Transport::LoRaWan { dev_eui },
-        peer_id,
-    })
-}
-
-/// Parse an optional `/p2p/<hex>` suffix starting at `start_index`.
-fn parse_optional_peer_id(parts: &[&str], start_index: usize) -> Result<Option<PeerId>> {
-    if parts.len() <= start_index {
-        return Ok(None);
-    }
-    if parts[start_index] == "p2p" && parts.len() > start_index + 1 {
-        if parts.len() > start_index + 2 {
-            return Err(anyhow!(
-                "Unexpected trailing components after peer ID: {:?}",
-                &parts[start_index + 2..]
-            ));
-        }
-        let peer_id = PeerId::from_hex(parts[start_index + 1])
-            .map_err(|e| anyhow!("Invalid peer ID in address: {}", e))?;
-        Ok(Some(peer_id))
-    } else {
-        Err(anyhow!(
-            "Unexpected trailing components: {:?}",
-            &parts[start_index..]
-        ))
     }
 }
 
-/// Parse a colon-separated MAC address string into 6 bytes.
-fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 6 {
-        return Err(anyhow!("Invalid MAC address (expected 6 octets): {}", s));
+// ---------------------------------------------------------------------------
+// Serde — serialize as canonical string
+// ---------------------------------------------------------------------------
+
+impl Serialize for MultiAddr {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
     }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)
-            .map_err(|_| anyhow!("Invalid MAC octet '{}' in: {}", part, s))?;
-    }
-    Ok(mac)
 }
+
+impl<'de> Deserialize<'de> for MultiAddr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<MultiAddr>().map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AddressBook
+// ---------------------------------------------------------------------------
 
 /// Collection of network addresses for a peer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,7 +372,7 @@ pub mod serde_as_string {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv6Addr;
 
     #[test]
     fn test_network_address_creation() {
@@ -633,7 +433,7 @@ mod tests {
         let addr = "/ip4/192.168.1.1/tcp/9000".parse::<MultiAddr>().unwrap();
         assert_eq!(addr.ip(), Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert_eq!(addr.port(), Some(9000));
-        assert!(matches!(addr.transport(), Transport::Tcp(_)));
+        assert!(matches!(addr.transport(), TransportAddr::Tcp(_)));
     }
 
     #[test]
@@ -641,7 +441,14 @@ mod tests {
         let addr = "/ip4/10.0.0.1/udp/9000/quic".parse::<MultiAddr>().unwrap();
         assert_eq!(addr.ip(), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(addr.port(), Some(9000));
-        assert!(matches!(addr.transport(), Transport::Quic(_)));
+        assert!(matches!(addr.transport(), TransportAddr::Quic(_)));
+    }
+
+    #[test]
+    fn test_multiaddr_raw_udp_parsing() {
+        let addr = "/ip4/10.0.0.1/udp/5000".parse::<MultiAddr>().unwrap();
+        assert_eq!(addr.port(), Some(5000));
+        assert!(matches!(addr.transport(), TransportAddr::Udp(_)));
     }
 
     #[test]
@@ -673,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_bluetooth_roundtrip() {
-        let addr = MultiAddr::new(Transport::Bluetooth {
+        let addr = MultiAddr::new(TransportAddr::Bluetooth {
             mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             channel: 5,
         });
@@ -685,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_ble_roundtrip() {
-        let addr = MultiAddr::new(Transport::Ble {
+        let addr = MultiAddr::new(TransportAddr::Ble {
             mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
             psm: 128,
         });
@@ -697,8 +504,8 @@ mod tests {
 
     #[test]
     fn test_lora_roundtrip() {
-        let addr = MultiAddr::new(Transport::LoRa {
-            dev_addr: 0xDEAD_BEEF,
+        let addr = MultiAddr::new(TransportAddr::LoRa {
+            dev_addr: [0xDE, 0xAD, 0xBE, 0xEF],
             freq_hz: 868_000_000,
         });
         let s = addr.to_string();
@@ -709,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_lorawan_roundtrip() {
-        let addr = MultiAddr::new(Transport::LoRaWan {
+        let addr = MultiAddr::new(TransportAddr::LoRaWan {
             dev_eui: 0x0011_2233_4455_6677,
         });
         let s = addr.to_string();
@@ -731,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_non_ip_transport_accessors() {
-        let addr = MultiAddr::new(Transport::Bluetooth {
+        let addr = MultiAddr::new(TransportAddr::Bluetooth {
             mac: [0; 6],
             channel: 1,
         });
@@ -746,8 +553,6 @@ mod tests {
 
     #[test]
     fn test_serde_as_string_roundtrip() {
-        use serde::{Deserialize, Serialize};
-
         #[derive(Serialize, Deserialize)]
         struct Wrapper {
             #[serde(with = "super::serde_as_string")]
@@ -767,17 +572,26 @@ mod tests {
     }
 
     #[test]
+    fn test_serde_direct_roundtrip() {
+        let addr = MultiAddr::from_ipv4(Ipv4Addr::new(10, 0, 0, 1), 9000);
+        let json = serde_json::to_string(&addr).unwrap();
+        assert_eq!(json, r#""/ip4/10.0.0.1/udp/9000/quic""#);
+        let recovered: MultiAddr = serde_json::from_str(&json).unwrap();
+        assert_eq!(addr, recovered);
+    }
+
+    #[test]
     fn test_transport_kind() {
         assert_eq!(
-            Transport::Quic(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).kind(),
+            TransportAddr::Quic(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).kind(),
             "quic"
         );
         assert_eq!(
-            Transport::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).kind(),
+            TransportAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).kind(),
             "tcp"
         );
         assert_eq!(
-            Transport::Bluetooth {
+            TransportAddr::Bluetooth {
                 mac: [0; 6],
                 channel: 0
             }
@@ -790,7 +604,7 @@ mod tests {
     fn test_invalid_format_rejected() {
         assert!("127.0.0.1:8080".parse::<MultiAddr>().is_err());
         assert!("garbage".parse::<MultiAddr>().is_err());
-        assert!("/ip4/127.0.0.1/udp/8080".parse::<MultiAddr>().is_err()); // missing /quic
         assert!("/ip4/not-an-ip/tcp/80".parse::<MultiAddr>().is_err());
+        assert!("".parse::<MultiAddr>().is_err());
     }
 }
