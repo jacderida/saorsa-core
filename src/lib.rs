@@ -37,7 +37,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let addr = "127.0.0.1:9000".parse::<MultiAddr>()?;
+//!     let addr = "/ip4/127.0.0.1/udp/9000/quic".parse::<MultiAddr>()?;
 //!     let node = P2PNode::builder()
 //!         .listen_on(addr)
 //!         .with_mcp_server()
@@ -165,7 +165,7 @@ pub mod placement;
 pub mod upgrade;
 
 // Re-export main types
-pub use address::{AddressBook, MultiAddr};
+pub use address::{AddressBook, MultiAddr, Transport};
 
 // New spec-compliant API exports
 pub use auth::{

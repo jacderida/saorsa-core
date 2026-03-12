@@ -270,7 +270,7 @@ mod tests {
     fn make_node(id_byte: u8) -> NodeInfo {
         NodeInfo {
             id: PeerId::from_bytes([id_byte; 32]),
-            address: format!("127.0.0.1:{}", 9000 + id_byte as u16)
+            address: format!("/ip4/127.0.0.1/udp/{}/quic", 9000 + id_byte as u16)
                 .parse()
                 .unwrap(),
             last_seen: SystemTime::now(),

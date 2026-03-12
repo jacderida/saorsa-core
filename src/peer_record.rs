@@ -489,7 +489,9 @@ mod tests {
     fn create_test_endpoint() -> PeerEndpoint {
         PeerEndpoint::new(
             EndpointId::new(),
-            "192.168.1.1:8080".parse::<MultiAddr>().unwrap(),
+            "/ip4/192.168.1.1/udp/8080/quic"
+                .parse::<MultiAddr>()
+                .unwrap(),
             NatType::FullCone,
             vec!["coordinator1".to_string()],
             Some("test-device".to_string()),

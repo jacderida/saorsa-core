@@ -30,25 +30,8 @@ pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, Re
 
 use crate::validation::{Validate, ValidationContext, validate_message_size};
 use crate::{P2PError, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt;
 use std::time::{Duration, Instant};
-
-/// Transport protocol types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TransportType {
-    /// QUIC transport protocol with NAT traversal
-    QUIC,
-}
-
-/// Transport selection strategy (simplified for QUIC-only)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub enum TransportSelection {
-    /// Use QUIC transport (default and only option)
-    #[default]
-    QUIC,
-}
 
 /// Connection quality metrics
 #[derive(Debug, Clone)]
@@ -66,10 +49,10 @@ pub struct ConnectionQuality {
 }
 
 /// Connection information
+///
+/// The transport kind is derivable from `remote_addr.transport().kind()`.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
-    /// Transport type being used
-    pub transport_type: TransportType,
     /// Local address
     pub local_addr: crate::MultiAddr,
     /// Remote address
@@ -152,14 +135,6 @@ pub struct TransportOptions {
     pub max_message_size: usize,
 }
 
-impl fmt::Display for TransportType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransportType::QUIC => write!(f, "quic"),
-        }
-    }
-}
-
 impl Default for TransportOptions {
     fn default() -> Self {
         Self {
@@ -184,37 +159,9 @@ impl Default for ConnectionQuality {
     }
 }
 
-/// Legacy transport types module for backward compatibility
-pub mod transport_types {
-    pub use super::TransportType;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_transport_type_display() {
-        assert_eq!(format!("{}", TransportType::QUIC), "quic");
-    }
-
-    #[test]
-    fn test_transport_type_serialization() {
-        let quic_type = TransportType::QUIC;
-        assert_eq!(quic_type, TransportType::QUIC);
-    }
-
-    #[test]
-    fn test_transport_selection_variants() {
-        let quic_selection = TransportSelection::QUIC;
-        assert!(matches!(quic_selection, TransportSelection::QUIC));
-    }
-
-    #[test]
-    fn test_transport_selection_default() {
-        let default = TransportSelection::default();
-        assert!(matches!(default, TransportSelection::QUIC));
-    }
 
     #[test]
     fn test_transport_options_default() {

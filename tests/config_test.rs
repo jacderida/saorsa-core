@@ -160,8 +160,8 @@ fn test_node_config_from_config() {
 fn test_bootstrap_address_parsing() {
     let mut config = Config::default();
     config.network.bootstrap_nodes = vec![
-        "192.168.1.1:9000".to_string(),
-        "10.0.0.2:9001".to_string(),
+        "/ip4/192.168.1.1/udp/9000/quic".to_string(),
+        "/ip4/10.0.0.2/udp/9001/quic".to_string(),
         "/ip4/10.0.0.1/tcp/9002".to_string(),
     ];
 

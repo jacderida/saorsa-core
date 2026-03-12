@@ -70,9 +70,8 @@ const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DHT node representation for network operations.
 ///
-/// The `address` field stores a typed [`MultiAddr`] for consistent
-/// MultiAddr support.  Serializes as a plain `"ip:port"` string for
-/// wire-protocol compatibility.
+/// The `address` field stores a typed [`MultiAddr`]. Serializes as
+/// a canonical `/`-delimited string via `serde_as_string`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DHTNode {
     pub peer_id: PeerId,
@@ -1404,7 +1403,7 @@ impl DhtNetworkManager {
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
             peer_id: self.config.peer_id,
-            address: MultiAddr::from(self.config.node_config.listen_addr),
+            address: MultiAddr::quic(self.config.node_config.listen_addr),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1419,14 +1418,14 @@ impl DhtNetworkManager {
     /// Parse the first valid address from a list of transport-reported address
     /// strings into a [`MultiAddr`].
     ///
-    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
-    /// `/ip4/1.2.3.4/udp/9000`).  Unspecified (`0.0.0.0`) addresses are
+    /// Accepts canonical MultiAddr format (e.g.
+    /// `/ip4/1.2.3.4/udp/9000/quic`).  Unspecified (`0.0.0.0`) addresses are
     /// rejected.  Loopback addresses are accepted for local/test use.
     fn first_valid_address(addresses: &[String]) -> Option<MultiAddr> {
         for addr_str in addresses {
             match addr_str.parse::<MultiAddr>() {
                 Ok(addr) => {
-                    if addr.ip().is_unspecified() {
+                    if addr.ip().is_some_and(|ip| ip.is_unspecified()) {
                         warn!("Rejecting unspecified address: {addr_str}");
                         continue;
                     }
@@ -1777,7 +1776,7 @@ impl DhtNetworkManager {
         }
 
         // Reject unspecified addresses before attempting the connection.
-        if address.ip().is_unspecified() {
+        if address.ip().is_some_and(|ip| ip.is_unspecified()) {
             debug!(
                 "dial_candidate: rejecting unspecified address for {}: {}",
                 peer_hex, address
@@ -2216,9 +2215,8 @@ impl DhtNetworkManager {
             .await
             .and_then(|info| Self::first_valid_address(&info.addresses));
 
-        let addr_string = current_address.map(|a| a.to_string());
         let dht = self.dht.read().await;
-        if dht.touch_node(&app_peer_id, addr_string.as_deref()).await {
+        if dht.touch_node(&app_peer_id, current_address.as_ref()).await {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
     }

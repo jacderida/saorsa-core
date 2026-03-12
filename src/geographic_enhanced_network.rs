@@ -360,16 +360,14 @@ pub mod integration_helpers {
 
     /// Extract peer ID from address (helper function)
     pub fn extract_peer_id_from_address(address: &MultiAddr) -> String {
-        // Reconstruct a multiaddr-like string from MultiAddr
-        let ip = address.ip();
-        let port = address.port();
-        match ip {
-            std::net::IpAddr::V4(v4) => {
+        match (address.ip(), address.port()) {
+            (Some(std::net::IpAddr::V4(v4)), Some(port)) => {
                 format!("peer_from__ip4_{}_tcp_{}", v4, port)
             }
-            std::net::IpAddr::V6(v6) => {
+            (Some(std::net::IpAddr::V6(v6)), Some(port)) => {
                 format!("peer_from__ip6_{}_tcp_{}", v6, port)
             }
+            _ => format!("peer_from_{}", address),
         }
     }
 }
@@ -413,7 +411,7 @@ mod tests {
     #[test]
     fn test_peer_id_extraction() {
         let addr: MultiAddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
-        let peer_id = integration_helpers::extract_peer_id_from_address(&addr);
-        assert_eq!(peer_id, "peer_from__ip4_159.89.81.21_tcp_9110");
+        let peer_str = integration_helpers::extract_peer_id_from_address(&addr);
+        assert_eq!(peer_str, "peer_from__ip4_159.89.81.21_tcp_9110");
     }
 }

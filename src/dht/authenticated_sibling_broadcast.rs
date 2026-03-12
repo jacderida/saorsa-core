@@ -611,7 +611,7 @@ mod tests {
     fn create_test_node() -> DHTNode {
         DHTNode {
             id: random_node_id(),
-            address: "127.0.0.1:8000".parse().unwrap(),
+            address: "/ip4/127.0.0.1/udp/8000/quic".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }

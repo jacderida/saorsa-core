@@ -197,7 +197,7 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
     let test_node = saorsa_core::adaptive::NodeDescriptor {
         id: PeerId::from_bytes([1u8; 32]),
         public_key: MlDsaPublicKey::from_bytes(&vec![0u8; 1952])?,
-        addresses: vec!["192.168.1.100:8080".parse().unwrap()],
+        addresses: vec!["/ip4/192.168.1.100/udp/8080/quic".parse().unwrap()],
         hyperbolic: None,
         som_position: None,
         trust: 0.8,

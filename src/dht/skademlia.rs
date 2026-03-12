@@ -1798,7 +1798,7 @@ mod tests {
         let port = 9000u16 + distance_bytes[0] as u16;
         NodeInfo {
             id: PeerId::new(&distance_bytes),
-            address: format!("127.0.0.1:{port}").parse().unwrap(),
+            address: format!("/ip4/127.0.0.1/udp/{port}/quic").parse().unwrap(),
             last_seen: std::time::SystemTime::now(),
             capacity: NodeCapacity::default(),
         }

@@ -97,8 +97,7 @@ impl GeographicNetworkIntegration {
 
     /// Extract IP address from multiaddr
     fn extract_ip_from_multiaddr(&self, address: &MultiAddr) -> Option<IpAddr> {
-        // MultiAddr directly contains the IP address
-        Some(address.ip())
+        address.ip()
     }
 
     /// Determine geographic region from IP address

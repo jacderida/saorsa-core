@@ -779,7 +779,7 @@ mod tests {
 
         let node_info = NodeInfo {
             id: PeerId::from_bytes([42u8; 32]),
-            address: "127.0.0.1:0".parse().unwrap(),
+            address: "/ip4/127.0.0.1/udp/0/quic".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };
@@ -805,7 +805,7 @@ mod tests {
         let target = PeerId::from_bytes([42u8; 32]);
         let peer_info = NodeInfo {
             id: target,
-            address: "127.0.0.1:0".parse().unwrap(),
+            address: "/ip4/127.0.0.1/udp/0/quic".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };

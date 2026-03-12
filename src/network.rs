@@ -1805,7 +1805,10 @@ impl P2PNode {
                 self.config.bootstrap_peers.len()
             );
             for multiaddr in &self.config.bootstrap_peers {
-                let socket_addr = multiaddr.socket_addr;
+                let Some(socket_addr) = multiaddr.socket_addr() else {
+                    warn!("Skipping non-IP bootstrap peer: {}", multiaddr);
+                    continue;
+                };
                 seen_addresses.insert(socket_addr);
                 // Use a zero sentinel PeerId — the real identity comes
                 // from wait_for_peer_identity() after connecting.
@@ -1873,7 +1876,7 @@ impl P2PNode {
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
-                match self.connect_peer(&addr.to_string()).await {
+                match self.connect_peer(&MultiAddr::quic(*addr).to_string()).await {
                     Ok(channel_id) => {
                         // Wait for the remote peer's signed identity announce
                         // so we get a real cryptographic PeerId.
@@ -2335,7 +2338,9 @@ mod tests {
 
         // Connect to a real peer (unsigned — no node_identity configured).
         // connect_peer returns a transport-level channel ID (String), not a PeerId.
-        let channel_id = node1.connect_peer(&node2_addr.to_string()).await?;
+        let channel_id = node1
+            .connect_peer(&MultiAddr::quic(node2_addr).to_string())
+            .await?;
 
         // Unauthenticated connections don't appear in the app-level peer maps.
         // Verify transport-level tracking via is_connection_active / peers map.
@@ -2614,7 +2619,7 @@ mod tests {
         let builder = P2PNode::builder()
             .listen_on("/ip4/127.0.0.1/tcp/0")
             .listen_on("/ip6/::1/tcp/0")
-            .with_bootstrap_peer("127.0.0.1:9000")
+            .with_bootstrap_peer("/ip4/127.0.0.1/udp/9000/quic")
             .with_ipv6(true)
             .with_connection_timeout(Duration::from_secs(15))
             .with_max_connections(200)

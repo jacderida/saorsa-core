@@ -618,7 +618,7 @@ mod tests {
         let port = 8080u16 + id_bytes[0] as u16;
         DHTNode {
             id: PeerId::from_bytes(id_bytes),
-            address: format!("[::1]:{port}").parse().unwrap(),
+            address: format!("/ip6/::1/udp/{port}/quic").parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }

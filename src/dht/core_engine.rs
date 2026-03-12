@@ -49,9 +49,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Node information for routing.
 ///
 /// The `address` field stores a typed [`MultiAddr`] that is always valid.
-/// For wire-protocol compatibility it serializes as a plain `"ip:port"` string
-/// and deserializes from both `"ip:port"` and MultiAddr formats like
-/// `/ip4/1.2.3.4/udp/9000`.
+/// Serializes as a canonical `/`-delimited string via `serde_as_string`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
@@ -62,17 +60,15 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    /// Get the socket address. Always succeeds because `MultiAddr`
-    /// guarantees a valid `SocketAddr`.
+    /// Get the socket address. Returns `None` for non-IP transports.
     #[must_use]
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.address.socket_addr
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.address.socket_addr()
     }
 
-    /// Get the IP address. Always succeeds because `MultiAddr`
-    /// guarantees a valid IP.
+    /// Get the IP address. Returns `None` for non-IP transports.
     #[must_use]
-    pub fn ip(&self) -> IpAddr {
+    pub fn ip(&self) -> Option<IpAddr> {
         self.address.ip()
     }
 }
@@ -136,18 +132,11 @@ impl KBucket {
 
     /// Update `last_seen` (and optionally the address) for a node, then move
     /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
-    ///
-    /// The `address` parameter accepts a string in either `"ip:port"` or
-    /// MultiAddr format.  Invalid strings are silently ignored — the existing
-    /// address is preserved.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
-            if let Some(addr) = address
-                && !addr.is_empty()
-                && let Ok(parsed) = addr.parse::<MultiAddr>()
-            {
-                self.nodes[pos].address = parsed;
+            if let Some(addr) = address {
+                self.nodes[pos].address = addr.clone();
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
@@ -199,7 +188,7 @@ impl KademliaRoutingTable {
 
     /// Update `last_seen` (and optionally address) for a node and move it to
     /// the tail of its k-bucket. Returns `true` if the node was found.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].touch_node(node_id, address)
     }
@@ -486,6 +475,15 @@ const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 /// DHT routing table maintenance interval in seconds
 /// Periodic refresh of buckets and eviction of stale nodes
 const MAINTENANCE_INTERVAL_SECS: u64 = 60;
+
+/// Subnet diversity multiplier: /24 (IPv4) or /64 (IPv6) limit = per-IP * this.
+const SUBNET_NARROW_MULTIPLIER: usize = 3;
+
+/// Subnet diversity multiplier: /16 (IPv4) or /48 (IPv6) limit = per-IP * this.
+const SUBNET_MEDIUM_MULTIPLIER: usize = 10;
+
+/// Subnet diversity multiplier for IPv6 /32 (widest prefix tier).
+const SUBNET_WIDE_MULTIPLIER: usize = 30;
 
 /// DHT request wrapper with request ID for correlation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1257,7 +1255,7 @@ impl DhtCoreEngine {
     /// routing table should reflect this without requiring dedicated pings.
     /// Passing the current address ensures stale addresses are replaced when a
     /// peer reconnects from a different endpoint.
-    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&str>) -> bool {
+    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address)
     }
@@ -1383,8 +1381,16 @@ impl DhtCoreEngine {
             }
         }
 
-        // MultiAddr guarantees a valid IP — no parsing can fail.
-        let candidate_ip = node.ip();
+        // IP-based transports always have an IP; non-IP transports skip diversity.
+        let candidate_ip = match node.ip() {
+            Some(ip) => ip,
+            None => {
+                // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
+                let mut routing = self.routing_table.write().await;
+                routing.add_node(node)?;
+                return Ok(());
+            }
+        };
 
         // 2. Security Check: IP + Geographic Diversity
         //
@@ -1454,7 +1460,10 @@ impl DhtCoreEngine {
             if node.id == *candidate_id {
                 continue;
             }
-            let existing_ip = node.ip();
+            let Some(existing_ip) = node.ip() else {
+                // Non-IP transports don't participate in IP diversity counting.
+                continue;
+            };
             // Loopback nodes don't contribute to network_size or any counts
             if existing_ip.is_loopback() {
                 continue;
@@ -1501,10 +1510,14 @@ impl DhtCoreEngine {
                     .map_or(per_ip, |cap| cap.min(per_ip));
                 let limit_24 = cfg
                     .max_nodes_per_ipv4_24
-                    .map_or(per_ip * 3, |cap| cap.min(per_ip * 3));
+                    .map_or(per_ip * SUBNET_NARROW_MULTIPLIER, |cap| {
+                        cap.min(per_ip * SUBNET_NARROW_MULTIPLIER)
+                    });
                 let limit_16 = cfg
                     .max_nodes_per_ipv4_16
-                    .map_or(per_ip * 10, |cap| cap.min(per_ip * 10));
+                    .map_or(per_ip * SUBNET_MEDIUM_MULTIPLIER, |cap| {
+                        cap.min(per_ip * SUBNET_MEDIUM_MULTIPLIER)
+                    });
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
@@ -1526,9 +1539,11 @@ impl DhtCoreEngine {
             }
             IpAddr::V6(_) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_64 = std::cmp::min(cfg.max_nodes_per_64, per_ip * 3);
-                let limit_48 = std::cmp::min(cfg.max_nodes_per_48, per_ip * 10);
-                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * 30);
+                let limit_64 =
+                    std::cmp::min(cfg.max_nodes_per_64, per_ip * SUBNET_NARROW_MULTIPLIER);
+                let limit_48 =
+                    std::cmp::min(cfg.max_nodes_per_48, per_ip * SUBNET_MEDIUM_MULTIPLIER);
+                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * SUBNET_WIDE_MULTIPLIER);
 
                 if v6_counts.slash_64 >= limit_64 {
                     return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));
@@ -1635,26 +1650,26 @@ mod tests {
     fn test_touch_node_updates_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
+        let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
         // Touch with a new address
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
+        let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(&new_addr));
         assert!(found);
-        let expected: MultiAddr = "5.6.7.8:9000".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, new_addr);
     }
 
     #[test]
     fn test_touch_node_none_preserves_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
+        let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
-        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
+        let expected: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
@@ -1662,9 +1677,15 @@ mod tests {
     fn test_touch_node_moves_to_tail() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
-        bucket.add_node(make_node(2, "2.2.2.2:9000")).unwrap();
-        bucket.add_node(make_node(3, "3.3.3.3:9000")).unwrap();
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+        bucket
+            .add_node(make_node(2, "/ip4/2.2.2.2/udp/9000/quic"))
+            .unwrap();
+        bucket
+            .add_node(make_node(3, "/ip4/3.3.3.3/udp/9000/quic"))
+            .unwrap();
 
         // Touch the first node — it should move to the tail
         bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
@@ -1677,26 +1698,15 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_node_empty_string_preserves_address() {
-        let k = 8;
-        let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
-        bucket.add_node(node).unwrap();
-
-        // Touch with an empty string should NOT overwrite the valid address
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
-        assert!(found);
-        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
-    }
-
-    #[test]
     fn test_touch_node_missing_returns_false() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
 
-        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some("9.9.9.9:9000"));
+        let new_addr: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some(&new_addr));
         assert!(!found);
     }
 
@@ -1717,7 +1727,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1728,7 +1738,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1761,7 +1771,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1772,7 +1782,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1802,7 +1812,9 @@ mod tests {
             table
                 .add_node(NodeInfo {
                     id: PeerId::from_bytes(id_bytes),
-                    address: format!("10.0.0.{}:9000", i + 1).parse().unwrap(),
+                    address: format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
+                        .parse()
+                        .unwrap(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 })
@@ -1841,7 +1853,7 @@ mod tests {
         // Default has allow_loopback = false
         assert!(!dht.allow_loopback);
 
-        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1856,7 +1868,7 @@ mod tests {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         assert!(!dht.allow_loopback);
 
-        let loopback_node = make_node(2, "[::1]:9000");
+        let loopback_node = make_node(2, "/ip6/::1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1871,7 +1883,7 @@ mod tests {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         dht.set_allow_loopback(true);
 
-        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_ok(), "loopback should be accepted: {:?}", result);
     }
@@ -1882,7 +1894,7 @@ mod tests {
         // allow_loopback = false should not affect normal addresses
         assert!(!dht.allow_loopback);
 
-        let normal_node = make_node(1, "10.0.0.1:9000");
+        let normal_node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
         let result = dht.add_node(normal_node).await;
         assert!(
             result.is_ok(),

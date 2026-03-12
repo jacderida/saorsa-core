@@ -370,7 +370,7 @@ impl TransportHandle {
         self.listen_addrs
             .try_read()
             .ok()
-            .and_then(|addrs| addrs.first().map(|a| a.to_string()))
+            .and_then(|addrs| addrs.first().map(|a| MultiAddr::quic(*a).to_string()))
     }
 
     /// Get all current listen addresses.
@@ -561,8 +561,8 @@ impl TransportHandle {
 impl TransportHandle {
     /// Connect to a peer at the given address.
     ///
-    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
-    /// `/ip4/1.2.3.4/udp/9000`).
+    /// Accepts canonical MultiAddr format (e.g.
+    /// `/ip4/1.2.3.4/udp/9000/quic`).
     pub async fn connect_peer(&self, address: &str) -> Result<String> {
         // Check production limits if resource manager is enabled
         let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
@@ -571,15 +571,17 @@ impl TransportHandle {
             None
         };
 
-        // Parse via MultiAddr for consistent MultiAddr support
-        let socket_addr: SocketAddr = address
-            .parse::<MultiAddr>()
-            .map(|na| na.socket_addr)
-            .map_err(|e| {
-                P2PError::Network(NetworkError::InvalidAddress(
-                    format!("{}: {}", address, e).into(),
-                ))
-            })?;
+        // Parse via MultiAddr for consistent address support
+        let parsed = address.parse::<MultiAddr>().map_err(|e| {
+            P2PError::Network(NetworkError::InvalidAddress(
+                format!("{}: {}", address, e).into(),
+            ))
+        })?;
+        let socket_addr: SocketAddr = parsed.socket_addr().ok_or_else(|| {
+            P2PError::Network(NetworkError::InvalidAddress(
+                format!("non-IP transport not supported for connect: {}", address).into(),
+            ))
+        })?;
 
         let normalized_addr = normalize_wildcard_to_loopback(socket_addr);
         let addr_list = vec![normalized_addr];
@@ -1295,7 +1297,7 @@ impl TransportHandle {
                 }
 
                 let channel_id = remote_sock.to_string();
-                let remote_addr = MultiAddr::from(remote_sock);
+                let remote_addr = MultiAddr::quic(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
                 register_new_channel(&peers, &channel_id, &remote_addr).await;
