@@ -32,12 +32,12 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use saorsa_core::{P2PNode, NodeConfig, Multiaddr};
+//! use saorsa_core::{P2PNode, NodeConfig, MultiAddr};
 //! use std::str::FromStr;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let addr = "127.0.0.1:9000".parse::<Multiaddr>()?;
+//!     let addr = "127.0.0.1:9000".parse::<MultiAddr>()?;
 //!     let node = P2PNode::builder()
 //!         .listen_on(addr)
 //!         .with_mcp_server()
@@ -165,7 +165,7 @@ pub mod placement;
 pub mod upgrade;
 
 // Re-export main types
-pub use address::{AddressBook, Multiaddr};
+pub use address::{AddressBook, MultiAddr};
 
 // New spec-compliant API exports
 pub use auth::{

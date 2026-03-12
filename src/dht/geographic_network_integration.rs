@@ -3,7 +3,7 @@
 //! Integrates geographic-aware DHT routing with the existing network infrastructure.
 //! Provides region detection, latency-aware peer selection, and cross-region routing optimization.
 
-use crate::Multiaddr;
+use crate::MultiAddr;
 use crate::PeerId;
 use crate::dht::{
     geographic_routing::{GeographicRegion, PeerQualityMetrics},
@@ -65,7 +65,7 @@ impl GeographicNetworkIntegration {
     }
 
     /// Detect geographic region for a multiaddr
-    pub async fn detect_region(&self, address: &Multiaddr) -> GeographicRegion {
+    pub async fn detect_region(&self, address: &MultiAddr) -> GeographicRegion {
         // Extract IP address from multiaddr
         let ip = match self.extract_ip_from_multiaddr(address) {
             Some(ip) => ip,
@@ -96,8 +96,8 @@ impl GeographicNetworkIntegration {
     }
 
     /// Extract IP address from multiaddr
-    fn extract_ip_from_multiaddr(&self, address: &Multiaddr) -> Option<IpAddr> {
-        // Multiaddr directly contains the IP address
+    fn extract_ip_from_multiaddr(&self, address: &MultiAddr) -> Option<IpAddr> {
+        // MultiAddr directly contains the IP address
         Some(address.ip())
     }
 
@@ -173,7 +173,7 @@ impl GeographicNetworkIntegration {
     }
 
     /// Add peer with geographic awareness
-    pub async fn add_peer(&self, peer_id: PeerId, address: Multiaddr) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: PeerId, address: MultiAddr) -> Result<()> {
         let region = self.detect_region(&address).await;
 
         debug!("Adding peer {} in region {:?}", peer_id, region);
@@ -393,7 +393,7 @@ mod tests {
             GeographicNetworkIntegration::new(GeographicRegion::NorthAmerica).unwrap();
 
         // Test IPv4 multiaddr
-        let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
+        let addr: MultiAddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
         let ip = integration.extract_ip_from_multiaddr(&addr).unwrap();
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(159, 89, 81, 21)));
     }
@@ -403,7 +403,7 @@ mod tests {
         let integration =
             GeographicNetworkIntegration::new(GeographicRegion::NorthAmerica).unwrap();
 
-        let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
+        let addr: MultiAddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
         let peer_id = PeerId::random();
         let result = integration.add_peer(peer_id, addr).await;
         assert!(result.is_ok());
@@ -418,7 +418,7 @@ mod tests {
         let integration =
             GeographicNetworkIntegration::new(GeographicRegion::NorthAmerica).unwrap();
 
-        let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
+        let addr: MultiAddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
         let peer_id = PeerId::random();
         integration.add_peer(peer_id, addr).await.unwrap();
 

@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
-use crate::Multiaddr;
+use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
@@ -145,7 +145,7 @@ pub struct NodeConfig {
     pub listen_addr: std::net::SocketAddr,
 
     /// Bootstrap peers to connect to on startup.
-    pub bootstrap_peers: Vec<crate::Multiaddr>,
+    pub bootstrap_peers: Vec<crate::MultiAddr>,
 
     /// Enable IPv6 support
     pub enable_ipv6: bool,
@@ -313,7 +313,7 @@ impl NodeConfig {
                 .network
                 .bootstrap_nodes
                 .iter()
-                .filter_map(|s| s.parse::<crate::Multiaddr>().ok())
+                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
@@ -348,7 +348,7 @@ impl NodeConfig {
 pub struct NodeConfigBuilder {
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
-    bootstrap_peers: Vec<crate::Multiaddr>,
+    bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
     keep_alive_interval: Option<Duration>,
@@ -375,7 +375,7 @@ impl NodeConfigBuilder {
     }
 
     /// Add a bootstrap peer.
-    pub fn bootstrap_peer(mut self, addr: crate::Multiaddr) -> Self {
+    pub fn bootstrap_peer(mut self, addr: crate::MultiAddr) -> Self {
         self.bootstrap_peers.push(addr);
         self
     }
@@ -540,7 +540,7 @@ impl NodeConfig {
                 .network
                 .bootstrap_nodes
                 .iter()
-                .filter_map(|s| s.parse::<crate::Multiaddr>().ok())
+                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
 
@@ -2011,7 +2011,7 @@ impl NodeBuilder {
 
     /// Add a bootstrap peer
     pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse::<crate::Multiaddr>() {
+        if let Ok(multiaddr) = addr.parse::<crate::MultiAddr>() {
             self.config.bootstrap_peers.push(multiaddr);
         }
         self
@@ -2143,7 +2143,7 @@ mod diversity_tests {
 pub(crate) async fn register_new_channel(
     peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
     channel_id: &str,
-    remote_addr: &Multiaddr,
+    remote_addr: &MultiAddr,
 ) {
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
@@ -2636,8 +2636,8 @@ mod tests {
     async fn test_bootstrap_peers() -> Result<()> {
         let mut config = create_test_node_config();
         config.bootstrap_peers = vec![
-            crate::Multiaddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9200),
-            crate::Multiaddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9201),
+            crate::MultiAddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9200),
+            crate::MultiAddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9201),
         ];
 
         let node = P2PNode::new(config).await?;

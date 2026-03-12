@@ -21,7 +21,7 @@ use super::som::NodeFeatures;
 use super::*;
 use crate::P2PNode;
 use crate::PeerId;
-use crate::address::Multiaddr;
+use crate::address::MultiAddr;
 use crate::dht::geographic_network_integration::GeographicNetworkIntegration;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::{DHT, DHTConfig, DhtKey, Key as DhtKeyBytes};
@@ -235,7 +235,7 @@ struct LayerScores {
 #[derive(Debug, Clone)]
 struct ScoredCandidate {
     peer_id: PeerId,
-    address: Option<Multiaddr>,
+    address: Option<MultiAddr>,
     region: GeographicRegion,
     scores: LayerScores,
     composite: f64,
@@ -244,7 +244,7 @@ struct ScoredCandidate {
 #[derive(Debug, Clone)]
 struct CandidateNode {
     peer_id: PeerId,
-    address: Multiaddr,
+    address: MultiAddr,
     reliability: f64,
 }
 
@@ -441,7 +441,7 @@ impl AdaptiveDHT {
         }
     }
 
-    async fn detect_region(&self, address: &Option<Multiaddr>) -> GeographicRegion {
+    async fn detect_region(&self, address: &Option<MultiAddr>) -> GeographicRegion {
         if let Some(addr) = address {
             self.geo_integration.detect_region(addr).await
         } else {

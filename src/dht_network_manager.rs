@@ -21,7 +21,7 @@
 use crate::{
     P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
-    address::Multiaddr,
+    address::MultiAddr,
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
@@ -70,14 +70,14 @@ const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DHT node representation for network operations.
 ///
-/// The `address` field stores a typed [`Multiaddr`] for consistent
-/// Multiaddr support.  Serializes as a plain `"ip:port"` string for
+/// The `address` field stores a typed [`MultiAddr`] for consistent
+/// MultiAddr support.  Serializes as a plain `"ip:port"` string for
 /// wire-protocol compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DHTNode {
     pub peer_id: PeerId,
     #[serde(with = "crate::address::serde_as_string")]
-    pub address: Multiaddr,
+    pub address: MultiAddr,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
 }
@@ -1404,7 +1404,7 @@ impl DhtNetworkManager {
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
             peer_id: self.config.peer_id,
-            address: Multiaddr::from(self.config.node_config.listen_addr),
+            address: MultiAddr::from(self.config.node_config.listen_addr),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1417,14 +1417,14 @@ impl DhtNetworkManager {
     }
 
     /// Parse the first valid address from a list of transport-reported address
-    /// strings into a [`Multiaddr`].
+    /// strings into a [`MultiAddr`].
     ///
-    /// Accepts both `"ip:port"` and Multiaddr formats (e.g.
+    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
     /// `/ip4/1.2.3.4/udp/9000`).  Unspecified (`0.0.0.0`) addresses are
     /// rejected.  Loopback addresses are accepted for local/test use.
-    fn first_valid_address(addresses: &[String]) -> Option<Multiaddr> {
+    fn first_valid_address(addresses: &[String]) -> Option<MultiAddr> {
         for addr_str in addresses {
-            match addr_str.parse::<Multiaddr>() {
+            match addr_str.parse::<MultiAddr>() {
                 Ok(addr) => {
                     if addr.ip().is_unspecified() {
                         warn!("Rejecting unspecified address: {addr_str}");
@@ -1551,7 +1551,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         operation: DhtNetworkOperation,
-        address_hint: Option<&Multiaddr>,
+        address_hint: Option<&MultiAddr>,
     ) -> Result<DhtNetworkResult> {
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
@@ -1616,7 +1616,7 @@ impl DhtNetworkManager {
         // `peer_to_channel` mapping is only populated after the asynchronous
         // identity-exchange handshake completes. Without waiting, the
         // subsequent `send_message` would fail with `PeerNotFound`.
-        let resolved_address: Option<Multiaddr> = if self.transport.is_peer_connected(peer_id).await
+        let resolved_address: Option<MultiAddr> = if self.transport.is_peer_connected(peer_id).await
         {
             None
         } else if let Some(hint) = address_hint {
@@ -1768,7 +1768,7 @@ impl DhtNetworkManager {
     /// [`TransportHandle::wait_for_peer_identity`] before sending, because
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &Multiaddr) -> Option<String> {
+    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
@@ -1819,8 +1819,8 @@ impl DhtNetworkManager {
     /// Checks the DHT routing table first (source of truth for DHT peer
     /// addresses), then falls back to the transport layer for connected peers.
     /// Returns `None` when the peer is unknown or has no addresses.
-    async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<Multiaddr> {
-        // 1. Routing table — contains validated Multiaddr entries
+    async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+        // 1. Routing table — contains validated MultiAddr entries
         if let Some(address) = self.dht.read().await.get_node_address(peer_id).await {
             return Some(address);
         }
@@ -2273,8 +2273,8 @@ impl DhtNetworkManager {
         let dht_key = *node_id.as_bytes();
 
         // peer_info() resolves app-level IDs internally via peer_to_channel.
-        // Parse the first valid address directly into a Multiaddr — this
-        // handles both "ip:port" and Multiaddr formats consistently.
+        // Parse the first valid address directly into a MultiAddr — this
+        // handles both "ip:port" and MultiAddr formats consistently.
         let address = if let Some(info) = self.transport.peer_info(&node_id).await {
             Self::first_valid_address(&info.addresses)
         } else {

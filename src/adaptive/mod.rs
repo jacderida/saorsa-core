@@ -189,7 +189,7 @@ pub struct NodeDescriptor {
     pub id: PeerId,
     // PQC-only: ML-DSA public key
     pub public_key: crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey,
-    pub addresses: Vec<crate::address::Multiaddr>,
+    pub addresses: Vec<crate::address::MultiAddr>,
     pub hyperbolic: Option<HyperbolicCoordinate>,
     pub som_position: Option<[f64; 4]>,
     pub trust: f64,

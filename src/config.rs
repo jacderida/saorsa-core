@@ -23,7 +23,7 @@
 //! - IPv4/IPv6 address validation
 //! - Secure defaults for production
 
-use crate::address::Multiaddr;
+use crate::address::MultiAddr;
 use crate::error::ConfigError;
 use crate::validation::{
     ValidationContext, validate_config_value, validate_file_path, validate_network_address,
@@ -575,12 +575,12 @@ impl Config {
     }
 
     /// Get parsed bootstrap addresses
-    pub fn bootstrap_addrs(&self) -> Result<Vec<Multiaddr>> {
+    pub fn bootstrap_addrs(&self) -> Result<Vec<MultiAddr>> {
         self.network
             .bootstrap_nodes
             .iter()
             .map(|addr| {
-                addr.parse::<Multiaddr>().map_err(|e| {
+                addr.parse::<MultiAddr>().map_err(|e| {
                     P2PError::Config(ConfigError::InvalidValue {
                         field: "bootstrap_nodes".to_string().into(),
                         reason: format!("Invalid address: {}", e).into(),
