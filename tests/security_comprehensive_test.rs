@@ -37,16 +37,16 @@ impl MockInputValidator {
         }
     }
 
-    pub fn validate_four_words(&self, input: &str) -> Result<String> {
+    pub fn validate_input(&self, input: &str) -> Result<String> {
         self.validation_count.fetch_add(1, Ordering::SeqCst);
 
         // Simulate comprehensive validation
         if input.is_empty() {
-            return Err(anyhow::anyhow!("Four-word address cannot be empty"));
+            return Err(anyhow::anyhow!("Input cannot be empty"));
         }
 
         if input.len() > 100 {
-            return Err(anyhow::anyhow!("Four-word address too long"));
+            return Err(anyhow::anyhow!("Input too long"));
         }
 
         // Check for malicious patterns
@@ -307,11 +307,7 @@ async fn test_input_validation_security() -> Result<()> {
 
     // Test 1: Valid inputs should pass
     println!("  Testing valid inputs...");
-    assert!(
-        validator
-            .validate_four_words("hello-world-test-network")
-            .is_ok()
-    );
+    assert!(validator.validate_input("hello-world-test-network").is_ok());
     assert!(
         validator
             .validate_message_content("This is a normal message")
@@ -345,7 +341,7 @@ async fn test_input_validation_security() -> Result<()> {
     ];
 
     for sql in &sql_injections {
-        let result = validator.validate_four_words(sql);
+        let result = validator.validate_input(sql);
         assert!(result.is_err(), "SQL injection should be blocked: {}", sql);
         println!("    ✅ Blocked SQL injection: {}", sql);
     }
@@ -367,7 +363,7 @@ async fn test_input_validation_security() -> Result<()> {
     println!("  Testing validation performance...");
     let start = Instant::now();
     for i in 0..1000 {
-        let _ = validator.validate_four_words(&format!("test-word-number-{}", i));
+        let _ = validator.validate_input(&format!("test-word-number-{}", i));
     }
     let validation_time = start.elapsed();
     println!("    ✅ 1000 validations completed in {:?}", validation_time);
@@ -823,7 +819,7 @@ async fn test_attack_scenarios() -> Result<()> {
         // Simulate various resource-intensive operations
         let _ = suite
             .input_validator
-            .validate_four_words(&format!("test-attack-resource-{}", i));
+            .validate_input(&format!("test-attack-resource-{}", i));
         let _ = suite
             .rate_limiter
             .check_rate_limit(&format!("resource_attacker_{}", i % 10))
@@ -966,7 +962,7 @@ async fn test_security_integration() -> Result<()> {
 
                 // Validate input
                 let test_message = format!("integration-test-message-{}", operation_id);
-                let validated = validator.validate_four_words(&test_message);
+                let validated = validator.validate_input(&test_message);
                 if validated.is_err() {
                     continue; // Skip invalid input
                 }
@@ -1084,7 +1080,7 @@ async fn test_security_system_health() -> Result<()> {
 
     let _ = suite
         .input_validator
-        .validate_four_words("health-check-test-message");
+        .validate_input("health-check-test-message");
     let _ = suite.rate_limiter.check_rate_limit("health_checker").await;
     let health_token = suite
         .auth_service
@@ -1147,7 +1143,7 @@ async fn test_security_system_health() -> Result<()> {
         let message = format!("load-test-message-{}", i);
 
         // Simulate normal user workflow
-        let _ = suite.input_validator.validate_four_words(&message);
+        let _ = suite.input_validator.validate_input(&message);
         let _ = suite.rate_limiter.check_rate_limit(&user_id).await;
 
         if i % 10 == 0 {
@@ -1192,7 +1188,7 @@ async fn test_security_system_health() -> Result<()> {
         let user_id = format!("stability_user_{}", operation_count % 10);
         let _ = suite
             .input_validator
-            .validate_four_words(&format!("stability-test-{}", operation_count));
+            .validate_input(&format!("stability-test-{}", operation_count));
         let _ = suite.rate_limiter.check_rate_limit(&user_id).await;
         operation_count += 1;
 

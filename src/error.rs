@@ -267,9 +267,6 @@ pub enum IdentityError {
     #[error("Invalid three-word address: {0}")]
     InvalidThreeWordAddress(Cow<'static, str>),
 
-    #[error("Invalid four-word address: {0}")]
-    InvalidFourWordAddress(Cow<'static, str>),
-
     #[error("Identity not found: {0}")]
     IdentityNotFound(Cow<'static, str>),
 

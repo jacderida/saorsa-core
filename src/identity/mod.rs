@@ -21,7 +21,6 @@
 //!
 //! - `NodeIdentity`: Cryptographic identity with ML-DSA keypair
 //! - `PeerId`: 32-byte hash of public key
-//! - `FourWordAddress`: Human-readable address for bootstrap
 //!
 //! # Identity Restart System
 //!
@@ -31,7 +30,6 @@
 pub mod cli;
 pub mod encryption;
 pub mod fitness;
-pub mod four_words;
 pub mod node_identity;
 pub mod peer_id;
 pub mod regeneration;
@@ -40,10 +38,6 @@ pub mod restart;
 pub mod secure_node_identity;
 pub mod targeting;
 
-#[cfg(test)]
-mod four_words_error_tests;
-
-pub use four_words::{FourWordAddress, WordEncoder};
 pub use node_identity::{IdentityData, NodeIdentity};
 pub use peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
 pub use secure_node_identity::SecureNodeIdentity;

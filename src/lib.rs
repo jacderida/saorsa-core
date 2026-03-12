@@ -27,7 +27,7 @@
 //! - QUIC-based transport with NAT traversal
 //! - IPv4-first with simple addressing
 //! - Kademlia DHT for distributed routing
-//! - Four-word human-readable addresses
+//! - Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
 //!
 //! ## Example
 //!
@@ -53,7 +53,7 @@
 #![allow(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
-/// Four-word identifier system
+/// Key derivation and hashing utilities
 pub mod fwid;
 
 /// Prelude module for convenient imports
@@ -166,7 +166,6 @@ pub mod upgrade;
 
 // Re-export main types
 pub use address::{AddressBook, Multiaddr};
-pub use identity::FourWordAddress;
 
 // New spec-compliant API exports
 pub use auth::{
@@ -184,7 +183,7 @@ pub use encrypted_key_storage::{
 };
 pub use error::{P2PError, P2pResult as Result, PeerFailureReason};
 pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subscribe_topology};
-pub use fwid::{FourWordsV1, Key as FwKey, fw_check, fw_to_key};
+pub use fwid::Key as FwKey;
 pub use health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
     HealthServer, HealthStatus, PrometheusExporter,

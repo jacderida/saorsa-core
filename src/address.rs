@@ -13,8 +13,7 @@
 
 //! # Address Types
 //!
-//! This module provides address types for the P2P network using IP:port combinations
-//! and four-word human-readable representations.
+//! This module provides address types for the P2P network using IP:port combinations.
 
 use std::fmt::{self, Display};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,26 +22,18 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use four_word_networking::FourWordAdaptiveEncoder;
-
-/// Network address that can be represented as IP:port or four-word format
+/// Network address represented as IP:port
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Multiaddr {
     /// The socket address (IP + port)
     pub socket_addr: SocketAddr,
-    /// Optional four-word representation
-    pub four_words: Option<String>,
 }
 
 impl Multiaddr {
     /// Create a new `Multiaddr` from a `SocketAddr`
     #[must_use]
     pub fn new(socket_addr: SocketAddr) -> Self {
-        let four_words = Self::encode_four_words(&socket_addr);
-        Self {
-            socket_addr,
-            four_words,
-        }
+        Self { socket_addr }
     }
 
     /// Create a `Multiaddr` from an IP address and port
@@ -78,36 +69,6 @@ impl Multiaddr {
     /// Get the socket address
     pub fn socket_addr(&self) -> SocketAddr {
         self.socket_addr
-    }
-
-    /// Get the four-word representation if available
-    pub fn four_words(&self) -> Option<&str> {
-        self.four_words.as_deref()
-    }
-
-    /// Force regeneration of four-word representation
-    pub fn regenerate_four_words(&mut self) {
-        self.four_words = Self::encode_four_words(&self.socket_addr);
-    }
-
-    /// Encode a SocketAddr to four-word format using four-word-networking
-    fn encode_four_words(addr: &SocketAddr) -> Option<String> {
-        match FourWordAdaptiveEncoder::new().and_then(|enc| enc.encode(&addr.to_string())) {
-            Ok(s) => Some(s.replace(' ', "-")),
-            Err(e) => {
-                tracing::warn!("Failed to encode address {addr}: {e}");
-                None
-            }
-        }
-    }
-
-    /// Decode four-word format to Multiaddr using four-word-networking
-    pub fn from_four_words(words: &str) -> Result<Self> {
-        let enc = FourWordAdaptiveEncoder::new()?;
-        let normalized = words.replace('-', " ");
-        let decoded = enc.decode(&normalized)?; // returns a normalized address string
-        let socket_addr: SocketAddr = decoded.parse()?; // must include port
-        Ok(Self::new(socket_addr))
     }
 
     /// Check if this is an IPv4 address
@@ -172,11 +133,6 @@ impl FromStr for Multiaddr {
                     }
                 }
             }
-        }
-
-        // Then try to parse as four-word format
-        if let Ok(addr) = Self::from_four_words(s) {
-            return Ok(addr);
         }
 
         Err(anyhow!("Invalid address format: {}", s))

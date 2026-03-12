@@ -31,7 +31,6 @@ pub use crate::error::{P2PError, P2pResult as Result};
 
 /// Network address types
 pub use crate::address::{AddressBook, Multiaddr};
-pub use crate::identity::FourWordAddress;
 
 // ============================================================================
 // Network & Node Types
