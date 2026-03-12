@@ -224,15 +224,9 @@ impl DhtStreamHandler {
                 }
             }
 
-            DhtMessage::Ping {
-                timestamp,
-                sender_info,
-            } => {
-                debug!(from = ?sender_info.id, "DHT ping received");
-                Ok(DhtResponse::Pong {
-                    timestamp,
-                    node_info: sender_info,
-                })
+            DhtMessage::Ping { timestamp } => {
+                debug!("DHT ping received");
+                Ok(DhtResponse::Pong { timestamp })
             }
 
             DhtMessage::Join { node_info, .. } => {

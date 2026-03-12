@@ -30,13 +30,11 @@ use tracing::{debug, info, warn};
 
 /// Timeout for waiting for a single event (PeerConnected, etc.).
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Maximum time to wait for stale peer cleanup after a disconnect.
-const STALE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time to wait for peer cleanup after a disconnect.
+const DISCONNECT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval when busy-waiting for state changes.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Short stale-peer threshold used for fast disconnect detection in tests.
-const SHORT_STALE_THRESHOLD: Duration = Duration::from_secs(2);
-/// Timeout for PeerDisconnected events (stale threshold + buffer).
+/// Timeout for PeerDisconnected events.
 const DISCONNECT_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Helper to create a test node configuration with unique port.
@@ -59,32 +57,6 @@ fn create_test_node_config() -> NodeConfig {
             }),
         ],
         bootstrap_peers: vec![],
-        node_identity: Some(identity),
-        ..Default::default()
-    }
-}
-
-/// Create a test config with a short stale peer threshold for faster tests.
-///
-/// Includes a generated `node_identity` so that messages are signed and
-/// `PeerConnected`/`PeerDisconnected` events fire on authentication.
-fn create_test_node_config_with_stale_threshold(threshold: Duration) -> NodeConfig {
-    let identity =
-        Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
-    NodeConfig {
-        listen_addr: "127.0.0.1:0"
-            .parse()
-            .unwrap_or_else(|_| panic!("Test setup error: hardcoded address should parse")),
-        listen_addrs: vec![
-            "127.0.0.1:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv4 address should parse")
-            }),
-            "[::]:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv6 address should parse")
-            }),
-        ],
-        bootstrap_peers: vec![],
-        stale_peer_threshold: threshold,
         node_identity: Some(identity),
         ..Default::default()
     }
@@ -403,18 +375,19 @@ async fn test_bidirectional_message_exchange() {
 // SPRINT 2: Peer Health Checks and Heartbeat
 // =============================================================================
 
-/// TEST 2.1: Periodic tasks update peer last_seen timestamps
+/// TEST 2.1: Connection survives idle period
 ///
-/// EXPECTED INITIAL STATE: FAIL
-/// - periodic_tasks() is currently an empty stub
+/// Verifies that an established connection remains alive after a period of
+/// inactivity (relying on QUIC transport-layer idle timeout), and that
+/// messages can still be exchanged afterwards.
 #[tokio::test]
-async fn test_periodic_tasks_updates_last_seen() {
+async fn test_connection_survives_idle_period() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("debug")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Periodic Tasks Update Last Seen ===");
+    info!("=== TEST: Connection Survives Idle Period ===");
 
     let config1 = create_test_node_config();
     let config2 = create_test_node_config();
@@ -424,56 +397,63 @@ async fn test_periodic_tasks_updates_last_seen() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    // Connect
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    // Connect and obtain the real authenticated PeerId
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    // Get initial peer info to check last_seen
-    // NOTE: This requires exposing peer info - we may need to add a method
-    let is_connected_before = node1.is_peer_connected(&peer2_id).await;
-    assert!(is_connected_before, "Peer should be connected initially");
+    // Verify the peer is connected initially
+    assert!(
+        node1.is_peer_connected(&peer2_id).await,
+        "Peer should be connected initially"
+    );
 
-    // Start periodic tasks (if not already running via start())
-    // Wait for some periodic task cycles
-    info!("Waiting for periodic tasks to run...");
+    // Wait for a period of inactivity. With keepalive removed, the
+    // connection should still survive via the transport-layer idle timeout
+    // (which is longer than this sleep).
+    info!("Waiting 2s to verify connection survives inactivity...");
     sleep(Duration::from_secs(2)).await;
 
-    // Verify peer is still tracked and last_seen was updated
-    let is_connected_after = node1.is_peer_connected(&peer2_id).await;
-    let is_active = node1.is_peer_connected(&peer2_id).await;
-
-    info!(
-        "After 2s: connected={}, active={}",
-        is_connected_after, is_active
-    );
-
+    // Verify the peer is still connected after the idle period
     assert!(
-        is_connected_after && is_active,
-        "Peer should still be connected and active after periodic tasks"
+        node1.is_peer_connected(&peer2_id).await,
+        "Peer should still be connected after 2s of inactivity"
     );
 
-    info!("=== TEST PASSED: Periodic Tasks Update Last Seen ===");
+    // Send a message to prove the connection is still functional
+    let mut events2 = node2.subscribe_events();
+    node1
+        .send_message(&peer2_id, "liveness", b"ping".to_vec())
+        .await
+        .expect("send_message should succeed after idle period");
+
+    let received = timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let Ok(P2PEvent::Message { data, .. }) = events2.recv().await {
+                return data;
+            }
+        }
+    })
+    .await
+    .expect("node2 should receive message after idle period");
+
+    assert_eq!(received, b"ping", "message content should match");
+
+    info!("=== TEST PASSED: Connection Survives Idle Period ===");
 }
 
-/// TEST 2.2: Stale peers are detected and removed
+/// TEST 2.2: Disconnected peers are detected and removed
 ///
-/// This test verifies that periodic_tasks() detects stale peers (no activity
-/// for longer than the configured threshold) and removes them from tracking.
-///
-/// Uses a short 5-second threshold for faster testing.
+/// This test verifies that when a peer drops, the transport layer detects the
+/// disconnect (via QUIC idle timeout) and removes the peer from tracking.
 #[tokio::test]
-async fn test_stale_peer_removal() {
+async fn test_disconnected_peer_removal() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("debug")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Stale Peer Removal ===");
+    info!("=== TEST: Disconnected Peer Removal ===");
 
-    // Use short stale threshold (5 seconds) for faster testing
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(5));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -481,11 +461,8 @@ async fn test_stale_peer_removal() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    // Connect — auto identity announce handles authentication
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    // Connect and obtain the real authenticated PeerId
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
     assert!(node1.is_peer_connected(&peer2_id).await);
     info!("Initial connection established");
@@ -493,27 +470,26 @@ async fn test_stale_peer_removal() {
     // Simulate network partition by dropping node2
     drop(node2);
 
-    // Wait for stale detection (5s threshold + buffer)
-    info!("Waiting for stale detection (5s threshold)...");
+    // Wait for QUIC idle timeout to detect the disconnect.
+    info!("Waiting for disconnect detection...");
 
-    // periodic_tasks() runs every 100ms and will detect stale peers
     // Wait up to 10 seconds for the peer to be cleaned up
-    let deadline = tokio::time::Instant::now() + STALE_CLEANUP_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + DISCONNECT_CLEANUP_TIMEOUT;
     loop {
         if !node1.is_peer_connected(&peer2_id).await {
-            info!("Stale peer {} detected and removed", peer2_id);
+            info!("Disconnected peer {} detected and removed", peer2_id);
             break;
         }
         if tokio::time::Instant::now() > deadline {
             panic!(
-                "FAIL: Stale peer should be removed from peers map.\n\
-                periodic_tasks() should detect unresponsive peers and remove them."
+                "FAIL: Disconnected peer should be removed from peers map.\n\
+                Transport layer should detect the QUIC disconnect and remove the peer."
             );
         }
         sleep(POLL_INTERVAL).await;
     }
 
-    info!("=== TEST PASSED: Stale Peer Removal ===");
+    info!("=== TEST PASSED: Disconnected Peer Removal ===");
 }
 
 /// TEST 2.3: Heartbeat/ping keeps connection alive
@@ -1103,9 +1079,8 @@ async fn test_peer_events_sequence() {
 
     info!("=== TEST: Peer Events Sequence ===");
 
-    // Use short threshold on node2 for faster disconnect detection
     let config1 = create_test_node_config();
-    let config2 = create_test_node_config_with_stale_threshold(SHORT_STALE_THRESHOLD);
+    let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
     node1.start().await.expect("Failed to start node1");
@@ -1136,7 +1111,7 @@ async fn test_peer_events_sequence() {
     // Drop node1 to simulate disconnect
     drop(node1);
 
-    // Wait for PeerDisconnected event on node2 (with short stale threshold + buffer)
+    // Wait for PeerDisconnected event on node2
     let disconnected_event = wait_for_event(&mut events2, DISCONNECT_EVENT_TIMEOUT, |event| {
         matches!(event, P2PEvent::PeerDisconnected(_))
     })
@@ -1303,8 +1278,7 @@ async fn test_no_duplicate_disconnect_events() {
 
     info!("=== TEST: No Duplicate Disconnect Events ===");
 
-    // Use short stale threshold
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(2));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1368,13 +1342,7 @@ async fn test_peer_cleanup_timing() {
 
     info!("=== TEST: Peer Cleanup Timing ===");
 
-    // 2 second stale threshold means:
-    // - Peer becomes stale after 2s of no activity
-    // - BUG: After marking disconnected, last_seen is reset, so cleanup takes another 4s (2x threshold)
-    // - EXPECTED: Peer should be gone from peers map within ~6s (2s stale + 4s cleanup)
-    // - WITH BUG: Peer takes up to 8s (2s + 2s + 4s due to double threshold)
-    let stale_threshold = Duration::from_secs(2);
-    let config1 = create_test_node_config_with_stale_threshold(stale_threshold);
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1382,10 +1350,7 @@ async fn test_peer_cleanup_timing() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
-    let peer2_channel = node1.connect_peer(&addr2).await.expect("Connect failed");
-    let peer2_id = saorsa_core::PeerId::from_name(&peer2_channel);
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
     assert!(
         node1.is_peer_connected(&peer2_id).await,
@@ -1412,8 +1377,6 @@ async fn test_peer_cleanup_timing() {
 
     assert!(was_removed, "Peer should be removed from tracking");
 
-    // Expected timing: stale_threshold + cleanup_threshold (2x stale) + margin
-    // With 2s stale threshold, cleanup threshold is 4s, so expect removal within ~8s
     // Add generous margin for CI timing variations
     let expected_max = Duration::from_secs(10);
     info!(
@@ -1818,20 +1781,19 @@ async fn test_late_event_subscription() {
 // PHASE 3: Boundary Tests
 // =============================================================================
 
-/// TEST 3.1: Zero Threshold Configuration
+/// TEST 3.1: Default Configuration Connection
 ///
-/// Set stale_peer_threshold = 0 and verify behavior.
+/// Verify basic connection behavior with default configuration.
 #[tokio::test]
-async fn test_zero_stale_threshold() {
+async fn test_default_config_connection() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Zero Stale Threshold ===");
+    info!("=== TEST: Default Config Connection ===");
 
-    // Use 0ms threshold - should handle gracefully
-    let config1 = create_test_node_config_with_stale_threshold(Duration::ZERO);
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1839,61 +1801,52 @@ async fn test_zero_stale_threshold() {
     let node2 = P2PNode::new(config2).await.expect("Failed to create node2");
     node2.start().await.expect("Failed to start node2");
 
-    let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    // Connection might succeed or fail immediately - both are valid
-    let peer2_peer_id = *node2.peer_id();
-    match node1.connect_peer(&addr2).await {
-        Ok(channel_id) => {
-            info!("Connection succeeded with zero threshold");
+    // Verify the connection is active
+    assert!(
+        node1.is_peer_connected(&peer2_id).await,
+        "node1 should see peer2 as connected"
+    );
 
-            // Wait briefly for identity exchange (may not complete with zero threshold)
-            let identified = node1
-                .wait_for_peer_identity(&channel_id, Duration::from_secs(2))
-                .await;
+    // Verify bidirectional message exchange
+    let mut events2 = node2.subscribe_events();
+    node1
+        .send_message(&peer2_id, "messaging", b"hello".to_vec())
+        .await
+        .expect("send_message should succeed");
 
-            if identified.is_ok() {
-                // Try to send a message quickly
-                let send_result = node1
-                    .send_message(&peer2_peer_id, "messaging", b"quick".to_vec())
-                    .await;
-
-                match send_result {
-                    Ok(()) => info!("Message sent with zero threshold"),
-                    Err(e) => info!("Message failed (acceptable with zero threshold): {e}"),
-                }
-            } else {
-                info!("Identity exchange didn't complete with zero threshold (acceptable)");
+    let received = timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let Ok(P2PEvent::Message { data, .. }) = events2.recv().await {
+                return data;
             }
         }
-        Err(e) => {
-            info!(
-                "Connection rejected with zero threshold (acceptable): {}",
-                e
-            );
-        }
-    }
+    })
+    .await
+    .expect("node2 should receive the message within timeout");
 
-    // Node should not have panicked or hung
-    info!("=== TEST PASSED: Zero Stale Threshold ===");
+    assert_eq!(
+        received, b"hello",
+        "received message should match sent data"
+    );
+
+    info!("=== TEST PASSED: Default Config Connection ===");
 }
 
-/// TEST 3.2: Short Threshold
+/// TEST 3.2: Quick Message Exchange
 ///
-/// Set 1 second threshold (short but realistic for testing).
-/// Verifies connections work with short stale thresholds.
+/// Verifies connection and message exchange with default configuration.
 #[tokio::test]
-async fn test_short_stale_threshold() {
+async fn test_quick_message_exchange() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
 
-    info!("=== TEST: Short Stale Threshold ===");
+    info!("=== TEST: Quick Message Exchange ===");
 
-    // Use 1 second threshold - short but realistic
-    let config1 = create_test_node_config_with_stale_threshold(Duration::from_secs(1));
+    let config1 = create_test_node_config();
     let config2 = create_test_node_config();
 
     let node1 = P2PNode::new(config1).await.expect("Failed to create node1");
@@ -1905,11 +1858,11 @@ async fn test_short_stale_threshold() {
 
     let peer2_id = connect_and_identify(&node1, &node2).await;
 
-    // Send a message - should work with 1s threshold
+    // Send a message
     node1
         .send_message(&peer2_id, "messaging", b"quick_msg".to_vec())
         .await
-        .expect("Should be able to send with short threshold");
+        .expect("Should be able to send message");
 
     let received = wait_for_event(
         &mut events2,
@@ -1920,10 +1873,10 @@ async fn test_short_stale_threshold() {
 
     assert!(
         matches!(received, Some(P2PEvent::Message { .. })),
-        "Should receive message even with short stale threshold"
+        "Should receive message"
     );
 
-    info!("=== TEST PASSED: Short Stale Threshold ===");
+    info!("=== TEST PASSED: Quick Message Exchange ===");
 }
 
 /// TEST 3.3: Many Peers Performance

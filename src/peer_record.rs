@@ -34,7 +34,7 @@ pub use crate::identity::node_identity::{PeerId, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature,
 };
-use crate::{NetworkAddress, P2PError, Result};
+use crate::{MultiAddr, P2PError, Result};
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -149,7 +149,7 @@ pub struct PeerEndpoint {
     pub endpoint_id: EndpointId,
 
     /// External network address as observed by the network
-    pub external_address: NetworkAddress,
+    pub external_address: MultiAddr,
 
     /// Detected NAT type for this endpoint
     pub nat_type: NatType,
@@ -168,7 +168,7 @@ impl PeerEndpoint {
     /// Create a new peer endpoint
     pub fn new(
         endpoint_id: EndpointId,
-        external_address: NetworkAddress,
+        external_address: MultiAddr,
         nat_type: NatType,
         coordinator_nodes: Vec<CoordinatorId>,
         device_info: Option<String>,
@@ -489,7 +489,7 @@ mod tests {
     fn create_test_endpoint() -> PeerEndpoint {
         PeerEndpoint::new(
             EndpointId::new(),
-            "192.168.1.1:8080".parse::<NetworkAddress>().unwrap(),
+            "192.168.1.1:8080".parse::<MultiAddr>().unwrap(),
             NatType::FullCone,
             vec!["coordinator1".to_string()],
             Some("test-device".to_string()),

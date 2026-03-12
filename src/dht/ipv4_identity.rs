@@ -175,7 +175,21 @@ fn ipv4_to_ipv6_mapped(ipv4: Ipv4Addr) -> Ipv6Addr {
 impl IPv4DHTIdentityManager {
     /// Create a new IPv4 DHT identity manager
     pub fn new(config: IPv4DHTConfig) -> Self {
-        let ip_enforcer = IPDiversityEnforcer::new(config.diversity_config.clone());
+        Self::with_loopback(config, false)
+    }
+
+    /// Create a new IPv4 DHT identity manager using the node's canonical
+    /// loopback policy.
+    pub fn from_node_config(
+        config: IPv4DHTConfig,
+        node_config: &crate::network::NodeConfig,
+    ) -> Self {
+        Self::with_loopback(config, node_config.allow_loopback)
+    }
+
+    fn with_loopback(config: IPv4DHTConfig, allow_loopback: bool) -> Self {
+        let ip_enforcer =
+            IPDiversityEnforcer::with_loopback(config.diversity_config.clone(), allow_loopback);
 
         Self {
             config,
@@ -604,10 +618,11 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
 
-    fn create_test_dht_node(peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
+    fn create_test_dht_node(_peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
+        let port = 8080u16 + id_bytes[0] as u16;
         DHTNode {
             id: PeerId::from_bytes(id_bytes),
-            address: format!("192.168.1.100:8080:{}", peer_id),
+            address: format!("192.168.1.100:{port}").parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }
@@ -621,6 +636,7 @@ mod tests {
 
     fn create_test_ip_analysis() -> IPAnalysis {
         IPAnalysis {
+            is_loopback: false,
             subnet_64: Ipv6Addr::from_str("::ffff:192.168.0.0").unwrap(),
             subnet_48: Ipv6Addr::from_str("::ffff:192.168.0.0").unwrap(),
             subnet_32: Ipv6Addr::from_str("::ffff:192.0.0.0").unwrap(),

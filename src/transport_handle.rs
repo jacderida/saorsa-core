@@ -17,16 +17,16 @@
 //! message I/O, events) extracted from [`P2PNode`] to enable sharing between
 //! `P2PNode` and [`DhtNetworkManager`] without coupling to the full node.
 
-use crate::NetworkAddress;
+use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::identity::node_identity::NodeIdentity;
 use crate::network::{
-    ConnectionStatus, KEEPALIVE_PAYLOAD, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT,
-    MESSAGE_RECV_CHANNEL_CAPACITY, NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse,
-    PendingRequest, RequestResponseEnvelope, WireMessage, broadcast_event,
-    normalize_wildcard_to_loopback, parse_protocol_message, register_new_channel,
+    ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
+    NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
+    RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
+    parse_protocol_message, register_new_channel,
 };
 use crate::production::{ProductionConfig, ResourceManager};
 use crate::security::GeoProvider;
@@ -43,36 +43,16 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-/// Background task maintenance interval in milliseconds.
-const MAINTENANCE_INTERVAL_MS: u64 = 100;
-
-/// Stale peer cleanup uses this multiplier on the stale threshold.
-const CLEANUP_THRESHOLD_MULTIPLIER: u32 = 2;
-
-/// Interval between keepalive pings to prevent idle connection timeout.
-const KEEPALIVE_INTERVAL_SECS: u64 = 15;
-
 // Test configuration defaults (used by `new_for_tests()` which is available in all builds)
 const TEST_EVENT_CHANNEL_CAPACITY: usize = 16;
 const TEST_MAX_REQUESTS: u32 = 100;
 const TEST_BURST_SIZE: u32 = 100;
 const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
 const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
-const TEST_STALE_PEER_THRESHOLD_SECS: u64 = 60;
 
 /// Internal protocol for automatic identity announcement on connect.
 /// Filtered from P2PEvent::Message emission — not visible to applications.
 const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
-
-/// Touch a channel's `last_seen` timestamp to prove it is still alive.
-///
-/// Acquires a write lock on the peer map, so callers should not already
-/// hold a lock on `peers`.
-async fn touch_channel_last_seen(peers: &RwLock<HashMap<String, PeerInfo>>, channel_id: &str) {
-    if let Some(peer_info) = peers.write().await.get_mut(channel_id) {
-        peer_info.last_seen = Instant::now();
-    }
-}
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
@@ -82,8 +62,6 @@ pub struct TransportConfig {
     pub enable_ipv6: bool,
     /// Connection timeout for outbound dials and sends.
     pub connection_timeout: Duration,
-    /// Stale peer threshold for maintenance sweeps.
-    pub stale_peer_threshold: Duration,
     /// Maximum concurrent connections.
     pub max_connections: usize,
     /// Optional production hardening config.
@@ -101,6 +79,30 @@ pub struct TransportConfig {
     pub node_identity: Arc<NodeIdentity>,
     /// User agent string identifying this node's software.
     pub user_agent: String,
+    /// Allow loopback addresses in the transport layer.
+    pub allow_loopback: bool,
+}
+
+impl TransportConfig {
+    /// Build transport config directly from the node's canonical config.
+    pub fn from_node_config(
+        config: &crate::network::NodeConfig,
+        event_channel_capacity: usize,
+        node_identity: Arc<NodeIdentity>,
+    ) -> Self {
+        Self {
+            listen_addr: config.listen_addr,
+            enable_ipv6: config.enable_ipv6,
+            connection_timeout: config.connection_timeout,
+            max_connections: config.max_connections,
+            production_config: config.production_config.clone(),
+            event_channel_capacity,
+            max_message_size: config.max_message_size,
+            node_identity,
+            user_agent: config.user_agent(),
+            allow_loopback: config.allow_loopback,
+        }
+    }
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -123,10 +125,7 @@ pub struct TransportHandle {
     shutdown: CancellationToken,
     resource_manager: Option<Arc<ResourceManager>>,
     connection_timeout: Duration,
-    stale_peer_threshold: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
-    keepalive_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
-    periodic_tasks_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     listener_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Cryptographic node identity for signing outgoing messages.
@@ -155,8 +154,7 @@ impl TransportHandle {
     ///
     /// This performs the transport-level initialization that was previously
     /// embedded in `P2PNode::new()`: dual-stack QUIC binding, rate limiter,
-    /// GeoIP provider, and background tasks (connection monitor, keepalive,
-    /// periodic maintenance).
+    /// GeoIP provider, and a background connection lifecycle monitor.
     pub async fn new(config: TransportConfig) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
 
@@ -190,11 +188,12 @@ impl TransportHandle {
         };
 
         let dual_node = Arc::new(
-            DualStackNetworkNode::new_with_max_connections(
+            DualStackNetworkNode::new_with_options(
                 v6_opt,
                 v4_opt,
                 config.max_connections,
                 config.max_message_size,
+                config.allow_loopback,
             )
             .await
             .map_err(|e| {
@@ -257,43 +256,6 @@ impl TransportHandle {
             Arc::new(RwLock::new(Some(handle)))
         };
 
-        let keepalive_handle = {
-            let active_conns = Arc::clone(&active_connections);
-            let dual_node_clone = Arc::clone(&dual_node);
-            let token = shutdown.clone();
-
-            let handle = tokio::spawn(async move {
-                Self::keepalive_task(active_conns, dual_node_clone, token).await;
-            });
-            Arc::new(RwLock::new(Some(handle)))
-        };
-
-        let periodic_tasks_handle = {
-            let peers_clone = Arc::clone(&peers);
-            let active_conns_clone = Arc::clone(&active_connections);
-            let event_tx_clone = event_tx.clone();
-            let stale_threshold = config.stale_peer_threshold;
-            let token = shutdown.clone();
-            let p2c = Arc::clone(&peer_to_channel);
-            let c2p = Arc::clone(&channel_to_peers);
-            let pua = Arc::clone(&peer_user_agents);
-
-            let handle = tokio::spawn(async move {
-                Self::periodic_maintenance_task(
-                    peers_clone,
-                    active_conns_clone,
-                    event_tx_clone,
-                    stale_threshold,
-                    token,
-                    p2c,
-                    c2p,
-                    pua,
-                )
-                .await;
-            });
-            Arc::new(RwLock::new(Some(handle)))
-        };
-
         Ok(Self {
             dual_node,
             peers,
@@ -306,10 +268,7 @@ impl TransportHandle {
             shutdown,
             resource_manager,
             connection_timeout: config.connection_timeout,
-            stale_peer_threshold: config.stale_peer_threshold,
             connection_monitor_handle,
-            keepalive_handle,
-            periodic_tasks_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: config.node_identity,
@@ -371,10 +330,7 @@ impl TransportHandle {
             shutdown: CancellationToken::new(),
             resource_manager: None,
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
-            stale_peer_threshold: Duration::from_secs(TEST_STALE_PEER_THRESHOLD_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
-            keepalive_handle: Arc::new(RwLock::new(None)),
-            periodic_tasks_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: identity,
@@ -604,6 +560,9 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Connect to a peer at the given address.
+    ///
+    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
+    /// `/ip4/1.2.3.4/udp/9000`).
     pub async fn connect_peer(&self, address: &str) -> Result<String> {
         // Check production limits if resource manager is enabled
         let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
@@ -612,11 +571,15 @@ impl TransportHandle {
             None
         };
 
-        let socket_addr: SocketAddr = address.parse().map_err(|e| {
-            P2PError::Network(NetworkError::InvalidAddress(
-                format!("{}: {}", address, e).into(),
-            ))
-        })?;
+        // Parse via MultiAddr for consistent MultiAddr support
+        let socket_addr: SocketAddr = address
+            .parse::<MultiAddr>()
+            .map(|na| na.socket_addr)
+            .map_err(|e| {
+                P2PError::Network(NetworkError::InvalidAddress(
+                    format!("{}: {}", address, e).into(),
+                ))
+            })?;
 
         let normalized_addr = normalize_wildcard_to_loopback(socket_addr);
         let addr_list = vec![normalized_addr];
@@ -750,9 +713,7 @@ impl TransportHandle {
                 }
             }
             self.active_connections.write().await.remove(channel_id);
-            if let Some(mut peer_info) = self.peers.write().await.remove(channel_id) {
-                peer_info.status = ConnectionStatus::Disconnected;
-            }
+            self.peers.write().await.remove(channel_id);
         }
 
         info!("Disconnected from peer: {}", peer_id);
@@ -1334,7 +1295,7 @@ impl TransportHandle {
                 }
 
                 let channel_id = remote_sock.to_string();
-                let remote_addr = NetworkAddress::from(remote_sock);
+                let remote_addr = MultiAddr::from(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
                 register_new_channel(&peers, &channel_id, &remote_addr).await;
@@ -1367,7 +1328,6 @@ impl TransportHandle {
 
         let event_tx = self.event_tx.clone();
         let active_requests = Arc::clone(&self.active_requests);
-        let peers_for_recv = Arc::clone(&self.peers);
         let peer_to_channel = Arc::clone(&self.peer_to_channel);
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
@@ -1377,16 +1337,6 @@ impl TransportHandle {
             while let Some((from_addr, bytes)) = rx.recv().await {
                 let channel_id = from_addr.to_string();
                 trace!("Received {} bytes from channel {}", bytes.len(), channel_id);
-
-                // Any incoming data (keepalive or protocol message) proves the peer
-                // is alive — update last_seen so the stale-peer reaper doesn't
-                // disconnect active peers.
-                touch_channel_last_seen(&peers_for_recv, &channel_id).await;
-
-                if bytes == KEEPALIVE_PAYLOAD {
-                    trace!("Received keepalive from {}", channel_id);
-                    continue;
-                }
 
                 match parse_protocol_message(&bytes, &channel_id) {
                     Some(ParsedMessage {
@@ -1517,8 +1467,6 @@ impl TransportHandle {
         Self::join_task_handles(handles, "recv").await;
         Self::join_task_slot(&self.listener_handle, "listener").await;
         Self::join_task_slot(&self.connection_monitor_handle, "connection monitor").await;
-        Self::join_task_slot(&self.keepalive_handle, "keepalive").await;
-        Self::join_task_slot(&self.periodic_tasks_handle, "periodic maintenance").await;
 
         self.disconnect_all_peers().await?;
 
@@ -1552,46 +1500,6 @@ impl TransportHandle {
                 tracing::warn!("{task_name} task join error during shutdown: {:?}", e);
             }
         }
-    }
-
-    /// Run periodic maintenance: detect stale peers and clean up.
-    ///
-    /// Called from `P2PNode::run()` and `P2PNode::periodic_tasks()`.
-    pub async fn maintenance_tick(&self) -> Result<()> {
-        let stale_threshold = self.stale_peer_threshold;
-        let cleanup_threshold = stale_threshold * CLEANUP_THRESHOLD_MULTIPLIER;
-
-        let (peers_to_remove, peers_to_mark_disconnected) = {
-            let peers = self.peers.read().await;
-            categorize_stale_peers(&peers, Instant::now(), stale_threshold, cleanup_threshold)
-        };
-
-        if !peers_to_mark_disconnected.is_empty() {
-            let mut peers = self.peers.write().await;
-            for peer_id in &peers_to_mark_disconnected {
-                if let Some(peer_info) = peers.get_mut(peer_id) {
-                    peer_info.status = ConnectionStatus::Disconnected;
-                }
-            }
-        }
-
-        for peer_id in &peers_to_mark_disconnected {
-            self.active_connections.write().await.remove(peer_id);
-            // remove_channel_mappings emits PeerDisconnected when the peer's
-            // last channel is removed.
-            self.remove_channel_mappings(peer_id).await;
-            info!(peer_id = %peer_id, "Stale peer disconnected");
-        }
-
-        if !peers_to_remove.is_empty() {
-            let mut peers = self.peers.write().await;
-            for peer_id in &peers_to_remove {
-                peers.remove(peer_id);
-                trace!(peer_id = %peer_id, "Peer removed from tracking");
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -1708,10 +1616,7 @@ impl TransportHandle {
                                 debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
 
                                 active_connections.write().await.remove(&channel_id);
-                                if let Some(peer_info) = peers.write().await.get_mut(&channel_id) {
-                                    peer_info.status = ConnectionStatus::Disconnected;
-                                    peer_info.last_seen = Instant::now();
-                                }
+                                peers.write().await.remove(&channel_id);
                                 // Remove channel mappings and emit PeerDisconnected
                                 // when the peer's last channel is closed.
                                 Self::remove_channel_mappings_static(
@@ -1738,142 +1643,6 @@ impl TransportHandle {
             }
         }
     }
-
-    /// Keepalive task — sends periodic pings to prevent idle timeout.
-    async fn keepalive_task(
-        active_connections: Arc<RwLock<HashSet<String>>>,
-        dual_node: Arc<DualStackNetworkNode>,
-        shutdown: CancellationToken,
-    ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        info!(
-            "Keepalive task started (interval: {}s)",
-            KEEPALIVE_INTERVAL_SECS
-        );
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                () = shutdown.cancelled() => {
-                    info!("Keepalive task shutting down");
-                    break;
-                }
-            }
-
-            let peers: Vec<String> = { active_connections.read().await.iter().cloned().collect() };
-
-            if peers.is_empty() {
-                trace!("Keepalive: no active connections");
-                continue;
-            }
-
-            debug!("Sending keepalive to {} active connections", peers.len());
-
-            let futs: Vec<_> = peers
-                .into_iter()
-                .filter_map(|channel_id| {
-                    let addr: SocketAddr = match channel_id.parse() {
-                        Ok(a) => a,
-                        Err(e) => {
-                            debug!("Skipping keepalive for invalid channel {channel_id}: {e}");
-                            return None;
-                        }
-                    };
-                    let node = Arc::clone(&dual_node);
-                    Some(async move {
-                        if let Err(e) = node
-                            .send_to_peer_optimized(&addr, KEEPALIVE_PAYLOAD)
-                            .await
-                        {
-                            debug!(
-                                "Failed to send keepalive to channel {}: {} (connection may have closed)",
-                                channel_id, e
-                            );
-                        } else {
-                            trace!("Keepalive sent to channel: {}", channel_id);
-                        }
-                    })
-                })
-                .collect();
-            futures::future::join_all(futs).await;
-        }
-
-        info!("Keepalive task stopped");
-    }
-
-    /// Periodic maintenance task — detects stale peers and removes them.
-    async fn periodic_maintenance_task(
-        peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-        active_connections: Arc<RwLock<HashSet<String>>>,
-        event_tx: broadcast::Sender<P2PEvent>,
-        stale_threshold: Duration,
-        shutdown: CancellationToken,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
-        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
-    ) {
-        let cleanup_threshold = stale_threshold * CLEANUP_THRESHOLD_MULTIPLIER;
-        let mut interval = tokio::time::interval(Duration::from_millis(MAINTENANCE_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        info!(
-            "Periodic maintenance task started (stale threshold: {:?})",
-            stale_threshold
-        );
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                () = shutdown.cancelled() => break,
-            }
-
-            let (peers_to_remove, peers_to_mark_disconnected) = {
-                let peers_lock = peers.read().await;
-                categorize_stale_peers(
-                    &peers_lock,
-                    Instant::now(),
-                    stale_threshold,
-                    cleanup_threshold,
-                )
-            };
-
-            if !peers_to_mark_disconnected.is_empty() {
-                let mut peers_lock = peers.write().await;
-                for peer_id in &peers_to_mark_disconnected {
-                    if let Some(peer_info) = peers_lock.get_mut(peer_id) {
-                        peer_info.status = ConnectionStatus::Disconnected;
-                    }
-                }
-            }
-
-            for peer_id in &peers_to_mark_disconnected {
-                active_connections.write().await.remove(peer_id);
-                // remove_channel_mappings_static emits PeerDisconnected when
-                // the peer's last channel is removed.
-                Self::remove_channel_mappings_static(
-                    peer_id,
-                    &peer_to_channel,
-                    &channel_to_peers,
-                    &peer_user_agents,
-                    &event_tx,
-                )
-                .await;
-                info!(peer_id = %peer_id, "Stale peer disconnected");
-            }
-
-            if !peers_to_remove.is_empty() {
-                let mut peers_lock = peers.write().await;
-                for peer_id in &peers_to_remove {
-                    peers_lock.remove(peer_id);
-                    trace!(peer_id = %peer_id, "Peer removed from tracking");
-                }
-            }
-        }
-
-        info!("Periodic maintenance task stopped");
-    }
 }
 
 // ============================================================================
@@ -1890,58 +1659,6 @@ fn validate_protocol_name(protocol: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Categorize peers into those needing removal vs disconnection based on staleness.
-///
-/// Returns `(peers_to_remove, peers_to_mark_disconnected)`.
-fn categorize_stale_peers(
-    peers: &HashMap<String, PeerInfo>,
-    now: Instant,
-    stale_threshold: Duration,
-    cleanup_threshold: Duration,
-) -> (Vec<String>, Vec<String>) {
-    let mut peers_to_remove = Vec::new();
-    let mut peers_to_mark_disconnected = Vec::new();
-
-    for (peer_id, peer_info) in peers.iter() {
-        let elapsed = now.duration_since(peer_info.last_seen);
-
-        match &peer_info.status {
-            ConnectionStatus::Connected => {
-                if elapsed > stale_threshold {
-                    debug!(
-                        peer_id = %peer_id,
-                        elapsed_secs = elapsed.as_secs(),
-                        "Peer went stale - marking for disconnection"
-                    );
-                    peers_to_mark_disconnected.push(peer_id.clone());
-                }
-            }
-            ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
-                if elapsed > cleanup_threshold {
-                    trace!(
-                        peer_id = %peer_id,
-                        elapsed_secs = elapsed.as_secs(),
-                        "Removing disconnected peer from tracking"
-                    );
-                    peers_to_remove.push(peer_id.clone());
-                }
-            }
-            ConnectionStatus::Connecting | ConnectionStatus::Disconnecting => {
-                if elapsed > stale_threshold {
-                    debug!(
-                        peer_id = %peer_id,
-                        status = ?peer_info.status,
-                        "Connection timed out in transitional state"
-                    );
-                    peers_to_mark_disconnected.push(peer_id.clone());
-                }
-            }
-        }
-    }
-
-    (peers_to_remove, peers_to_mark_disconnected)
 }
 
 // ============================================================================

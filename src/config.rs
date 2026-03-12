@@ -23,7 +23,7 @@
 //! - IPv4/IPv6 address validation
 //! - Secure defaults for production
 
-use crate::address::NetworkAddress;
+use crate::address::MultiAddr;
 use crate::error::ConfigError;
 use crate::validation::{
     ValidationContext, validate_config_value, validate_file_path, validate_network_address,
@@ -76,6 +76,8 @@ pub struct NetworkConfig {
     pub connection_timeout: u64,
     /// Keepalive interval in seconds
     pub keepalive_interval: u64,
+    /// Allow loopback addresses (for devnet/testnet)
+    pub allow_loopback: bool,
 }
 
 /// Security configuration
@@ -193,6 +195,7 @@ impl Default for NetworkConfig {
             max_connections: 10000,
             connection_timeout: 30,
             keepalive_interval: 60,
+            allow_loopback: false,
         }
     }
 }
@@ -515,21 +518,6 @@ impl Config {
             });
         }
 
-        // Try parsing as four-word address format (always enabled)
-        if let Ok(network_addr) = crate::NetworkAddress::from_four_words(addr) {
-            // Validate the parsed socket address
-            let ctx = ValidationContext::default()
-                .allow_localhost()
-                .allow_private_ips();
-
-            return validate_network_address(&network_addr.socket_addr(), &ctx).map_err(|e| {
-                P2PError::Config(ConfigError::InvalidValue {
-                    field: field.to_string().into(),
-                    reason: e.to_string().into(),
-                })
-            });
-        }
-
         // Try parsing as multiaddr format
         if addr.starts_with("/ip4/") || addr.starts_with("/ip6/") {
             // Basic multiaddr validation
@@ -587,12 +575,12 @@ impl Config {
     }
 
     /// Get parsed bootstrap addresses
-    pub fn bootstrap_addrs(&self) -> Result<Vec<NetworkAddress>> {
+    pub fn bootstrap_addrs(&self) -> Result<Vec<MultiAddr>> {
         self.network
             .bootstrap_nodes
             .iter()
             .map(|addr| {
-                addr.parse::<NetworkAddress>().map_err(|e| {
+                addr.parse::<MultiAddr>().map_err(|e| {
                     P2PError::Config(ConfigError::InvalidValue {
                         field: "bootstrap_nodes".to_string().into(),
                         reason: format!("Invalid address: {}", e).into(),

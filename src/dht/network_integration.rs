@@ -20,8 +20,8 @@ const MAX_CONNECTIONS: usize = 100;
 /// Connection idle timeout
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Keep-alive interval
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Interval between connection maintenance sweeps
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Message batch window
 const _BATCH_WINDOW: Duration = Duration::from_millis(10);
@@ -59,7 +59,6 @@ pub enum DhtMessage {
     // Network Management
     Ping {
         timestamp: u64,
-        sender_info: NodeInfo,
     },
     Join {
         node_info: NodeInfo,
@@ -106,7 +105,6 @@ pub enum DhtResponse {
     // Management Responses
     Pong {
         timestamp: u64,
-        node_info: NodeInfo,
     },
     JoinAck {
         routing_info: RoutingInfo,
@@ -483,13 +481,7 @@ impl DhtProtocolHandler {
                 })
             }
 
-            DhtMessage::Ping {
-                timestamp,
-                sender_info,
-            } => Ok(DhtResponse::Pong {
-                timestamp,
-                node_info: sender_info,
-            }),
+            DhtMessage::Ping { timestamp } => Ok(DhtResponse::Pong { timestamp }),
 
             _ => Ok(DhtResponse::Error {
                 code: ErrorCode::InvalidMessage,
@@ -546,7 +538,7 @@ impl NetworkIntegrationLayer {
         // Get peer info
         let peers = self.peer_manager.known_peers.read().await;
         let peer_info = peers.get(target).ok_or_else(|| anyhow!("Unknown peer"))?;
-        let address = peer_info.node_info.address.clone();
+        let address = peer_info.node_info.address.to_string();
         drop(peers);
 
         // Get connection
@@ -662,27 +654,14 @@ impl NetworkIntegrationLayer {
         Ok(discovered)
     }
 
-    /// Maintain connections and perform housekeeping
+    /// Maintain connections by cleaning up idle ones periodically.
+    ///
+    /// Liveness verification relies on implicit Kademlia liveness: any
+    /// successful RPC proves a peer is alive via `touch_node()`.
     pub async fn maintain_connections(&self) -> Result<()> {
         loop {
-            // Cleanup idle connections
             self.connection_pool.cleanup_idle_connections().await;
-
-            // Send keepalive pings
-            let peers = self.peer_manager.get_peers(10).await;
-            for peer in peers {
-                let message = DhtMessage::Ping {
-                    timestamp: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    sender_info: peer.clone(),
-                };
-
-                let _ = self.send_message(peer.id, message).await;
-            }
-
-            sleep(KEEPALIVE_INTERVAL).await;
+            sleep(MAINTENANCE_INTERVAL).await;
         }
     }
 }
@@ -734,15 +713,7 @@ mod tests {
         }
 
         async fn receive(&mut self) -> Result<Vec<u8>> {
-            let response = DhtResponse::Pong {
-                timestamp: 0,
-                node_info: NodeInfo {
-                    id: PeerId::from_bytes([42u8; 32]),
-                    address: "mock".to_string(),
-                    last_seen: SystemTime::now(),
-                    capacity: NodeCapacity::default(),
-                },
-            };
+            let response = DhtResponse::Pong { timestamp: 0 };
             Ok(postcard::to_stdvec(&response)?)
         }
 
@@ -791,15 +762,7 @@ mod tests {
         let router = MessageRouter::new();
         let node_id = PeerId::from_bytes([42u8; 32]);
 
-        let message = DhtMessage::Ping {
-            timestamp: 0,
-            sender_info: NodeInfo {
-                id: node_id,
-                address: "test".to_string(),
-                last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
-            },
-        };
+        let message = DhtMessage::Ping { timestamp: 0 };
 
         router.queue_message(node_id, message.clone(), true).await;
         router.queue_message(node_id, message.clone(), false).await;
@@ -816,7 +779,7 @@ mod tests {
 
         let node_info = NodeInfo {
             id: PeerId::from_bytes([42u8; 32]),
-            address: "test".to_string(),
+            address: "127.0.0.1:0".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };
@@ -842,17 +805,14 @@ mod tests {
         let target = PeerId::from_bytes([42u8; 32]);
         let peer_info = NodeInfo {
             id: target,
-            address: "mock://test".to_string(),
+            address: "127.0.0.1:0".parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         };
 
         network.peer_manager.add_peer(peer_info.clone()).await;
 
-        let message = DhtMessage::Ping {
-            timestamp: 0,
-            sender_info: peer_info,
-        };
+        let message = DhtMessage::Ping { timestamp: 0 };
 
         let response = network.send_message(target, message).await?;
 

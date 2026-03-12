@@ -79,7 +79,6 @@ Every identity is bound to an ML-DSA-65 keypair:
 ```rust
 // Identity cannot be forged without private key
 pub struct Identity {
-    pub four_words: FourWordAddress,
     pub public_key: MlDsaPublicKey,  // 1,952 bytes
     pub created_at: SystemTime,
 }

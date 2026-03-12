@@ -2,8 +2,8 @@
 //!
 //! Coordinates periodic maintenance tasks:
 //! - Bucket refresh operations
-//! - Node liveness checks
-//! - Eviction evaluation
+//! - Close group validation
+//! - Record republishing
 //!
 //! Copyright 2024 Saorsa Labs
 //! SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
@@ -17,10 +17,6 @@ use super::config::MaintenanceConfig;
 pub enum MaintenanceTask {
     /// Refresh k-buckets
     BucketRefresh,
-    /// Check liveness of nodes
-    LivenessCheck,
-    /// Evaluate nodes for eviction
-    EvictionEvaluation,
     /// Validate nodes via close group consensus
     CloseGroupValidation,
     /// Republish stored records
@@ -33,8 +29,6 @@ impl MaintenanceTask {
     pub fn all() -> Vec<MaintenanceTask> {
         vec![
             MaintenanceTask::BucketRefresh,
-            MaintenanceTask::LivenessCheck,
-            MaintenanceTask::EvictionEvaluation,
             MaintenanceTask::CloseGroupValidation,
             MaintenanceTask::RecordRepublish,
         ]
@@ -45,8 +39,6 @@ impl MaintenanceTask {
     pub fn default_interval(&self, config: &MaintenanceConfig) -> Duration {
         match self {
             MaintenanceTask::BucketRefresh => config.bucket_refresh_interval,
-            MaintenanceTask::LivenessCheck => config.ping_timeout * 10, // Check every 10 ping timeouts
-            MaintenanceTask::EvictionEvaluation => Duration::from_secs(60), // Every minute
             MaintenanceTask::CloseGroupValidation => Duration::from_secs(300), // Every 5 minutes
             MaintenanceTask::RecordRepublish => config.republish_interval,
         }
@@ -261,7 +253,7 @@ mod tests {
     #[test]
     fn test_maintenance_task_all() {
         let all_tasks = MaintenanceTask::all();
-        assert_eq!(all_tasks.len(), 5);
+        assert_eq!(all_tasks.len(), 3);
     }
 
     #[test]
@@ -289,7 +281,10 @@ mod tests {
 
     #[test]
     fn test_scheduled_task_start_complete() {
-        let mut task = ScheduledTask::new(MaintenanceTask::LivenessCheck, Duration::from_secs(60));
+        let mut task = ScheduledTask::new(
+            MaintenanceTask::CloseGroupValidation,
+            Duration::from_secs(60),
+        );
 
         task.start();
         assert!(task.is_running);
@@ -318,7 +313,7 @@ mod tests {
         let config = MaintenanceConfig::default();
         let scheduler = MaintenanceScheduler::new(config);
 
-        assert_eq!(scheduler.tasks.len(), 5);
+        assert_eq!(scheduler.tasks.len(), 3);
         assert!(!scheduler.is_active());
     }
 
@@ -352,9 +347,7 @@ mod tests {
         }
 
         let due = scheduler.get_due_tasks();
-        // There are 5 maintenance task types: BucketRefresh, LivenessCheck,
-        // EvictionEvaluation, CloseGroupValidation, RecordRepublish
-        assert_eq!(due.len(), 5);
+        assert_eq!(due.len(), 3);
     }
 
     #[test]
@@ -388,9 +381,7 @@ mod tests {
         let scheduler = MaintenanceScheduler::new(config);
 
         let stats = scheduler.get_stats();
-        // There are 5 maintenance task types: BucketRefresh, LivenessCheck,
-        // EvictionEvaluation, CloseGroupValidation, RecordRepublish
-        assert_eq!(stats.len(), 5);
+        assert_eq!(stats.len(), 3);
 
         for stat in stats {
             assert_eq!(stat.run_count, 0);

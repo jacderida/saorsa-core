@@ -71,9 +71,9 @@ pub struct ConnectionInfo {
     /// Transport type being used
     pub transport_type: TransportType,
     /// Local address
-    pub local_addr: crate::NetworkAddress,
+    pub local_addr: crate::MultiAddr,
     /// Remote address
-    pub remote_addr: crate::NetworkAddress,
+    pub remote_addr: crate::MultiAddr,
     /// Whether connection is encrypted
     pub is_encrypted: bool,
     /// Cipher suite being used

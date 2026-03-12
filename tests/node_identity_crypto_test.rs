@@ -13,11 +13,10 @@ use blake3::Hasher;
 use rand::{RngCore, thread_rng};
 use saorsa_core::identity::{
     encryption::{decrypt_with_device_password, encrypt_with_device_password},
-    four_words::FourWordAddress,
     node_identity::{NodeIdentity, PeerId, peer_id_from_public_key},
 };
 use saorsa_core::quantum_crypto::saorsa_transport_integration::ml_dsa_verify;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Helper to create deterministic test identity
@@ -37,79 +36,6 @@ fn create_random_data(size: usize) -> Vec<u8> {
     let mut data = vec![0u8; size];
     thread_rng().fill_bytes(&mut data);
     data
-}
-
-#[tokio::test]
-async fn test_four_word_address_generation() -> Result<()> {
-    println!("🔤 Testing Four-Word Address Generation");
-
-    // Test deterministic generation from node IDs
-    let test_cases = [
-        (1u64, "alpha-alpha-alpha-amber"),
-        (255u64, "alpha-alpha-alpha-zombie"),
-        (1000000u64, "alpha-alpha-chaos-dance"),
-    ];
-
-    for (seed, _expected_pattern) in &test_cases {
-        let identity = create_test_identity(*seed);
-        let node_id = identity.peer_id();
-        let four_word_addr = FourWordAddress::from_peer_id(node_id);
-
-        // Four-word address should be deterministic for same node ID
-        let four_word_addr2 = FourWordAddress::from_peer_id(node_id);
-        assert_eq!(
-            four_word_addr, four_word_addr2,
-            "Four-word address should be deterministic"
-        );
-
-        let addr_string = four_word_addr.to_string();
-
-        // Should contain exactly 4 words separated by hyphens
-        let parts: Vec<&str> = addr_string.split('-').collect();
-        assert_eq!(
-            parts.len(),
-            4,
-            "Should have exactly 4 words: {}",
-            addr_string
-        );
-
-        // Each word should be from the word list (non-empty, alphabetic)
-        for word in &parts {
-            assert!(!word.is_empty(), "Word should not be empty");
-            assert!(
-                word.chars().all(|c| c.is_ascii_lowercase()),
-                "Word should be lowercase alphabetic: {}",
-                word
-            );
-        }
-
-        // Should be able to parse back
-        let parsed = FourWordAddress::parse_str(&addr_string)?;
-        assert_eq!(parsed, four_word_addr, "Should parse back to same address");
-
-        println!("  ✅ Seed {}: {} -> {}", seed, node_id, addr_string);
-    }
-
-    // Test uniqueness across different node IDs
-    let mut addresses = HashSet::new();
-    for seed in 0..1000 {
-        let identity = create_test_identity(seed);
-        let node_id = identity.peer_id();
-        let addr = FourWordAddress::from_peer_id(node_id);
-        let addr_string = addr.to_string();
-
-        assert!(
-            !addresses.contains(&addr_string),
-            "Address should be unique: {} (seed {})",
-            addr_string,
-            seed
-        );
-        addresses.insert(addr_string);
-    }
-
-    println!("  ✅ Generated {} unique addresses", addresses.len());
-    println!("✅ Four-word address generation test passed");
-    Ok(())
 }
 
 #[tokio::test]
@@ -423,25 +349,6 @@ async fn test_identity_consistency() -> Result<()> {
         "Same seed should produce same public key"
     );
 
-    // Test four-word address consistency
-    let addr1 = FourWordAddress::from_peer_id(identity1.peer_id());
-    let addr2 = FourWordAddress::from_peer_id(identity2.peer_id());
-    assert_eq!(
-        addr1, addr2,
-        "Same node ID should produce same four-word address"
-    );
-
-    // Test cross-system consistency (node ID -> four words -> parse -> verify)
-    let original_node_id = identity1.peer_id();
-    let four_word_addr = FourWordAddress::from_peer_id(original_node_id);
-    let addr_string = four_word_addr.to_string();
-    let parsed_addr = FourWordAddress::parse_str(&addr_string)?;
-
-    assert_eq!(
-        four_word_addr, parsed_addr,
-        "Four-word address should parse back consistently"
-    );
-
     // Test that different seeds produce different identities
     let different_identity = create_test_identity(seed + 1);
     assert_ne!(
@@ -495,22 +402,6 @@ async fn test_identity_performance() -> Result<()> {
     println!(
         "  Identity generation: {:.0} identities/sec",
         generation_rate
-    );
-
-    // Benchmark four-word address generation
-    let start = Instant::now();
-    let mut addresses = Vec::new();
-
-    for identity in &identities {
-        let addr = FourWordAddress::from_peer_id(identity.peer_id());
-        addresses.push(addr);
-    }
-
-    let addr_time = start.elapsed();
-    let addr_rate = generation_count as f64 / addr_time.as_secs_f64();
-    println!(
-        "  Four-word address generation: {:.0} addresses/sec",
-        addr_rate
     );
 
     // Benchmark signing
@@ -583,7 +474,6 @@ async fn test_identity_performance() -> Result<()> {
         min_generation_rate,
         generation_rate
     );
-    assert!(addr_rate > 1000.0, "Address generation should be >1000/sec");
     // Real ML-DSA-65 is slower than classical signatures; debug builds are ~50/sec
     let min_sign_rate = if cfg!(debug_assertions) { 10.0 } else { 50.0 };
     let min_verify_rate = if cfg!(debug_assertions) { 25.0 } else { 100.0 };
@@ -617,45 +507,6 @@ async fn test_identity_edge_cases() -> Result<()> {
         min_identity.peer_id(),
         "Max and min seeds should produce different identities"
     );
-
-    // Test four-word address parsing edge cases
-    let valid_addresses = [
-        "alpha-bravo-charlie-delta",
-        "a-b-c-d",                    // Minimal length words
-        "zebra-zephyr-zenith-zodiac", // Z-words
-    ];
-
-    for addr_str in &valid_addresses {
-        let parsed = FourWordAddress::parse_str(addr_str);
-        assert!(parsed.is_ok(), "Should parse valid address: {}", addr_str);
-
-        let addr = parsed.unwrap();
-        let regenerated = addr.to_string();
-        assert_eq!(&regenerated, addr_str, "Should regenerate same string");
-    }
-
-    // Test invalid four-word addresses
-    let invalid_addresses = [
-        "alpha-bravo-charlie",            // Only 3 words
-        "alpha-bravo-charlie-delta-echo", // 5 words
-        "alpha.bravo.charlie.delta",      // Wrong separator
-        "alpha-bravo-charlie-",           // Trailing separator
-        "-alpha-bravo-charlie-delta",     // Leading separator
-        "alpha--bravo-charlie-delta",     // Double separator
-        "alpha-bravo-charlie-DELTA",      // Uppercase
-        "alpha-bravo-charlie-123",        // Number
-        "",                               // Empty
-        "   ",                            // Whitespace only
-    ];
-
-    for addr_str in &invalid_addresses {
-        let result = FourWordAddress::parse_str(addr_str);
-        assert!(
-            result.is_err(),
-            "Should reject invalid address: {}",
-            addr_str
-        );
-    }
 
     // Test encryption with edge case passwords and data
     let edge_passwords = ["", "a", "🚀", &"x".repeat(1000)];
@@ -699,7 +550,6 @@ async fn test_identity_edge_cases() -> Result<()> {
     );
 
     println!("  ✅ Edge case identities handled correctly");
-    println!("  ✅ Invalid address parsing rejected properly");
     println!("  ✅ Encryption edge cases handled gracefully");
     println!("  ✅ XOR distance edge cases work correctly");
     println!("✅ Identity edge cases test passed");
@@ -738,25 +588,14 @@ async fn test_identity_system_integration() -> Result<()> {
     // Simulate a network with multiple identities
     let network_size = 20;
     let mut network_identities = Vec::new();
-    let mut four_word_registry = HashMap::new();
 
     // Phase 1: Network bootstrap - create identities
     println!("  Phase 1: Network bootstrap");
     for i in 0..network_size {
         let identity = create_test_identity(1000 + i as u64);
-        let four_word_addr = FourWordAddress::from_peer_id(identity.peer_id());
 
-        // Ensure no collisions in four-word addresses
-        let addr_string = four_word_addr.to_string();
-        assert!(
-            !four_word_registry.contains_key(&addr_string),
-            "Four-word address collision detected: {}",
-            addr_string
-        );
-
-        println!("    Node {}: {} -> {}", i, identity.peer_id(), addr_string);
-        four_word_registry.insert(addr_string.clone(), *identity.peer_id());
-        network_identities.push((identity, four_word_addr));
+        println!("    Node {}: {}", i, identity.peer_id());
+        network_identities.push(identity);
     }
 
     // Phase 2: Identity operations
@@ -765,14 +604,14 @@ async fn test_identity_system_integration() -> Result<()> {
     let mut signatures = Vec::new();
 
     // All nodes sign the same message
-    for (identity, addr) in &network_identities {
+    for identity in &network_identities {
         let signature = identity.sign(test_message).expect("signing should succeed");
 
         // Verify signature immediately
         assert!(
             ml_dsa_verify(identity.public_key(), test_message, &signature).unwrap_or(false),
             "Signature should verify for node: {}",
-            addr
+            identity.peer_id()
         );
 
         signatures.push((*identity.peer_id(), signature));
@@ -782,9 +621,9 @@ async fn test_identity_system_integration() -> Result<()> {
     println!("  Phase 3: Cross-verification");
     for (node_id, signature) in &signatures {
         // Find the identity that created this signature
-        let (identity, _) = network_identities
+        let identity = network_identities
             .iter()
-            .find(|(id, _)| *id.peer_id() == *node_id)
+            .find(|id| *id.peer_id() == *node_id)
             .expect("Should find identity for node ID");
 
         // Verify with correct identity
@@ -794,7 +633,7 @@ async fn test_identity_system_integration() -> Result<()> {
         );
 
         // Verify it doesn't work with other identities
-        for (other_identity, _) in &network_identities {
+        for other_identity in &network_identities {
             if *other_identity.peer_id() != *node_id {
                 assert!(
                     !ml_dsa_verify(other_identity.public_key(), test_message, signature)
@@ -811,14 +650,15 @@ async fn test_identity_system_integration() -> Result<()> {
     let sync_data = b"Identity sync package for network node";
 
     // Test encryption/decryption for each node
-    for (_identity, addr) in &network_identities {
+    for identity in &network_identities {
         let encrypted = encrypt_with_device_password(sync_data, device_password)?;
         let decrypted = decrypt_with_device_password(&encrypted, device_password)?;
 
         assert_eq!(
-            decrypted, sync_data,
+            decrypted,
+            sync_data,
             "Identity sync should work for node: {}",
-            addr
+            identity.peer_id()
         );
     }
 
@@ -845,29 +685,10 @@ async fn test_identity_system_integration() -> Result<()> {
 
     // All node IDs should be unique
     let mut node_id_set = HashSet::new();
-    for (identity, _) in &network_identities {
+    for identity in &network_identities {
         let node_id = *identity.peer_id();
         assert!(!node_id_set.contains(&node_id), "Node IDs should be unique");
         node_id_set.insert(node_id);
-    }
-
-    // All four-word addresses should be unique
-    assert_eq!(
-        four_word_registry.len(),
-        network_size,
-        "All four-word addresses should be unique"
-    );
-
-    // Address registry should be consistent with identities
-    for (identity, addr) in &network_identities {
-        let registered_node_id = four_word_registry
-            .get(&addr.to_string())
-            .expect("Address should be registered");
-        assert_eq!(
-            registered_node_id,
-            identity.peer_id(),
-            "Registry should match identity node ID"
-        );
     }
 
     println!(

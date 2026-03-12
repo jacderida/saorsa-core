@@ -267,9 +267,6 @@ pub enum IdentityError {
     #[error("Invalid three-word address: {0}")]
     InvalidThreeWordAddress(Cow<'static, str>),
 
-    #[error("Invalid four-word address: {0}")]
-    InvalidFourWordAddress(Cow<'static, str>),
-
     #[error("Identity not found: {0}")]
     IdentityNotFound(Cow<'static, str>),
 
@@ -296,6 +293,12 @@ pub enum IdentityError {
 
     #[error("Permission denied")]
     PermissionDenied,
+
+    #[error("Identity mismatch: expected {expected} but peer authenticated as {actual}")]
+    IdentityMismatch {
+        expected: Cow<'static, str>,
+        actual: Cow<'static, str>,
+    },
 
     #[error("Invalid peer ID: {0}")]
     InvalidPeerId(Cow<'static, str>),

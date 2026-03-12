@@ -16,33 +16,27 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 async fn create_node_with_transport(
-    peer_id: &str,
+    _name: &str,
 ) -> saorsa_core::Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
-    let peer = saorsa_core::PeerId::from_name(peer_id);
+    let identity = Arc::new(NodeIdentity::generate().unwrap());
     let node_config = NodeConfig::builder()
         .listen_port(0)
         .ipv6(false)
+        .allow_loopback(true)
         .build()
         .expect("Failed to build NodeConfig");
 
     let transport = Arc::new(
-        TransportHandle::new(TransportConfig {
-            listen_addr: node_config.listen_addr,
-            enable_ipv6: node_config.enable_ipv6,
-            connection_timeout: node_config.connection_timeout,
-            stale_peer_threshold: node_config.stale_peer_threshold,
-            max_connections: node_config.max_connections,
-            production_config: node_config.production_config.clone(),
-            event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_message_size: node_config.max_message_size,
-            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
-            user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
-        })
+        TransportHandle::new(TransportConfig::from_node_config(
+            &node_config,
+            saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            identity.clone(),
+        ))
         .await?,
     );
 
     let config = DhtNetworkConfig {
-        peer_id: peer,
+        peer_id: *identity.peer_id(),
         dht_config: DHTConfig::default(),
         node_config,
         request_timeout: Duration::from_secs(5),
@@ -195,27 +189,19 @@ async fn step4_connect_managers() -> Result<()> {
     println!("  Manager 1 listening at: {}", addr1);
     println!("  Attempting connection from manager2 -> manager1...");
 
-    let connect_result = timeout(Duration::from_secs(15), manager2.connect_to_peer(&addr1)).await;
+    let peer_id = timeout(Duration::from_secs(15), manager2.connect_to_peer(&addr1))
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timed out after 15s"))??;
+    println!("  Connected! Peer ID: {}", peer_id);
 
-    match connect_result {
-        Ok(Ok(peer_id)) => {
-            println!("  ✓ Connected! Peer ID: {}", peer_id);
-        }
-        Ok(Err(e)) => {
-            println!("  ✗ Connection failed: {}", e);
-            // Don't fail the test - continue to see what we can learn
-        }
-        Err(_) => {
-            println!("  ✗ Connection timed out after 15s");
-        }
-    }
-
-    // Check connected peers
+    // Wait briefly for the connection to be fully established on both sides
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let peers1 = manager1.get_connected_peers().await;
+
     let peers2 = manager2.get_connected_peers().await;
-    println!("  Manager 1 connected peers: {}", peers1.len());
-    println!("  Manager 2 connected peers: {}", peers2.len());
+    assert!(
+        !peers2.is_empty(),
+        "Manager 2 should have at least one connected peer"
+    );
 
     let _ = manager1.stop().await;
     let _ = manager2.stop().await;
@@ -271,12 +257,15 @@ async fn step5_local_put_get() -> Result<()> {
     Ok(())
 }
 
-/// Step 6: Cross-node replication test
+/// Step 6: Local put/get on a connected two-node cluster
+///
+/// Tests that a local put on manager1 succeeds and manager1 can retrieve
+/// the value.  Cross-node replication is not yet implemented (store returns
+/// `success: false` for remote targets), so we only assert the local path.
 #[tokio::test]
-async fn step6_cross_node_replication() -> Result<()> {
-    println!("STEP 6: Cross-node replication test...");
+async fn step6_local_put_on_connected_cluster() -> Result<()> {
+    println!("STEP 6: Local put on connected two-node cluster...");
 
-    // Create and start two managers
     let manager1 = Arc::new(
         timeout(Duration::from_secs(10), async {
             let (transport, config) = create_node_with_transport("diag_node_6a").await?;
@@ -296,77 +285,48 @@ async fn step6_cross_node_replication() -> Result<()> {
 
     timeout(Duration::from_secs(10), manager1.start()).await??;
     timeout(Duration::from_secs(10), manager2.start()).await??;
-    println!("  Both managers started");
 
-    // Connect them
     let addr1 = manager1
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("No addr"))?;
-    println!("  Connecting manager2 -> manager1 at {}", addr1);
 
-    let connect_result = timeout(Duration::from_secs(15), manager2.connect_to_peer(&addr1)).await;
-    match &connect_result {
-        Ok(Ok(peer_id)) => println!("  ✓ Connected: {}", peer_id),
-        Ok(Err(e)) => println!("  ✗ Connect error: {}", e),
-        Err(_) => println!("  ✗ Connect timeout"),
-    }
+    let _peer_id = timeout(Duration::from_secs(15), manager2.connect_to_peer(&addr1))
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timed out"))??;
     tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Check connected peers before put (these are DHT peers, not just network connections)
-    let peers1 = manager1.get_connected_peers().await;
-    let peers2 = manager2.get_connected_peers().await;
-    println!("  Manager1 DHT peers: {}", peers1.len());
-    for p in &peers1 {
-        println!("    - {} (connected: {})", p.peer_id, p.is_connected);
-    }
-    println!("  Manager2 DHT peers: {}", peers2.len());
-    for p in &peers2 {
-        println!("    - {} (connected: {})", p.peer_id, p.is_connected);
-    }
 
     // Store on manager1
     let key = key_from_str("cross_node_test_key");
     let value = b"cross_node_test_value".to_vec();
 
-    println!("  Storing on manager1 (timeout 30s)...");
-    let put_result = timeout(Duration::from_secs(30), manager1.put(key, value.clone())).await;
+    let put_result = timeout(Duration::from_secs(30), manager1.put(key, value.clone()))
+        .await
+        .map_err(|_| anyhow::anyhow!("put() timed out after 30s"))??;
 
-    match &put_result {
-        Ok(Ok(DhtNetworkResult::PutSuccess { replicated_to, .. })) => {
-            println!("  ✓ Put succeeded, replicated to {} nodes", replicated_to);
+    match put_result {
+        DhtNetworkResult::PutSuccess { replicated_to, .. } => {
+            assert!(replicated_to >= 1, "Should replicate to at least 1 node");
+            println!("  Put succeeded, replicated_to={}", replicated_to);
         }
-        Ok(Ok(other)) => {
-            println!("  ? Put returned unexpected: {:?}", other);
-        }
-        Ok(Err(e)) => {
-            println!("  ✗ Put failed with error: {}", e);
-        }
-        Err(_) => {
-            println!("  ✗ Put TIMED OUT after 30s!");
-            println!("    This means put() is blocking on network operations");
+        other => {
+            panic!("Expected PutSuccess, got: {:?}", other);
         }
     }
 
-    // Wait for potential replication
-    println!("  Waiting for replication...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Check local storage on BOTH nodes
-    let has_on_1 = manager1.has_key_locally(&key).await;
-    let has_on_2 = manager2.has_key_locally(&key).await;
-
-    println!("\n  === REPLICATION RESULTS ===");
-    println!("  Manager 1 has key locally: {}", has_on_1);
-    println!("  Manager 2 has key locally: {}", has_on_2);
-
-    if has_on_1 && has_on_2 {
-        println!("  ✓✓ REPLICATION WORKS! Data exists on both nodes.");
-    } else if has_on_1 && !has_on_2 {
-        println!("  ⚠ Data only on originating node - replication may not be working");
-    } else if !has_on_1 && !has_on_2 {
-        println!("  ✗ Data not even stored locally - put() likely timed out");
-    } else {
-        println!("  ✗ Unexpected state");
+    // Note: the originating node only stores locally if it is among the
+    // K-closest nodes to the key.  We verify has_key_locally if it is
+    // stored, and gracefully accept if it isn't (the key landed on
+    // remote targets instead).
+    if manager1.has_key_locally(&key).await {
+        let retrieved = manager1
+            .get_local(&key)
+            .await
+            .expect("get_local should not error");
+        assert_eq!(
+            retrieved,
+            Some(value),
+            "Retrieved value should match stored value"
+        );
     }
 
     let _ = manager1.stop().await;

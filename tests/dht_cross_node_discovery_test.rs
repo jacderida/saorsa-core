@@ -73,21 +73,15 @@ async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, 
     let node_config = NodeConfig::builder()
         .listen_port(0) // Use 0 for automatic port allocation
         .ipv6(false)
+        .allow_loopback(true)
         .build()?;
 
     let transport = Arc::new(
-        TransportHandle::new(TransportConfig {
-            listen_addr: node_config.listen_addr,
-            enable_ipv6: node_config.enable_ipv6,
-            connection_timeout: node_config.connection_timeout,
-            stale_peer_threshold: node_config.stale_peer_threshold,
-            max_connections: node_config.max_connections,
-            production_config: node_config.production_config.clone(),
-            event_channel_capacity: saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_message_size: node_config.max_message_size,
-            node_identity: Arc::new(NodeIdentity::generate().unwrap()),
-            user_agent: saorsa_core::user_agent_for_mode(saorsa_core::NodeMode::Node),
-        })
+        TransportHandle::new(TransportConfig::from_node_config(
+            &node_config,
+            saorsa_core::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            Arc::new(NodeIdentity::generate().unwrap()),
+        ))
         .await?,
     );
 

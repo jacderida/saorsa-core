@@ -114,23 +114,29 @@ async fn test_node_mode_dht_routing_table_gating() {
 
     // --- Connect both peers to the observer --------------------------------
     connect_and_wait(&node_peer, &observer).await;
-    let node_connected = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
-        .await
-        .expect("observer should receive PeerConnected for node peer");
-
     connect_and_wait(&client_peer, &observer).await;
-    let client_connected = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
-        .await
-        .expect("observer should receive PeerConnected for client peer");
 
-    // Verify user agents carried in the events.
-    let (node_peer_id, node_ua) = match node_connected {
+    // Collect both PeerConnected events (order may vary due to scheduling).
+    let event1 = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
+        .await
+        .expect("observer should receive first PeerConnected event");
+    let event2 = wait_for_peer_connected(&mut observer_events, EVENT_TIMEOUT)
+        .await
+        .expect("observer should receive second PeerConnected event");
+
+    // Extract (PeerId, user_agent) from each event.
+    let extract = |e: P2PEvent| match e {
         P2PEvent::PeerConnected(id, ua) => (id, ua),
         _ => panic!("unexpected event variant"),
     };
-    let (client_peer_id, client_ua) = match client_connected {
-        P2PEvent::PeerConnected(id, ua) => (id, ua),
-        _ => panic!("unexpected event variant"),
+    let (id1, ua1) = extract(event1);
+    let (id2, ua2) = extract(event2);
+
+    // Assign based on user agent prefix, not arrival order.
+    let (node_peer_id, node_ua, client_peer_id, client_ua) = if ua1.starts_with("node/") {
+        (id1, ua1, id2, ua2)
+    } else {
+        (id2, ua2, id1, ua1)
     };
 
     assert!(
@@ -157,16 +163,15 @@ async fn test_node_mode_dht_routing_table_gating() {
         "Client-mode peer should NOT be present in the DHT routing table"
     );
 
-    // Both should still be tracked in the broader dht_peers bookkeeping.
+    // Both should still be tracked as connected via the transport layer.
     let connected = dht.get_connected_peers().await;
-    let connected_ids: Vec<_> = connected.iter().map(|p| p.peer_id).collect();
     assert!(
-        connected_ids.contains(&node_peer_id),
-        "Node peer should be in connected DHT peers"
+        connected.contains(&node_peer_id),
+        "Node peer should be in connected peers"
     );
     assert!(
-        connected_ids.contains(&client_peer_id),
-        "Client peer should be in connected DHT peers"
+        connected.contains(&client_peer_id),
+        "Client peer should be in connected peers"
     );
 
     info!("=== PASS: Node-mode DHT routing table gating ===");

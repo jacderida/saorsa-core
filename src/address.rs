@@ -13,8 +13,7 @@
 
 //! # Address Types
 //!
-//! This module provides address types for the P2P network using IP:port combinations
-//! and four-word human-readable representations.
+//! This module provides address types for the P2P network using IP:port combinations.
 
 use std::fmt::{self, Display};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,42 +22,34 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use four_word_networking::FourWordAdaptiveEncoder;
-
-/// Network address that can be represented as IP:port or four-word format
+/// Network address represented as IP:port
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NetworkAddress {
+pub struct MultiAddr {
     /// The socket address (IP + port)
     pub socket_addr: SocketAddr,
-    /// Optional four-word representation
-    pub four_words: Option<String>,
 }
 
-impl NetworkAddress {
-    /// Create a new `NetworkAddress` from a `SocketAddr`
+impl MultiAddr {
+    /// Create a new `MultiAddr` from a `SocketAddr`
     #[must_use]
     pub fn new(socket_addr: SocketAddr) -> Self {
-        let four_words = Self::encode_four_words(&socket_addr);
-        Self {
-            socket_addr,
-            four_words,
-        }
+        Self { socket_addr }
     }
 
-    /// Create a `NetworkAddress` from an IP address and port
+    /// Create a `MultiAddr` from an IP address and port
     #[must_use]
     pub fn from_ip_port(ip: IpAddr, port: u16) -> Self {
         let socket_addr = SocketAddr::new(ip, port);
         Self::new(socket_addr)
     }
 
-    /// Create a `NetworkAddress` from IPv4 address and port
+    /// Create a `MultiAddr` from IPv4 address and port
     #[must_use]
     pub fn from_ipv4(ip: Ipv4Addr, port: u16) -> Self {
         Self::from_ip_port(IpAddr::V4(ip), port)
     }
 
-    /// Create a `NetworkAddress` from IPv6 address and port
+    /// Create a `MultiAddr` from IPv6 address and port
     #[must_use]
     pub fn from_ipv6(ip: Ipv6Addr, port: u16) -> Self {
         Self::from_ip_port(IpAddr::V6(ip), port)
@@ -73,41 +64,6 @@ impl NetworkAddress {
     /// Get the port
     pub fn port(&self) -> u16 {
         self.socket_addr.port()
-    }
-
-    /// Get the socket address
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.socket_addr
-    }
-
-    /// Get the four-word representation if available
-    pub fn four_words(&self) -> Option<&str> {
-        self.four_words.as_deref()
-    }
-
-    /// Force regeneration of four-word representation
-    pub fn regenerate_four_words(&mut self) {
-        self.four_words = Self::encode_four_words(&self.socket_addr);
-    }
-
-    /// Encode a SocketAddr to four-word format using four-word-networking
-    fn encode_four_words(addr: &SocketAddr) -> Option<String> {
-        match FourWordAdaptiveEncoder::new().and_then(|enc| enc.encode(&addr.to_string())) {
-            Ok(s) => Some(s.replace(' ', "-")),
-            Err(e) => {
-                tracing::warn!("Failed to encode address {addr}: {e}");
-                None
-            }
-        }
-    }
-
-    /// Decode four-word format to NetworkAddress using four-word-networking
-    pub fn from_four_words(words: &str) -> Result<Self> {
-        let enc = FourWordAdaptiveEncoder::new()?;
-        let normalized = words.replace('-', " ");
-        let decoded = enc.decode(&normalized)?; // returns a normalized address string
-        let socket_addr: SocketAddr = decoded.parse()?; // must include port
-        Ok(Self::new(socket_addr))
     }
 
     /// Check if this is an IPv4 address
@@ -138,17 +94,13 @@ impl NetworkAddress {
     }
 }
 
-impl Display for NetworkAddress {
+impl Display for MultiAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref words) = self.four_words {
-            write!(f, "{} ({})", self.socket_addr, words)
-        } else {
-            write!(f, "{}", self.socket_addr)
-        }
+        write!(f, "{}", self.socket_addr)
     }
 }
 
-impl FromStr for NetworkAddress {
+impl FromStr for MultiAddr {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -157,12 +109,16 @@ impl FromStr for NetworkAddress {
             return Ok(Self::new(socket_addr));
         }
 
-        // Basic Multiaddr support: /ip4/<ip>/tcp/<port> or /ip6/<ip>/tcp/<port>
+        // Basic MultiAddr support: /ip4/<ip>/<proto>/<port> or /ip6/<ip>/<proto>/<port>
+        // Supported protocols: tcp, udp, quic (all resolve to a SocketAddr)
         if s.starts_with("/ip4/") || s.starts_with("/ip6/") {
             let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
-            // Expect: ["ip4"|"ip6", ip, "tcp", port]
+            // Expect: ["ip4"|"ip6", ip, "tcp"|"udp"|"quic", port]
             #[allow(clippy::collapsible_if)]
-            if parts.len() >= 4 && (parts[0] == "ip4" || parts[0] == "ip6") && parts[2] == "tcp" {
+            if parts.len() >= 4
+                && (parts[0] == "ip4" || parts[0] == "ip6")
+                && matches!(parts[2], "tcp" | "udp" | "quic")
+            {
                 if let Ok(port) = parts[3].parse::<u16>() {
                     // Parse IP
                     let ip_str = parts[1];
@@ -174,35 +130,30 @@ impl FromStr for NetworkAddress {
             }
         }
 
-        // Then try to parse as four-word format
-        if let Ok(addr) = Self::from_four_words(s) {
-            return Ok(addr);
-        }
-
         Err(anyhow!("Invalid address format: {}", s))
     }
 }
 
-impl From<SocketAddr> for NetworkAddress {
+impl From<SocketAddr> for MultiAddr {
     fn from(socket_addr: SocketAddr) -> Self {
         Self::new(socket_addr)
     }
 }
 
-impl From<&SocketAddr> for NetworkAddress {
+impl From<&SocketAddr> for MultiAddr {
     fn from(socket_addr: &SocketAddr) -> Self {
         Self::new(*socket_addr)
     }
 }
 
-impl From<NetworkAddress> for SocketAddr {
-    fn from(addr: NetworkAddress) -> Self {
+impl From<MultiAddr> for SocketAddr {
+    fn from(addr: MultiAddr) -> Self {
         addr.socket_addr
     }
 }
 
-impl From<&NetworkAddress> for SocketAddr {
-    fn from(addr: &NetworkAddress) -> Self {
+impl From<&MultiAddr> for SocketAddr {
+    fn from(addr: &MultiAddr) -> Self {
         addr.socket_addr
     }
 }
@@ -211,9 +162,9 @@ impl From<&NetworkAddress> for SocketAddr {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressBook {
     /// Primary addresses for this peer
-    pub addresses: Vec<NetworkAddress>,
+    pub addresses: Vec<MultiAddr>,
     /// Last known good address
-    pub last_known_good: Option<NetworkAddress>,
+    pub last_known_good: Option<MultiAddr>,
 }
 
 impl AddressBook {
@@ -226,7 +177,7 @@ impl AddressBook {
     }
 
     /// Create an address book with a single address
-    pub fn with_address(address: NetworkAddress) -> Self {
+    pub fn with_address(address: MultiAddr) -> Self {
         Self {
             addresses: vec![address.clone()],
             last_known_good: Some(address),
@@ -234,14 +185,14 @@ impl AddressBook {
     }
 
     /// Add an address to the book
-    pub fn add_address(&mut self, address: NetworkAddress) {
+    pub fn add_address(&mut self, address: MultiAddr) {
         if !self.addresses.contains(&address) {
             self.addresses.push(address);
         }
     }
 
     /// Remove an address from the book
-    pub fn remove_address(&mut self, address: &NetworkAddress) {
+    pub fn remove_address(&mut self, address: &MultiAddr) {
         self.addresses.retain(|a| a != address);
         if self.last_known_good.as_ref() == Some(address) {
             self.last_known_good = self.addresses.first().cloned();
@@ -249,21 +200,21 @@ impl AddressBook {
     }
 
     /// Update the last known good address
-    pub fn update_last_known_good(&mut self, address: NetworkAddress) {
+    pub fn update_last_known_good(&mut self, address: MultiAddr) {
         if self.addresses.contains(&address) {
             self.last_known_good = Some(address);
         }
     }
 
     /// Get the best address to try first
-    pub fn best_address(&self) -> Option<&NetworkAddress> {
+    pub fn best_address(&self) -> Option<&MultiAddr> {
         self.last_known_good
             .as_ref()
             .or_else(|| self.addresses.first())
     }
 
     /// Get all addresses
-    pub fn addresses(&self) -> &[NetworkAddress] {
+    pub fn addresses(&self) -> &[MultiAddr] {
         &self.addresses
     }
 
@@ -302,6 +253,25 @@ impl Display for AddressBook {
     }
 }
 
+/// Serde helpers for serializing `MultiAddr` as a plain string.
+///
+/// Use with `#[serde(with = "crate::address::serde_as_string")]` on fields
+/// of type `MultiAddr` to maintain wire-protocol compatibility with
+/// code that expects a plain `"ip:port"` string.
+pub mod serde_as_string {
+    use super::MultiAddr;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(addr: &MultiAddr, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&addr.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MultiAddr, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<MultiAddr>().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_network_address_creation() {
-        let addr = NetworkAddress::from_ipv4(Ipv4Addr::new(127, 0, 0, 1), 8080);
+        let addr = MultiAddr::from_ipv4(Ipv4Addr::new(127, 0, 0, 1), 8080);
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         assert_eq!(addr.port(), 8080);
         assert!(addr.is_ipv4());
@@ -318,14 +288,14 @@ mod tests {
 
     #[test]
     fn test_network_address_from_string() {
-        let addr = "127.0.0.1:8080".parse::<NetworkAddress>().unwrap();
+        let addr = "127.0.0.1:8080".parse::<MultiAddr>().unwrap();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         assert_eq!(addr.port(), 8080);
     }
 
     #[test]
     fn test_network_address_display() {
-        let addr = NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
+        let addr = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
         let display = addr.to_string();
         assert!(display.contains("192.168.1.1:9000"));
     }
@@ -333,8 +303,8 @@ mod tests {
     #[test]
     fn test_address_book() {
         let mut book = AddressBook::new();
-        let addr1 = NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
-        let addr2 = NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 2), 9001);
+        let addr1 = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
+        let addr2 = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 2), 9001);
 
         book.add_address(addr1.clone());
         book.add_address(addr2.clone());
@@ -348,17 +318,68 @@ mod tests {
 
     #[test]
     fn test_private_address_detection() {
-        let private_addr = NetworkAddress::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
+        let private_addr = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
         assert!(private_addr.is_private());
 
-        let public_addr = NetworkAddress::from_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53);
+        let public_addr = MultiAddr::from_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53);
         assert!(!public_addr.is_private());
     }
 
     #[test]
     fn test_ipv6_address() {
-        let addr = NetworkAddress::from_ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 8080);
+        let addr = MultiAddr::from_ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 8080);
         assert!(addr.is_ipv6());
         assert!(addr.is_loopback());
+    }
+
+    #[test]
+    fn test_multiaddr_tcp_parsing() {
+        let addr = "/ip4/192.168.1.1/tcp/9000".parse::<MultiAddr>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn test_multiaddr_udp_parsing() {
+        let addr = "/ip4/127.0.0.1/udp/10000".parse::<MultiAddr>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(addr.port(), 10000);
+    }
+
+    #[test]
+    fn test_multiaddr_quic_parsing() {
+        let addr = "/ip4/10.0.0.1/quic/9000".parse::<MultiAddr>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn test_multiaddr_ipv6_udp_parsing() {
+        let addr = "/ip6/::1/udp/8080".parse::<MultiAddr>().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(addr.port(), 8080);
+        assert!(addr.is_loopback());
+    }
+
+    #[test]
+    fn test_serde_as_string_roundtrip() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            #[serde(with = "super::serde_as_string")]
+            addr: MultiAddr,
+        }
+
+        let original = Wrapper {
+            addr: MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("192.168.1.1:9000"));
+
+        let recovered: Wrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.addr.ip(), original.addr.ip());
+        assert_eq!(recovered.addr.port(), original.addr.port());
     }
 }

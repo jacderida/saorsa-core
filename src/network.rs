@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
-use crate::NetworkAddress;
+use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
@@ -64,9 +64,6 @@ pub(crate) struct WireMessage {
     #[serde(default)]
     pub(crate) signature: Vec<u8>,
 }
-
-/// Payload bytes used for keepalive messages to prevent connection timeouts.
-pub(crate) const KEEPALIVE_PAYLOAD: &[u8] = b"keepalive";
 
 /// Operating mode of a P2P node.
 ///
@@ -120,9 +117,6 @@ const DEFAULT_LISTEN_PORT: u16 = 9000;
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
 
-/// Interval for the P2PNode run loop's maintenance tick.
-const RUN_LOOP_TICK_INTERVAL_MS: u64 = 100;
-
 /// Quality score for successful bootstrap connections.
 const BOOTSTRAP_QUALITY_SCORE_SUCCESS: f64 = 0.8;
 /// Quality score for failed bootstrap connections.
@@ -151,7 +145,7 @@ pub struct NodeConfig {
     pub listen_addr: std::net::SocketAddr,
 
     /// Bootstrap peers to connect to on startup.
-    pub bootstrap_peers: Vec<std::net::SocketAddr>,
+    pub bootstrap_peers: Vec<crate::MultiAddr>,
 
     /// Enable IPv6 support
     pub enable_ipv6: bool,
@@ -187,11 +181,6 @@ pub struct NodeConfig {
     /// other diversity-enforcing subsystems. If `None`, defaults are used.
     pub diversity_config: Option<crate::security::IPDiversityConfig>,
 
-    /// Stale peer threshold - peers with no activity for this duration are considered stale.
-    /// Defaults to 60 seconds. Can be reduced for testing purposes.
-    #[serde(default = "default_stale_peer_threshold")]
-    pub stale_peer_threshold: Duration,
-
     /// Optional override for the maximum application-layer message size.
     ///
     /// When `None`, the underlying saorsa-transport default is used.
@@ -219,11 +208,16 @@ pub struct NodeConfig {
     /// When `None`, the user agent is derived from [`NodeConfig::mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
-}
 
-/// Default stale peer threshold (60 seconds)
-fn default_stale_peer_threshold() -> Duration {
-    Duration::from_secs(60)
+    /// Allow loopback addresses (127.0.0.1, ::1) in the transport layer.
+    ///
+    /// In production, loopback addresses are rejected because they are not
+    /// routable. Enable this for local devnets and testnets where all nodes
+    /// run on the same machine.
+    ///
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_loopback: bool,
 }
 
 /// DHT-specific configuration
@@ -319,7 +313,7 @@ impl NodeConfig {
                 .network
                 .bootstrap_nodes
                 .iter()
-                .filter_map(|s| s.parse().ok())
+                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
@@ -331,11 +325,11 @@ impl NodeConfig {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: config.network.allow_loopback,
         })
     }
 
@@ -354,7 +348,7 @@ impl NodeConfig {
 pub struct NodeConfigBuilder {
     listen_port: Option<u16>,
     enable_ipv6: Option<bool>,
-    bootstrap_peers: Vec<std::net::SocketAddr>,
+    bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
     keep_alive_interval: Option<Duration>,
@@ -364,6 +358,7 @@ pub struct NodeConfigBuilder {
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
+    allow_loopback: Option<bool>,
 }
 
 impl NodeConfigBuilder {
@@ -380,7 +375,7 @@ impl NodeConfigBuilder {
     }
 
     /// Add a bootstrap peer.
-    pub fn bootstrap_peer(mut self, addr: std::net::SocketAddr) -> Self {
+    pub fn bootstrap_peer(mut self, addr: crate::MultiAddr) -> Self {
         self.bootstrap_peers.push(addr);
         self
     }
@@ -441,6 +436,15 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Allow loopback addresses in the transport layer.
+    ///
+    /// Enable for devnet/testnet modes where multiple nodes run on the same
+    /// machine. Default: `false`.
+    pub fn allow_loopback(mut self, allow: bool) -> Self {
+        self.allow_loopback = Some(allow);
+        self
+    }
+
     /// Build the NodeConfig
     ///
     /// # Errors
@@ -478,13 +482,15 @@ impl NodeConfigBuilder {
             production_config: self.production_config,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: self
                 .max_message_size
                 .or(base_config.transport.max_message_size),
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
+            allow_loopback: self
+                .allow_loopback
+                .unwrap_or(base_config.network.allow_loopback),
         })
     }
 }
@@ -513,11 +519,11 @@ impl Default for NodeConfig {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: config.network.allow_loopback,
         }
     }
 }
@@ -534,7 +540,7 @@ impl NodeConfig {
                 .network
                 .bootstrap_nodes
                 .iter()
-                .filter_map(|s| s.parse().ok())
+                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
                 .collect(),
             enable_ipv6: config.network.ipv6_enabled,
 
@@ -542,12 +548,7 @@ impl NodeConfig {
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
             max_connections: config.network.max_connections,
             max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig {
-                k_value: 20,
-                alpha_value: 3,
-                record_ttl: Duration::from_secs(3600),
-                refresh_interval: Duration::from_secs(900),
-            },
+            dht_config: DHTConfig::default(),
             security_config: SecurityConfig {
                 enable_noise: true,
                 enable_tls: true,
@@ -568,11 +569,11 @@ impl NodeConfig {
             }),
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: config.transport.max_message_size,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: config.network.allow_loopback,
         };
 
         // Add IPv6 listen address if enabled
@@ -891,11 +892,10 @@ impl P2PNode {
 
         // Initialize bootstrap cache manager
         let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let diversity_config = config.diversity_config.clone().unwrap_or_default();
         let bootstrap_manager = match BootstrapManager::with_full_config(
             cache_config,
             crate::rate_limit::JoinRateLimiterConfig::default(),
-            diversity_config,
+            &config,
         )
         .await
         {
@@ -915,18 +915,11 @@ impl P2PNode {
         let trust_engine = Some(trust_engine);
 
         // Build transport handle with all transport-level concerns
-        let transport_config = crate::transport_handle::TransportConfig {
-            listen_addr: config.listen_addr,
-            enable_ipv6: config.enable_ipv6,
-            connection_timeout: config.connection_timeout,
-            stale_peer_threshold: config.stale_peer_threshold,
-            max_connections: config.max_connections,
-            production_config: config.production_config.clone(),
-            event_channel_capacity: crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
-            max_message_size: config.max_message_size,
-            node_identity: node_identity.clone(),
-            user_agent: config.user_agent(),
-        };
+        let transport_config = crate::transport_handle::TransportConfig::from_node_config(
+            &config,
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            node_identity.clone(),
+        );
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
 
@@ -1332,20 +1325,9 @@ impl P2PNode {
 
         info!("P2P node running...");
 
-        let mut interval = tokio::time::interval(Duration::from_millis(RUN_LOOP_TICK_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Main event loop
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    self.transport.maintenance_tick().await?;
-                }
-                () = self.shutdown.cancelled() => {
-                    break;
-                }
-            }
-        }
+        // Block until shutdown is signalled. All background work (connection
+        // lifecycle, DHT maintenance, EigenTrust) runs in dedicated tasks.
+        self.shutdown.cancelled().await;
 
         info!("P2P node stopped");
         Ok(())
@@ -1822,11 +1804,12 @@ impl P2PNode {
                 "Using {} configured bootstrap peers (priority)",
                 self.config.bootstrap_peers.len()
             );
-            for socket_addr in &self.config.bootstrap_peers {
-                seen_addresses.insert(*socket_addr);
+            for multiaddr in &self.config.bootstrap_peers {
+                let socket_addr = multiaddr.socket_addr;
+                seen_addresses.insert(socket_addr);
                 // Use a zero sentinel PeerId — the real identity comes
                 // from wait_for_peer_identity() after connecting.
-                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![*socket_addr]);
+                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![socket_addr]);
                 bootstrap_contacts.push(contact);
             }
         }
@@ -2028,8 +2011,8 @@ impl NodeBuilder {
 
     /// Add a bootstrap peer
     pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(socket_addr) = addr.parse() {
-            self.config.bootstrap_peers.push(socket_addr);
+        if let Ok(multiaddr) = addr.parse::<crate::MultiAddr>() {
+            self.config.bootstrap_peers.push(multiaddr);
         }
         self
     }
@@ -2086,6 +2069,15 @@ impl NodeBuilder {
         self
     }
 
+    /// Allow loopback addresses in the transport layer.
+    ///
+    /// Enable for devnet/testnet modes where multiple nodes run on the same
+    /// machine. Default: `false`.
+    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
+        self.config.allow_loopback = allow;
+        self
+    }
+
     /// Configure IP diversity limits for Sybil protection.
     pub fn with_diversity_config(
         mut self,
@@ -2120,7 +2112,6 @@ mod diversity_tests {
     use crate::security::IPDiversityConfig;
 
     async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
-        let diversity_config = config.diversity_config.clone().unwrap_or_default();
         // Use a temp dir to avoid conflicts with cached files from old format
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let mut cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
@@ -2129,7 +2120,7 @@ mod diversity_tests {
         BootstrapManager::with_full_config(
             cache_config,
             crate::rate_limit::JoinRateLimiterConfig::default(),
-            diversity_config,
+            config,
         )
         .await
         .expect("bootstrap manager")
@@ -2152,7 +2143,7 @@ mod diversity_tests {
 pub(crate) async fn register_new_channel(
     peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
     channel_id: &str,
-    remote_addr: &NetworkAddress,
+    remote_addr: &MultiAddr,
 ) {
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
@@ -2204,11 +2195,11 @@ mod tests {
             production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            stale_peer_threshold: default_stale_peer_threshold(),
             max_message_size: None,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
+            allow_loopback: true,
         }
     }
 
@@ -2645,8 +2636,8 @@ mod tests {
     async fn test_bootstrap_peers() -> Result<()> {
         let mut config = create_test_node_config();
         config.bootstrap_peers = vec![
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9200),
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9201),
+            crate::MultiAddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9200),
+            crate::MultiAddr::from_ipv4(std::net::Ipv4Addr::LOCALHOST, 9201),
         ];
 
         let node = P2PNode::new(config).await?;

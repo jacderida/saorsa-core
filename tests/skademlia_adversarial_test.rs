@@ -49,7 +49,7 @@ fn random_key() -> Key {
 fn create_test_node() -> DHTNode {
     DHTNode {
         id: PeerId::random(),
-        address: "127.0.0.1:8000".to_string(),
+        address: "127.0.0.1:8000".parse().unwrap(),
         last_seen: SystemTime::now(),
         capacity: NodeCapacity::default(),
     }

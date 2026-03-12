@@ -1794,10 +1794,11 @@ mod tests {
         }
     }
 
-    fn create_test_dht_node(peer_id: &str, _distance_bytes: [u8; 32]) -> NodeInfo {
+    fn create_test_dht_node(_peer_id: &str, distance_bytes: [u8; 32]) -> NodeInfo {
+        let port = 9000u16 + distance_bytes[0] as u16;
         NodeInfo {
-            id: PeerId::new(&[42u8; 32]),
-            address: peer_id.to_string(),
+            id: PeerId::new(&distance_bytes),
+            address: format!("127.0.0.1:{port}").parse().unwrap(),
             last_seen: std::time::SystemTime::now(),
             capacity: NodeCapacity::default(),
         }

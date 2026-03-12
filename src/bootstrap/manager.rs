@@ -120,13 +120,10 @@ pub struct BootstrapManager {
 }
 
 impl BootstrapManager {
-    /// Create a new bootstrap manager with default configuration
-    pub async fn new() -> Result<Self> {
-        Self::with_config(BootstrapConfig::default()).await
-    }
-
-    /// Create a new bootstrap manager with custom configuration
-    pub async fn with_config(config: BootstrapConfig) -> Result<Self> {
+    async fn with_config_and_loopback(
+        config: BootstrapConfig,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let ant_config = BootstrapCacheConfig::builder()
             .cache_dir(&config.cache_dir)
             .max_peers(config.max_peers)
@@ -142,29 +139,47 @@ impl BootstrapManager {
         Ok(Self {
             cache: Arc::new(cache),
             rate_limiter: JoinRateLimiter::new(config.rate_limit),
-            diversity_enforcer: Mutex::new(IPDiversityEnforcer::new(config.diversity.clone())),
+            diversity_enforcer: Mutex::new(IPDiversityEnforcer::with_loopback(
+                config.diversity.clone(),
+                allow_loopback,
+            )),
             diversity_config: config.diversity,
             maintenance_handle: None,
         })
     }
 
+    /// Create a new bootstrap manager with default configuration
+    pub async fn new() -> Result<Self> {
+        Self::with_config(BootstrapConfig::default()).await
+    }
+
+    /// Create a new bootstrap manager with custom configuration.
+    ///
+    /// This lower-level constructor does not enable loopback bypass. Use
+    /// [`BootstrapManager::with_full_config`] when the policy should come from
+    /// the node's canonical config.
+    pub async fn with_config(config: BootstrapConfig) -> Result<Self> {
+        Self::with_config_and_loopback(config, false).await
+    }
+
     /// Create a new bootstrap manager with full custom configuration
     ///
     /// This is a compatibility method for migrating from the old BootstrapManager.
-    /// It accepts the old `CacheConfig` type and maps it to the new configuration.
+    /// It accepts the old `CacheConfig` type and derives both diversity settings
+    /// and loopback policy from the node config so they cannot drift apart.
     pub async fn with_full_config(
         cache_config: CacheConfig,
         rate_limit_config: JoinRateLimiterConfig,
-        diversity_config: IPDiversityConfig,
+        node_config: &crate::network::NodeConfig,
     ) -> Result<Self> {
         let config = BootstrapConfig {
             cache_dir: cache_config.cache_dir,
             max_peers: cache_config.max_contacts,
             epsilon: 0.1, // Default exploration rate
             rate_limit: rate_limit_config,
-            diversity: diversity_config,
+            diversity: node_config.diversity_config.clone().unwrap_or_default(),
         };
-        Self::with_config(config).await
+        Self::with_config_and_loopback(config, node_config.allow_loopback).await
     }
 
     /// Start background maintenance tasks (delegated to saorsa-transport)
@@ -685,9 +700,9 @@ mod tests {
             max_nodes_per_64: 100,
             max_nodes_per_48: 100,
             max_nodes_per_32: 100,
-            max_nodes_per_ipv4_32: 100, // Allow many per IP for rate limit test
-            max_nodes_per_ipv4_24: 100,
-            max_nodes_per_ipv4_16: 100,
+            max_nodes_per_ipv4_32: None, // No static cap for rate limit test
+            max_nodes_per_ipv4_24: None,
+            max_nodes_per_ipv4_16: None,
             max_per_ip_cap: 100,
             max_network_fraction: 1.0,
             max_nodes_per_asn: 1000,

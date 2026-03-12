@@ -33,10 +33,6 @@ pub use contact::{
     QuicContactInfo, QuicQualityMetrics,
 };
 
-// Four-word address encoding (via four-word-networking crate)
-pub use four_word_networking as fourwords;
-use four_word_networking::FourWordAdaptiveEncoder;
-
 use crate::error::BootstrapError;
 use crate::{P2PError, Result};
 use std::net::IpAddr;
@@ -45,85 +41,6 @@ use std::path::PathBuf;
 
 /// Default directory for storing bootstrap cache files
 pub const DEFAULT_CACHE_DIR: &str = ".cache/saorsa";
-
-/// Minimal facade around external four-word types
-#[derive(Debug, Clone)]
-pub struct FourWordAddress(pub String);
-
-impl FourWordAddress {
-    pub fn from_string(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.split(['.', '-']).collect();
-        if parts.len() != 4 {
-            return Err(P2PError::Bootstrap(BootstrapError::InvalidData(
-                "Four-word address must have exactly 4 words"
-                    .to_string()
-                    .into(),
-            )));
-        }
-        Ok(FourWordAddress(parts.join("-")))
-    }
-
-    pub fn validate(&self, _encoder: &WordEncoder) -> bool {
-        let parts: Vec<&str> = self.0.split(['.', '-']).collect();
-        parts.len() == 4 && parts.iter().all(|part| !part.is_empty())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WordDictionary;
-
-#[derive(Debug, Clone)]
-pub struct WordEncoder;
-
-impl Default for WordEncoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WordEncoder {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn encode_multiaddr_string(&self, multiaddr: &str) -> Result<FourWordAddress> {
-        let socket_addr: std::net::SocketAddr = multiaddr
-            .parse()
-            .map_err(|e| P2PError::Bootstrap(BootstrapError::InvalidData(format!("{e}").into())))?;
-        self.encode_socket_addr(&socket_addr)
-    }
-
-    pub fn decode_to_socket_addr(&self, words: &FourWordAddress) -> Result<std::net::SocketAddr> {
-        let encoder = FourWordAdaptiveEncoder::new().map_err(|e| {
-            P2PError::Bootstrap(BootstrapError::InvalidData(
-                format!("Encoder init failed: {e}").into(),
-            ))
-        })?;
-        let normalized = words.0.replace(' ', "-");
-        let decoded = encoder.decode(&normalized).map_err(|e| {
-            P2PError::Bootstrap(BootstrapError::InvalidData(
-                format!("Failed to decode four-word address: {e}").into(),
-            ))
-        })?;
-        decoded.parse::<std::net::SocketAddr>().map_err(|_| {
-            P2PError::Bootstrap(BootstrapError::InvalidData(
-                "Decoded address missing port".to_string().into(),
-            ))
-        })
-    }
-
-    pub fn encode_socket_addr(&self, addr: &std::net::SocketAddr) -> Result<FourWordAddress> {
-        let encoder = FourWordAdaptiveEncoder::new().map_err(|e| {
-            P2PError::Bootstrap(BootstrapError::InvalidData(
-                format!("Encoder init failed: {e}").into(),
-            ))
-        })?;
-        let encoded = encoder
-            .encode(&addr.to_string())
-            .map_err(|e| P2PError::Bootstrap(BootstrapError::InvalidData(format!("{e}").into())))?;
-        Ok(FourWordAddress(encoded.replace(' ', "-")))
-    }
-}
 
 /// Cache statistics for monitoring
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -190,8 +107,8 @@ pub fn home_cache_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::NodeConfig;
     use crate::rate_limit::JoinRateLimiterConfig;
-    use crate::security::IPDiversityConfig;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -202,11 +119,12 @@ mod tests {
             max_contacts: 1000,
             ..CacheConfig::default()
         };
+        let node_config = NodeConfig::default();
 
         let manager = BootstrapManager::with_full_config(
             config,
             JoinRateLimiterConfig::default(),
-            IPDiversityConfig::default(),
+            &node_config,
         )
         .await;
         assert!(manager.is_ok());

@@ -147,7 +147,6 @@ Distributed storage with geographic awareness:
 
 #### 4. Identity System (`src/identity/`)
 - **Cryptography**: ML-DSA-65 for post-quantum signatures
-- **Four-Word Addresses**: Human-readable via `four-word-networking` crate
 - **No PoW**: Pure cryptographic identity without proof-of-work
 
 #### 5. Placement System (`src/placement/`)
@@ -162,7 +161,6 @@ Advanced storage orchestration with EigenTrust integration:
 - `saorsa-rsps` (0.2.0): DHT optimization with provider summaries
 - `saorsa-webrtc` (0.1.2): WebRTC with pluggable signaling
 - `saorsa-pqc` (0.3.12): Post-quantum cryptography
-- `four-word-networking` (2.6+): Human-readable addresses (IPv4+port encodes to 4 words)
 - `saorsa-transport` (0.10+): QUIC transport with NAT traversal and PQC
 
 ### Feature Flags

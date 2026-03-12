@@ -4,6 +4,7 @@
 
 use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
+use crate::address::MultiAddr;
 use crate::dht::geographic_routing::GeographicRegion;
 use crate::dht::metrics::SecurityMetricsCollector;
 use crate::dht::network_integration::{DhtMessage, DhtResponse};
@@ -15,12 +16,12 @@ use crate::dht::routing_maintenance::{
 };
 use crate::dht::trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
 use crate::network::NetworkSender;
-use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
+use crate::security::IPDiversityConfig;
 use anyhow::{Context, Result, anyhow};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -45,13 +46,35 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Node information for routing
+/// Node information for routing.
+///
+/// The `address` field stores a typed [`MultiAddr`] that is always valid.
+/// For wire-protocol compatibility it serializes as a plain `"ip:port"` string
+/// and deserializes from both `"ip:port"` and MultiAddr formats like
+/// `/ip4/1.2.3.4/udp/9000`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
-    pub address: String,
+    #[serde(with = "crate::address::serde_as_string")]
+    pub address: MultiAddr,
     pub last_seen: SystemTime,
     pub capacity: NodeCapacity,
+}
+
+impl NodeInfo {
+    /// Get the socket address. Always succeeds because `MultiAddr`
+    /// guarantees a valid `SocketAddr`.
+    #[must_use]
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.address.socket_addr
+    }
+
+    /// Get the IP address. Always succeeds because `MultiAddr`
+    /// guarantees a valid IP.
+    #[must_use]
+    pub fn ip(&self) -> IpAddr {
+        self.address.ip()
+    }
 }
 
 /// Node capacity metrics
@@ -87,6 +110,14 @@ impl KBucket {
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+        // If the node is already in this bucket, replace it fully and move to
+        // tail (most-recently-seen) per standard Kademlia protocol.
+        if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
+            self.nodes.remove(pos);
+            self.nodes.push(node);
+            return Ok(());
+        }
+
         if self.nodes.len() < self.max_size {
             self.nodes.push(node);
             Ok(())
@@ -103,8 +134,35 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
+    /// Update `last_seen` (and optionally the address) for a node, then move
+    /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
+    ///
+    /// The `address` parameter accepts a string in either `"ip:port"` or
+    /// MultiAddr format.  Invalid strings are silently ignored — the existing
+    /// address is preserved.
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+        if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
+            self.nodes[pos].last_seen = SystemTime::now();
+            if let Some(addr) = address
+                && !addr.is_empty()
+                && let Ok(parsed) = addr.parse::<MultiAddr>()
+            {
+                self.nodes[pos].address = parsed;
+            }
+            let node = self.nodes.remove(pos);
+            self.nodes.push(node);
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_nodes(&self) -> &[NodeInfo] {
         &self.nodes
+    }
+
+    fn find_node(&self, node_id: &PeerId) -> Option<&NodeInfo> {
+        self.nodes.iter().find(|n| &n.id == node_id)
     }
 }
 
@@ -139,6 +197,13 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].remove_node(node_id);
     }
 
+    /// Update `last_seen` (and optionally address) for a node and move it to
+    /// the tail of its k-bucket. Returns `true` if the node was found.
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+        let bucket_index = self.get_bucket_index(node_id);
+        self.buckets[bucket_index].touch_node(node_id, address)
+    }
+
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
         // Optimization: Start from the bucket closest to the key and work outwards
         // This avoids collecting all nodes from all 256 buckets when we only need a few
@@ -146,25 +211,23 @@ impl KademliaRoutingTable {
 
         let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
 
-        // Collect from target bucket first, then expand outwards
-        for offset in 0..256 {
-            // Check bucket above target (or at target when offset == 0)
-            let bucket_above = target_bucket.saturating_add(offset).min(255);
-            for node in self.buckets[bucket_above].get_nodes() {
+        // Visit buckets in order of proximity to target, each exactly once.
+        // Uses checked arithmetic so indices that would exceed [0, 255] are
+        // skipped rather than clamped, preventing duplicate bucket visits.
+        let bucket_iter = std::iter::once(target_bucket).chain(
+            (1..KADEMLIA_BUCKET_COUNT).flat_map(move |offset| {
+                let above = target_bucket
+                    .checked_add(offset)
+                    .filter(|&b| b < KADEMLIA_BUCKET_COUNT);
+                let below = target_bucket.checked_sub(offset);
+                above.into_iter().chain(below)
+            }),
+        );
+
+        for bucket_idx in bucket_iter {
+            for node in self.buckets[bucket_idx].get_nodes() {
                 let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
                 candidates.push((node.clone(), distance));
-            }
-
-            // Check bucket below target (skip when offset == 0 to avoid duplicate)
-            if offset > 0 {
-                let bucket_below = target_bucket.saturating_sub(offset);
-                // Only check if it's a different bucket (saturating_sub may equal target_bucket)
-                if bucket_below != bucket_above {
-                    for node in self.buckets[bucket_below].get_nodes() {
-                        let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
-                        candidates.push((node.clone(), distance));
-                    }
-                }
             }
 
             // Early exit: if we have enough candidates, we can stop expanding
@@ -200,20 +263,24 @@ impl KademliaRoutingTable {
         255 // Same key as node
     }
 
+    /// Look up a node by its exact peer ID. O(K) scan of the target bucket.
+    fn find_node_by_id(&self, node_id: &PeerId) -> Option<&NodeInfo> {
+        let bucket_index = self.get_bucket_index(node_id);
+        self.buckets[bucket_index].find_node(node_id)
+    }
+
+    /// Total number of nodes across all buckets.
+    pub fn node_count(&self) -> usize {
+        self.buckets.iter().map(|b| b.get_nodes().len()).sum()
+    }
+
+    /// Iterate over every node in the routing table.
+    fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
+        self.buckets.iter().flat_map(|b| b.get_nodes().iter())
+    }
+
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
-        let distance = xor_distance_bytes(self.node_id.to_bytes(), node_id.to_bytes());
-
-        // Find first bit that differs
-        for i in 0..256 {
-            let byte_index = i / 8;
-            let bit_index = 7 - (i % 8);
-
-            if (distance[byte_index] >> bit_index) & 1 == 1 {
-                return i;
-            }
-        }
-
-        255 // Same node
+        self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
 }
 
@@ -258,8 +325,6 @@ struct DataStore {
 struct DataMetadata {
     _size: usize,
     _stored_at: SystemTime,
-    access_count: u64,
-    last_accessed: SystemTime,
 }
 
 impl DataStore {
@@ -274,26 +339,15 @@ impl DataStore {
         let metadata = DataMetadata {
             _size: value.len(),
             _stored_at: SystemTime::now(),
-            access_count: 0,
-            last_accessed: SystemTime::now(),
         };
 
         self.data.insert(key, value);
         self.metadata.insert(key, metadata);
     }
 
-    fn get(&mut self, key: &DhtKey) -> Option<Vec<u8>> {
-        if let Some(metadata) = self.metadata.get_mut(key) {
-            metadata.access_count += 1;
-            metadata.last_accessed = SystemTime::now();
-        }
-
+    /// Look up a value without updating access metadata (read-only).
+    fn get(&self, key: &DhtKey) -> Option<Vec<u8>> {
         self.data.get(key).cloned()
-    }
-
-    fn _remove(&mut self, key: &DhtKey) -> Option<Vec<u8>> {
-        self.metadata.remove(key);
-        self.data.remove(key)
     }
 }
 
@@ -312,23 +366,6 @@ impl ReplicationManager {
             _pending_repairs: Vec::new(),
         }
     }
-
-    fn _required_replicas(&self) -> usize {
-        match self._consistency_level {
-            ConsistencyLevel::One => 1,
-            // Quorum requires strict majority for Byzantine fault tolerance: floor(n/2) + 1
-            // For K=8, this gives 5 (tolerates 3 failures). This is intentionally stricter
-            // than simple majority (div_ceil which gives 4) to ensure BFT guarantees.
-            ConsistencyLevel::Quorum => (self._replication_factor / 2) + 1,
-            ConsistencyLevel::All => self._replication_factor,
-        }
-    }
-
-    fn _schedule_repair(&mut self, key: DhtKey) {
-        if !self._pending_repairs.contains(&key) {
-            self._pending_repairs.push(key);
-        }
-    }
 }
 
 /// Load balancer for intelligent data distribution
@@ -343,10 +380,6 @@ impl LoadBalancer {
             node_loads: HashMap::new(),
             _rebalance_threshold: 0.8,
         }
-    }
-
-    fn _update_load(&mut self, node_id: PeerId, load: LoadMetric) {
-        self.node_loads.insert(node_id, load);
     }
 
     fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<PeerId> {
@@ -373,44 +406,53 @@ impl LoadBalancer {
 
         sorted.into_iter().take(count).map(|(id, _)| id).collect()
     }
-
-    fn _should_rebalance(&self) -> bool {
-        self.node_loads
-            .values()
-            .any(|load| load.storage_used_percent > self._rebalance_threshold)
-    }
 }
 
-/// Geographic diversity enforcer for routing table
-/// Limits the number of nodes from any single region to prevent geographic concentration attacks
-struct GeographicDiversityEnforcer {
-    region_counts: HashMap<GeographicRegion, usize>,
-    max_per_region: usize,
+// ---------------------------------------------------------------------------
+// Address parsing and subnet masking helpers for diversity checks
+// ---------------------------------------------------------------------------
+
+/// Accumulator for IPv4 subnet match counts during diversity scan.
+#[derive(Default)]
+struct Ipv4SubnetCounts {
+    exact: usize,
+    slash_24: usize,
+    slash_16: usize,
 }
 
-impl GeographicDiversityEnforcer {
-    fn new(max_per_region: usize) -> Self {
-        Self {
-            region_counts: HashMap::new(),
-            max_per_region,
-        }
-    }
-
-    fn can_accept(&self, region: GeographicRegion) -> bool {
-        let count = self.region_counts.get(&region).copied().unwrap_or(0);
-        count < self.max_per_region
-    }
-
-    fn add(&mut self, region: GeographicRegion) {
-        *self.region_counts.entry(region).or_insert(0) += 1;
-    }
-
-    fn _remove(&mut self, region: GeographicRegion) {
-        if let Some(count) = self.region_counts.get_mut(&region) {
-            *count = count.saturating_sub(1);
-        }
-    }
+/// Accumulator for IPv6 subnet match counts during diversity scan.
+#[derive(Default)]
+struct Ipv6SubnetCounts {
+    slash_64: usize,
+    slash_48: usize,
+    slash_32: usize,
 }
+
+/// Zero out the host bits of an IPv4 address beyond `prefix_len`.
+fn mask_ipv4(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let bits = u32::from(addr);
+    let mask = if prefix_len >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    Ipv4Addr::from(bits & mask)
+}
+
+/// Zero out the host bits of an IPv6 address beyond `prefix_len`.
+fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let bits = u128::from(addr);
+    let mask = if prefix_len >= 128 {
+        u128::MAX
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    Ipv6Addr::from(bits & mask)
+}
+
+/// Default maximum nodes per geographic region. Matches
+/// `GeographicRoutingConfig::max_nodes_per_region` default.
+const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 
 /// DHT query timeout duration
 const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -475,9 +517,19 @@ pub struct DhtCoreEngine {
     security_metrics: Arc<SecurityMetricsCollector>,
     bucket_refresh_manager: Arc<RwLock<BucketRefreshManager>>,
     close_group_validator: Arc<RwLock<CloseGroupValidator>>,
-    ip_diversity_enforcer: Arc<RwLock<IPDiversityEnforcer>>,
     eviction_manager: Arc<RwLock<EvictionManager>>,
-    geographic_diversity_enforcer: Arc<RwLock<GeographicDiversityEnforcer>>,
+
+    /// IP diversity limits — checked against the live routing table on each
+    /// `add_node` call rather than maintained as incremental counters.
+    ip_diversity_config: IPDiversityConfig,
+    /// Allow loopback addresses in the routing table.
+    ///
+    /// Set once at construction from `NodeConfig.allow_loopback` and never
+    /// mutated — `NodeConfig` is the single source of truth. Kept separate
+    /// from `IPDiversityConfig` to prevent duplication and drift.
+    allow_loopback: bool,
+    /// Maximum nodes per geographic region.
+    geo_max_per_region: usize,
 
     // Network query components
     /// Transport handle for sending messages to remote peers
@@ -497,19 +549,32 @@ pub struct DhtCoreEngine {
 impl DhtCoreEngine {
     /// Create new DHT engine with specified node ID
     pub fn new(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict)
+        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict, false)
     }
 
     /// Create new DHT engine for testing (permissive validation)
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly)
+        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly, false)
+    }
+
+    /// Override the IP diversity configuration.
+    pub fn set_ip_diversity_config(&mut self, config: IPDiversityConfig) {
+        self.ip_diversity_config = config;
+    }
+
+    /// Set whether loopback addresses are allowed in the routing table.
+    /// Only available in test builds — production code sets this at construction.
+    #[cfg(test)]
+    pub fn set_allow_loopback(&mut self, allow: bool) {
+        self.allow_loopback = allow;
     }
 
     /// Create new DHT engine with specified validation mode
     pub(crate) fn new_with_validation_mode(
         node_id: PeerId,
         enforcement_mode: CloseGroupEnforcementMode,
+        allow_loopback: bool,
     ) -> Result<Self> {
         // Initialize security components
         let security_metrics = Arc::new(SecurityMetricsCollector::new());
@@ -519,25 +584,15 @@ impl DhtCoreEngine {
             validator_config.clone(),
         )));
 
-        let mut bucket_refresh_manager = BucketRefreshManager::new_with_validation(
-            node_id,
-            CloseGroupValidatorConfig::default(),
-        );
+        let mut bucket_refresh_manager =
+            BucketRefreshManager::new_with_validation(node_id, validator_config.clone());
         // Link validator to refresh manager
         bucket_refresh_manager.set_validator(close_group_validator.clone());
         let bucket_refresh_manager = Arc::new(RwLock::new(bucket_refresh_manager));
 
-        let ip_diversity_enforcer = Arc::new(RwLock::new(IPDiversityEnforcer::new(
-            IPDiversityConfig::default(),
-        )));
-
         let eviction_manager = Arc::new(RwLock::new(EvictionManager::new(
             MaintenanceConfig::default(),
         )));
-
-        // Geographic diversity: limit to 50 nodes per region (matches GeographicRoutingConfig default)
-        let geographic_diversity_enforcer =
-            Arc::new(RwLock::new(GeographicDiversityEnforcer::new(50)));
 
         Ok(Self {
             node_id,
@@ -548,9 +603,10 @@ impl DhtCoreEngine {
             security_metrics,
             bucket_refresh_manager,
             close_group_validator,
-            ip_diversity_enforcer,
             eviction_manager,
-            geographic_diversity_enforcer,
+            ip_diversity_config: IPDiversityConfig::default(),
+            allow_loopback,
+            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
             transport: None,
             pending_requests: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(MAX_PENDING_DHT_REQUESTS)
@@ -578,6 +634,11 @@ impl DhtCoreEngine {
     #[must_use]
     pub fn node_id(&self) -> &PeerId {
         &self.node_id
+    }
+
+    /// Number of peers currently in the routing table.
+    pub async fn routing_table_size(&self) -> usize {
+        self.routing_table.read().await.node_count()
     }
 
     // ===== Trust-weighted peer selection methods =====
@@ -674,6 +735,7 @@ impl DhtCoreEngine {
 
     /// Start background maintenance tasks for security and health
     pub fn start_maintenance_tasks(&self) {
+        let routing_table = self.routing_table.clone();
         let refresh_manager = self.bucket_refresh_manager.clone();
         let eviction_manager = self.eviction_manager.clone();
         let close_group_validator = self.close_group_validator.clone();
@@ -793,15 +855,18 @@ impl DhtCoreEngine {
                     }
                 }
 
-                // 2. Active Eviction Enforcement
+                // 2. Active Eviction Enforcement — remove candidates from both
+                //    the eviction tracker and the routing table.
                 {
                     let mut eviction_mgr = eviction_manager.write().await;
                     let candidates = eviction_mgr.get_eviction_candidates();
-                    for (node_id, reason) in candidates {
-                        tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
-                        // Remove from eviction tracking (routing table removal
-                        // would be triggered by the caller or a separate mechanism)
-                        eviction_mgr.remove_node(&node_id);
+                    if !candidates.is_empty() {
+                        let mut routing = routing_table.write().await;
+                        for (node_id, reason) in candidates {
+                            tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
+                            routing.remove_node(&node_id);
+                            eviction_mgr.remove_node(&node_id);
+                        }
                     }
                 }
 
@@ -825,6 +890,11 @@ impl DhtCoreEngine {
     ///
     /// # Errors
     /// Returns an error if the value exceeds `MAX_DHT_VALUE_SIZE` (512 bytes).
+    ///
+    /// **Note:** When the local node is not among the selected storage targets,
+    /// the receipt will have `success: false` and an empty `stored_at` list
+    /// because network store-forwarding is not yet implemented.  Callers
+    /// should check [`StoreReceipt::is_successful`] and handle this case.
     pub async fn store(&mut self, key: &DhtKey, value: Vec<u8>) -> Result<StoreReceipt> {
         // Security: Reject oversized values to prevent memory exhaustion
         if value.len() > MAX_DHT_VALUE_SIZE {
@@ -863,11 +933,14 @@ impl DhtCoreEngine {
             });
         }
 
+        // TODO: send data to selected_nodes via transport when network
+        //       store-forwarding is implemented.  Until then, the receipt
+        //       must not claim success for a remote store that never happened.
         Ok(StoreReceipt {
             key: *key,
-            stored_at: selected_nodes,
+            stored_at: Vec::new(),
             timestamp: SystemTime::now(),
-            success: true,
+            success: false,
         })
     }
 
@@ -876,9 +949,9 @@ impl DhtCoreEngine {
     /// First checks local storage. If not found locally and a transport is configured,
     /// queries the K closest nodes in parallel and returns the first successful response.
     pub async fn retrieve(&self, key: &DhtKey) -> Result<Option<Vec<u8>>> {
-        // Step 1: Check local store first
+        // Step 1: Check local store first (read-only lock)
         {
-            let mut store = self.data_store.write().await;
+            let store = self.data_store.read().await;
             if let Some(value) = store.get(key) {
                 tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found in local store");
                 return Ok(Some(value));
@@ -1058,7 +1131,7 @@ impl DhtCoreEngine {
     /// Processes the request and returns a response wrapper ready to be sent back.
     pub async fn handle_request(&self, request_wrapper: DhtRequestWrapper) -> DhtResponseWrapper {
         let response = match request_wrapper.message {
-            DhtMessage::Retrieve { ref key, .. } => match self.data_store.write().await.get(key) {
+            DhtMessage::Retrieve { ref key, .. } => match self.data_store.read().await.get(key) {
                 Some(value) => DhtResponse::RetrieveReply { value: Some(value) },
                 None => DhtResponse::RetrieveReply { value: None },
             },
@@ -1096,7 +1169,7 @@ impl DhtCoreEngine {
                 }
             }
             DhtMessage::FindValue { ref key } => {
-                let value = self.data_store.write().await.get(key);
+                let value = self.data_store.read().await.get(key);
                 if value.is_some() {
                     DhtResponse::FindValueReply {
                         value,
@@ -1108,13 +1181,7 @@ impl DhtCoreEngine {
                     DhtResponse::FindValueReply { value: None, nodes }
                 }
             }
-            DhtMessage::Ping {
-                timestamp,
-                sender_info,
-            } => DhtResponse::Pong {
-                timestamp,
-                node_info: sender_info,
-            },
+            DhtMessage::Ping { timestamp } => DhtResponse::Pong { timestamp },
             _ => DhtResponse::Error {
                 code: crate::dht::network_integration::ErrorCode::InvalidMessage,
                 message: "Unsupported message type".to_string(),
@@ -1134,12 +1201,28 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Join the DHT network
+    /// Join the DHT network.
+    ///
+    /// Bootstrap nodes go through the same close-group validation and
+    /// IP/geographic diversity checks as every other `add_node` call, so a
+    /// compromised bootstrap list cannot bypass security invariants.
+    ///
+    /// Returns an error if the list is non-empty but *every* node fails
+    /// validation (the caller would be left with an empty routing table).
     pub async fn join_network(&mut self, bootstrap_nodes: Vec<NodeInfo>) -> Result<()> {
-        let mut routing = self.routing_table.write().await;
-
+        let total = bootstrap_nodes.len();
+        let mut added: usize = 0;
         for node in bootstrap_nodes {
-            routing.add_node(node)?;
+            match self.add_node(node).await {
+                Ok(()) => added += 1,
+                Err(e) => tracing::warn!("Skipping bootstrap node that failed validation: {e}"),
+            }
+        }
+
+        if total > 0 && added == 0 {
+            return Err(anyhow!(
+                "All {total} bootstrap nodes failed validation — cannot join network"
+            ));
         }
 
         Ok(())
@@ -1155,6 +1238,28 @@ impl DhtCoreEngine {
         store.metadata.clear();
 
         Ok(())
+    }
+
+    /// Look up a node's address from the routing table by peer ID.
+    ///
+    /// Returns the stored address if the peer is in the routing table,
+    /// `None` otherwise. O(K) scan of the target k-bucket.
+    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+        let routing = self.routing_table.read().await;
+        routing.find_node_by_id(peer_id).map(|n| n.address.clone())
+    }
+
+    /// Record a successful interaction with a peer by updating its `last_seen`
+    /// timestamp (and optionally its address) and moving it to the tail of its
+    /// k-bucket (most recently seen).
+    ///
+    /// Standard Kademlia: any successful RPC implicitly proves liveness, so the
+    /// routing table should reflect this without requiring dedicated pings.
+    /// Passing the current address ensures stale addresses are replaced when a
+    /// peer reconnects from a different endpoint.
+    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&str>) -> bool {
+        let mut routing = self.routing_table.write().await;
+        routing.touch_node(node_id, address)
     }
 
     /// Handle node failure
@@ -1263,11 +1368,14 @@ impl DhtCoreEngine {
         self.close_group_validator.clone()
     }
 
-    /// Add a node to the DHT with security checks
+    /// Add a node to the DHT with security checks.
+    ///
+    /// Diversity limits (IP subnet and geographic region) are derived from the
+    /// live routing table contents on every call, so counts are always accurate
+    /// regardless of evictions, reconnections, or address changes.
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
         // 1. Security Check: Close Group Validator
         {
-            // Active validation query
             let validator = self.close_group_validator.read().await;
             if !validator.validate(&node.id) {
                 tracing::warn!("Node failed close group validation: {:?}", node.id);
@@ -1275,77 +1383,185 @@ impl DhtCoreEngine {
             }
         }
 
-        // 2. Security Check: IP Diversity (both IPv4 and IPv6)
-        {
-            // Parse IP address from node.address string
-            // address comes as "ip:port" or just "ip"
-            let ip_addr: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
-                Some(socket.ip())
-            } else {
-                node.address.parse::<IpAddr>().ok()
-            };
+        // MultiAddr guarantees a valid IP — no parsing can fail.
+        let candidate_ip = node.ip();
 
-            if let Some(ip) = ip_addr {
-                let mut enforcer = self.ip_diversity_enforcer.write().await;
-                match enforcer.analyze_unified(ip) {
-                    Ok(analysis) => {
-                        if !enforcer.can_accept_unified(&analysis) {
-                            tracing::warn!("Node rejected due to IP diversity limits: {:?}", ip);
-                            return Err(anyhow::anyhow!(
-                                "IP diversity limits exceeded for address {ip}"
-                            ));
-                        }
-                        // Record valid node - propagate error as this is a critical security operation
-                        enforcer.add_unified(&analysis).map_err(|e| {
-                            tracing::error!(
-                                "Failed to record node IP for diversity tracking: {:?}",
-                                e
-                            );
-                            anyhow::anyhow!("IP diversity tracking failed: {e:?}")
-                        })?;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Could not analyze IP {:?}: {:?}", ip, e);
-                        // Continue without IP diversity check if analysis fails
-                    }
-                }
-            }
-        }
-
-        // 3. Security Check: Geographic Diversity
-        {
-            // Parse IP address from node.address string (reuse parsed IP from above)
-            let ip_addr: Option<IpAddr> = if let Ok(socket) = node.address.parse::<SocketAddr>() {
-                Some(socket.ip())
-            } else {
-                node.address.parse::<IpAddr>().ok()
-            };
-
-            if let Some(ip) = ip_addr {
-                let region = GeographicRegion::from_ip(ip);
-                let mut enforcer = self.geographic_diversity_enforcer.write().await;
-                if !enforcer.can_accept(region) {
-                    tracing::warn!(
-                        "Node rejected due to geographic diversity limits: {:?} in region {:?}",
-                        ip,
-                        region
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Geographic diversity limits exceeded for region {region:?} (IP: {ip})"
-                    ));
-                }
-                enforcer.add(region);
-            }
-        }
-
-        // 4. Add to routing table
+        // 2. Security Check: IP + Geographic Diversity
+        //
+        // Counts are derived from the routing table in a single pass.
+        // Nodes already present (reconnecting with the same ID) are
+        // excluded from the count so they can update their address
+        // without inflating limits.
+        // 3. Add to routing table — single write lock for both the diversity
+        //    check and the insertion to avoid a TOCTOU race where touch_node
+        //    could change an address between a read-lock check and the write.
         let mut routing = self.routing_table.write().await;
+        self.check_diversity(&routing, &node.id, candidate_ip)?;
         routing.add_node(node)?;
 
-        // 5. Update Metrics
-        // (Placeholder: Add metric for new node joining if available)
+        Ok(())
+    }
+
+    /// Check IP subnet and geographic diversity against the live routing table.
+    ///
+    /// Single pass over all nodes — each node's address is parsed once.
+    /// `candidate_id` is excluded from counting so that a reconnecting node
+    /// doesn't block itself.  Loopback candidates are only accepted when
+    /// `self.allow_loopback` is `true`; otherwise they are
+    /// rejected outright.  Existing loopback nodes in the table are always
+    /// excluded from `network_size` and subnet/region counts so they don't
+    /// inflate the dynamic per-IP limit in devnet environments.
+    fn check_diversity(
+        &self,
+        routing: &KademliaRoutingTable,
+        candidate_id: &PeerId,
+        candidate_ip: IpAddr,
+    ) -> Result<()> {
+        // Loopback addresses (127.0.0.0/8, ::1) are used in tests and local
+        // development where many nodes share the same IP.  When
+        // `allow_loopback` is enabled, diversity limits don't apply to them.
+        // In production (allow_loopback = false), loopback addresses are
+        // rejected outright — a peer advertising 127.0.0.1/::1 should never
+        // enter the routing table.
+        if candidate_ip.is_loopback() {
+            if self.allow_loopback {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "IP diversity: loopback address {candidate_ip} rejected (allow_loopback=false)"
+            ));
+        }
+
+        let candidate_region = GeographicRegion::from_ip(candidate_ip);
+        let mut region_count: usize = 0;
+        let mut network_size: usize = 0;
+
+        // Protocol-specific subnet accumulators
+        let mut v4_counts = Ipv4SubnetCounts::default();
+        let mut v6_counts = Ipv6SubnetCounts::default();
+
+        // Precompute candidate subnet masks
+        let v4_masks = match candidate_ip {
+            IpAddr::V4(v4) => Some((v4, mask_ipv4(v4, 24), mask_ipv4(v4, 16))),
+            _ => None,
+        };
+        let v6_masks = match candidate_ip {
+            IpAddr::V6(v6) => Some((mask_ipv6(v6, 64), mask_ipv6(v6, 48), mask_ipv6(v6, 32))),
+            _ => None,
+        };
+
+        for node in routing.iter_nodes() {
+            if node.id == *candidate_id {
+                continue;
+            }
+            let existing_ip = node.ip();
+            // Loopback nodes don't contribute to network_size or any counts
+            if existing_ip.is_loopback() {
+                continue;
+            }
+            network_size += 1;
+            if GeographicRegion::from_ip(existing_ip) == candidate_region {
+                region_count += 1;
+            }
+            // Count subnet matches for the candidate's address family
+            match (existing_ip, v4_masks, v6_masks) {
+                (IpAddr::V4(existing_v4), Some((v4, cand_24, cand_16)), _) => {
+                    if existing_v4 == v4 {
+                        v4_counts.exact += 1;
+                    }
+                    if mask_ipv4(existing_v4, 24) == cand_24 {
+                        v4_counts.slash_24 += 1;
+                    }
+                    if mask_ipv4(existing_v4, 16) == cand_16 {
+                        v4_counts.slash_16 += 1;
+                    }
+                }
+                (IpAddr::V6(existing_v6), _, Some((cand_64, cand_48, cand_32))) => {
+                    if mask_ipv6(existing_v6, 64) == cand_64 {
+                        v6_counts.slash_64 += 1;
+                    }
+                    if mask_ipv6(existing_v6, 48) == cand_48 {
+                        v6_counts.slash_48 += 1;
+                    }
+                    if mask_ipv6(existing_v6, 32) == cand_32 {
+                        v6_counts.slash_32 += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Enforce subnet limits
+        let per_ip = self.dynamic_per_ip_limit(network_size);
+        match candidate_ip {
+            IpAddr::V4(v4) => {
+                let cfg = &self.ip_diversity_config;
+                let limit_32 = cfg
+                    .max_nodes_per_ipv4_32
+                    .map_or(per_ip, |cap| cap.min(per_ip));
+                let limit_24 = cfg
+                    .max_nodes_per_ipv4_24
+                    .map_or(per_ip * 3, |cap| cap.min(per_ip * 3));
+                let limit_16 = cfg
+                    .max_nodes_per_ipv4_16
+                    .map_or(per_ip * 10, |cap| cap.min(per_ip * 10));
+
+                if v4_counts.exact >= limit_32 {
+                    return Err(anyhow!(
+                        "IP diversity: /32 limit ({limit_32}) exceeded for {v4}"
+                    ));
+                }
+                if v4_counts.slash_24 >= limit_24 {
+                    let cand_24 = mask_ipv4(v4, 24);
+                    return Err(anyhow!(
+                        "IP diversity: /24 limit ({limit_24}) exceeded for {cand_24}"
+                    ));
+                }
+                if v4_counts.slash_16 >= limit_16 {
+                    let cand_16 = mask_ipv4(v4, 16);
+                    return Err(anyhow!(
+                        "IP diversity: /16 limit ({limit_16}) exceeded for {cand_16}"
+                    ));
+                }
+            }
+            IpAddr::V6(_) => {
+                let cfg = &self.ip_diversity_config;
+                let limit_64 = std::cmp::min(cfg.max_nodes_per_64, per_ip * 3);
+                let limit_48 = std::cmp::min(cfg.max_nodes_per_48, per_ip * 10);
+                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * 30);
+
+                if v6_counts.slash_64 >= limit_64 {
+                    return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));
+                }
+                if v6_counts.slash_48 >= limit_48 {
+                    return Err(anyhow!("IP diversity: /48 limit ({limit_48}) exceeded"));
+                }
+                if v6_counts.slash_32 >= limit_32 {
+                    return Err(anyhow!("IP diversity: /32 limit ({limit_32}) exceeded"));
+                }
+            }
+        }
+
+        if region_count >= self.geo_max_per_region {
+            return Err(anyhow!(
+                "Geographic diversity: region {candidate_region:?} limit ({}) exceeded",
+                self.geo_max_per_region
+            ));
+        }
 
         Ok(())
+    }
+
+    /// Dynamic per-IP limit: `min(cap, floor(network_size * fraction))`,
+    /// clamped to at least 1.  `network_size` excludes loopback nodes so
+    /// devnet environments don't inflate the limit for non-loopback IPs.
+    fn dynamic_per_ip_limit(&self, network_size: usize) -> usize {
+        let fraction =
+            (network_size as f64 * self.ip_diversity_config.max_network_fraction).floor() as usize;
+        std::cmp::min(
+            self.ip_diversity_config.max_per_ip_cap,
+            std::cmp::max(1, fraction),
+        )
     }
 }
 
@@ -1364,12 +1580,9 @@ impl std::fmt::Debug for DhtCoreEngine {
                 &"Arc<RwLock<BucketRefreshManager>>",
             )
             .field("close_group_validator", &"Arc<RwLock<CloseGroupValidator>>")
-            .field("ip_diversity_enforcer", &"Arc<RwLock<IPDiversityEnforcer>>")
             .field("eviction_manager", &"Arc<RwLock<EvictionManager>>")
-            .field(
-                "geographic_diversity_enforcer",
-                &"Arc<RwLock<GeographicDiversityEnforcer>>",
-            )
+            .field("ip_diversity_config", &self.ip_diversity_config)
+            .field("geo_max_per_region", &self.geo_max_per_region)
             .finish()
     }
 }
@@ -1377,6 +1590,7 @@ impl std::fmt::Debug for DhtCoreEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn test_basic_store_retrieve() -> Result<()> {
@@ -1400,5 +1614,280 @@ mod tests {
 
         let distance = key1.distance(&key2);
         assert_eq!(distance, [255u8; 32]);
+    }
+
+    /// Helper: create a NodeInfo with a deterministic PeerId derived from a
+    /// single byte.  Keeps tests concise.
+    fn make_node(byte: u8, address: &str) -> NodeInfo {
+        NodeInfo {
+            id: PeerId::from_bytes([byte; 32]),
+            address: address.parse::<MultiAddr>().unwrap(),
+            last_seen: SystemTime::now(),
+            capacity: NodeCapacity::default(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KBucket::touch_node tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_touch_node_updates_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        // Touch with a new address
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
+        assert!(found);
+        let expected: MultiAddr = "5.6.7.8:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+    }
+
+    #[test]
+    fn test_touch_node_none_preserves_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        assert!(found);
+        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+    }
+
+    #[test]
+    fn test_touch_node_moves_to_tail() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+        bucket.add_node(make_node(2, "2.2.2.2:9000")).unwrap();
+        bucket.add_node(make_node(3, "3.3.3.3:9000")).unwrap();
+
+        // Touch the first node — it should move to the tail
+        bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        let ids: Vec<u8> = bucket
+            .get_nodes()
+            .iter()
+            .map(|n| n.id.to_bytes()[0])
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_touch_node_empty_string_preserves_address() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let node = make_node(1, "1.2.3.4:9000");
+        bucket.add_node(node).unwrap();
+
+        // Touch with an empty string should NOT overwrite the valid address
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
+        assert!(found);
+        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+    }
+
+    #[test]
+    fn test_touch_node_missing_returns_false() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+
+        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some("9.9.9.9:9000"));
+        assert!(!found);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_closest_nodes tests — boundary bucket indices
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_closest_nodes_no_duplicates_at_bucket_zero() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Insert nodes that land in different buckets.  XOR with [0;32]
+        // means the bucket index is the leading-bit position of the node id.
+        // Byte 0 = 0x80 → bucket 0, byte 0 = 0x40 → bucket 1, etc.
+        let mut id_bytes = [0u8; 32];
+        id_bytes[0] = 0x80; // bucket 0
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.1:9000".parse().unwrap(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        id_bytes = [0u8; 32];
+        id_bytes[0] = 0x40; // bucket 1
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.2:9000".parse().unwrap(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        // Search for a key that targets bucket 0
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = 0x80;
+        let key = DhtKey::from_bytes(key_bytes);
+        let results = table.find_closest_nodes(&key, 8);
+
+        // Verify no duplicates by collecting IDs into a set
+        let mut seen = HashSet::new();
+        for node in &results {
+            assert!(seen.insert(node.id), "Duplicate node {:?}", node.id);
+        }
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_find_closest_nodes_no_duplicates_at_bucket_255() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Bucket 255 requires the differing bit at position 255 (last bit
+        // of last byte).  XOR distance with [0;32] is the id itself, so we
+        // need id where only the very last bit is set.
+        let mut id_bytes = [0u8; 32];
+        id_bytes[31] = 0x01; // bucket 255
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.1:9000".parse().unwrap(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        id_bytes = [0u8; 32];
+        id_bytes[31] = 0x02; // bucket 254
+        table
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes(id_bytes),
+                address: "10.0.0.2:9000".parse().unwrap(),
+                last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
+            })
+            .unwrap();
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = 0x01;
+        let key = DhtKey::from_bytes(key_bytes);
+        let results = table.find_closest_nodes(&key, 8);
+
+        let mut seen = HashSet::new();
+        for node in &results {
+            assert!(seen.insert(node.id), "Duplicate node {:?}", node.id);
+        }
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_find_closest_nodes_returns_sorted_by_distance() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+
+        // Insert 5 nodes at varying distances
+        for i in 0..5u8 {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[0] = 0x80 >> i; // buckets 0,1,2,3,4
+            table
+                .add_node(NodeInfo {
+                    id: PeerId::from_bytes(id_bytes),
+                    address: format!("10.0.0.{}:9000", i + 1).parse().unwrap(),
+                    last_seen: SystemTime::now(),
+                    capacity: NodeCapacity::default(),
+                })
+                .unwrap();
+        }
+
+        let key = DhtKey::from_bytes([0u8; 32]);
+        let results = table.find_closest_nodes(&key, 3);
+
+        assert_eq!(results.len(), 3);
+        // Results should be sorted by XOR distance to key
+        for window in results.windows(2) {
+            let d0 = xor_distance_bytes(window[0].id.to_bytes(), key.as_bytes());
+            let d1 = xor_distance_bytes(window[1].id.to_bytes(), key.as_bytes());
+            assert!(d0 <= d1, "Results not sorted by distance");
+        }
+    }
+
+    #[test]
+    fn test_find_closest_nodes_empty_table() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let table = KademliaRoutingTable::new(local_id, 8);
+
+        let key = DhtKey::from_bytes([42u8; 32]);
+        let results = table.find_closest_nodes(&key, 8);
+        assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_diversity loopback gating tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_loopback_rejected_when_allow_loopback_false() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        // Default has allow_loopback = false
+        assert!(!dht.allow_loopback);
+
+        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let result = dht.add_node(loopback_node).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("loopback"),
+            "expected loopback rejection, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loopback_v6_rejected_when_allow_loopback_false() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        assert!(!dht.allow_loopback);
+
+        let loopback_node = make_node(2, "[::1]:9000");
+        let result = dht.add_node(loopback_node).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("loopback"),
+            "expected loopback rejection, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loopback_accepted_when_allow_loopback_true() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_allow_loopback(true);
+
+        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let result = dht.add_node(loopback_node).await;
+        assert!(result.is_ok(), "loopback should be accepted: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_non_loopback_unaffected_by_allow_loopback_flag() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        // allow_loopback = false should not affect normal addresses
+        assert!(!dht.allow_loopback);
+
+        let normal_node = make_node(1, "10.0.0.1:9000");
+        let result = dht.add_node(normal_node).await;
+        assert!(
+            result.is_ok(),
+            "non-loopback should be accepted: {:?}",
+            result
+        );
     }
 }

@@ -19,17 +19,17 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Multiaddr, P2PError, PeerId, Result,
+    P2PError, PeerId, Result,
     adaptive::EigenTrustEngine,
+    address::MultiAddr,
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
-    error::{DhtError, NetworkError},
+    error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -64,17 +64,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The local node is always considered fully reliable for its own lookups.
 const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
-/// Default assumed latency for newly discovered peers before real measurements.
-const DEFAULT_PEER_LATENCY: Duration = Duration::from_millis(50);
+/// Maximum time to wait for the identity-exchange handshake after dialling
+/// a peer. The actual timeout is `min(request_timeout, this)`.
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Initial reliability score for newly discovered peers.
-const INITIAL_PEER_RELIABILITY: f64 = 1.0;
-
-/// DHT node representation for network operations
+/// DHT node representation for network operations.
+///
+/// The `address` field stores a typed [`MultiAddr`] for consistent
+/// MultiAddr support.  Serializes as a plain `"ip:port"` string for
+/// wire-protocol compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DHTNode {
     pub peer_id: PeerId,
-    pub address: String,
+    #[serde(with = "crate::address::serde_as_string")]
+    pub address: MultiAddr,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
 }
@@ -99,17 +102,6 @@ pub struct DhtNetworkConfig {
     pub replication_factor: usize,
     /// Enable enhanced security features
     pub enable_security: bool,
-}
-
-/// Bootstrap node information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapNode {
-    /// Node's peer ID
-    pub peer_id: PeerId,
-    /// Network addresses
-    pub addresses: Vec<Multiaddr>,
-    /// Known DHT key (optional)
-    pub dht_key: Option<Key>,
 }
 
 /// DHT network operation types
@@ -270,8 +262,6 @@ pub struct DhtNetworkManager {
     active_operations: Arc<Mutex<HashMap<String, DhtOperationContext>>>,
     /// Network message broadcaster
     event_tx: broadcast::Sender<DhtNetworkEvent>,
-    /// Known DHT peers
-    dht_peers: Arc<RwLock<HashMap<PeerId, DhtPeerInfo>>>,
     /// Operation statistics
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Maintenance scheduler for periodic security and DHT tasks
@@ -318,25 +308,6 @@ impl std::fmt::Debug for DhtOperationContext {
             .field("response_tx", &self.response_tx.is_some())
             .finish()
     }
-}
-
-/// DHT peer information
-#[derive(Debug, Clone)]
-pub struct DhtPeerInfo {
-    /// Peer ID
-    pub peer_id: PeerId,
-    /// DHT key/ID in the DHT address space
-    pub dht_key: Key,
-    /// Network addresses
-    pub addresses: Vec<Multiaddr>,
-    /// Last seen timestamp
-    pub last_seen: Instant,
-    /// Connection status
-    pub is_connected: bool,
-    /// Response latency statistics
-    pub avg_latency: Duration,
-    /// Reliability score (0.0 to 1.0)
-    pub reliability_score: f64,
 }
 
 /// DHT network events
@@ -387,9 +358,9 @@ pub struct DhtNetworkStats {
     pub bytes_sent: u64,
     /// Total bytes received
     pub bytes_received: u64,
-    /// Connected DHT peers
+    /// Connected transport peers (all authenticated peers, including Client-mode)
     pub connected_peers: usize,
-    /// Routing table size
+    /// DHT routing table size (Node-mode peers only)
     pub routing_table_size: usize,
 }
 
@@ -401,17 +372,18 @@ enum LookupRequestKind {
 }
 
 impl DhtNetworkManager {
-    fn init_dht_core(local_peer_id: &PeerId) -> Result<Arc<RwLock<DhtCoreEngine>>> {
+    fn init_dht_core(local_peer_id: &PeerId, allow_loopback: bool) -> Result<DhtCoreEngine> {
         // Use LogOnly mode so nodes can join the routing table without prior validation.
         // Strict mode rejects every unknown node, making it impossible to bootstrap a
         // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
         let dht_instance = DhtCoreEngine::new_with_validation_mode(
             *local_peer_id,
             crate::dht::routing_maintenance::close_group_validator::CloseGroupEnforcementMode::LogOnly,
+            allow_loopback,
         )
             .map_err(|e| P2PError::Dht(DhtError::StorageFailed(e.to_string().into())))?;
         dht_instance.start_maintenance_tasks();
-        Ok(Arc::new(RwLock::new(dht_instance)))
+        Ok(dht_instance)
     }
 
     fn new_from_components(
@@ -419,7 +391,17 @@ impl DhtNetworkManager {
         trust_engine: Option<Arc<EigenTrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let dht = Self::init_dht_core(&config.peer_id)?;
+        let mut dht_instance =
+            Self::init_dht_core(&config.peer_id, config.node_config.allow_loopback)?;
+
+        // Propagate IP diversity settings from the node config into the DHT
+        // core engine so diversity overrides take effect on routing table
+        // insertion, not just bootstrap discovery.
+        if let Some(diversity) = &config.node_config.diversity_config {
+            dht_instance.set_ip_diversity_config(diversity.clone());
+        }
+
+        let dht = Arc::new(RwLock::new(dht_instance));
 
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
         let maintenance_config = MaintenanceConfig::from(&config.dht_config);
@@ -438,7 +420,6 @@ impl DhtNetworkManager {
             config,
             active_operations: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
-            dht_peers: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             maintenance_scheduler,
             message_handler_semaphore,
@@ -624,14 +605,15 @@ impl DhtNetworkManager {
     /// of new peers discovered.
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
-        let mut discovered = 0;
+        let mut seen = HashSet::new();
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
-            match self.send_dht_request(peer_id, op).await {
+            match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        self.dial_candidate(&node.peer_id, &node.address).await;
-                        discovered += 1;
+                        if seen.insert(node.peer_id) {
+                            self.dial_candidate(&node.peer_id, &node.address).await;
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -640,7 +622,7 @@ impl DhtNetworkManager {
                 }
             }
         }
-        Ok(discovered)
+        Ok(seen.len())
     }
 
     /// Stop the DHT network manager.
@@ -737,10 +719,14 @@ impl DhtNetworkManager {
         // Create parallel replication requests
         let replication_futures = closest_nodes.iter().map(|node| {
             let peer_id = node.peer_id;
+            let address = &node.address;
             let op = operation.clone();
             async move {
                 debug!("Sending PUT to peer: {}", peer_id.to_hex());
-                (peer_id, self.send_dht_request(&peer_id, op).await)
+                (
+                    peer_id,
+                    self.send_dht_request(&peer_id, op, Some(address)).await,
+                )
             }
         });
 
@@ -813,7 +799,7 @@ impl DhtNetworkManager {
         let replication_futures = targets.iter().map(|peer_id| {
             let peer = *peer_id;
             let op = operation.clone();
-            async move { (peer, self.send_dht_request(&peer, op).await) }
+            async move { (peer, self.send_dht_request(&peer, op, None).await) }
         });
 
         let results = futures::future::join_all(replication_futures).await;
@@ -943,11 +929,14 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = node.address.clone();
+                    let address = &node.address;
                     let op = DhtNetworkOperation::FindValue { key: *key };
                     async move {
-                        self.dial_candidate(&peer_id, &address).await;
-                        (peer_id, self.send_dht_request(&peer_id, op).await)
+                        self.dial_candidate(&peer_id, address).await;
+                        (
+                            peer_id,
+                            self.send_dht_request(&peer_id, op, Some(address)).await,
+                        )
                     }
                 })
                 .collect();
@@ -1102,7 +1091,7 @@ impl DhtNetworkManager {
         let start_time = Instant::now();
         let operation = DhtNetworkOperation::Ping;
 
-        match self.send_dht_request(peer_id, operation).await {
+        match self.send_dht_request(peer_id, operation, None).await {
             Ok(DhtNetworkResult::PongReceived { responder, .. }) => {
                 let latency = start_time.elapsed();
                 info!("Received pong from {} in {:?}", responder, latency);
@@ -1134,26 +1123,23 @@ impl DhtNetworkManager {
     //
     // Two functions for finding closest nodes to a key:
     //
-    // 1. find_closest_nodes_local() - Instant address book check
-    //    - Only checks local routing table + connected peers
+    // 1. find_closest_nodes_local() - Routing table lookup
+    //    - Only checks the local Kademlia routing table
     //    - No network requests, safe to call from request handlers
-    //    - Returns nodes we already know about
+    //    - Returns security-validated DHT participants only
     //
     // 2. find_closest_nodes_network() - Iterative network lookup
-    //    - Starts with local knowledge, then queries the network
+    //    - Starts with routing table knowledge, then queries the network
     //    - Asks known nodes for their closest nodes, then queries those
     //    - Continues until convergence (same answers or worse quality)
     //    - Full Kademlia-style iterative lookup
     // =========================================================================
 
-    /// Find closest nodes to a key using ONLY local knowledge.
+    /// Find closest nodes to a key using ONLY the local routing table.
     ///
-    /// This is an instant address book check - no network requests are made.
-    /// Safe to call from request handlers without risk of deadlock.
-    ///
-    /// Returns nodes from:
-    /// - Local routing table
-    /// - Currently connected peers
+    /// No network requests are made — safe to call from request handlers.
+    /// Only returns peers that passed the `is_dht_participant` security gate
+    /// and were added to the Kademlia routing table.
     ///
     /// Results are sorted by XOR distance to the key.
     pub async fn find_closest_nodes_local(&self, key: &Key, count: usize) -> Vec<DHTNode> {
@@ -1163,64 +1149,23 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
-        let mut seen_peer_ids: HashSet<PeerId> = HashSet::new();
-        let mut all_nodes: Vec<DHTNode> = Vec::new();
-
-        // 1. Check local routing table
-        {
-            let dht_guard = self.dht.read().await;
-            match dht_guard.find_nodes(&DhtKey::from_bytes(*key), count).await {
-                Ok(nodes) => {
-                    for node in nodes {
-                        let id = node.id;
-                        if self.is_local_peer_id(&id) {
-                            continue;
-                        }
-                        if seen_peer_ids.insert(id) {
-                            all_nodes.push(DHTNode {
-                                peer_id: id,
-                                address: node.address,
-                                distance: None,
-                                reliability: node.capacity.reliability_score,
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("find_nodes failed for key {}: {e}", hex::encode(key));
-                }
+        let dht_guard = self.dht.read().await;
+        match dht_guard.find_nodes(&DhtKey::from_bytes(*key), count).await {
+            Ok(nodes) => nodes
+                .into_iter()
+                .filter(|node| !self.is_local_peer_id(&node.id))
+                .map(|node| DHTNode {
+                    peer_id: node.id,
+                    address: node.address,
+                    distance: None,
+                    reliability: node.capacity.reliability_score,
+                })
+                .collect(),
+            Err(e) => {
+                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+                Vec::new()
             }
         }
-
-        // 2. Add connected peers
-        {
-            let peers = self.dht_peers.read().await;
-            for (peer_id, peer_info) in peers.iter() {
-                if !peer_info.is_connected {
-                    continue;
-                }
-                if self.is_local_peer_id(peer_id) {
-                    continue;
-                }
-                if !seen_peer_ids.insert(*peer_id) {
-                    continue;
-                }
-                let address = match peer_info.addresses.first() {
-                    Some(a) => a.to_string(),
-                    None => continue,
-                };
-                all_nodes.push(DHTNode {
-                    peer_id: *peer_id,
-                    address,
-                    distance: Some(peer_id.as_bytes().to_vec()),
-                    reliability: peer_info.reliability_score,
-                });
-            }
-        }
-
-        // Sort by XOR distance and return closest
-        all_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-        all_nodes.into_iter().take(count).collect()
     }
 
     /// Find closest nodes to a key using iterative network lookup.
@@ -1261,8 +1206,9 @@ impl DhtNetworkManager {
         let initial = self.find_closest_nodes_local(key, count).await;
         let mut candidates: VecDeque<DHTNode> = VecDeque::new();
         for node in initial {
-            queued_peer_ids.insert(node.peer_id);
-            candidates.push_back(node);
+            if queued_peer_ids.insert(node.peer_id) {
+                candidates.push_back(node);
+            }
         }
         let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
 
@@ -1307,11 +1253,14 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = node.address.clone();
+                    let address = &node.address;
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
-                        self.dial_candidate(&peer_id, &address).await;
-                        (peer_id, self.send_dht_request(&peer_id, op).await)
+                        self.dial_candidate(&peer_id, address).await;
+                        (
+                            peer_id,
+                            self.send_dht_request(&peer_id, op, Some(address)).await,
+                        )
                     }
                 })
                 .collect();
@@ -1378,8 +1327,9 @@ impl DhtNetworkManager {
                 }
             }
 
-            // Sort and truncate once per iteration instead of per result
+            // Sort, deduplicate, and truncate once per iteration instead of per result
             best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+            best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
             if !found_new_closer {
@@ -1403,6 +1353,7 @@ impl DhtNetworkManager {
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        best_nodes.dedup_by_key(|n| n.peer_id);
         best_nodes.truncate(count);
 
         info!(
@@ -1453,7 +1404,7 @@ impl DhtNetworkManager {
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
             peer_id: self.config.peer_id,
-            address: self.config.node_config.listen_addr.to_string(),
+            address: MultiAddr::from(self.config.node_config.listen_addr),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1465,59 +1416,31 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Convert peer addresses reported by the transport into multiaddresses the DHT understands.
-    fn parse_peer_addresses(addresses: &[String]) -> Vec<Multiaddr> {
-        addresses
-            .iter()
-            .filter_map(|addr| Self::multiaddr_from_address(addr))
-            .collect()
-    }
-
-    /// Convert a human friendly socket string (possibly with a four-word suffix) into a Multiaddr.
-    fn multiaddr_from_address(address: &str) -> Option<Multiaddr> {
-        let clean_addr = address.split(" (").next().unwrap_or(address);
-        match clean_addr.parse::<SocketAddr>() {
-            Ok(socket_addr) => {
-                let ip = socket_addr.ip();
-                if ip.is_unspecified() {
-                    warn!("Rejecting unspecified address: {clean_addr}");
-                    return None;
+    /// Parse the first valid address from a list of transport-reported address
+    /// strings into a [`MultiAddr`].
+    ///
+    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
+    /// `/ip4/1.2.3.4/udp/9000`).  Unspecified (`0.0.0.0`) addresses are
+    /// rejected.  Loopback addresses are accepted for local/test use.
+    fn first_valid_address(addresses: &[String]) -> Option<MultiAddr> {
+        for addr_str in addresses {
+            match addr_str.parse::<MultiAddr>() {
+                Ok(addr) => {
+                    if addr.ip().is_unspecified() {
+                        warn!("Rejecting unspecified address: {addr_str}");
+                        continue;
+                    }
+                    if addr.is_loopback() {
+                        trace!("Accepting loopback address (local/test): {addr_str}");
+                    }
+                    return Some(addr);
                 }
-                if ip.is_loopback() {
-                    trace!("Accepting loopback address (local/test): {clean_addr}");
+                Err(e) => {
+                    warn!("Failed to parse address '{addr_str}': {e}");
                 }
-                Self::socket_addr_to_multiaddr(&socket_addr)
-            }
-            Err(e) => {
-                warn!("Failed to parse '{clean_addr}' as SocketAddr: {e}");
-                None
             }
         }
-    }
-
-    /// Render a SocketAddr as a Multiaddr, preserving IPv4/IPv6 protocol tags.
-    fn socket_addr_to_multiaddr(socket_addr: &SocketAddr) -> Option<Multiaddr> {
-        let ip_protocol = if socket_addr.ip().is_ipv4() {
-            "ip4"
-        } else {
-            "ip6"
-        };
-        let multiaddr_string = format!(
-            "/{}/{}/tcp/{}",
-            ip_protocol,
-            socket_addr.ip(),
-            socket_addr.port()
-        );
-        match multiaddr_string.parse::<Multiaddr>() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                warn!(
-                    "Failed to convert socket address {} to multiaddr: {}",
-                    socket_addr, e
-                );
-                None
-            }
-        }
+        None
     }
 
     /// Process replication results from parallel PUT requests.
@@ -1620,11 +1543,15 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Send a DHT request to a specific peer
+    /// Send a DHT request to a specific peer.
+    ///
+    /// When `address_hint` is provided (e.g. from a `DHTNode` in an iterative
+    /// lookup), it is used directly for dialling without a routing-table lookup.
     async fn send_dht_request(
         &self,
         peer_id: &PeerId,
         operation: DhtNetworkOperation,
+        address_hint: Option<&MultiAddr>,
     ) -> Result<DhtNetworkResult> {
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
@@ -1676,15 +1603,92 @@ impl DhtNetworkManager {
             ops.insert(message_id.clone(), operation_context);
         }
 
-        // Send message via network layer
+        // Send message via network layer, reconnecting on demand if needed.
         let peer_hex = peer_id.to_hex();
+        let local_hex = self.config.peer_id.to_hex();
         info!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
-            self.config.peer_id.to_hex(),
-            peer_hex,
-            message.payload,
-            message_id
+            local_hex, peer_hex, message.payload, message_id
         );
+
+        // Ensure we have an open channel to the peer before sending.
+        // A fresh dial establishes a QUIC connection but the app-level
+        // `peer_to_channel` mapping is only populated after the asynchronous
+        // identity-exchange handshake completes. Without waiting, the
+        // subsequent `send_message` would fail with `PeerNotFound`.
+        let resolved_address: Option<MultiAddr> = if self.transport.is_peer_connected(peer_id).await
+        {
+            None
+        } else if let Some(hint) = address_hint {
+            Some(hint.clone())
+        } else {
+            self.peer_address_for_dial(peer_id).await
+        };
+        if let Some(ref address) = resolved_address {
+            info!(
+                "[STEP 1b] {} -> {}: No open channel, dialling {}",
+                local_hex, peer_hex, address
+            );
+            if let Some(channel_id) = self.dial_candidate(peer_id, address).await {
+                let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
+                match self
+                    .transport
+                    .wait_for_peer_identity(&channel_id, identity_timeout)
+                    .await
+                {
+                    Ok(authenticated) => {
+                        if &authenticated != peer_id {
+                            warn!(
+                                "[STEP 1b] {} -> {}: identity MISMATCH — dialled {} but authenticated as {}. \
+                                 Routing table entry may be stale.",
+                                local_hex,
+                                peer_hex,
+                                address,
+                                authenticated.to_hex()
+                            );
+                            if let Ok(mut ops) = self.active_operations.lock() {
+                                ops.remove(&message_id);
+                            }
+                            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
+                                expected: peer_hex.into(),
+                                actual: authenticated.to_hex().into(),
+                            }));
+                        }
+                        debug!(
+                            "[STEP 1b] {} -> {}: identity confirmed ({})",
+                            local_hex,
+                            peer_hex,
+                            authenticated.to_hex()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[STEP 1b] {} -> {}: identity exchange failed, disconnecting channel: {}",
+                            local_hex, peer_hex, e
+                        );
+                        self.transport.disconnect_channel(&channel_id).await;
+                        if let Ok(mut ops) = self.active_operations.lock() {
+                            ops.remove(&message_id);
+                        }
+                        return Err(P2PError::Network(NetworkError::ProtocolError(
+                            format!("identity exchange with {} failed: {}", peer_hex, e).into(),
+                        )));
+                    }
+                }
+            } else {
+                warn!(
+                    "[STEP 1b] {} -> {}: dial failed to {}",
+                    local_hex, peer_hex, address
+                );
+                if let Ok(mut ops) = self.active_operations.lock() {
+                    ops.remove(&message_id);
+                }
+                return Err(P2PError::Network(NetworkError::PeerNotFound(
+                    format!("failed to dial {} at {}", peer_hex, address).into(),
+                )));
+            }
+        }
+
         let result = match self
             .transport
             .send_message(peer_id, "/dht/1.0.0", message_data)
@@ -1693,8 +1697,7 @@ impl DhtNetworkManager {
             Ok(_) => {
                 info!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
-                    self.config.peer_id.to_hex(),
-                    peer_hex
+                    local_hex, peer_hex
                 );
 
                 // Wait for response via oneshot channel with timeout
@@ -1702,15 +1705,13 @@ impl DhtNetworkManager {
                 match &result {
                     Ok(r) => info!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
-                        self.config.peer_id.to_hex(),
+                        local_hex,
                         peer_hex,
                         std::mem::discriminant(r)
                     ),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
-                        self.config.peer_id.to_hex(),
-                        peer_hex,
-                        e
+                        local_hex, peer_hex, e
                     ),
                 }
                 result
@@ -1760,51 +1761,76 @@ impl DhtNetworkManager {
     /// All iterative lookups share the same saorsa-transport connection pool, so reusing the node's
     /// connection timeout keeps behavior consistent with the transport while still letting
     /// us parallelize lookups safely.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &str) {
+    ///
+    /// Returns the transport channel ID on a successful QUIC connection, or
+    /// `None` when the dial fails or is skipped. Callers that need to send
+    /// messages immediately should pass the channel ID to
+    /// [`TransportHandle::wait_for_peer_identity`] before sending, because
+    /// the app-level `peer_to_channel` mapping is only populated after the
+    /// asynchronous identity-exchange handshake completes.
+    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
         let peer_hex = peer_id.to_hex();
-        if address.is_empty() {
-            debug!("dial_candidate: peer {} missing address", peer_hex);
-            return;
-        }
 
         if self.transport.is_peer_connected(peer_id).await {
             debug!("dial_candidate: peer {} already connected", peer_hex);
-            return;
+            return None;
         }
 
-        let socket_addr = address.split(" (").next().unwrap_or(address);
-        // Validate address before attempting connection
-        if let Ok(parsed) = socket_addr.parse::<SocketAddr>()
-            && parsed.ip().is_unspecified()
-        {
+        // Reject unspecified addresses before attempting the connection.
+        if address.ip().is_unspecified() {
             debug!(
                 "dial_candidate: rejecting unspecified address for {}: {}",
-                peer_hex, socket_addr
+                peer_hex, address
             );
-            return;
+            return None;
         }
         let dial_timeout = self
             .transport
             .connection_timeout()
             .min(self.config.request_timeout);
-        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(socket_addr)).await {
-            Ok(Ok(_)) => debug!(
-                "dial_candidate: connected to {} at {}",
-                peer_hex, socket_addr
-            ),
+        let address_str = address.to_string();
+        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(&address_str)).await {
+            Ok(Ok(channel_id)) => {
+                debug!(
+                    "dial_candidate: connected to {} at {} (channel {})",
+                    peer_hex, address, channel_id
+                );
+                Some(channel_id)
+            }
             Ok(Err(e)) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {}: {}",
-                    peer_hex, socket_addr, e
-                )
+                    peer_hex, address, e
+                );
+                None
             }
             Err(_) => {
                 debug!(
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
-                    peer_hex, socket_addr, dial_timeout
-                )
+                    peer_hex, address, dial_timeout
+                );
+                None
             }
         }
+    }
+
+    /// Look up a connectable address for `peer_id`.
+    ///
+    /// Checks the DHT routing table first (source of truth for DHT peer
+    /// addresses), then falls back to the transport layer for connected peers.
+    /// Returns `None` when the peer is unknown or has no addresses.
+    async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+        // 1. Routing table — contains validated MultiAddr entries
+        if let Some(address) = self.dht.read().await.get_node_address(peer_id).await {
+            return Some(address);
+        }
+
+        // 2. Transport layer — for connected peers not yet in the routing table
+        if let Some(info) = self.transport.peer_info(peer_id).await {
+            return Self::first_valid_address(&info.addresses);
+        }
+
+        None
     }
 
     /// Wait for DHT network response via oneshot channel with timeout
@@ -1838,23 +1864,6 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Handle incoming DHT network response (for real network integration)
-    pub async fn handle_network_response(
-        &self,
-        message_id: &str,
-        _response: DhtNetworkResult,
-    ) -> Result<()> {
-        // Store the response for the waiting request
-        // In a real implementation, this would use a proper response queue/store
-
-        debug!("Received DHT network response for message: {}", message_id);
-
-        // For now, we'll complete the operation immediately
-        // This method would be called by the network layer when a response is received
-
-        Ok(())
-    }
-
     /// Handle incoming DHT message
     pub async fn handle_dht_message(
         &self,
@@ -1880,7 +1889,7 @@ impl DhtNetworkManager {
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
 
-        info!(
+        debug!(
             "[STEP 3] {}: Received {:?} from {} (msg_id: {})",
             self.config.peer_id.to_hex(),
             message.message_type,
@@ -1893,14 +1902,14 @@ impl DhtNetworkManager {
 
         match message.message_type {
             DhtMessageType::Request => {
-                info!(
+                debug!(
                     "[STEP 3a] {}: Processing {:?} request from {}",
                     self.config.peer_id.to_hex(),
                     message.payload,
                     sender
                 );
-                let result = self.handle_dht_request(&message).await?;
-                info!(
+                let result = self.handle_dht_request(&message, sender).await?;
+                debug!(
                     "[STEP 4] {}: Sending response {:?} back to {} (msg_id: {})",
                     self.config.peer_id.to_hex(),
                     std::mem::discriminant(&result),
@@ -1913,7 +1922,7 @@ impl DhtNetworkManager {
                 })?))
             }
             DhtMessageType::Response => {
-                info!(
+                debug!(
                     "[STEP 5] {}: Received response from {} (msg_id: {})",
                     self.config.peer_id.to_hex(),
                     sender,
@@ -1933,8 +1942,16 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Handle DHT request message
-    async fn handle_dht_request(&self, message: &DhtNetworkMessage) -> Result<DhtNetworkResult> {
+    /// Handle DHT request message.
+    ///
+    /// `authenticated_sender` is the transport-authenticated peer ID, used
+    /// instead of the self-reported `message.source` for any security-sensitive
+    /// decisions (e.g. filtering nodes in lookup responses).
+    async fn handle_dht_request(
+        &self,
+        message: &DhtNetworkMessage,
+        authenticated_sender: &PeerId,
+    ) -> Result<DhtNetworkResult> {
         match &message.payload {
             DhtNetworkOperation::Put { key, value } => {
                 trace!(
@@ -1953,44 +1970,37 @@ impl DhtNetworkManager {
                 })
             }
             DhtNetworkOperation::Get { key } => {
-                info!("Handling GET request for key: {}", hex::encode(key));
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::Get)
+                debug!("Handling GET request for key: {}", hex::encode(key));
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::Get)
                     .await
             }
             DhtNetworkOperation::FindNode { key } => {
-                info!("Handling FIND_NODE request for key: {}", hex::encode(key));
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::FindNode)
+                debug!("Handling FIND_NODE request for key: {}", hex::encode(key));
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::FindNode)
                     .await
             }
             DhtNetworkOperation::FindValue { key } => {
-                info!(
+                debug!(
                     "[STEP 3b] {}: Handling FIND_VALUE for key {}",
                     self.config.peer_id.to_hex(),
                     hex::encode(key)
                 );
-                self.handle_lookup_request(key, &message.source, LookupRequestKind::FindValue)
+                self.handle_lookup_request(key, authenticated_sender, LookupRequestKind::FindValue)
                     .await
             }
             DhtNetworkOperation::Ping => {
-                info!("Handling PING request from: {}", message.source);
+                debug!("Handling PING request from: {}", authenticated_sender);
                 Ok(DhtNetworkResult::PongReceived {
                     responder: self.config.peer_id,
                     latency: Duration::from_millis(0), // Local response
                 })
             }
             DhtNetworkOperation::Join => {
-                info!("Handling JOIN request from: {}", message.source);
-                // Add the joining node to our routing table
-                let dht_key = *message.source.as_bytes();
-                let _node = DHTNode {
-                    peer_id: message.source,
-                    address: String::new(),
-                    distance: Some(dht_key.to_vec()),
-                    reliability: 1.0,
-                };
+                debug!("Handling JOIN request from: {}", authenticated_sender);
+                let dht_key = *authenticated_sender.as_bytes();
 
                 // Node will be added to routing table through normal DHT operations
-                debug!("Node {} joined the network", message.source);
+                debug!("Node {} joined the network", authenticated_sender);
 
                 Ok(DhtNetworkResult::JoinSuccess {
                     assigned_key: dht_key,
@@ -1998,11 +2008,11 @@ impl DhtNetworkManager {
                 })
             }
             DhtNetworkOperation::Leave => {
-                info!("Handling LEAVE request from: {}", message.source);
+                debug!("Handling LEAVE request from: {}", authenticated_sender);
                 // Remove the leaving node from our routing table
                 // TODO: Implement node removal from DHT routing table
                 // let dht_guard = self.dht.write().await;
-                // if let Err(e) = dht_guard.remove_node(&message.source).await {
+                // if let Err(e) = dht_guard.remove_node(authenticated_sender).await {
                 //     warn!("Failed to remove leaving node from routing table: {}", e);
                 // }
                 Ok(DhtNetworkResult::LeaveSuccess)
@@ -2019,7 +2029,7 @@ impl DhtNetworkManager {
         peer_id: &PeerId,
         operation: DhtNetworkOperation,
     ) -> Result<DhtNetworkResult> {
-        self.send_dht_request(peer_id, operation).await
+        self.send_dht_request(peer_id, operation, None).await
     }
 
     /// Handle DHT response message
@@ -2085,13 +2095,14 @@ impl DhtNetworkManager {
 
             // Take the sender out of the context (can only send once)
             if let Some(tx) = context.response_tx.take() {
-                info!(
+                debug!(
                     "[STEP 5a] {}: Delivering response for msg_id {} to waiting request",
                     self.config.peer_id.to_hex(),
                     message_id
                 );
-                // Send response - if receiver dropped (timeout), log it
-                if tx.send((message.source, result)).is_err() {
+                // Send the transport-authenticated sender identity, not the
+                // self-reported message.source which could be spoofed.
+                if tx.send((sender_app_id, result)).is_err() {
                     warn!(
                         "[STEP 5a FAILED] {}: Response channel closed for msg_id {} (receiver timed out)",
                         self.config.peer_id.to_hex(),
@@ -2136,7 +2147,18 @@ impl DhtNetworkManager {
             },
             DhtNetworkResult::GetSuccess { key, .. } => DhtNetworkOperation::Get { key: *key },
             DhtNetworkResult::GetNotFound { key, .. } => DhtNetworkOperation::Get { key: *key },
-            DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
+            DhtNetworkResult::NodesFound { key, .. } => {
+                // Preserve the original operation type — NodesFound can be a
+                // response to FindNode, Get, or FindValue when the value is
+                // not found locally.
+                match &request.payload {
+                    DhtNetworkOperation::Get { .. } => DhtNetworkOperation::Get { key: *key },
+                    DhtNetworkOperation::FindValue { .. } => {
+                        DhtNetworkOperation::FindValue { key: *key }
+                    }
+                    _ => DhtNetworkOperation::FindNode { key: *key },
+                }
+            }
             DhtNetworkResult::ValueFound { key, .. } => {
                 DhtNetworkOperation::FindValue { key: *key }
             }
@@ -2170,7 +2192,13 @@ impl DhtNetworkManager {
         })
     }
 
-    /// Update peer information
+    /// Update routing-table liveness (and address) for a peer on successful
+    /// message exchange.
+    ///
+    /// Standard Kademlia: any successful RPC proves liveness. We touch the
+    /// routing table entry to move it to the tail of its k-bucket and refresh
+    /// the stored address so that `FindNode` responses stay current when a peer
+    /// reconnects from a different endpoint.
     async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
@@ -2179,41 +2207,20 @@ impl DhtNetworkManager {
             );
             return;
         };
-        let dht_key = *app_peer_id.as_bytes();
 
-        // peer_info() resolves app-level IDs internally via peer_to_channel
-        let addresses = if let Some(info) = self.transport.peer_info(&app_peer_id).await {
-            Self::parse_peer_addresses(&info.addresses)
-        } else {
-            warn!(
-                "peer_info unavailable for app_peer_id {}",
-                app_peer_id.to_hex()
-            );
-            Vec::new()
-        };
+        // Resolve current address from the transport layer so the routing
+        // table stays up-to-date when a peer reconnects from a new endpoint.
+        let current_address = self
+            .transport
+            .peer_info(&app_peer_id)
+            .await
+            .and_then(|info| Self::first_valid_address(&info.addresses));
 
-        let mut peers = self.dht_peers.write().await;
-        let peer_info = peers.entry(app_peer_id).or_insert_with(|| DhtPeerInfo {
-            peer_id: app_peer_id,
-            dht_key,
-            addresses: addresses.clone(),
-            last_seen: Instant::now(),
-            is_connected: true,
-            avg_latency: DEFAULT_PEER_LATENCY,
-            reliability_score: INITIAL_PEER_RELIABILITY,
-        });
-
-        peer_info.last_seen = Instant::now();
-        peer_info.is_connected = true;
-        if !addresses.is_empty() {
-            peer_info.addresses = addresses;
+        let addr_string = current_address.map(|a| a.to_string());
+        let dht = self.dht.read().await;
+        if dht.touch_node(&app_peer_id, addr_string.as_deref()).await {
+            trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
-
-        debug!(
-            "Updated peer info for {} with {} addresses",
-            app_peer_id.to_hex(),
-            peer_info.addresses.len()
-        );
     }
 
     /// Reconcile already-connected peers into DHT bookkeeping/routing.
@@ -2265,62 +2272,24 @@ impl DhtNetworkManager {
         );
         let dht_key = *node_id.as_bytes();
 
-        // peer_info() resolves app-level IDs internally via peer_to_channel
-        let addresses = if let Some(info) = self.transport.peer_info(&node_id).await {
-            Self::parse_peer_addresses(&info.addresses)
+        // peer_info() resolves app-level IDs internally via peer_to_channel.
+        // Parse the first valid address directly into a MultiAddr — this
+        // handles both "ip:port" and MultiAddr formats consistently.
+        let address = if let Some(info) = self.transport.peer_info(&node_id).await {
+            Self::first_valid_address(&info.addresses)
         } else {
             warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
-            Vec::new()
+            None
         };
 
-        // Track peer and decide whether it should be promoted to routing table.
-        let should_add_to_routing = {
-            let mut peers = self.dht_peers.write().await;
-            match peers.entry(node_id) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let peer_info = entry.get_mut();
-                    let had_addresses = !peer_info.addresses.is_empty();
-                    peer_info.last_seen = Instant::now();
-                    peer_info.is_connected = true;
-                    if !addresses.is_empty() {
-                        peer_info.addresses = addresses.clone();
-                    }
-                    !addresses.is_empty() && !had_addresses
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(DhtPeerInfo {
-                        peer_id: node_id,
-                        dht_key,
-                        addresses: addresses.clone(),
-                        last_seen: Instant::now(),
-                        is_connected: true,
-                        avg_latency: DEFAULT_PEER_LATENCY,
-                        reliability_score: INITIAL_PEER_RELIABILITY,
-                    });
-                    !addresses.is_empty()
-                }
-            }
-        };
-
-        // Skip peers with no addresses - they cannot be used for DHT routing.
-        let address_str = match addresses.first() {
-            Some(addr) => addr.to_string(),
-            None => {
-                warn!(
-                    "Peer {} has no addresses, skipping DHT routing table addition",
-                    app_peer_id_hex
-                );
-                return;
-            }
-        };
-
-        if !should_add_to_routing {
-            debug!(
-                "Peer {} already tracked in DHT routing state",
+        // Skip peers with no addresses — they cannot be used for DHT routing.
+        let Some(address) = address else {
+            warn!(
+                "Peer {} has no valid addresses, skipping DHT routing table addition",
                 app_peer_id_hex
             );
             return;
-        }
+        };
 
         // Only add full nodes to the DHT routing table. Ephemeral clients
         // (user_agent not starting with "node/") are excluded to prevent stale
@@ -2333,7 +2302,7 @@ impl DhtNetworkManager {
         } else {
             let node_info = NodeInfo {
                 id: node_id,
-                address: address_str,
+                address,
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             };
@@ -2385,15 +2354,6 @@ impl DhtNetworkManager {
                                         "DHT peer fully disconnected: app_id={}",
                                         peer_id.to_hex()
                                     );
-
-                                    {
-                                        let mut peers = self_arc.dht_peers.write().await;
-                                        if let Some(peer_info) =
-                                            peers.get_mut(&peer_id)
-                                        {
-                                            peer_info.is_connected = false;
-                                        }
-                                    }
 
                                     if self_arc.event_tx.receiver_count() > 0
                                         && let Err(e) = self_arc
@@ -2513,7 +2473,7 @@ impl DhtNetworkManager {
         // Main scheduler loop
         let scheduler = Arc::clone(&self.maintenance_scheduler);
         let dht = Arc::clone(&self.dht);
-        let dht_peers = Arc::clone(&self.dht_peers);
+        let transport = Arc::clone(&self.transport);
         let stats = Arc::clone(&self.stats);
         let event_tx = self.event_tx.clone();
         let shutdown = self.shutdown.clone();
@@ -2548,39 +2508,6 @@ impl DhtNetworkManager {
                             debug!("Running BucketRefresh maintenance task");
                             // Refresh k-buckets by looking up random IDs in each bucket
                             // This helps discover new nodes and keep routing table fresh
-                            Ok(())
-                        }
-                        MaintenanceTask::LivenessCheck => {
-                            debug!("Running LivenessCheck maintenance task");
-                            // Check liveness of nodes in routing table
-                            let peers = dht_peers.read().await;
-                            let stale_count = peers
-                                .values()
-                                .filter(|p| p.last_seen.elapsed() > Duration::from_secs(300))
-                                .count();
-                            if stale_count > 0 {
-                                debug!(
-                                    "Found {} stale peers that need liveness check",
-                                    stale_count
-                                );
-                            }
-                            Ok(())
-                        }
-                        MaintenanceTask::EvictionEvaluation => {
-                            debug!("Running EvictionEvaluation maintenance task");
-                            // Evaluate nodes for eviction based on:
-                            // - Response rate
-                            // - Trust scores
-                            // - Consecutive failures
-                            let peers = dht_peers.read().await;
-                            let low_reliability =
-                                peers.values().filter(|p| p.reliability_score < 0.3).count();
-                            if low_reliability > 0 {
-                                info!(
-                                    "Found {} low-reliability peers for potential eviction",
-                                    low_reliability
-                                );
-                            }
                             Ok(())
                         }
                         MaintenanceTask::CloseGroupValidation => {
@@ -2628,14 +2555,13 @@ impl DhtNetworkManager {
                 }
 
                 // Update stats periodically
-                let connected_peers = {
-                    let peers = dht_peers.read().await;
-                    peers.values().filter(|p| p.is_connected).count()
-                };
+                let connected_peers = transport.peer_count().await;
+                let routing_table_size = dht.read().await.routing_table_size().await;
 
                 {
                     let mut stats_guard = stats.write().await;
                     stats_guard.connected_peers = connected_peers;
+                    stats_guard.routing_table_size = routing_table_size;
                 }
             }
         });
@@ -2659,33 +2585,23 @@ impl DhtNetworkManager {
         self.event_tx.subscribe()
     }
 
-    /// Get connected DHT peers
-    pub async fn get_connected_peers(&self) -> Vec<DhtPeerInfo> {
-        let peers = self.dht_peers.read().await;
-        peers.values().filter(|p| p.is_connected).cloned().collect()
+    /// Get currently connected peers from the transport layer.
+    pub async fn get_connected_peers(&self) -> Vec<PeerId> {
+        self.transport.connected_peers().await
     }
 
-    /// Get DHT routing table size
+    /// Get DHT routing table size (Node-mode peers only).
     pub async fn get_routing_table_size(&self) -> usize {
-        // TODO: Implement DHT stats
-        // let dht_guard = self.dht.read().await;
-        // let stats = dht_guard.stats().await;
-        // stats.total_nodes
-        0
+        self.dht.read().await.routing_table_size().await
     }
 
     /// Check whether a peer is present in the DHT routing table.
     ///
-    /// This queries the core Kademlia routing table, *not* the broader
-    /// `dht_peers` bookkeeping map. Only peers that passed the
-    /// `is_dht_participant` gate are added to the routing table.
+    /// Only peers that passed the `is_dht_participant` gate are added
+    /// to the routing table.
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
-        let key = DhtKey::from_bytes(*peer_id.as_bytes());
         let dht_guard = self.dht.read().await;
-        match dht_guard.find_nodes(&key, 1).await {
-            Ok(nodes) => nodes.iter().any(|n| n.id == *peer_id),
-            Err(_) => false,
-        }
+        dht_guard.get_node_address(peer_id).await.is_some()
     }
 
     /// Get this node's peer ID.
@@ -2730,11 +2646,7 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Get a value from local storage only (no network query)
-    ///
-    /// Returns the value if it exists in local storage, None otherwise.
-    /// Unlike `get()`, this does NOT query remote nodes.
-    /// Connect to a specific peer by address
+    /// Connect to a specific peer by address.
     ///
     /// This is useful for manually building network topology in tests.
     pub async fn connect_to_peer(&self, address: &str) -> Result<String> {

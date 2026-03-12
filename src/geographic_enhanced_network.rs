@@ -3,7 +3,7 @@
 //! Enhances the core network functionality with geographic-aware routing capabilities.
 //! Provides a drop-in enhancement for existing P2P network nodes that adds geographic optimization.
 
-use crate::Multiaddr;
+use crate::MultiAddr;
 use crate::PeerId;
 use crate::dht::{
     geographic_network_integration::{
@@ -168,7 +168,7 @@ impl GeographicNetworkService {
     }
 
     /// Add a peer to geographic routing
-    pub async fn add_peer(&self, peer_id: PeerId, address: Multiaddr) -> Result<()> {
+    pub async fn add_peer(&self, peer_id: PeerId, address: MultiAddr) -> Result<()> {
         if !self.config.enable_geographic_routing {
             return Ok(()); // No-op if disabled
         }
@@ -359,8 +359,8 @@ pub mod integration_helpers {
     }
 
     /// Extract peer ID from address (helper function)
-    pub fn extract_peer_id_from_address(address: &Multiaddr) -> String {
-        // Reconstruct a multiaddr-like string from NetworkAddress
+    pub fn extract_peer_id_from_address(address: &MultiAddr) -> String {
+        // Reconstruct a multiaddr-like string from MultiAddr
         let ip = address.ip();
         let port = address.port();
         match ip {
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_peer_id_extraction() {
-        let addr: Multiaddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
+        let addr: MultiAddr = "/ip4/159.89.81.21/tcp/9110".parse().unwrap();
         let peer_id = integration_helpers::extract_peer_id_from_address(&addr);
         assert_eq!(peer_id, "peer_from__ip4_159.89.81.21_tcp_9110");
     }

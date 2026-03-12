@@ -168,7 +168,21 @@ impl Default for IPv6DHTConfig {
 impl IPv6DHTIdentityManager {
     /// Create a new IPv6 DHT identity manager
     pub fn new(config: IPv6DHTConfig) -> Self {
-        let ip_enforcer = IPDiversityEnforcer::new(config.diversity_config.clone());
+        Self::with_loopback(config, false)
+    }
+
+    /// Create a new IPv6 DHT identity manager using the node's canonical
+    /// loopback policy.
+    pub fn from_node_config(
+        config: IPv6DHTConfig,
+        node_config: &crate::network::NodeConfig,
+    ) -> Self {
+        Self::with_loopback(config, node_config.allow_loopback)
+    }
+
+    fn with_loopback(config: IPv6DHTConfig, allow_loopback: bool) -> Self {
+        let ip_enforcer =
+            IPDiversityEnforcer::with_loopback(config.diversity_config.clone(), allow_loopback);
 
         Self {
             config,
@@ -598,12 +612,13 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
 
-    fn create_test_dht_node(peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
+    fn create_test_dht_node(_peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
         use crate::PeerId;
         use crate::dht::NodeCapacity;
+        let port = 8080u16 + id_bytes[0] as u16;
         DHTNode {
             id: PeerId::from_bytes(id_bytes),
-            address: format!("::1:8080:{}", peer_id),
+            address: format!("[::1]:{port}").parse().unwrap(),
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }
@@ -617,6 +632,7 @@ mod tests {
 
     fn create_test_ip_analysis() -> IPAnalysis {
         IPAnalysis {
+            is_loopback: false,
             subnet_64: Ipv6Addr::from_str("2001:db8::").unwrap(),
             subnet_48: Ipv6Addr::from_str("2001:db8::").unwrap(),
             subnet_32: Ipv6Addr::from_str("2001:db8::").unwrap(),

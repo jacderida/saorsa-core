@@ -267,6 +267,7 @@ impl NetworkConfig {
                 prefer_rfc_nat_traversal: *prefer_rfc_nat_traversal,
                 relay_nodes: vec![],
                 enable_relay_service: false,
+                ..NatConfig::default()
             },
         })
     }

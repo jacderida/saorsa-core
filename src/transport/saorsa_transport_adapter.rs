@@ -58,11 +58,11 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
-    LinkConn, LinkEvent, LinkTransport, P2pConfig, P2pLinkTransport, ProtocolId,
+    LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId,
 };
 
 // Import saorsa-transport types for SharedTransport integration
@@ -150,6 +150,17 @@ impl P2PNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_options(bind_addr, max_connections, max_msg_size, false).await
+    }
+
+    /// Create a new P2P network node with full control over connection
+    /// limits, message size, and loopback address acceptance.
+    pub async fn new_with_options(
+        bind_addr: SocketAddr,
+        max_connections: usize,
+        max_msg_size: Option<usize>,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
             .max_connections(max_connections)
@@ -157,6 +168,12 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
         if let Some(max_msg_size) = max_msg_size {
             builder = builder.max_message_size(max_msg_size);
+        }
+        if allow_loopback {
+            builder = builder.nat(NatConfig {
+                allow_loopback: true,
+                ..NatConfig::default()
+            });
         }
         let config = builder
             .build()
@@ -167,19 +184,25 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
-        let actual_addr = transport.endpoint().local_addr().unwrap_or(bind_addr);
+        let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Transport endpoint has no local address — bind to {bind_addr} may have failed"
+            )
+        })?;
 
         Self::with_transport(Arc::new(transport), actual_addr).await
     }
 
     /// Create a new P2P network node with custom P2pConfig
-    pub async fn new_with_config(bind_addr: SocketAddr, config: P2pConfig) -> Result<Self> {
+    pub async fn new_with_config(_bind_addr: SocketAddr, config: P2pConfig) -> Result<Self> {
         let transport = P2pLinkTransport::new(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
 
         // Get the actual bound address from the endpoint
-        let actual_addr = transport.endpoint().local_addr().unwrap_or(bind_addr);
+        let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
+            anyhow::anyhow!("Transport endpoint has no local address — bind may have failed")
+        })?;
 
         Self::with_transport(Arc::new(transport), actual_addr).await
     }
@@ -192,6 +215,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
         bind_addr: SocketAddr,
         net_config: &crate::transport::NetworkConfig,
         max_msg_size: Option<usize>,
+        allow_loopback: bool,
     ) -> Result<Self> {
         // Build P2pConfig based on NetworkConfig
         let mut builder = P2pConfig::builder()
@@ -203,9 +227,17 @@ impl P2PNetworkNode<P2pLinkTransport> {
             builder = builder.max_message_size(max_msg_size);
         }
 
-        // Apply NAT traversal settings if present
-        if let Some(ref nat_config) = net_config.to_ant_config() {
-            builder = builder.nat(nat_config.clone());
+        // Apply NAT traversal settings if present, merging allow_loopback.
+        if let Some(mut nat_config) = net_config.to_ant_config() {
+            if allow_loopback {
+                nat_config.allow_loopback = true;
+            }
+            builder = builder.nat(nat_config);
+        } else if allow_loopback {
+            builder = builder.nat(NatConfig {
+                allow_loopback: true,
+                ..NatConfig::default()
+            });
         }
 
         let config = builder
@@ -223,26 +255,14 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// P2pEndpoint's send() method which corresponds with recv() for proper
     /// bidirectional communication.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        info!(
-            "[QUIC SEND] Calling endpoint().send() to {} ({} bytes)",
+        trace!(
+            "[QUIC SEND] endpoint().send() to {} ({} bytes)",
             addr,
             data.len()
         );
         let result = self.transport.endpoint().send(addr, data).await;
-        match &result {
-            Ok(()) => {
-                info!(
-                    "[QUIC SEND] endpoint().send() returned Ok to {} ({} bytes)",
-                    addr,
-                    data.len()
-                );
-            }
-            Err(e) => {
-                info!(
-                    "[QUIC SEND] endpoint().send() returned Err to {}: {}",
-                    addr, e
-                );
-            }
+        if let Err(ref e) = result {
+            debug!("[QUIC SEND] send failed to {}: {}", addr, e);
         }
         result.map_err(|e| anyhow::anyhow!("Send failed: {e}"))
     }
@@ -921,18 +941,40 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false).await
+    }
+
+    /// Create dual nodes with full control over connection limits, message
+    /// size, and loopback address acceptance.
+    pub async fn new_with_options(
+        v6_addr: Option<SocketAddr>,
+        v4_addr: Option<SocketAddr>,
+        max_connections: usize,
+        max_msg_size: Option<usize>,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let v6 = if let Some(addr) = v6_addr {
             Some(
-                P2PNetworkNode::new_with_max_connections(addr, max_connections, max_msg_size)
-                    .await?,
+                P2PNetworkNode::new_with_options(
+                    addr,
+                    max_connections,
+                    max_msg_size,
+                    allow_loopback,
+                )
+                .await?,
             )
         } else {
             None
         };
         let v4 = if let Some(addr) = v4_addr {
             Some(
-                P2PNetworkNode::new_with_max_connections(addr, max_connections, max_msg_size)
-                    .await?,
+                P2PNetworkNode::new_with_options(
+                    addr,
+                    max_connections,
+                    max_msg_size,
+                    allow_loopback,
+                )
+                .await?,
             )
         } else {
             None
@@ -946,42 +988,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// bidirectional communication. Tries IPv6 first, then IPv4.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6 {
-            info!(
-                "[DUAL SEND] Attempting IPv6 send to {} ({} bytes)",
-                addr,
-                data.len()
-            );
             match v6.send_to_peer_optimized(addr, data).await {
-                Ok(()) => {
-                    info!(
-                        "[DUAL SEND] IPv6 send SUCCESS to {} ({} bytes)",
-                        addr,
-                        data.len()
-                    );
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(e) => {
-                    info!("[DUAL SEND] IPv6 send FAILED to {}: {}", addr, e);
+                    trace!(
+                        "[DUAL SEND] IPv6 failed to {}, falling back to IPv4: {}",
+                        addr, e
+                    );
                 }
             }
         }
         if let Some(v4) = &self.v4 {
-            info!(
-                "[DUAL SEND] Attempting IPv4 send to {} ({} bytes)",
-                addr,
-                data.len()
-            );
             match v4.send_to_peer_optimized(addr, data).await {
-                Ok(()) => {
-                    info!(
-                        "[DUAL SEND] IPv4 send SUCCESS to {} ({} bytes)",
-                        addr,
-                        data.len()
-                    );
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(e) => {
-                    info!("[DUAL SEND] IPv4 send FAILED to {}: {}", addr, e);
+                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, e);
                 }
             }
         }

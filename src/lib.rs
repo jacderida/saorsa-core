@@ -27,17 +27,17 @@
 //! - QUIC-based transport with NAT traversal
 //! - IPv4-first with simple addressing
 //! - Kademlia DHT for distributed routing
-//! - Four-word human-readable addresses
+//! - Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
 //!
 //! ## Example
 //!
 //! ```rust,ignore
-//! use saorsa_core::{P2PNode, NodeConfig, NetworkAddress};
+//! use saorsa_core::{P2PNode, NodeConfig, MultiAddr};
 //! use std::str::FromStr;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let addr = "127.0.0.1:9000".parse::<NetworkAddress>()?;
+//!     let addr = "127.0.0.1:9000".parse::<MultiAddr>()?;
 //!     let node = P2PNode::builder()
 //!         .listen_on(addr)
 //!         .with_mcp_server()
@@ -53,7 +53,7 @@
 #![allow(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
-/// Four-word identifier system
+/// Key derivation and hashing utilities
 pub mod fwid;
 
 /// Prelude module for convenient imports
@@ -165,8 +165,7 @@ pub mod placement;
 pub mod upgrade;
 
 // Re-export main types
-pub use address::{AddressBook, NetworkAddress};
-pub use identity::FourWordAddress;
+pub use address::{AddressBook, MultiAddr};
 
 // New spec-compliant API exports
 pub use auth::{
@@ -176,7 +175,7 @@ pub use bootstrap::{BootstrapConfig, BootstrapManager, CacheConfig, ContactEntry
 pub use dht::{Key, Record};
 pub use dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
-    DhtPeerInfo, PeerStoreOutcome,
+    PeerStoreOutcome,
 };
 pub use encrypted_key_storage::{
     Argon2Config, DerivationPriority as KeyDerivationPriority, EncryptedKeyStorageManager,
@@ -184,7 +183,7 @@ pub use encrypted_key_storage::{
 };
 pub use error::{P2PError, P2pResult as Result, PeerFailureReason};
 pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subscribe_topology};
-pub use fwid::{FourWordsV1, Key as FwKey, fw_check, fw_to_key};
+pub use fwid::Key as FwKey;
 pub use health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
     HealthServer, HealthStatus, PrometheusExporter,
@@ -326,11 +325,6 @@ pub use crate::placement::{
 
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
 pub use identity::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
-
-/// Network address used for peer-to-peer communication
-///
-/// Supports both traditional IP:port format and human-readable four-word format.
-pub type Multiaddr = NetworkAddress;
 
 /// Saorsa Core version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -57,9 +57,6 @@ We use **pure cryptographic identity** based on ML-DSA-65 key pairs, without any
 
 /// User identity bound to ML-DSA-65 keypair
 pub struct UserIdentity {
-    /// Human-readable four-word address
-    pub four_words: FourWordAddress,
-
     /// ML-DSA-65 public key (1,952 bytes)
     pub public_key: MlDsaPublicKey,
 
