@@ -129,8 +129,6 @@ impl SecureNodeIdentity {
         &self.peer_id
     }
 
-    // No four-word address embedded; see bootstrap/transport layers
-
     /// Get public key
     pub fn public_key(&self) -> &MlDsaPublicKey {
         &self.public_key
