@@ -255,62 +255,69 @@ impl TelemetryCollector {
         let _ = writeln!(out, "# TYPE p2p_auth_failures_total counter");
         let _ = writeln!(out, "p2p_auth_failures_total {}", counters.auth_failures);
 
-        // Stream metrics per class
-        let _ = writeln!(
-            out,
-            "# HELP p2p_stream_bandwidth_p50_bytes_per_sec Stream bandwidth P50 in bytes/sec"
-        );
-        let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p50_bytes_per_sec gauge");
-        let _ = writeln!(
-            out,
-            "# HELP p2p_stream_bandwidth_p95_bytes_per_sec Stream bandwidth P95 in bytes/sec"
-        );
-        let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p95_bytes_per_sec gauge");
-        let _ = writeln!(
-            out,
-            "# HELP p2p_stream_rtt_p50_ms Stream RTT P50 in milliseconds"
-        );
-        let _ = writeln!(out, "# TYPE p2p_stream_rtt_p50_ms gauge");
-        let _ = writeln!(
-            out,
-            "# HELP p2p_stream_rtt_p95_ms Stream RTT P95 in milliseconds"
-        );
-        let _ = writeln!(out, "# TYPE p2p_stream_rtt_p95_ms gauge");
+        // Collect stream metrics for all classes first, then emit grouped by metric family
+        let classes = [
+            (StreamClass::Control, "control"),
+            (StreamClass::Mls, "mls"),
+            (StreamClass::File, "file"),
+            (StreamClass::Media, "media"),
+        ];
 
-        for class in &[
-            StreamClass::Control,
-            StreamClass::Mls,
-            StreamClass::File,
-            StreamClass::Media,
-        ] {
-            let label = match class {
-                StreamClass::Control => "control",
-                StreamClass::Mls => "mls",
-                StreamClass::File => "file",
-                StreamClass::Media => "media",
-            };
+        let mut bw_p50_samples = Vec::new();
+        let mut bw_p95_samples = Vec::new();
+        let mut rtt_p50_samples = Vec::new();
+        let mut rtt_p95_samples = Vec::new();
 
+        for (class, label) in &classes {
             if let Some(stream) = self.get_stream_metrics(*class).await {
+                bw_p50_samples.push((*label, stream.bandwidth_p50));
+                bw_p95_samples.push((*label, stream.bandwidth_p95));
+                rtt_p50_samples.push((*label, stream.rtt_p50_ms));
+                rtt_p95_samples.push((*label, stream.rtt_p95_ms));
+            }
+        }
+
+        if !bw_p50_samples.is_empty() {
+            let _ = writeln!(
+                out,
+                "# HELP p2p_stream_bandwidth_p50_bytes_per_sec Stream bandwidth P50 in bytes/sec"
+            );
+            let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p50_bytes_per_sec gauge");
+            for (label, val) in &bw_p50_samples {
                 let _ = writeln!(
                     out,
-                    "p2p_stream_bandwidth_p50_bytes_per_sec{{class=\"{}\"}} {}",
-                    label, stream.bandwidth_p50
+                    "p2p_stream_bandwidth_p50_bytes_per_sec{{class=\"{label}\"}} {val}"
                 );
+            }
+
+            let _ = writeln!(
+                out,
+                "# HELP p2p_stream_bandwidth_p95_bytes_per_sec Stream bandwidth P95 in bytes/sec"
+            );
+            let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p95_bytes_per_sec gauge");
+            for (label, val) in &bw_p95_samples {
                 let _ = writeln!(
                     out,
-                    "p2p_stream_bandwidth_p95_bytes_per_sec{{class=\"{}\"}} {}",
-                    label, stream.bandwidth_p95
+                    "p2p_stream_bandwidth_p95_bytes_per_sec{{class=\"{label}\"}} {val}"
                 );
-                let _ = writeln!(
-                    out,
-                    "p2p_stream_rtt_p50_ms{{class=\"{}\"}} {}",
-                    label, stream.rtt_p50_ms
-                );
-                let _ = writeln!(
-                    out,
-                    "p2p_stream_rtt_p95_ms{{class=\"{}\"}} {}",
-                    label, stream.rtt_p95_ms
-                );
+            }
+
+            let _ = writeln!(
+                out,
+                "# HELP p2p_stream_rtt_p50_ms Stream RTT P50 in milliseconds"
+            );
+            let _ = writeln!(out, "# TYPE p2p_stream_rtt_p50_ms gauge");
+            for (label, val) in &rtt_p50_samples {
+                let _ = writeln!(out, "p2p_stream_rtt_p50_ms{{class=\"{label}\"}} {val}");
+            }
+
+            let _ = writeln!(
+                out,
+                "# HELP p2p_stream_rtt_p95_ms Stream RTT P95 in milliseconds"
+            );
+            let _ = writeln!(out, "# TYPE p2p_stream_rtt_p95_ms gauge");
+            for (label, val) in &rtt_p95_samples {
+                let _ = writeln!(out, "p2p_stream_rtt_p95_ms{{class=\"{label}\"}} {val}");
             }
         }
 
@@ -579,8 +586,9 @@ mod tests {
         assert!(output.contains("p2p_dht_gets_total 0"));
         assert!(output.contains("p2p_auth_failures_total 0"));
 
-        // No stream metrics when nothing recorded
+        // No stream metrics or orphaned HELP/TYPE headers when nothing recorded
         assert!(!output.contains("class="));
+        assert!(!output.contains("p2p_stream_"));
     }
 
     #[test]

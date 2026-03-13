@@ -22,6 +22,7 @@ use crate::dht::metrics::DhtMetricsAggregator;
 use crate::telemetry::TelemetryCollector;
 use async_trait::async_trait;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Trait for any component that can export metrics as Prometheus text.
 ///
@@ -35,6 +36,7 @@ pub trait PrometheusCollector: Send + Sync {
 
 /// Registry that holds references to all internal metric collectors and produces
 /// a combined Prometheus text export.
+#[derive(Clone)]
 pub struct MetricsRegistry {
     dht_aggregator: Option<Arc<DhtMetricsAggregator>>,
     telemetry: Option<Arc<TelemetryCollector>>,
@@ -73,11 +75,16 @@ impl MetricsRegistry {
     pub async fn export_prometheus(&self) -> String {
         let mut output = String::new();
 
-        if let Some(ref agg) = self.dht_aggregator
-            && let Ok(text) = agg.export_prometheus().await
-        {
-            output.push_str(&text);
-            output.push('\n');
+        if let Some(ref agg) = self.dht_aggregator {
+            match agg.export_prometheus().await {
+                Ok(text) => {
+                    output.push_str(&text);
+                    output.push('\n');
+                }
+                Err(e) => {
+                    warn!("Failed to export DHT prometheus metrics: {}", e);
+                }
+            }
         }
 
         if let Some(ref tel) = self.telemetry {

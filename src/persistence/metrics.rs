@@ -135,7 +135,7 @@ impl MetricsCollector {
             let _ = writeln!(out, "{prefix}_errors_total {}", metrics.errors);
 
             let avg = if metrics.count > 0 {
-                metrics.total_duration.as_millis() as f64 / metrics.count as f64
+                metrics.total_duration.as_secs_f64() * 1000.0 / metrics.count as f64
             } else {
                 0.0
             };

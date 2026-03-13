@@ -231,8 +231,12 @@ impl PrometheusExporter {
         ).map_err(|e| crate::P2PError::Internal(format!("Failed to write metrics: {}", e).into()))?;
 
         // Append domain metrics from registry
-        let registry = self.metrics_registry.read().await;
-        if let Some(ref reg) = *registry {
+        // Clone the registry out of the lock to avoid holding RwLock across await
+        let registry = {
+            let guard = self.metrics_registry.read().await;
+            guard.clone()
+        };
+        if let Some(ref reg) = registry {
             output.push('\n');
             output.push_str(&reg.export_prometheus().await);
         }
