@@ -23,66 +23,19 @@
 use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
-use crate::{P2PError, PeerId, Result};
+use crate::{P2PError, Result};
 use parking_lot::Mutex;
 use saorsa_transport::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-// Default configuration values
-pub const DEFAULT_MAX_CONTACTS: usize = 30_000;
-pub const DEFAULT_MERGE_INTERVAL: Duration = Duration::from_secs(60);
-pub const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
-pub const DEFAULT_QUALITY_UPDATE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Legacy cache configuration for backward compatibility
-///
-/// This type is used by `with_full_config()` to accept old-style configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheConfig {
-    /// Directory where cache files are stored
-    pub cache_dir: PathBuf,
-    /// Maximum number of contacts to keep in cache
-    pub max_contacts: usize,
-    /// Interval between cache merge operations
-    pub merge_interval: Duration,
-    /// Interval between cache cleanup operations
-    pub cleanup_interval: Duration,
-    /// Interval between quality score updates
-    pub quality_update_interval: Duration,
-    /// Age threshold for considering contacts stale
-    pub stale_threshold: Duration,
-    /// Interval between connectivity checks
-    pub connectivity_check_interval: Duration,
-    /// Number of peers to check connectivity with
-    pub connectivity_check_count: usize,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            cache_dir: PathBuf::from(".cache/saorsa"),
-            max_contacts: DEFAULT_MAX_CONTACTS,
-            merge_interval: DEFAULT_MERGE_INTERVAL,
-            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
-            quality_update_interval: DEFAULT_QUALITY_UPDATE_INTERVAL,
-            stale_threshold: Duration::from_secs(86400 * 7), // 7 days
-            connectivity_check_interval: Duration::from_secs(900), // 15 minutes
-            connectivity_check_count: 100,
-        }
-    }
-}
-
 /// Configuration for the bootstrap manager
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapConfig {
     /// Directory for cache files
     pub cache_dir: PathBuf,
@@ -159,32 +112,23 @@ impl BootstrapManager {
         Self::with_config(BootstrapConfig::default()).await
     }
 
-    /// Create a new bootstrap manager with custom configuration.
-    ///
-    /// This lower-level constructor does not enable loopback bypass. Use
-    /// [`BootstrapManager::with_full_config`] when the policy should come from
-    /// the node's canonical config.
+    /// Create a new bootstrap manager with custom configuration
     pub async fn with_config(config: BootstrapConfig) -> Result<Self> {
         Self::with_config_and_loopback(config, false).await
     }
 
-    /// Create a new bootstrap manager with full custom configuration
+    /// Create a new bootstrap manager from a `BootstrapConfig` and a `NodeConfig`.
     ///
-    /// This is a compatibility method for migrating from the old BootstrapManager.
-    /// It accepts the old `CacheConfig` type and derives both diversity settings
-    /// and loopback policy from the node config so they cannot drift apart.
-    pub async fn with_full_config(
-        cache_config: CacheConfig,
-        rate_limit_config: JoinRateLimiterConfig,
+    /// Derives the loopback policy from `node_config.allow_loopback` and merges
+    /// the node-level `diversity_config` (if set) so the transport and bootstrap
+    /// layers stay consistent.
+    pub async fn with_node_config(
+        mut config: BootstrapConfig,
         node_config: &crate::network::NodeConfig,
     ) -> Result<Self> {
-        let config = BootstrapConfig {
-            cache_dir: cache_config.cache_dir,
-            max_peers: cache_config.max_contacts,
-            epsilon: 0.1, // Default exploration rate
-            rate_limit: rate_limit_config,
-            diversity: node_config.diversity_config.clone().unwrap_or_default(),
-        };
+        if let Some(ref diversity) = node_config.diversity_config {
+            config.diversity = diversity.clone();
+        }
         Self::with_config_and_loopback(config, node_config.allow_loopback).await
     }
 
@@ -221,7 +165,7 @@ impl BootstrapManager {
         })?;
 
         // IP diversity check (scoped to avoid holding lock across await)
-        let ipv6 = ip_to_ipv6(&ip);
+        let ipv6 = super::ip_to_ipv6(&ip);
         {
             let mut diversity = self.diversity_enforcer.lock();
             let analysis = diversity.analyze_ip(ipv6).map_err(|e| {
@@ -323,154 +267,6 @@ impl BootstrapManager {
         self.cache.get(addr).await
     }
 
-    /// Reconstruct a [`MultiAddr`] for a `SocketAddr`, using the recorded
-    /// transport kind if available, falling back to QUIC.
-    fn multiaddr_for_socket(&self, addr: SocketAddr) -> crate::address::MultiAddr {
-        let kinds = self.transport_kinds.lock();
-        match kinds.get(&addr) {
-            Some(transport) => crate::address::MultiAddr::new(transport.clone()),
-            None => crate::address::MultiAddr::quic(addr),
-        }
-    }
-
-    /// Record the transport kind for every IP-based address so that
-    /// round-trips through the `SocketAddr`-only cache preserve the
-    /// original transport type.
-    fn record_transport_kinds(&self, addrs: &[crate::address::MultiAddr]) {
-        let mut kinds = self.transport_kinds.lock();
-        for addr in addrs {
-            if let Some(sa) = addr.socket_addr() {
-                kinds.insert(sa, addr.transport().clone());
-            }
-        }
-    }
-
-    // ========================================================================
-    // Backward Compatibility Methods
-    // These methods provide compatibility with the old BootstrapManager API
-    // ========================================================================
-
-    /// Add a discovered peer to the cache (compatibility method)
-    ///
-    /// This accepts the old `ContactEntry` type and converts it to the new API.
-    /// Uses the first address as the primary cache key.
-    pub async fn add_contact(&self, contact: super::ContactEntry) -> Result<()> {
-        let primary = contact
-            .addresses
-            .iter()
-            .find_map(|a| a.socket_addr())
-            .ok_or_else(|| {
-                P2PError::Bootstrap(BootstrapError::InvalidData(
-                    "No IP-based addresses provided".to_string().into(),
-                ))
-            })?;
-        let socket_addrs: Vec<SocketAddr> = contact
-            .addresses
-            .iter()
-            .filter_map(|a| a.socket_addr())
-            .collect();
-        self.record_transport_kinds(&contact.addresses);
-        self.add_peer(&primary, socket_addrs).await
-    }
-
-    /// Add a contact bypassing rate limiting (compatibility method)
-    pub async fn add_contact_trusted(&self, contact: super::ContactEntry) {
-        self.record_transport_kinds(&contact.addresses);
-        let socket_addrs: Vec<SocketAddr> = contact
-            .addresses
-            .iter()
-            .filter_map(|a| a.socket_addr())
-            .collect();
-        if let Some(primary) = socket_addrs.first() {
-            self.add_peer_trusted(primary, socket_addrs.clone()).await;
-        }
-    }
-
-    /// Update contact performance metrics (compatibility method)
-    ///
-    /// Maps the old `QualityMetrics` to record_success/record_failure calls.
-    pub async fn update_contact_metrics(
-        &self,
-        addr: &crate::address::MultiAddr,
-        metrics: super::QualityMetrics,
-    ) -> Result<()> {
-        let Some(addr) = addr.socket_addr() else {
-            return Ok(());
-        };
-        let addr = &addr;
-        // Convert QualityMetrics to success/failure recording
-        // If success_rate is high (>= 0.5), record as success with estimated RTT
-        // Otherwise record as failure
-        if metrics.success_rate >= 0.5 {
-            let rtt_ms = metrics.avg_latency_ms as u32;
-            self.record_success(addr, rtt_ms).await;
-        } else {
-            self.record_failure(addr).await;
-        }
-        Ok(())
-    }
-
-    /// Get bootstrap cache statistics (compatibility method)
-    ///
-    /// Returns stats in the old `CacheStats` format.
-    pub async fn get_stats(&self) -> Result<super::CacheStats> {
-        let stats = self.stats().await;
-        Ok(super::CacheStats {
-            total_contacts: stats.total_peers,
-            high_quality_contacts: stats.relay_peers + stats.coordinator_peers,
-            verified_contacts: stats.total_peers - stats.untested_peers,
-            average_quality_score: stats.average_quality,
-            cache_hit_rate: 0.0, // saorsa-transport doesn't track this
-            last_cleanup: chrono::Utc::now(),
-            last_merge: chrono::Utc::now(),
-            // QUIC-specific fields
-            iroh_contacts: stats.total_peers, // All peers are QUIC-capable via saorsa-transport
-            nat_traversal_contacts: stats.coordinator_peers,
-            avg_iroh_setup_time_ms: 0.0,
-            preferred_iroh_connection_type: None,
-        })
-    }
-
-    /// Start background maintenance tasks (compatibility method)
-    ///
-    /// Alias for `start_maintenance()`.
-    pub async fn start_background_tasks(&mut self) -> Result<()> {
-        self.start_maintenance()
-    }
-
-    /// Get bootstrap peers for initial connection (compatibility method)
-    ///
-    /// Converts saorsa-transport CachedPeer results to ContactEntry format.
-    /// Uses a zeroed PeerId since saorsa-transport no longer tracks peer identity.
-    pub async fn get_bootstrap_peers(&self, count: usize) -> Result<Vec<super::ContactEntry>> {
-        let peers = self.select_peers(count).await;
-        let contacts: Vec<super::ContactEntry> = peers
-            .into_iter()
-            .map(|cached| {
-                let primary = cached.primary_address;
-                let mut addrs = vec![self.multiaddr_for_socket(primary)];
-                addrs.extend(
-                    cached
-                        .addresses
-                        .into_iter()
-                        .filter(|sa| *sa != primary)
-                        .map(|sa| self.multiaddr_for_socket(sa)),
-                );
-                // Use a zeroed PeerId — real identity is established after connecting
-                super::ContactEntry::new(PeerId::from_bytes([0u8; 32]), addrs)
-            })
-            .collect();
-        Ok(contacts)
-    }
-
-    /// Get QUIC-capable bootstrap peers (compatibility method)
-    pub async fn get_quic_bootstrap_peers(&self, count: usize) -> Result<Vec<super::ContactEntry>> {
-        // For now, just return regular peers since saorsa-transport handles QUIC natively
-        self.get_bootstrap_peers(count).await
-    }
-}
-
-impl BootstrapManager {
     /// Get the diversity config
     pub fn diversity_config(&self) -> &IPDiversityConfig {
         &self.diversity_config
@@ -490,14 +286,6 @@ pub struct BootstrapStats {
     pub average_quality: f64,
     /// Number of untested peers
     pub untested_peers: usize,
-}
-
-/// Convert IP address to IPv6 (IPv4 mapped if needed)
-fn ip_to_ipv6(ip: &IpAddr) -> Ipv6Addr {
-    match ip {
-        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-        IpAddr::V6(v6) => *v6,
-    }
 }
 
 /// Get the default cache directory
