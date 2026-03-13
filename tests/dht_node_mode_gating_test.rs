@@ -41,6 +41,7 @@ fn test_config(mode: NodeMode) -> NodeConfig {
         bootstrap_peers: vec![],
         node_identity: Some(identity),
         mode,
+        allow_loopback: true,
         ..Default::default()
     }
 }
