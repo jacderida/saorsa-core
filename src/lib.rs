@@ -187,7 +187,7 @@ pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subsc
 pub use fwid::{FourWordsV1, Key as FwKey, fw_check, fw_to_key};
 pub use health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
-    HealthServer, HealthStatus, PrometheusExporter,
+    HealthServer, HealthStatus, MetricsRegistry, PrometheusCollector, PrometheusExporter,
 };
 pub use key_derivation::{
     BatchDerivationRequest, BatchDerivationResult, DerivationPath, DerivationPriority,

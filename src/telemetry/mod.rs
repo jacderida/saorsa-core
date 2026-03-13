@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -211,6 +212,109 @@ impl TelemetryCollector {
 
         // Record a bandwidth sample for the class (placeholder value)
         self.record_stream_bandwidth(class, 1024).await;
+    }
+
+    /// Export metrics in Prometheus text format
+    pub async fn export_prometheus(&self) -> String {
+        let metrics = self.get_metrics().await;
+        let counters = self.get_counters();
+
+        let mut out = String::with_capacity(2048);
+
+        // Lookup latency P95
+        let _ = writeln!(
+            out,
+            "# HELP p2p_lookup_latency_p95_ms Lookup latency P95 in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE p2p_lookup_latency_p95_ms gauge");
+        let _ = writeln!(out, "p2p_lookup_latency_p95_ms {}", metrics.lookups_p95_ms);
+
+        // Hop count P95
+        let _ = writeln!(out, "# HELP p2p_hop_count_p95 Hop count P95");
+        let _ = writeln!(out, "# TYPE p2p_hop_count_p95 gauge");
+        let _ = writeln!(out, "p2p_hop_count_p95 {}", metrics.hop_p95);
+
+        // Timeout rate
+        let _ = writeln!(out, "# HELP p2p_timeout_rate Timeout rate (0.0-1.0)");
+        let _ = writeln!(out, "# TYPE p2p_timeout_rate gauge");
+        let _ = writeln!(out, "p2p_timeout_rate {}", metrics.timeout_rate);
+
+        // DHT operation counters
+        let _ = writeln!(out, "# HELP p2p_dht_puts_total Total DHT PUT operations");
+        let _ = writeln!(out, "# TYPE p2p_dht_puts_total counter");
+        let _ = writeln!(out, "p2p_dht_puts_total {}", counters.dht_puts);
+
+        let _ = writeln!(out, "# HELP p2p_dht_gets_total Total DHT GET operations");
+        let _ = writeln!(out, "# TYPE p2p_dht_gets_total counter");
+        let _ = writeln!(out, "p2p_dht_gets_total {}", counters.dht_gets);
+
+        let _ = writeln!(
+            out,
+            "# HELP p2p_auth_failures_total Total authentication failures"
+        );
+        let _ = writeln!(out, "# TYPE p2p_auth_failures_total counter");
+        let _ = writeln!(out, "p2p_auth_failures_total {}", counters.auth_failures);
+
+        // Stream metrics per class
+        let _ = writeln!(
+            out,
+            "# HELP p2p_stream_bandwidth_p50_bytes_per_sec Stream bandwidth P50 in bytes/sec"
+        );
+        let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p50_bytes_per_sec gauge");
+        let _ = writeln!(
+            out,
+            "# HELP p2p_stream_bandwidth_p95_bytes_per_sec Stream bandwidth P95 in bytes/sec"
+        );
+        let _ = writeln!(out, "# TYPE p2p_stream_bandwidth_p95_bytes_per_sec gauge");
+        let _ = writeln!(
+            out,
+            "# HELP p2p_stream_rtt_p50_ms Stream RTT P50 in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE p2p_stream_rtt_p50_ms gauge");
+        let _ = writeln!(
+            out,
+            "# HELP p2p_stream_rtt_p95_ms Stream RTT P95 in milliseconds"
+        );
+        let _ = writeln!(out, "# TYPE p2p_stream_rtt_p95_ms gauge");
+
+        for class in &[
+            StreamClass::Control,
+            StreamClass::Mls,
+            StreamClass::File,
+            StreamClass::Media,
+        ] {
+            let label = match class {
+                StreamClass::Control => "control",
+                StreamClass::Mls => "mls",
+                StreamClass::File => "file",
+                StreamClass::Media => "media",
+            };
+
+            if let Some(stream) = self.get_stream_metrics(*class).await {
+                let _ = writeln!(
+                    out,
+                    "p2p_stream_bandwidth_p50_bytes_per_sec{{class=\"{}\"}} {}",
+                    label, stream.bandwidth_p50
+                );
+                let _ = writeln!(
+                    out,
+                    "p2p_stream_bandwidth_p95_bytes_per_sec{{class=\"{}\"}} {}",
+                    label, stream.bandwidth_p95
+                );
+                let _ = writeln!(
+                    out,
+                    "p2p_stream_rtt_p50_ms{{class=\"{}\"}} {}",
+                    label, stream.rtt_p50_ms
+                );
+                let _ = writeln!(
+                    out,
+                    "p2p_stream_rtt_p95_ms{{class=\"{}\"}} {}",
+                    label, stream.rtt_p95_ms
+                );
+            }
+        }
+
+        out
     }
 
     /// Reset all metrics
@@ -415,6 +519,68 @@ mod tests {
         let status = monitor.get_status().await;
         assert!(status.healthy);
         assert!(status.uptime.as_secs() < 10);
+    }
+
+    #[tokio::test]
+    async fn test_export_prometheus_basic() {
+        let collector = TelemetryCollector::new();
+
+        // Record some data
+        collector.record_lookup(Duration::from_millis(50), 3).await;
+        collector.record_lookup(Duration::from_millis(100), 5).await;
+        collector.record_timeout();
+        collector.record_dht_put();
+        collector.record_dht_put();
+        collector.record_dht_get();
+        collector.record_auth_failure();
+
+        let output = collector.export_prometheus().await;
+
+        // Check latency/hop/timeout metrics
+        assert!(output.contains("# HELP p2p_lookup_latency_p95_ms"));
+        assert!(output.contains("# TYPE p2p_lookup_latency_p95_ms gauge"));
+        assert!(output.contains("# HELP p2p_hop_count_p95"));
+        assert!(output.contains("# HELP p2p_timeout_rate"));
+
+        // Check counters
+        assert!(output.contains("p2p_dht_puts_total 2"));
+        assert!(output.contains("p2p_dht_gets_total 1"));
+        assert!(output.contains("p2p_auth_failures_total 1"));
+    }
+
+    #[tokio::test]
+    async fn test_export_prometheus_with_stream_metrics() {
+        let collector = TelemetryCollector::new();
+
+        collector
+            .record_stream_bandwidth(StreamClass::Media, 1_000_000)
+            .await;
+        collector
+            .record_stream_rtt(StreamClass::Media, Duration::from_millis(15))
+            .await;
+
+        let output = collector.export_prometheus().await;
+
+        assert!(output.contains("# HELP p2p_stream_bandwidth_p50_bytes_per_sec"));
+        assert!(output.contains("p2p_stream_bandwidth_p50_bytes_per_sec{class=\"media\"}"));
+        assert!(output.contains("p2p_stream_rtt_p50_ms{class=\"media\"}"));
+    }
+
+    #[tokio::test]
+    async fn test_export_prometheus_empty_collector() {
+        let collector = TelemetryCollector::new();
+        let output = collector.export_prometheus().await;
+
+        // Should still produce metric declarations with zero values
+        assert!(output.contains("p2p_lookup_latency_p95_ms 0"));
+        assert!(output.contains("p2p_hop_count_p95 0"));
+        assert!(output.contains("p2p_timeout_rate 0"));
+        assert!(output.contains("p2p_dht_puts_total 0"));
+        assert!(output.contains("p2p_dht_gets_total 0"));
+        assert!(output.contains("p2p_auth_failures_total 0"));
+
+        // No stream metrics when nothing recorded
+        assert!(!output.contains("class="));
     }
 
     #[test]

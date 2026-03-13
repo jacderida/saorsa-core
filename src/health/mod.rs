@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 mod checks;
 mod endpoints;
 mod metrics;
+mod metrics_registry;
 
 pub use checks::{
     ComponentChecker, CompositeHealthChecker, DhtHealthChecker, NetworkHealthChecker,
@@ -37,6 +38,7 @@ pub use checks::{
 };
 pub use endpoints::{HealthEndpoints, HealthServer};
 pub use metrics::{HealthMetrics, PrometheusExporter};
+pub use metrics_registry::{MetricsRegistry, PrometheusCollector};
 
 /// Health status for a component
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

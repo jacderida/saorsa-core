@@ -13,11 +13,13 @@
 
 //! Prometheus metrics export for P2P health monitoring
 
+use super::metrics_registry::MetricsRegistry;
 use super::{HealthManager, HealthStatus};
 use crate::Result;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 /// Health metrics for Prometheus export
 pub struct HealthMetrics {
@@ -52,12 +54,22 @@ pub struct HealthMetrics {
 /// Prometheus exporter for health metrics
 pub struct PrometheusExporter {
     health_manager: Arc<HealthManager>,
+    metrics_registry: Arc<RwLock<Option<MetricsRegistry>>>,
 }
 
 impl PrometheusExporter {
     /// Create a new Prometheus exporter
     pub fn new(health_manager: Arc<HealthManager>) -> Self {
-        Self { health_manager }
+        Self {
+            health_manager,
+            metrics_registry: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Set the metrics registry for domain-specific metrics
+    pub async fn set_registry(&self, registry: MetricsRegistry) {
+        let mut lock = self.metrics_registry.write().await;
+        *lock = Some(registry);
     }
 
     /// Export metrics in Prometheus format
@@ -217,6 +229,13 @@ impl PrometheusExporter {
             "\n# HELP p2p_last_scrape_timestamp_seconds Unix timestamp of last scrape\n# TYPE p2p_last_scrape_timestamp_seconds gauge\np2p_last_scrape_timestamp_seconds {}",
             timestamp
         ).map_err(|e| crate::P2PError::Internal(format!("Failed to write metrics: {}", e).into()))?;
+
+        // Append domain metrics from registry
+        let registry = self.metrics_registry.read().await;
+        if let Some(ref reg) = *registry {
+            output.push('\n');
+            output.push_str(&reg.export_prometheus().await);
+        }
 
         Ok(output)
     }

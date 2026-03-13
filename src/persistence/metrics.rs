@@ -13,6 +13,7 @@
 
 //! Storage metrics collection and reporting
 
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -113,6 +114,51 @@ impl MetricsCollector {
         }
     }
 
+    /// Export metrics in Prometheus text format
+    pub async fn export_prometheus(&self) -> String {
+        let mut out = String::with_capacity(1024);
+
+        for (op_name, metrics_lock) in [
+            ("read", &self.read_metrics),
+            ("write", &self.write_metrics),
+            ("delete", &self.delete_metrics),
+        ] {
+            let metrics = metrics_lock.read().await;
+            let prefix = format!("p2p_storage_{}", op_name);
+
+            let _ = writeln!(out, "# HELP {prefix}_total Total {op_name} operations");
+            let _ = writeln!(out, "# TYPE {prefix}_total counter");
+            let _ = writeln!(out, "{prefix}_total {}", metrics.count);
+
+            let _ = writeln!(out, "# HELP {prefix}_errors_total Total {op_name} errors");
+            let _ = writeln!(out, "# TYPE {prefix}_errors_total counter");
+            let _ = writeln!(out, "{prefix}_errors_total {}", metrics.errors);
+
+            let avg = if metrics.count > 0 {
+                metrics.total_duration.as_millis() as f64 / metrics.count as f64
+            } else {
+                0.0
+            };
+            let _ = writeln!(out, "# HELP {prefix}_avg_duration_ms Average {op_name} duration in ms");
+            let _ = writeln!(out, "# TYPE {prefix}_avg_duration_ms gauge");
+            let _ = writeln!(out, "{prefix}_avg_duration_ms {avg:.2}");
+
+            if let Some(min) = metrics.min_duration {
+                let _ = writeln!(out, "# HELP {prefix}_min_duration_ms Minimum {op_name} duration in ms");
+                let _ = writeln!(out, "# TYPE {prefix}_min_duration_ms gauge");
+                let _ = writeln!(out, "{prefix}_min_duration_ms {:.2}", min.as_secs_f64() * 1000.0);
+            }
+
+            if let Some(max) = metrics.max_duration {
+                let _ = writeln!(out, "# HELP {prefix}_max_duration_ms Maximum {op_name} duration in ms");
+                let _ = writeln!(out, "# TYPE {prefix}_max_duration_ms gauge");
+                let _ = writeln!(out, "{prefix}_max_duration_ms {:.2}", max.as_secs_f64() * 1000.0);
+            }
+        }
+
+        out
+    }
+
     /// Reset all metrics
     pub async fn reset(&self) {
         *self.read_metrics.write().await = OperationMetrics::default();
@@ -137,5 +183,81 @@ impl Timer {
     /// Get elapsed time
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_export_prometheus_with_operations() {
+        let collector = MetricsCollector::new();
+
+        collector.record_read(Duration::from_millis(10), true).await;
+        collector.record_read(Duration::from_millis(20), true).await;
+        collector
+            .record_write(Duration::from_millis(30), true)
+            .await;
+        collector
+            .record_delete(Duration::from_millis(5), false)
+            .await;
+
+        let output = collector.export_prometheus().await;
+
+        assert!(output.contains("p2p_storage_read_total 2"));
+        assert!(output.contains("p2p_storage_read_errors_total 0"));
+        assert!(output.contains("p2p_storage_read_avg_duration_ms 15.00"));
+        assert!(output.contains("p2p_storage_read_min_duration_ms 10.00"));
+        assert!(output.contains("p2p_storage_read_max_duration_ms 20.00"));
+
+        assert!(output.contains("p2p_storage_write_total 1"));
+        assert!(output.contains("p2p_storage_write_avg_duration_ms 30.00"));
+
+        assert!(output.contains("p2p_storage_delete_total 1"));
+        assert!(output.contains("p2p_storage_delete_errors_total 1"));
+    }
+
+    #[tokio::test]
+    async fn test_export_prometheus_empty() {
+        let collector = MetricsCollector::new();
+        let output = collector.export_prometheus().await;
+
+        assert!(output.contains("p2p_storage_read_total 0"));
+        assert!(output.contains("p2p_storage_read_errors_total 0"));
+        assert!(output.contains("p2p_storage_read_avg_duration_ms 0.00"));
+        assert!(output.contains("p2p_storage_write_total 0"));
+        assert!(output.contains("p2p_storage_delete_total 0"));
+
+        // No min/max when no operations recorded
+        assert!(!output.contains("min_duration_ms"));
+        assert!(!output.contains("max_duration_ms"));
+    }
+
+    #[tokio::test]
+    async fn test_export_prometheus_format_valid() {
+        let collector = MetricsCollector::new();
+        collector.record_read(Duration::from_millis(5), true).await;
+
+        let output = collector.export_prometheus().await;
+
+        for line in output.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('#') {
+                assert!(line.starts_with("# HELP") || line.starts_with("# TYPE"));
+                continue;
+            }
+            // Metric lines should have name and value
+            assert!(line.contains(' '), "Missing space in metric line: {}", line);
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            assert_eq!(parts.len(), 2);
+            assert!(
+                parts[1].trim().parse::<f64>().is_ok(),
+                "Invalid metric value: {}",
+                parts[1]
+            );
+        }
     }
 }
