@@ -84,7 +84,7 @@ pub use monitoring::{
     Alert, AlertManager, DashboardData, MonitoringConfig, MonitoringSystem, NetworkHealth,
 };
 pub use multi_armed_bandit::{
-    MABConfig, MABRoutingStrategy, MultiArmedBandit, RouteDecision, RouteId,
+    MABConfig, MABRoutingStrategy, MultiArmedBandit, RouteDecision, RouteId, StrategyStats,
 };
 pub use performance::{
     BatchProcessor, ConcurrencyLimiter, ConnectionPool, OptimizedSerializer, PerformanceCache,

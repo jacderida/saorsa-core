@@ -22,6 +22,7 @@ use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::identity::node_identity::NodeIdentity;
+use crate::metric_event::MetricEvent;
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
     NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
@@ -52,6 +53,19 @@ const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
 /// Internal protocol for automatic identity announcement on connect.
 /// Filtered from P2PEvent::Message emission — not visible to applications.
 const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
+
+/// Transport-level statistics for external monitoring.
+#[derive(Debug, Clone, Default)]
+pub struct TransportStats {
+    /// Number of currently active connections
+    pub active_connections: usize,
+    /// Number of currently tracked peers
+    pub known_peers: usize,
+    /// Number of active IPv4 connections (estimated from peer addresses)
+    pub ipv4_connections: usize,
+    /// Number of active IPv6 connections (estimated from peer addresses)
+    pub ipv6_connections: usize,
+}
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
@@ -115,6 +129,7 @@ pub struct TransportHandle {
     peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
     active_connections: Arc<RwLock<HashSet<String>>>,
     event_tx: broadcast::Sender<P2PEvent>,
+    metric_tx: broadcast::Sender<MetricEvent>,
     listen_addrs: RwLock<Vec<SocketAddr>>,
     rate_limiter: Arc<RateLimiter>,
     active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
@@ -156,6 +171,7 @@ impl TransportHandle {
     /// GeoIP provider, and a background connection lifecycle monitor.
     pub async fn new(config: TransportConfig) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
+        let (metric_tx, _) = broadcast::channel(4096);
 
         // Initialize dual-stack saorsa-transport nodes
         let (v6_opt, v4_opt) = {
@@ -260,6 +276,7 @@ impl TransportHandle {
             peers,
             active_connections,
             event_tx,
+            metric_tx,
             listen_addrs: RwLock::new(Vec::new()),
             rate_limiter,
             active_requests: Arc::new(RwLock::new(HashMap::new())),
@@ -286,6 +303,7 @@ impl TransportHandle {
             ))
         })?);
         let (event_tx, _) = broadcast::channel(TEST_EVENT_CHANNEL_CAPACITY);
+        let (metric_tx, _) = broadcast::channel(4096);
         let dual_node = {
             let v6: Option<SocketAddr> = "[::1]:0"
                 .parse()
@@ -317,6 +335,7 @@ impl TransportHandle {
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_connections: Arc::new(RwLock::new(HashSet::new())),
             event_tx,
+            metric_tx,
             listen_addrs: RwLock::new(Vec::new()),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                 max_requests: TEST_MAX_REQUESTS,
@@ -1248,10 +1267,49 @@ impl TransportHandle {
         self.event_tx.subscribe()
     }
 
+    /// Subscribe to metric events for external monitoring.
+    ///
+    /// Returns a receiver for [`MetricEvent`]s emitted by internal subsystems.
+    /// If the receiver falls behind, older events are dropped (lossy by design).
+    pub fn subscribe_metric_events(&self) -> broadcast::Receiver<MetricEvent> {
+        self.metric_tx.subscribe()
+    }
+
+    /// Get the metric event sender for internal use by [`MetricsEmitter`].
+    #[allow(dead_code)]
+    pub(crate) fn metric_sender(&self) -> broadcast::Sender<MetricEvent> {
+        self.metric_tx.clone()
+    }
+
     /// Send an event to all subscribers.
     pub(crate) fn send_event(&self, event: P2PEvent) {
         if let Err(e) = self.event_tx.send(event) {
             tracing::trace!("Event broadcast has no receivers: {e}");
+        }
+    }
+
+    /// Get current transport statistics for monitoring.
+    pub async fn transport_stats(&self) -> TransportStats {
+        let active = self.active_connections.read().await;
+        let peers = self.peers.read().await;
+
+        let mut ipv4 = 0usize;
+        let mut ipv6 = 0usize;
+        for peer_info in peers.values() {
+            for addr in &peer_info.addresses {
+                if addr.contains(':') && addr.contains('[') {
+                    ipv6 += 1;
+                } else {
+                    ipv4 += 1;
+                }
+            }
+        }
+
+        TransportStats {
+            active_connections: active.len(),
+            known_peers: peers.len(),
+            ipv4_connections: ipv4,
+            ipv6_connections: ipv6,
         }
     }
 }

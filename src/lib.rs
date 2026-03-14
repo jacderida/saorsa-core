@@ -92,6 +92,12 @@ pub mod types;
 /// Telemetry for metrics and health signals
 pub mod telemetry;
 
+/// Metric events emitted for external monitoring
+pub mod metric_event;
+
+/// Bridges internal telemetry with the metric event channel
+pub(crate) mod metrics_emitter;
+
 // MCP removed; will be redesigned later
 
 /// Security and cryptography
@@ -204,8 +210,12 @@ pub use network::{
 };
 pub use transport_handle::TransportHandle;
 // Trust system exports for saorsa-node integration
-pub use adaptive::{EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, TrustProvider};
+pub use adaptive::{
+    EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, StrategyStats, TrustProvider,
+};
+pub use metric_event::MetricEvent;
 pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemetry};
+pub use transport_handle::TransportStats;
 // Back-compat exports for tests
 pub use config::Config;
 pub use network::P2PNode as Node;

@@ -53,6 +53,10 @@ pub struct EigenTrustEngine {
 
     /// Cached trust scores for fast synchronous access
     trust_cache: Arc<RwLock<HashMap<PeerId, f64>>>,
+
+    /// Cached global trust scores from the last background computation.
+    /// Updated by `start_background_updates()` after each cycle.
+    cached_scores: Arc<RwLock<Option<HashMap<PeerId, f64>>>>,
 }
 
 /// Local trust data with interaction history
@@ -127,6 +131,7 @@ impl EigenTrustEngine {
             last_update: RwLock::new(Instant::now()),
             update_interval: Duration::from_secs(300), // 5 minutes
             trust_cache: Arc::new(RwLock::new(initial_cache)),
+            cached_scores: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -135,9 +140,20 @@ impl EigenTrustEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(self.update_interval).await;
-                let _ = self.compute_global_trust().await;
+                let scores = self.compute_global_trust().await;
+                if !scores.is_empty() {
+                    *self.cached_scores.write().await = Some(scores);
+                }
             }
         });
+    }
+
+    /// Get the most recently computed global trust scores.
+    ///
+    /// Returns the cached result from the last background update cycle.
+    /// Returns `None` if no computation has run yet.
+    pub async fn cached_global_trust(&self) -> Option<HashMap<PeerId, f64>> {
+        self.cached_scores.read().await.clone()
     }
 
     /// Update local trust based on interaction
