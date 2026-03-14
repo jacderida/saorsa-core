@@ -26,7 +26,7 @@ pub mod dht_handler;
 // Network binding and NAT traversal configuration (moved from messaging)
 pub mod network_config;
 
-pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, RetryBehavior};
+pub use network_config::NetworkConfig;
 
 use crate::validation::{Validate, ValidationContext, validate_message_size};
 use crate::{P2PError, Result};
@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 /// Connection quality metrics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionQuality {
     /// Round-trip latency
     pub latency: Duration,
@@ -52,6 +53,7 @@ pub struct ConnectionQuality {
 ///
 /// The transport kind is derivable from `remote_addr.transport().kind()`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionInfo {
     /// Local address
     pub local_addr: crate::MultiAddr,
@@ -71,6 +73,7 @@ pub struct ConnectionInfo {
 
 /// Connection pool information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionPoolInfo {
     /// Number of active connections
     pub active_connections: usize,
@@ -84,6 +87,7 @@ pub struct ConnectionPoolInfo {
 
 /// Connection pool statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionPoolStats {
     /// Messages sent per connection
     pub messages_per_connection: HashMap<String, usize>,
@@ -95,6 +99,7 @@ pub struct ConnectionPoolStats {
 
 /// Message received from transport
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransportMessage {
     /// Sender peer ID
     pub sender: crate::PeerId,
@@ -122,6 +127,7 @@ impl Validate for TransportMessage {
 
 /// Transport configuration options
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransportOptions {
     /// Enable 0-RTT for QUIC
     pub enable_0rtt: bool,
