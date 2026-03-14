@@ -445,9 +445,7 @@ impl TransportHandle {
 
         for (channel_id, peer_info) in peers.iter() {
             for peer_addr in &peer_info.addresses {
-                if let Ok(peer_socket) = peer_addr.parse::<SocketAddr>()
-                    && peer_socket == socket_addr
-                {
+                if peer_addr.socket_addr() == Some(socket_addr) {
                     return Some(channel_id.clone());
                 }
             }
@@ -457,7 +455,7 @@ impl TransportHandle {
 
     /// List all active connections with peer IDs and addresses (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<MultiAddr>)> {
         let active = self.active_connections.read().await;
         let peers = self.peers.read().await;
 
@@ -635,7 +633,7 @@ impl TransportHandle {
 
         let peer_info = PeerInfo {
             channel_id: peer_id.clone(),
-            addresses: vec![address.to_string()],
+            addresses: vec![parsed.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -1584,7 +1582,7 @@ impl TransportHandle {
                                         channel_id.clone(),
                                         PeerInfo {
                                             channel_id: channel_id.clone(),
-                                            addresses: vec![remote_address.to_string()],
+                                            addresses: vec![MultiAddr::quic(remote_address)],
                                             status: ConnectionStatus::Connected,
                                             last_seen: Instant::now(),
                                             connected_at: Instant::now(),

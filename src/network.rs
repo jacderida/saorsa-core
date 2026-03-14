@@ -641,7 +641,7 @@ pub struct PeerInfo {
     pub(crate) channel_id: String,
 
     /// Peer's addresses
-    pub addresses: Vec<String>,
+    pub addresses: Vec<MultiAddr>,
 
     /// Connection timestamp
     pub connected_at: Instant,
@@ -682,7 +682,7 @@ pub enum NetworkEvent {
         /// The identifier of the newly connected peer
         peer_id: PeerId,
         /// The network addresses where the peer can be reached
-        addresses: Vec<String>,
+        addresses: Vec<MultiAddr>,
     },
 
     /// A peer has disconnected
@@ -708,7 +708,7 @@ pub enum NetworkEvent {
         /// The identifier of the peer (if known)
         peer_id: Option<PeerId>,
         /// The address where connection was attempted
-        address: String,
+        address: MultiAddr,
         /// The error message describing the failure
         error: String,
     },
@@ -1400,7 +1400,7 @@ impl P2PNode {
 
     /// List all active transport-level connections (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<MultiAddr>)> {
         self.transport.list_active_connections().await
     }
 
@@ -1716,14 +1716,14 @@ impl P2PNode {
     }
 
     /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
+    pub async fn add_discovered_peer(
+        &self,
+        peer_id: PeerId,
+        addresses: Vec<MultiAddr>,
+    ) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.write().await;
-            let socket_addresses: Vec<std::net::SocketAddr> = addresses
-                .iter()
-                .filter_map(|addr| addr.parse().ok())
-                .collect();
-            let contact = ContactEntry::new(peer_id, socket_addresses);
+            let contact = ContactEntry::new(peer_id, addresses);
             manager.add_contact(contact).await.map_err(|e| {
                 protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
             })?;
@@ -1734,7 +1734,7 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        addr: &std::net::SocketAddr,
+        addr: &MultiAddr,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
@@ -1812,7 +1812,8 @@ impl P2PNode {
                 seen_addresses.insert(socket_addr);
                 // Use a zero sentinel PeerId — the real identity comes
                 // from wait_for_peer_identity() after connecting.
-                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![socket_addr]);
+                let contact =
+                    ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![multiaddr.clone()]);
                 bootstrap_contacts.push(contact);
             }
         }
@@ -1834,13 +1835,18 @@ impl P2PNode {
                             let new_addresses: Vec<_> = contact
                                 .addresses
                                 .iter()
-                                .filter(|addr| !seen_addresses.contains(addr))
-                                .copied()
+                                .filter(|addr| {
+                                    addr.socket_addr()
+                                        .is_none_or(|sa| !seen_addresses.contains(&sa))
+                                })
+                                .cloned()
                                 .collect();
 
                             if !new_addresses.is_empty() {
                                 for addr in &new_addresses {
-                                    seen_addresses.insert(*addr);
+                                    if let Some(sa) = addr.socket_addr() {
+                                        seen_addresses.insert(sa);
+                                    }
                                 }
                                 let mut contact = contact.clone();
                                 contact.addresses = new_addresses;
@@ -1876,7 +1882,7 @@ impl P2PNode {
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
-                match self.connect_peer(&MultiAddr::quic(*addr).to_string()).await {
+                match self.connect_peer(&addr.to_string()).await {
                     Ok(channel_id) => {
                         // Wait for the remote peer's signed identity announce
                         // so we get a real cryptographic PeerId.
@@ -2151,7 +2157,7 @@ pub(crate) async fn register_new_channel(
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
         channel_id: channel_id.to_owned(),
-        addresses: vec![remote_addr.to_string()],
+        addresses: vec![remote_addr.clone()],
         connected_at: tokio::time::Instant::now(),
         last_seen: tokio::time::Instant::now(),
         status: ConnectionStatus::Connected,
@@ -2679,7 +2685,7 @@ mod tests {
     async fn test_network_event_variants() {
         // Test that all network event variants can be created
         let peer_id = PeerId::from_name("test_peer");
-        let address = "/ip4/127.0.0.1/tcp/9000".to_string();
+        let address: MultiAddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
 
         let _peer_connected = NetworkEvent::PeerConnected {
             peer_id,
@@ -2718,7 +2724,7 @@ mod tests {
     async fn test_peer_info_structure() {
         let peer_info = PeerInfo {
             channel_id: "test_peer".to_string(),
-            addresses: vec!["/ip4/127.0.0.1/tcp/9000".to_string()],
+            addresses: vec!["/ip4/127.0.0.1/tcp/9000".parse::<MultiAddr>().unwrap()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2752,11 +2758,12 @@ mod tests {
 
         // Manually insert a peer for testing
         let test_channel_id = "peer_test_123".to_string();
-        let test_address = "192.168.1.100:9000".to_string();
+        let test_address = "192.168.1.100:9000";
+        let test_multiaddr = MultiAddr::quic(test_address.parse().unwrap());
 
         let peer_info = PeerInfo {
             channel_id: test_channel_id.clone(),
-            addresses: vec![test_address.clone()],
+            addresses: vec![test_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2769,7 +2776,7 @@ mod tests {
             .await;
 
         // Test: Find channel by address
-        let found_channel_id = node.get_channel_id_by_address(&test_address).await;
+        let found_channel_id = node.get_channel_id_by_address(test_address).await;
         assert_eq!(found_channel_id, Some(test_channel_id));
 
         Ok(())
@@ -2806,14 +2813,16 @@ mod tests {
 
         // Add multiple peers with different addresses
         let peer1_id = "peer_1".to_string();
-        let peer1_addr = "192.168.1.101:9001".to_string();
+        let peer1_addr_str = "192.168.1.101:9001";
+        let peer1_multiaddr = MultiAddr::quic(peer1_addr_str.parse().unwrap());
 
         let peer2_id = "peer_2".to_string();
-        let peer2_addr = "192.168.1.102:9002".to_string();
+        let peer2_addr_str = "192.168.1.102:9002";
+        let peer2_multiaddr = MultiAddr::quic(peer2_addr_str.parse().unwrap());
 
         let peer1_info = PeerInfo {
             channel_id: peer1_id.clone(),
-            addresses: vec![peer1_addr.clone()],
+            addresses: vec![peer1_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2823,7 +2832,7 @@ mod tests {
 
         let peer2_info = PeerInfo {
             channel_id: peer2_id.clone(),
-            addresses: vec![peer2_addr.clone()],
+            addresses: vec![peer2_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2839,8 +2848,8 @@ mod tests {
             .await;
 
         // Test: Find each channel by their unique address
-        let found_peer1 = node.get_channel_id_by_address(&peer1_addr).await;
-        let found_peer2 = node.get_channel_id_by_address(&peer2_addr).await;
+        let found_peer1 = node.get_channel_id_by_address(peer1_addr_str).await;
+        let found_peer2 = node.get_channel_id_by_address(peer2_addr_str).await;
 
         assert_eq!(found_peer1, Some(peer1_id));
         assert_eq!(found_peer2, Some(peer2_id));
@@ -2868,12 +2877,12 @@ mod tests {
         // Add multiple peers
         let peer1_id = "peer_1".to_string();
         let peer1_addrs = vec![
-            "192.168.1.101:9001".to_string(),
-            "192.168.1.101:9002".to_string(),
+            MultiAddr::quic("192.168.1.101:9001".parse().unwrap()),
+            MultiAddr::quic("192.168.1.101:9002".parse().unwrap()),
         ];
 
         let peer2_id = "peer_2".to_string();
-        let peer2_addrs = vec!["192.168.1.102:9003".to_string()];
+        let peer2_addrs = vec![MultiAddr::quic("192.168.1.102:9003".parse().unwrap())];
 
         let peer1_info = PeerInfo {
             channel_id: peer1_id.clone(),
@@ -2938,7 +2947,7 @@ mod tests {
         let channel_peer_id = PeerId::from_name(&channel_id);
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
-            addresses: vec!["192.168.1.100:9000".to_string()],
+            addresses: vec![MultiAddr::quic("192.168.1.100:9000".parse().unwrap())],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2992,7 +3001,7 @@ mod tests {
         // Add peer
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
-            addresses: vec!["192.168.1.100:9000".to_string()],
+            addresses: vec![MultiAddr::quic("192.168.1.100:9000".parse().unwrap())],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,

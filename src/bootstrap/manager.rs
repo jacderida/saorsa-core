@@ -327,19 +327,32 @@ impl BootstrapManager {
     /// This accepts the old `ContactEntry` type and converts it to the new API.
     /// Uses the first address as the primary cache key.
     pub async fn add_contact(&self, contact: super::ContactEntry) -> Result<()> {
-        let primary = contact.addresses.first().copied().ok_or_else(|| {
-            P2PError::Bootstrap(BootstrapError::InvalidData(
-                "No addresses provided".to_string().into(),
-            ))
-        })?;
-        self.add_peer(&primary, contact.addresses).await
+        let primary = contact
+            .addresses
+            .first()
+            .and_then(|a| a.socket_addr())
+            .ok_or_else(|| {
+                P2PError::Bootstrap(BootstrapError::InvalidData(
+                    "No IP-based addresses provided".to_string().into(),
+                ))
+            })?;
+        let socket_addrs: Vec<SocketAddr> = contact
+            .addresses
+            .iter()
+            .filter_map(|a| a.socket_addr())
+            .collect();
+        self.add_peer(&primary, socket_addrs).await
     }
 
     /// Add a contact bypassing rate limiting (compatibility method)
     pub async fn add_contact_trusted(&self, contact: super::ContactEntry) {
-        if let Some(primary) = contact.addresses.first() {
-            self.add_peer_trusted(primary, contact.addresses.clone())
-                .await;
+        let socket_addrs: Vec<SocketAddr> = contact
+            .addresses
+            .iter()
+            .filter_map(|a| a.socket_addr())
+            .collect();
+        if let Some(primary) = socket_addrs.first() {
+            self.add_peer_trusted(primary, socket_addrs.clone()).await;
         }
     }
 
@@ -348,9 +361,13 @@ impl BootstrapManager {
     /// Maps the old `QualityMetrics` to record_success/record_failure calls.
     pub async fn update_contact_metrics(
         &self,
-        addr: &SocketAddr,
+        addr: &crate::address::MultiAddr,
         metrics: super::QualityMetrics,
     ) -> Result<()> {
+        let Some(addr) = addr.socket_addr() else {
+            return Ok(());
+        };
+        let addr = &addr;
         // Convert QualityMetrics to success/failure recording
         // If success_rate is high (>= 0.5), record as success with estimated RTT
         // Otherwise record as failure
@@ -400,8 +417,13 @@ impl BootstrapManager {
         let contacts: Vec<super::ContactEntry> = peers
             .into_iter()
             .map(|cached| {
-                let mut addrs = vec![cached.primary_address];
-                addrs.extend(cached.addresses);
+                let mut addrs = vec![crate::address::MultiAddr::quic(cached.primary_address)];
+                addrs.extend(
+                    cached
+                        .addresses
+                        .into_iter()
+                        .map(crate::address::MultiAddr::quic),
+                );
                 // Use a zeroed PeerId — real identity is established after connecting
                 super::ContactEntry::new(PeerId::from_bytes([0u8; 32]), addrs)
             })

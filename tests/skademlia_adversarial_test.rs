@@ -49,7 +49,10 @@ fn random_key() -> Key {
 fn create_test_node() -> DHTNode {
     DHTNode {
         id: PeerId::random(),
-        address: "127.0.0.1:8000".parse().unwrap(),
+        address: saorsa_core::MultiAddr::from_ip_port(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            8000,
+        ),
         last_seen: SystemTime::now(),
         capacity: NodeCapacity::default(),
     }

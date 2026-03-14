@@ -19,10 +19,9 @@
 //! - TTL management (60 minutes)
 //! - Cryptographic signatures where needed
 
+use crate::address::MultiAddr;
 use crate::error::{P2PError, P2pResult};
 use serde::{Deserialize, Serialize};
-// use std::collections::HashMap; // Unused import - commented out
-use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // External dependencies for cryptography
@@ -270,7 +269,7 @@ pub struct NodeAd {
     /// Node identifier
     pub node_id: PeerId,
     /// Network addresses
-    pub addrs: Vec<SocketAddr>,
+    pub addrs: Vec<MultiAddr>,
     /// Node capabilities
     pub caps: NodeCapabilities,
     /// NAT type
@@ -293,7 +292,7 @@ impl NodeAd {
     /// Create a new node advertisement
     pub fn new(
         node_id: PeerId,
-        addrs: Vec<SocketAddr>,
+        addrs: Vec<MultiAddr>,
         caps: NodeCapabilities,
         nat_type: NatType,
         asn: u32,
@@ -735,7 +734,7 @@ impl Default for DhtRecordBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     #[test]
     fn test_node_capabilities_creation() {
@@ -768,7 +767,10 @@ mod tests {
     #[test]
     fn test_node_ad_creation() {
         let node_id = PeerId::from_bytes([1u8; 32]);
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+        let addr = MultiAddr::quic(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            8080,
+        )));
         let caps = NodeCapabilities::new(1000, 500, 50).unwrap();
         let os_sig = OsSignature::current();
 
@@ -811,8 +813,13 @@ mod tests {
         );
 
         // Too many addresses
-        let many_addrs: Vec<SocketAddr> = (0..10)
-            .map(|i| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080 + i)))
+        let many_addrs: Vec<MultiAddr> = (0..10)
+            .map(|i| {
+                MultiAddr::quic(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(127, 0, 0, 1),
+                    8080 + i,
+                )))
+            })
             .collect();
 
         assert!(
@@ -907,7 +914,10 @@ mod tests {
     #[test]
     fn test_dht_record_serialization() {
         let node_id = PeerId::from_bytes([1u8; 32]);
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+        let addr = MultiAddr::quic(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            8080,
+        )));
         let caps = NodeCapabilities::new(1000, 500, 50).unwrap();
         let os_sig = OsSignature::current();
 
@@ -969,12 +979,12 @@ mod tests {
     fn test_record_size_limit() {
         // Create a record that would exceed size limit
         let node_id = PeerId::from_bytes([1u8; 32]);
-        let many_addrs: Vec<SocketAddr> = (0..100)
+        let many_addrs: Vec<MultiAddr> = (0..100)
             .map(|i| {
-                SocketAddr::V4(SocketAddrV4::new(
+                MultiAddr::quic(SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::new(127, 0, 0, 1),
                     8080 + (i % 65535) as u16,
-                ))
+                )))
             })
             .collect();
 

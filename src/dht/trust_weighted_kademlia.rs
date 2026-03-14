@@ -22,6 +22,7 @@
 //! convergence properties while allowing trust to meaningfully reduce timeouts and improve
 //! reliability among similarly-distant nodes.
 
+use crate::address::MultiAddr;
 use crate::identity::node_identity::PeerId;
 use anyhow::Result;
 use bytes::Bytes;
@@ -40,7 +41,7 @@ pub type Key = [u8; 32];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
     pub peer: PeerId,
-    pub address: String,
+    pub address: MultiAddr,
     pub rtt_est: Duration,
     pub last_seen: SystemTime,
     pub trust_score: f32,

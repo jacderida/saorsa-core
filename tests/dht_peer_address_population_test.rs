@@ -435,12 +435,9 @@ async fn test_address_consistency_with_p2p_layer() -> Result<()> {
         Some(node) => {
             info!("Routing table address for peer B: {}", node.address);
             // The routing table address should match one of the P2P addresses
-            let rt_addr_str = node.address.to_string();
-            let match_found = p2p_addresses.iter().any(|p2p_addr| {
-                p2p_addr == &rt_addr_str
-                    || p2p_addr.contains(&rt_addr_str)
-                    || rt_addr_str.contains(p2p_addr)
-            });
+            let match_found = p2p_addresses
+                .iter()
+                .any(|p2p_addr| *p2p_addr == node.address);
             assert!(
                 match_found,
                 "Routing table address {} does not match any P2P address: {:?}",

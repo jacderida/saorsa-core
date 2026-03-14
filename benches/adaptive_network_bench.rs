@@ -87,7 +87,7 @@ fn bench_ml_operations(c: &mut Criterion) {
 
         b.iter(|| {
             let node_id = PeerId::from_bytes(data);
-            let hash = node_id.0;
+            let hash = *node_id.as_bytes();
             black_box(hash);
         });
     });
@@ -189,7 +189,7 @@ fn hyperbolic_distance(a: &HyperbolicCoordinate, b: &HyperbolicCoordinate) -> f6
 /// Calculate XOR distance between two node IDs
 fn xor_distance(a: &PeerId, b: &PeerId) -> [u8; 32] {
     let mut result = [0u8; 32];
-    for (i, (a_byte, b_byte)) in a.0.iter().zip(b.0.iter()).enumerate() {
+    for (i, (a_byte, b_byte)) in a.as_bytes().iter().zip(b.as_bytes().iter()).enumerate() {
         result[i] = a_byte ^ b_byte;
     }
     result

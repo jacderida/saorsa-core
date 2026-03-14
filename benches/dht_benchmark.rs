@@ -115,7 +115,7 @@ fn network_address_benchmarks(c: &mut Criterion) {
             |b, addr_str| {
                 b.iter(|| {
                     let socket_addr: SocketAddr = black_box(addr_str).parse().unwrap();
-                    let addr = saorsa_core::MultiAddr::new(socket_addr);
+                    let addr = saorsa_core::MultiAddr::quic(socket_addr);
                     black_box(addr);
                 });
             },

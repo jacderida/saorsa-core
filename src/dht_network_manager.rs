@@ -1415,29 +1415,20 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Parse the first valid address from a list of transport-reported address
-    /// strings into a [`MultiAddr`].
+    /// Return the first valid address from a list of [`MultiAddr`] values.
     ///
-    /// Accepts canonical MultiAddr format (e.g.
-    /// `/ip4/1.2.3.4/udp/9000/quic`).  Unspecified (`0.0.0.0`) addresses are
-    /// rejected.  Loopback addresses are accepted for local/test use.
-    fn first_valid_address(addresses: &[String]) -> Option<MultiAddr> {
-        for addr_str in addresses {
-            match addr_str.parse::<MultiAddr>() {
-                Ok(addr) => {
-                    if addr.ip().is_some_and(|ip| ip.is_unspecified()) {
-                        warn!("Rejecting unspecified address: {addr_str}");
-                        continue;
-                    }
-                    if addr.is_loopback() {
-                        trace!("Accepting loopback address (local/test): {addr_str}");
-                    }
-                    return Some(addr);
-                }
-                Err(e) => {
-                    warn!("Failed to parse address '{addr_str}': {e}");
-                }
+    /// Unspecified (`0.0.0.0`) addresses are rejected. Loopback addresses are
+    /// accepted for local/test use.
+    fn first_valid_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
+        for addr in addresses {
+            if addr.ip().is_some_and(|ip| ip.is_unspecified()) {
+                warn!("Rejecting unspecified address: {addr}");
+                continue;
             }
+            if addr.is_loopback() {
+                trace!("Accepting loopback address (local/test): {addr}");
+            }
+            return Some(addr.clone());
         }
         None
     }

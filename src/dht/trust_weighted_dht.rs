@@ -2,6 +2,7 @@
 //!
 //! Defines the interface for DHT operations with trust bias and capacity signaling.
 
+use crate::address::MultiAddr;
 pub use crate::identity::node_identity::PeerId;
 use anyhow::Result;
 use bytes::Bytes;
@@ -14,7 +15,7 @@ pub type Key = [u8; 32];
 #[derive(Debug, Clone)]
 pub struct Contact {
     pub peer: PeerId,
-    pub address: String,
+    pub address: MultiAddr,
 }
 
 /// PUT operation policy

@@ -16,6 +16,7 @@
 //! This module provides subscription-based event handling for
 //! state changes throughout the system.
 
+use crate::address::MultiAddr;
 use crate::fwid::Key;
 use crate::types::Forward;
 use anyhow::Result;
@@ -56,7 +57,10 @@ impl<T: Clone> Subscription<T> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TopologyEvent {
     /// A new peer joined the network
-    PeerJoined { peer_id: Vec<u8>, address: String },
+    PeerJoined {
+        peer_id: Vec<u8>,
+        address: MultiAddr,
+    },
     /// A peer left the network
     PeerLeft { peer_id: Vec<u8>, reason: String },
     /// Network partition detected
@@ -225,7 +229,7 @@ mod tests {
 
         let event = TopologyEvent::PeerJoined {
             peer_id: vec![1, 2, 3],
-            address: "127.0.0.1:9000".to_string(),
+            address: MultiAddr::quic("127.0.0.1:9000".parse().unwrap()),
         };
 
         bus.publish_topology(event.clone()).await.unwrap();
@@ -234,7 +238,7 @@ mod tests {
         match received {
             TopologyEvent::PeerJoined { peer_id, address } => {
                 assert_eq!(peer_id, vec![1, 2, 3]);
-                assert_eq!(address, "127.0.0.1:9000");
+                assert_eq!(address, MultiAddr::quic("127.0.0.1:9000".parse().unwrap()));
             }
             _ => panic!("Wrong event type"),
         }

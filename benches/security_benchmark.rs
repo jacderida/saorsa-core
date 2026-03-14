@@ -85,7 +85,7 @@ fn ipv6_benchmarks(c: &mut Criterion) {
 fn xor_distance(a: &PeerId, b: &PeerId) -> [u8; 32] {
     let mut result = [0u8; 32];
     for (i, byte) in result.iter_mut().enumerate() {
-        *byte = a.0[i] ^ b.0[i];
+        *byte = a.as_bytes()[i] ^ b.as_bytes()[i];
     }
     result
 }

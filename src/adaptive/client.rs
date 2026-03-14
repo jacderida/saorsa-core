@@ -25,6 +25,7 @@ use crate::adaptive::{
     AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentHash, ContentStore, MonitoringSystem,
     ReplicationManager, RetrievalManager, StorageConfig,
 };
+use crate::address::MultiAddr;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -172,7 +173,7 @@ pub struct NodeInfo {
     pub id: String,
 
     /// Network addresses
-    pub addresses: Vec<String>,
+    pub addresses: Vec<MultiAddr>,
 
     /// Node capabilities
     pub capabilities: NodeCapabilities,
@@ -505,7 +506,10 @@ impl Client {
         state.connected = true;
         state.node_info = Some(NodeInfo {
             id: "node_123".to_string(),
-            addresses: vec![address.to_string()],
+            addresses: address
+                .parse::<MultiAddr>()
+                .map(|a| vec![a])
+                .unwrap_or_default(),
             capabilities: NodeCapabilities {
                 storage_gb: 100,
                 compute_score: 1000,
