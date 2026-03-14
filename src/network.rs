@@ -1805,8 +1805,8 @@ impl P2PNode {
                 self.config.bootstrap_peers.len()
             );
             for multiaddr in &self.config.bootstrap_peers {
-                let Some(socket_addr) = multiaddr.socket_addr() else {
-                    warn!("Skipping non-IP bootstrap peer: {}", multiaddr);
+                let Some(socket_addr) = multiaddr.dialable_socket_addr() else {
+                    warn!("Skipping non-QUIC bootstrap peer: {}", multiaddr);
                     continue;
                 };
                 seen_addresses.insert(socket_addr);
@@ -2366,6 +2366,27 @@ mod tests {
 
         node1.stop().await?;
         node2.stop().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connect_peer_rejects_tcp_multiaddr() -> Result<()> {
+        let config = create_test_node_config();
+        let node = P2PNode::new(config).await?;
+
+        let result = node.connect_peer("/ip4/127.0.0.1/tcp/1").await;
+
+        assert!(
+            matches!(
+                result,
+                Err(P2PError::Network(
+                    crate::error::NetworkError::InvalidAddress(_)
+                ))
+            ),
+            "TCP multiaddrs should be rejected before a QUIC dial is attempted, got: {:?}",
+            result
+        );
 
         Ok(())
     }

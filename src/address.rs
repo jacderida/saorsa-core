@@ -117,6 +117,28 @@ impl MultiAddr {
         self.peer_id.as_ref()
     }
 
+    /// `true` when this address uses the QUIC transport — the only transport
+    /// currently supported for dialing. When additional transports are added,
+    /// update this method (and [`Self::dialable_socket_addr`]) accordingly.
+    #[must_use]
+    pub fn is_quic(&self) -> bool {
+        matches!(self.transport, TransportAddr::Quic(_))
+    }
+
+    /// Returns the [`SocketAddr`] **only** for transports we can currently
+    /// dial (QUIC). Returns `None` for all other transports, including
+    /// IP-based ones like TCP that we do not yet support.
+    ///
+    /// Use [`Self::socket_addr`] when you need the raw socket address
+    /// regardless of transport (e.g. IP diversity checks, geo lookups).
+    #[must_use]
+    pub fn dialable_socket_addr(&self) -> Option<SocketAddr> {
+        match self.transport {
+            TransportAddr::Quic(sa) => Some(sa),
+            _ => None,
+        }
+    }
+
     /// Returns the socket address for IP-based transports (`Quic`, `Tcp`,
     /// `Udp`), `None` for non-IP transports.
     #[must_use]

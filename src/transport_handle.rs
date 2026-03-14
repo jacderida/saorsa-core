@@ -569,15 +569,20 @@ impl TransportHandle {
             None
         };
 
-        // Parse via MultiAddr for consistent address support
+        // Parse via MultiAddr and require a dialable (QUIC) transport.
         let parsed = address.parse::<MultiAddr>().map_err(|e| {
             P2PError::Network(NetworkError::InvalidAddress(
                 format!("{}: {}", address, e).into(),
             ))
         })?;
-        let socket_addr: SocketAddr = parsed.socket_addr().ok_or_else(|| {
+        let socket_addr = parsed.dialable_socket_addr().ok_or_else(|| {
             P2PError::Network(NetworkError::InvalidAddress(
-                format!("non-IP transport not supported for connect: {}", address).into(),
+                format!(
+                    "only QUIC transport is supported for connect, got {}: {}",
+                    parsed.transport().kind(),
+                    address
+                )
+                .into(),
             ))
         })?;
 

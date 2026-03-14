@@ -1415,17 +1415,22 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Return the first valid address from a list of [`MultiAddr`] values.
+    /// Return the first dialable address from a list of [`MultiAddr`] values.
     ///
-    /// Unspecified (`0.0.0.0`) addresses are rejected. Loopback addresses are
-    /// accepted for local/test use.
-    fn first_valid_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
+    /// Only QUIC addresses are considered dialable. Unspecified (`0.0.0.0`)
+    /// addresses are rejected. Loopback addresses are accepted for local/test
+    /// use.
+    fn first_dialable_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
         for addr in addresses {
-            if addr.ip().is_some_and(|ip| ip.is_unspecified()) {
+            let Some(sa) = addr.dialable_socket_addr() else {
+                trace!("Skipping non-dialable address: {addr}");
+                continue;
+            };
+            if sa.ip().is_unspecified() {
                 warn!("Rejecting unspecified address: {addr}");
                 continue;
             }
-            if addr.is_loopback() {
+            if sa.ip().is_loopback() {
                 trace!("Accepting loopback address (local/test): {addr}");
             }
             return Some(addr.clone());
@@ -1817,7 +1822,7 @@ impl DhtNetworkManager {
 
         // 2. Transport layer — for connected peers not yet in the routing table
         if let Some(info) = self.transport.peer_info(peer_id).await {
-            return Self::first_valid_address(&info.addresses);
+            return Self::first_dialable_address(&info.addresses);
         }
 
         None
@@ -2204,7 +2209,7 @@ impl DhtNetworkManager {
             .transport
             .peer_info(&app_peer_id)
             .await
-            .and_then(|info| Self::first_valid_address(&info.addresses));
+            .and_then(|info| Self::first_dialable_address(&info.addresses));
 
         let dht = self.dht.read().await;
         if dht.touch_node(&app_peer_id, current_address.as_ref()).await {
@@ -2265,7 +2270,7 @@ impl DhtNetworkManager {
         // Parse the first valid address directly into a MultiAddr — this
         // handles both "ip:port" and MultiAddr formats consistently.
         let address = if let Some(info) = self.transport.peer_info(&node_id).await {
-            Self::first_valid_address(&info.addresses)
+            Self::first_dialable_address(&info.addresses)
         } else {
             warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
             None
@@ -2669,5 +2674,27 @@ impl Default for DhtNetworkConfig {
             replication_factor: 8, // K=8 replication
             enable_security: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first_dialable_address_skips_non_ip_when_ip_address_exists() {
+        let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let quic = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
+
+        let selected = DhtNetworkManager::first_dialable_address(&[ble, quic.clone()]);
+
+        assert_eq!(
+            selected,
+            Some(quic),
+            "address selection should prefer a dialable IP transport over a preceding non-IP entry"
+        );
     }
 }

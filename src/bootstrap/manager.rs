@@ -29,6 +29,7 @@ use saorsa_transport::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -117,6 +118,10 @@ pub struct BootstrapManager {
     diversity_enforcer: Mutex<IPDiversityEnforcer>,
     diversity_config: IPDiversityConfig,
     maintenance_handle: Option<JoinHandle<()>>,
+    /// Maps socket addresses to their original transport kind so that
+    /// round-trips through the `SocketAddr`-only cache preserve the
+    /// transport type (e.g. TCP vs QUIC).
+    transport_kinds: Mutex<HashMap<SocketAddr, crate::address::TransportAddr>>,
 }
 
 impl BootstrapManager {
@@ -145,6 +150,7 @@ impl BootstrapManager {
             )),
             diversity_config: config.diversity,
             maintenance_handle: None,
+            transport_kinds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -317,6 +323,28 @@ impl BootstrapManager {
         self.cache.get(addr).await
     }
 
+    /// Reconstruct a [`MultiAddr`] for a `SocketAddr`, using the recorded
+    /// transport kind if available, falling back to QUIC.
+    fn multiaddr_for_socket(&self, addr: SocketAddr) -> crate::address::MultiAddr {
+        let kinds = self.transport_kinds.lock();
+        match kinds.get(&addr) {
+            Some(transport) => crate::address::MultiAddr::new(transport.clone()),
+            None => crate::address::MultiAddr::quic(addr),
+        }
+    }
+
+    /// Record the transport kind for every IP-based address so that
+    /// round-trips through the `SocketAddr`-only cache preserve the
+    /// original transport type.
+    fn record_transport_kinds(&self, addrs: &[crate::address::MultiAddr]) {
+        let mut kinds = self.transport_kinds.lock();
+        for addr in addrs {
+            if let Some(sa) = addr.socket_addr() {
+                kinds.insert(sa, addr.transport().clone());
+            }
+        }
+    }
+
     // ========================================================================
     // Backward Compatibility Methods
     // These methods provide compatibility with the old BootstrapManager API
@@ -329,8 +357,8 @@ impl BootstrapManager {
     pub async fn add_contact(&self, contact: super::ContactEntry) -> Result<()> {
         let primary = contact
             .addresses
-            .first()
-            .and_then(|a| a.socket_addr())
+            .iter()
+            .find_map(|a| a.socket_addr())
             .ok_or_else(|| {
                 P2PError::Bootstrap(BootstrapError::InvalidData(
                     "No IP-based addresses provided".to_string().into(),
@@ -341,11 +369,13 @@ impl BootstrapManager {
             .iter()
             .filter_map(|a| a.socket_addr())
             .collect();
+        self.record_transport_kinds(&contact.addresses);
         self.add_peer(&primary, socket_addrs).await
     }
 
     /// Add a contact bypassing rate limiting (compatibility method)
     pub async fn add_contact_trusted(&self, contact: super::ContactEntry) {
+        self.record_transport_kinds(&contact.addresses);
         let socket_addrs: Vec<SocketAddr> = contact
             .addresses
             .iter()
@@ -417,12 +447,14 @@ impl BootstrapManager {
         let contacts: Vec<super::ContactEntry> = peers
             .into_iter()
             .map(|cached| {
-                let mut addrs = vec![crate::address::MultiAddr::quic(cached.primary_address)];
+                let primary = cached.primary_address;
+                let mut addrs = vec![self.multiaddr_for_socket(primary)];
                 addrs.extend(
                     cached
                         .addresses
                         .into_iter()
-                        .map(crate::address::MultiAddr::quic),
+                        .filter(|sa| *sa != primary)
+                        .map(|sa| self.multiaddr_for_socket(sa)),
                 );
                 // Use a zeroed PeerId — real identity is established after connecting
                 super::ContactEntry::new(PeerId::from_bytes([0u8; 32]), addrs)
@@ -769,5 +801,46 @@ mod tests {
             result.unwrap_err(),
             P2PError::Bootstrap(BootstrapError::RateLimited(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_add_contact_accepts_ip_address_after_non_ip_primary() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        let ble = crate::address::MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let quic = crate::address::MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
+        let contact = crate::ContactEntry::new(PeerId::random(), vec![ble, quic.clone()]);
+
+        manager
+            .add_contact(contact)
+            .await
+            .expect("contact should be accepted when a later IP address exists");
+
+        assert!(manager.contains(&quic.socket_addr().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_bootstrap_peers_preserves_tcp_transport_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        let tcp = crate::address::MultiAddr::tcp("127.0.0.1:9100".parse().unwrap());
+        let contact = crate::ContactEntry::new(PeerId::random(), vec![tcp.clone()]);
+
+        manager.add_contact_trusted(contact).await;
+
+        let peers = manager.get_bootstrap_peers(1).await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].addresses,
+            vec![tcp],
+            "bootstrap cache round-trip should preserve the original transport kind"
+        );
     }
 }
