@@ -213,7 +213,7 @@ pub use transport_handle::TransportHandle;
 pub use adaptive::{
     EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, StrategyStats, TrustProvider,
 };
-pub use metric_event::MetricEvent;
+pub use metric_event::{ConnectionFailureReason, ConnectionNatType, MetricEvent};
 pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemetry};
 pub use transport_handle::TransportStats;
 // Back-compat exports for tests

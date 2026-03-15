@@ -27,13 +27,14 @@ use crate::adaptive::{
     routing::AdaptiveRouter,
     storage::{ContentMetadata, ReplicationConfig},
 };
+use crate::metric_event::MetricEvent;
 use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 
 /// Replication manager for adaptive content replication
 pub struct ReplicationManager {
@@ -54,6 +55,9 @@ pub struct ReplicationManager {
 
     /// Replication statistics
     stats: Arc<RwLock<ReplicationStats>>,
+
+    /// Metric event sender for emitting replication metrics
+    metric_tx: Option<broadcast::Sender<MetricEvent>>,
 }
 
 /// Information about content replicas
@@ -125,7 +129,14 @@ impl ReplicationManager {
             router,
             replica_map: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(ReplicationStats::default())),
+            metric_tx: None,
         }
+    }
+
+    /// Set the metric event sender for emitting replication metrics.
+    pub fn with_metric_tx(mut self, metric_tx: broadcast::Sender<MetricEvent>) -> Self {
+        self.metric_tx = Some(metric_tx);
+        self
     }
 
     /// Calculate adaptive replication factor based on network conditions
@@ -321,6 +332,7 @@ impl ReplicationManager {
 
     /// Check and maintain replication for stored content
     pub async fn maintain_replications(&self) -> Result<()> {
+        let repair_start = Instant::now();
         let replica_map = self.replica_map.read().await;
         let content_to_check: Vec<_> = replica_map
             .iter()
@@ -332,6 +344,14 @@ impl ReplicationManager {
             .collect();
         drop(replica_map);
 
+        let keys_to_repair = content_to_check.len() as u64;
+        if keys_to_repair > 0
+            && let Some(ref tx) = self.metric_tx
+        {
+            let _ = tx.send(MetricEvent::ReplicationStarted { keys_to_repair });
+        }
+
+        let mut keys_repaired = 0u64;
         for (content_hash, mut replica_info) in content_to_check {
             // Check if any storing nodes are at risk of churning
             let mut at_risk_nodes = Vec::new();
@@ -361,6 +381,7 @@ impl ReplicationManager {
                     replica_info.storing_nodes.remove(old_node);
                     replica_info.storing_nodes.insert(*new_node);
                 }
+                keys_repaired += 1;
             }
 
             // Update last check time
@@ -371,10 +392,23 @@ impl ReplicationManager {
                 .insert(content_hash, replica_info);
         }
 
+        if keys_to_repair > 0
+            && let Some(ref tx) = self.metric_tx
+        {
+            let _ = tx.send(MetricEvent::ReplicationCompleted {
+                duration: repair_start.elapsed(),
+                keys_repaired,
+                bytes_transferred: 0, // Actual bytes tracked when real replication is implemented
+            });
+        }
+
         Ok(())
     }
 
-    /// Handle node departure by checking affected content
+    /// Handle node departure by checking affected content.
+    ///
+    /// When a grace period expires and a departed node has not returned, this
+    /// method is called to trigger replication of the affected keys.
     pub async fn handle_node_departure(&self, departed_node: &PeerId) -> Result<()> {
         let replica_map = self.replica_map.read().await;
         let affected_content: Vec<_> = replica_map
@@ -383,6 +417,14 @@ impl ReplicationManager {
             .map(|(hash, info)| (*hash, info.clone()))
             .collect();
         drop(replica_map);
+
+        if !affected_content.is_empty()
+            && let Some(ref tx) = self.metric_tx
+        {
+            let _ = tx.send(MetricEvent::GracePeriodExpired {
+                keys_affected: affected_content.len() as u64,
+            });
+        }
 
         for (content_hash, mut replica_info) in affected_content {
             // Remove departed node

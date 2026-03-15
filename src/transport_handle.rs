@@ -36,6 +36,7 @@ use crate::validation::{RateLimitConfig, RateLimiter};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -65,6 +66,20 @@ pub struct TransportStats {
     pub ipv4_connections: usize,
     /// Number of active IPv6 connections (estimated from peer addresses)
     pub ipv6_connections: usize,
+    /// Total connections established since startup
+    pub total_connections_established: u64,
+    /// Total connection failures since startup
+    pub connection_failures: u64,
+    /// Total bytes sent at the application layer
+    pub bytes_sent_total: u64,
+    /// Total bytes received at the application layer
+    pub bytes_received_total: u64,
+    /// Total NAT traversal attempts
+    pub nat_traversal_attempts: u64,
+    /// Successful NAT traversal attempts
+    pub nat_traversal_successes: u64,
+    /// Current connection pool size (same as active_connections, for pool-oriented monitoring)
+    pub connection_pool_size: usize,
 }
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
@@ -157,6 +172,20 @@ pub struct TransportHandle {
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
     /// up a peer's mode without re-receiving the `PeerConnected` event.
     peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+
+    // --- Transport metric counters ---
+    /// Total connections established since startup
+    transport_connections_established: Arc<AtomicU64>,
+    /// Total connection failures since startup
+    transport_connection_failures: Arc<AtomicU64>,
+    /// Total bytes sent at the application layer
+    transport_bytes_sent: Arc<AtomicU64>,
+    /// Total bytes received at the application layer
+    transport_bytes_received: Arc<AtomicU64>,
+    /// Total NAT traversal attempts
+    transport_nat_attempts: Arc<AtomicU64>,
+    /// Total NAT traversal successes
+    transport_nat_successes: Arc<AtomicU64>,
 }
 
 // ============================================================================
@@ -238,10 +267,14 @@ impl TransportHandle {
         let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
+        let transport_connections_established = Arc::new(AtomicU64::new(0));
+        let transport_connection_failures = Arc::new(AtomicU64::new(0));
+
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
             let peers_map = Arc::clone(&peers);
             let event_tx_clone = event_tx.clone();
+            let metric_tx_clone = metric_tx.clone();
             let dual_node_clone = Arc::clone(&dual_node);
             let geo_provider_clone = Arc::clone(&geo_provider);
             let shutdown_token = shutdown.clone();
@@ -250,6 +283,8 @@ impl TransportHandle {
             let pua = Arc::clone(&peer_user_agents);
             let identity_clone = config.node_identity.clone();
             let user_agent_clone = config.user_agent.clone();
+            let conn_established = Arc::clone(&transport_connections_established);
+            let conn_failures = Arc::clone(&transport_connection_failures);
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -258,6 +293,7 @@ impl TransportHandle {
                     active_conns,
                     peers_map,
                     event_tx_clone,
+                    metric_tx_clone,
                     geo_provider_clone,
                     shutdown_token,
                     p2c,
@@ -265,6 +301,8 @@ impl TransportHandle {
                     pua,
                     identity_clone,
                     user_agent_clone,
+                    conn_established,
+                    conn_failures,
                 )
                 .await;
             });
@@ -292,6 +330,12 @@ impl TransportHandle {
             peer_to_channel,
             channel_to_peers,
             peer_user_agents,
+            transport_connections_established,
+            transport_connection_failures,
+            transport_bytes_sent: Arc::new(AtomicU64::new(0)),
+            transport_bytes_received: Arc::new(AtomicU64::new(0)),
+            transport_nat_attempts: Arc::new(AtomicU64::new(0)),
+            transport_nat_successes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -356,6 +400,12 @@ impl TransportHandle {
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
             channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
             peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
+            transport_connections_established: Arc::new(AtomicU64::new(0)),
+            transport_connection_failures: Arc::new(AtomicU64::new(0)),
+            transport_bytes_sent: Arc::new(AtomicU64::new(0)),
+            transport_bytes_received: Arc::new(AtomicU64::new(0)),
+            transport_nat_attempts: Arc::new(AtomicU64::new(0)),
+            transport_nat_successes: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -878,6 +928,8 @@ impl TransportHandle {
             });
 
         if result.is_ok() {
+            self.transport_bytes_sent
+                .fetch_add(message_data.len() as u64, Ordering::Relaxed);
             info!(
                 "Successfully sent {} bytes to channel {}",
                 message_data.len(),
@@ -1305,11 +1357,21 @@ impl TransportHandle {
             }
         }
 
+        let active_count = active.len();
         TransportStats {
-            active_connections: active.len(),
+            active_connections: active_count,
             known_peers: peers.len(),
             ipv4_connections: ipv4,
             ipv6_connections: ipv6,
+            total_connections_established: self
+                .transport_connections_established
+                .load(Ordering::Relaxed),
+            connection_failures: self.transport_connection_failures.load(Ordering::Relaxed),
+            bytes_sent_total: self.transport_bytes_sent.load(Ordering::Relaxed),
+            bytes_received_total: self.transport_bytes_received.load(Ordering::Relaxed),
+            nat_traversal_attempts: self.transport_nat_attempts.load(Ordering::Relaxed),
+            nat_traversal_successes: self.transport_nat_successes.load(Ordering::Relaxed),
+            connection_pool_size: active_count,
         }
     }
 }
@@ -1388,11 +1450,13 @@ impl TransportHandle {
         let peer_to_channel = Arc::clone(&self.peer_to_channel);
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
+        let bytes_received_counter = Arc::clone(&self.transport_bytes_received);
         let self_peer_id = *self.node_identity.peer_id();
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((from_addr, bytes)) = rx.recv().await {
                 let channel_id = from_addr.to_string();
+                bytes_received_counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 trace!("Received {} bytes from channel {}", bytes.len(), channel_id);
 
                 match parse_protocol_message(&bytes, &channel_id) {
@@ -1575,6 +1639,7 @@ impl TransportHandle {
         active_connections: Arc<RwLock<HashSet<String>>>,
         peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         event_tx: broadcast::Sender<P2PEvent>,
+        metric_tx: broadcast::Sender<MetricEvent>,
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
@@ -1582,6 +1647,8 @@ impl TransportHandle {
         peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
+        connections_established: Arc<AtomicU64>,
+        connection_failures: Arc<AtomicU64>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1642,11 +1709,28 @@ impl TransportHandle {
 
                                 // PeerConnected is emitted when the remote receives and
                                 // verifies our identity announce — not at transport level.
+
+                                // Emit transport metric events
+                                connections_established.fetch_add(1, Ordering::Relaxed);
+                                let _ = metric_tx.send(MetricEvent::ConnectionEstablished {
+                                    duration: Duration::ZERO, // No per-connection timing at transport event level
+                                    nat_type: crate::metric_event::ConnectionNatType::Unknown,
+                                });
+                                let _ = metric_tx.send(MetricEvent::HandshakeCompleted {
+                                    duration: Duration::ZERO,
+                                });
                             }
                             ConnectionEvent::Lost { remote_address, reason }
                             | ConnectionEvent::Failed { remote_address, reason } => {
                                 let channel_id = remote_address.to_string();
                                 debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
+
+                                connection_failures.fetch_add(1, Ordering::Relaxed);
+                                let _ = metric_tx.send(MetricEvent::ConnectionFailed {
+                                    reason: crate::metric_event::ConnectionFailureReason::Other(
+                                        reason.clone(),
+                                    ),
+                                });
 
                                 active_connections.write().await.remove(&channel_id);
                                 peers.write().await.remove(&channel_id);
