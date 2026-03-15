@@ -16,6 +16,7 @@
 //! - **Client** peers are tracked as connected but excluded from the
 //!   routing table to prevent stale-address pollution.
 
+use saorsa_core::MultiAddr;
 use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 use std::sync::Arc;
@@ -35,14 +36,8 @@ fn test_config(mode: NodeMode) -> NodeConfig {
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        listen_addr: "127.0.0.1:0"
-            .parse()
-            .expect("Test setup: hardcoded address should parse"),
-        listen_addrs: vec![
-            "127.0.0.1:0"
-                .parse()
-                .expect("Test setup: hardcoded address should parse"),
-        ],
+        listen_addr: MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
+        listen_addrs: vec![MultiAddr::quic("127.0.0.1:0".parse().unwrap())],
         bootstrap_peers: vec![],
         node_identity: Some(identity),
         mode,
@@ -70,11 +65,8 @@ async fn wait_for_peer_connected(
 /// Connect `from` to `to` and wait for identity exchange.
 async fn connect_and_wait(from: &P2PNode, to: &P2PNode) {
     let addrs = to.listen_addrs().await;
-    let addr = addrs
-        .first()
-        .expect("target node needs a listen address")
-        .to_string();
-    let channel_id = from.connect_peer(&addr).await.expect("connect_peer failed");
+    let addr = addrs.first().expect("target node needs a listen address");
+    let channel_id = from.connect_peer(addr).await.expect("connect_peer failed");
     from.wait_for_peer_identity(&channel_id, EVENT_TIMEOUT)
         .await
         .expect("identity exchange timed out");

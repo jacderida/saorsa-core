@@ -138,11 +138,11 @@ const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Addresses to listen on for incoming connections
-    pub listen_addrs: Vec<std::net::SocketAddr>,
+    /// Addresses to listen on for incoming connections.
+    pub listen_addrs: Vec<MultiAddr>,
 
-    /// Primary listen address (for compatibility)
-    pub listen_addr: std::net::SocketAddr,
+    /// Primary listen address (for compatibility).
+    pub listen_addr: MultiAddr,
 
     /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<crate::MultiAddr>,
@@ -268,20 +268,20 @@ pub enum TrustLevel {
 ///
 /// This helper consolidates the duplicated address construction logic.
 #[inline]
-fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<std::net::SocketAddr> {
+fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<MultiAddr> {
     let mut addrs = Vec::with_capacity(if ipv6_enabled { 2 } else { 1 });
 
     if ipv6_enabled {
-        addrs.push(std::net::SocketAddr::new(
+        addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
             std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             port,
-        ));
+        )));
     }
 
-    addrs.push(std::net::SocketAddr::new(
+    addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         port,
-    ));
+    )));
 
     addrs
 }
@@ -304,10 +304,11 @@ impl NodeConfig {
     /// Returns an error if default addresses cannot be parsed
     pub fn new() -> Result<Self> {
         let config = Config::default();
-        let listen_addr = config.listen_socket_addr()?;
+        let listen_sa = config.listen_socket_addr()?;
+        let listen_addr = MultiAddr::quic(listen_sa);
 
         Ok(Self {
-            listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
+            listen_addrs: build_listen_addrs(listen_sa.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: config
                 .network
@@ -459,8 +460,10 @@ impl NodeConfigBuilder {
         let port = self.listen_port.unwrap_or(default_port);
         let ipv6_enabled = self.enable_ipv6.unwrap_or(base_config.network.ipv6_enabled);
 
-        let listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+        let listen_addr = MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port,
+        ));
 
         Ok(NodeConfig {
             listen_addrs: build_listen_addrs(port, ipv6_enabled),
@@ -498,15 +501,16 @@ impl NodeConfigBuilder {
 impl Default for NodeConfig {
     fn default() -> Self {
         let config = Config::default();
-        let listen_addr = config.listen_socket_addr().unwrap_or_else(|_| {
+        let listen_sa = config.listen_socket_addr().unwrap_or_else(|_| {
             std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 DEFAULT_LISTEN_PORT,
             )
         });
+        let listen_addr = MultiAddr::quic(listen_sa);
 
         Self {
-            listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
+            listen_addrs: build_listen_addrs(listen_sa.port(), config.network.ipv6_enabled),
             listen_addr,
             bootstrap_peers: Vec::new(),
             enable_ipv6: config.network.ipv6_enabled,
@@ -531,10 +535,11 @@ impl Default for NodeConfig {
 impl NodeConfig {
     /// Create NodeConfig from Config
     pub fn from_config(config: &Config) -> Result<Self> {
-        let listen_addr = config.listen_socket_addr()?;
+        let listen_sa = config.listen_socket_addr()?;
+        let listen_addr = MultiAddr::quic(listen_sa);
 
         let mut node_config = Self {
-            listen_addrs: vec![listen_addr],
+            listen_addrs: vec![listen_addr.clone()],
             listen_addr,
             bootstrap_peers: config
                 .network
@@ -578,26 +583,36 @@ impl NodeConfig {
 
         // Add IPv6 listen address if enabled
         if config.network.ipv6_enabled {
-            node_config.listen_addrs.push(std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                listen_addr.port(),
-            ));
+            node_config
+                .listen_addrs
+                .push(MultiAddr::quic(std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    listen_sa.port(),
+                )));
         }
 
         Ok(node_config)
     }
 
-    /// Try to build a NodeConfig from a listen address string
-    pub fn with_listen_addr(addr: &str) -> Result<Self> {
-        let listen_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| {
-                NetworkError::InvalidAddress(e.to_string().into())
-            })
-            .map_err(P2PError::Network)?;
+    /// Build a [`NodeConfig`] from a QUIC [`MultiAddr`].
+    ///
+    /// Returns [`NetworkError::InvalidAddress`] if the address is not a
+    /// dialable (QUIC) transport.
+    pub fn with_listen_addr(addr: &MultiAddr) -> Result<Self> {
+        // Validate this is a dialable transport
+        addr.dialable_socket_addr().ok_or_else(|| {
+            P2PError::Network(NetworkError::InvalidAddress(
+                format!(
+                    "only QUIC addresses are supported for listen, got {}: {}",
+                    addr.transport().kind(),
+                    addr
+                )
+                .into(),
+            ))
+        })?;
         let cfg = NodeConfig {
-            listen_addr,
-            listen_addrs: vec![listen_addr],
+            listen_addr: addr.clone(),
+            listen_addrs: vec![addr.clone()],
             diversity_config: None,
             ..Default::default()
         };
@@ -998,7 +1013,7 @@ impl P2PNode {
         self.transport.channel_id()
     }
 
-    pub fn local_addr(&self) -> Option<String> {
+    pub fn local_addr(&self) -> Option<MultiAddr> {
         self.transport.local_addr()
     }
 
@@ -1373,7 +1388,7 @@ impl P2PNode {
     }
 
     /// Get the current listen addresses
-    pub async fn listen_addrs(&self) -> Vec<std::net::SocketAddr> {
+    pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.transport.listen_addrs().await
     }
 
@@ -1392,9 +1407,9 @@ impl P2PNode {
         self.transport.peer_info(peer_id).await
     }
 
-    /// Get the channel ID for a given socket address, if connected (internal only).
+    /// Get the channel ID for a given address, if connected (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &MultiAddr) -> Option<String> {
         self.transport.get_channel_id_by_address(addr).await
     }
 
@@ -1429,7 +1444,7 @@ impl P2PNode {
     /// the authenticated peer identity, call
     /// [`wait_for_peer_identity`](Self::wait_for_peer_identity) with the
     /// returned channel ID.
-    pub async fn connect_peer(&self, address: &str) -> Result<String> {
+    pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
         self.transport.connect_peer(address).await
     }
 
@@ -1882,7 +1897,7 @@ impl P2PNode {
 
         for contact in bootstrap_contacts.iter() {
             for addr in &contact.addresses {
-                match self.connect_peer(&addr.to_string()).await {
+                match self.connect_peer(addr).await {
                     Ok(channel_id) => {
                         // Wait for the remote peer's signed identity announce
                         // so we get a real cryptographic PeerId.
@@ -2003,26 +2018,42 @@ impl Default for NodeBuilder {
 }
 
 impl NodeBuilder {
-    /// Create a new node builder
+    /// Create a new node builder.
+    ///
+    /// Starts with an empty `listen_addrs` list — callers must add at
+    /// least one via [`listen_on`](Self::listen_on).
     pub fn new() -> Self {
         Self {
-            config: NodeConfig::default(),
+            config: NodeConfig {
+                listen_addrs: Vec::new(),
+                ..NodeConfig::default()
+            },
         }
     }
 
-    /// Add a listen address
-    pub fn listen_on(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse() {
-            self.config.listen_addrs.push(multiaddr);
+    /// Add a listen address.
+    ///
+    /// Only QUIC addresses are accepted — non-QUIC addresses are skipped
+    /// with a warning. Use [`MultiAddr::quic`] to construct a QUIC address.
+    pub fn listen_on(mut self, addr: &MultiAddr) -> Self {
+        if addr.dialable_socket_addr().is_some() {
+            // First listen address also becomes the primary listen_addr.
+            if self.config.listen_addrs.is_empty() {
+                self.config.listen_addr = addr.clone();
+            }
+            self.config.listen_addrs.push(addr.clone());
+        } else {
+            tracing::warn!(
+                "NodeBuilder::listen_on: skipping non-QUIC address: {}",
+                addr
+            );
         }
         self
     }
 
-    /// Add a bootstrap peer
-    pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse::<crate::MultiAddr>() {
-            self.config.bootstrap_peers.push(multiaddr);
-        }
+    /// Add a bootstrap peer.
+    pub fn with_bootstrap_peer(mut self, addr: &MultiAddr) -> Self {
+        self.config.bootstrap_peers.push(addr.clone());
         self
     }
 
@@ -2183,15 +2214,17 @@ mod tests {
 
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
+        let ipv4_listen = MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ));
+        let ipv6_listen = MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            0,
+        ));
         NodeConfig {
-            listen_addrs: vec![
-                std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            ],
-            listen_addr: std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                0,
-            ),
+            listen_addrs: vec![ipv6_listen, ipv4_listen.clone()],
+            listen_addr: ipv4_listen,
             bootstrap_peers: vec![],
             enable_ipv6: true,
 
@@ -2335,7 +2368,7 @@ mod tests {
             .listen_addrs()
             .await
             .into_iter()
-            .find(|a| a.ip().is_ipv4())
+            .find(|a| a.is_ipv4())
             .ok_or_else(|| {
                 P2PError::Network(crate::error::NetworkError::InvalidAddress(
                     "Node 2 did not expose an IPv4 listen address".into(),
@@ -2344,9 +2377,7 @@ mod tests {
 
         // Connect to a real peer (unsigned — no node_identity configured).
         // connect_peer returns a transport-level channel ID (String), not a PeerId.
-        let channel_id = node1
-            .connect_peer(&MultiAddr::quic(node2_addr).to_string())
-            .await?;
+        let channel_id = node1.connect_peer(&node2_addr).await?;
 
         // Unauthenticated connections don't appear in the app-level peer maps.
         // Verify transport-level tracking via is_connection_active / peers map.
@@ -2375,7 +2406,8 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        let result = node.connect_peer("/ip4/127.0.0.1/tcp/1").await;
+        let tcp_addr: MultiAddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        let result = node.connect_peer(&tcp_addr).await;
 
         assert!(
             matches!(
@@ -2403,8 +2435,10 @@ mod tests {
         // PeerConnected/PeerDisconnected only fire for authenticated peers
         // (nodes with node_identity that send signed messages).
         // Configure both nodes with identities so the event subscription test works.
-        let ipv4_localhost =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let ipv4_localhost = MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ));
 
         let identity1 =
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node1"));
@@ -2412,14 +2446,14 @@ mod tests {
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node2"));
 
         let mut config1 = create_test_node_config();
-        config1.listen_addr = ipv4_localhost;
-        config1.listen_addrs = vec![ipv4_localhost];
+        config1.listen_addr = ipv4_localhost.clone();
+        config1.listen_addrs = vec![ipv4_localhost.clone()];
         config1.enable_ipv6 = false;
         config1.node_identity = Some(identity1);
 
         let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
-        config2.listen_addr = ipv4_localhost;
+        config2.listen_addr = ipv4_localhost.clone();
         config2.listen_addrs = vec![ipv4_localhost];
         config2.enable_ipv6 = false;
         config2.node_identity = Some(identity2);
@@ -2499,15 +2533,17 @@ mod tests {
     #[tokio::test]
     async fn test_message_sending() -> Result<()> {
         // Create two nodes
+        let localhost_quic = MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ));
         let mut config1 = create_test_node_config();
-        config1.listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        config1.listen_addr = localhost_quic.clone();
         let node1 = P2PNode::new(config1).await?;
         node1.start().await?;
 
         let mut config2 = create_test_node_config();
-        config2.listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        config2.listen_addr = localhost_quic;
         let node2 = P2PNode::new(config2).await?;
         node2.start().await?;
 
@@ -2642,11 +2678,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_node_builder() -> Result<()> {
+        let listen_v4: MultiAddr = "/ip4/127.0.0.1/udp/0/quic".parse().unwrap();
+        let listen_v6: MultiAddr = "/ip6/::1/udp/0/quic".parse().unwrap();
+        let bootstrap: MultiAddr = "/ip4/127.0.0.1/udp/9000/quic".parse().unwrap();
+
         // Create a config using the builder but don't actually build a real node
         let builder = P2PNode::builder()
-            .listen_on("/ip4/127.0.0.1/tcp/0")
-            .listen_on("/ip6/::1/tcp/0")
-            .with_bootstrap_peer("/ip4/127.0.0.1/udp/9000/quic")
+            .listen_on(&listen_v4)
+            .listen_on(&listen_v6)
+            .with_bootstrap_peer(&bootstrap)
             .with_ipv6(true)
             .with_connection_timeout(Duration::from_secs(15))
             .with_max_connections(200)
@@ -2654,7 +2694,7 @@ mod tests {
 
         // Test the configuration that was built
         let config = builder.config;
-        assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
+        assert_eq!(config.listen_addrs.len(), 2); // 2 QUIC addrs added by builder
         assert_eq!(config.bootstrap_peers.len(), 1);
         assert!(config.enable_ipv6);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
@@ -2797,7 +2837,8 @@ mod tests {
             .await;
 
         // Test: Find channel by address
-        let found_channel_id = node.get_channel_id_by_address(test_address).await;
+        let lookup_addr = MultiAddr::quic(test_address.parse().unwrap());
+        let found_channel_id = node.get_channel_id_by_address(&lookup_addr).await;
         assert_eq!(found_channel_id, Some(test_channel_id));
 
         Ok(())
@@ -2809,7 +2850,8 @@ mod tests {
         let node = P2PNode::new(config).await?;
 
         // Test: Try to find a channel that doesn't exist
-        let result = node.get_channel_id_by_address("192.168.1.200:9000").await;
+        let unknown_addr = MultiAddr::quic("192.168.1.200:9000".parse().unwrap());
+        let result = node.get_channel_id_by_address(&unknown_addr).await;
         assert_eq!(result, None);
 
         Ok(())
@@ -2820,8 +2862,12 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Test: Invalid address format should return None
-        let result = node.get_channel_id_by_address("invalid-address").await;
+        // Test: Non-IP address should return None (no matching socket addr)
+        let ble_addr = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let result = node.get_channel_id_by_address(&ble_addr).await;
         assert_eq!(result, None);
 
         Ok(())
@@ -2869,8 +2915,12 @@ mod tests {
             .await;
 
         // Test: Find each channel by their unique address
-        let found_peer1 = node.get_channel_id_by_address(peer1_addr_str).await;
-        let found_peer2 = node.get_channel_id_by_address(peer2_addr_str).await;
+        let found_peer1 = node
+            .get_channel_id_by_address(&MultiAddr::quic(peer1_addr_str.parse().unwrap()))
+            .await;
+        let found_peer2 = node
+            .get_channel_id_by_address(&MultiAddr::quic(peer2_addr_str.parse().unwrap()))
+            .await;
 
         assert_eq!(found_peer1, Some(peer1_id));
         assert_eq!(found_peer2, Some(peer2_id));

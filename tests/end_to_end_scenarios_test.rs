@@ -26,7 +26,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 
-use saorsa_core::{NodeConfig, P2PNode};
+use saorsa_core::{MultiAddr, NodeConfig, P2PNode};
 
 /// Simplified test user for basic integration testing
 struct TestUser {
@@ -39,8 +39,8 @@ struct TestUser {
 impl TestUser {
     async fn new(username: String) -> Result<Self> {
         // Bind to an ephemeral port to avoid CI flakiness from port collisions.
-        let listen_addr = "127.0.0.1:0";
-        let mut config = NodeConfig::with_listen_addr(listen_addr)?;
+        let listen_addr: MultiAddr = "/ip4/127.0.0.1/udp/0/quic".parse().unwrap();
+        let mut config = NodeConfig::with_listen_addr(&listen_addr)?;
         config.bootstrap_peers.clear();
 
         let peer_id = format!("test_user_{}", username);

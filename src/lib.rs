@@ -39,7 +39,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let addr = "/ip4/127.0.0.1/udp/9000/quic".parse::<MultiAddr>()?;
 //!     let node = P2PNode::builder()
-//!         .listen_on(addr)
+//!         .listen_on(&addr)
 //!         .with_mcp_server()
 //!         .build()
 //!         .await?;

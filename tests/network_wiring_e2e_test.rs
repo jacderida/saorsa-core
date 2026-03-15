@@ -19,6 +19,7 @@
 //!
 //! Run with: cargo test --test network_wiring_e2e_test -- --nocapture
 
+use saorsa_core::MultiAddr;
 use saorsa_core::PeerId;
 use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, P2PEvent, P2PNode};
@@ -45,16 +46,10 @@ fn create_test_node_config() -> NodeConfig {
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        listen_addr: "127.0.0.1:0"
-            .parse()
-            .unwrap_or_else(|_| panic!("Test setup error: hardcoded address should parse")),
+        listen_addr: MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
         listen_addrs: vec![
-            "127.0.0.1:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv4 address should parse")
-            }),
-            "[::]:0".parse().unwrap_or_else(|_| {
-                panic!("Test setup error: hardcoded IPv6 address should parse")
-            }),
+            MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         bootstrap_peers: vec![],
         node_identity: Some(identity),
@@ -96,11 +91,8 @@ where
 /// [`PeerId`] in its `connected_peers()` list. Returns `to`'s [`PeerId`].
 async fn connect_and_identify(from: &P2PNode, to: &P2PNode) -> PeerId {
     let addrs = to.listen_addrs().await;
-    let addr = addrs
-        .first()
-        .expect("target node needs a listen address")
-        .to_string();
-    let channel_id = from.connect_peer(&addr).await.expect("connect_peer failed");
+    let addr = addrs.first().expect("target node needs a listen address");
+    let channel_id = from.connect_peer(addr).await.expect("connect_peer failed");
     let peer_id = from
         .wait_for_peer_identity(&channel_id, Duration::from_secs(5))
         .await
@@ -144,10 +136,7 @@ async fn test_two_node_message_exchange() {
 
     // Get node2's address
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2
-        .first()
-        .expect("Node2 should have a listen address")
-        .to_string();
+    let addr2 = addrs2.first().expect("Node2 should have a listen address");
 
     info!("Node1 connecting to Node2 at {}", addr2);
 
@@ -304,7 +293,7 @@ async fn test_bidirectional_message_exchange() {
 
     // Connect node1 to node2
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
     let _channel_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
     // Wait for auto identity announce to authenticate node1 on node2
@@ -614,8 +603,8 @@ async fn test_three_node_dht_routing() {
     let addrs_a = node_a.listen_addrs().await;
     let addrs_b = node_b.listen_addrs().await;
 
-    let _addr_a = addrs_a.first().expect("Node A needs address").to_string();
-    let addr_b = addrs_b.first().expect("Node B needs address").to_string();
+    let _addr_a = addrs_a.first().expect("Node A needs address");
+    let addr_b = addrs_b.first().expect("Node B needs address");
 
     // Connect: A <-> B <-> C (A and C not directly connected)
     let _peer_b_from_a = node_a
@@ -752,7 +741,7 @@ async fn test_event_subscription_sanity() {
     let mut events2 = node2.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
 
     node1.connect_peer(&addr2).await.expect("Connect failed");
 
@@ -800,7 +789,7 @@ async fn test_simple_ping_pong() {
 
     // Connect node1 to node2
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
     let _channel_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
     // Wait for auto identity announce to authenticate both sides
@@ -1024,7 +1013,7 @@ async fn test_reconnection_works() {
     node2.start().await.expect("Failed to start node2");
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
 
     // First connection
     let peer2_peer_id = connect_and_identify(&node1, &node2).await;
@@ -1091,7 +1080,7 @@ async fn test_peer_events_sequence() {
     let mut events2 = node2.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
 
     // Connect — auto identity announce triggers PeerConnected on node2
     node1.connect_peer(&addr2).await.expect("Connect failed");
@@ -1289,7 +1278,7 @@ async fn test_no_duplicate_disconnect_events() {
     let mut events1 = node1.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
     let _channel_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
     // Wait for connection to stabilize
@@ -1499,7 +1488,7 @@ async fn test_rapid_reconnection_stress() {
     node2.start().await.expect("Failed to start node2");
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
 
     // Perform multiple rapid connections
     let cycles = 10;
@@ -1554,7 +1543,7 @@ async fn test_concurrent_message_flood() {
     let mut events2 = node2.subscribe_events();
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
     node1.connect_peer(&addr2).await.expect("Connect failed");
 
     // Wait for auto identity announce to authenticate both sides
@@ -1718,7 +1707,7 @@ async fn test_send_to_disconnecting_peer() {
     let node3 = P2PNode::new(config3).await.expect("Failed to create node3");
     node3.start().await.expect("Failed to start node3");
     let addrs3 = node3.listen_addrs().await;
-    let addr3 = addrs3.first().expect("Need address").to_string();
+    let addr3 = addrs3.first().expect("Need address");
 
     let connect_result = node1.connect_peer(&addr3).await;
     assert!(
@@ -1973,7 +1962,7 @@ async fn test_graceful_shutdown() {
     node2.start().await.expect("Failed to start node2");
 
     let addrs2 = node2.listen_addrs().await;
-    let addr2 = addrs2.first().expect("Need address").to_string();
+    let addr2 = addrs2.first().expect("Need address");
     let _peer2_id = node1.connect_peer(&addr2).await.expect("Connect failed");
 
     sleep(Duration::from_millis(200)).await;

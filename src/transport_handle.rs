@@ -90,8 +90,17 @@ impl TransportConfig {
         event_channel_capacity: usize,
         node_identity: Arc<NodeIdentity>,
     ) -> Self {
+        // Extract SocketAddr at the transport boundary — saorsa-transport
+        // binds on SocketAddr. Fallback to unspecified if non-IP (shouldn't
+        // happen with QUIC-only listen addrs, but safe to handle).
+        let listen_addr = config
+            .listen_addr
+            .dialable_socket_addr()
+            .unwrap_or_else(|| {
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            });
         Self {
-            listen_addr: config.listen_addr,
+            listen_addr,
             enable_ipv6: config.enable_ipv6,
             connection_timeout: config.connection_timeout,
             max_connections: config.max_connections,
@@ -116,7 +125,7 @@ pub struct TransportHandle {
     peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
     active_connections: Arc<RwLock<HashSet<String>>>,
     event_tx: broadcast::Sender<P2PEvent>,
-    listen_addrs: RwLock<Vec<SocketAddr>>,
+    listen_addrs: RwLock<Vec<MultiAddr>>,
     rate_limiter: Arc<RateLimiter>,
     active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
     // Held to keep the Arc alive for background tasks that captured a clone.
@@ -362,19 +371,19 @@ impl TransportHandle {
     /// This is the transport-level connection identifier. It differs from
     /// `peer_id()` which is the app-level cryptographic identity.
     pub(crate) fn channel_id(&self) -> Option<String> {
-        self.local_addr()
+        self.local_addr().map(|a| a.to_string())
     }
 
     /// Get the first listen address as a string.
-    pub fn local_addr(&self) -> Option<String> {
+    pub fn local_addr(&self) -> Option<MultiAddr> {
         self.listen_addrs
             .try_read()
             .ok()
-            .and_then(|addrs| addrs.first().map(|a| MultiAddr::quic(*a).to_string()))
+            .and_then(|addrs| addrs.first().cloned())
     }
 
     /// Get all current listen addresses.
-    pub async fn listen_addrs(&self) -> Vec<SocketAddr> {
+    pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.listen_addrs.read().await.clone()
     }
 
@@ -437,15 +446,15 @@ impl TransportHandle {
         self.peers.read().await.get(channel_id).cloned()
     }
 
-    /// Get the channel ID for a given socket address, if connected (internal only).
+    /// Get the channel ID for a given address, if connected (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
-        let socket_addr: SocketAddr = addr.parse().ok()?;
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &MultiAddr) -> Option<String> {
+        let target = addr.socket_addr()?;
         let peers = self.peers.read().await;
 
         for (channel_id, peer_info) in peers.iter() {
             for peer_addr in &peer_info.addresses {
-                if peer_addr.socket_addr() == Some(socket_addr) {
+                if peer_addr.socket_addr() == Some(target) {
                     return Some(channel_id.clone());
                 }
             }
@@ -559,9 +568,9 @@ impl TransportHandle {
 impl TransportHandle {
     /// Connect to a peer at the given address.
     ///
-    /// Accepts canonical MultiAddr format (e.g.
-    /// `/ip4/1.2.3.4/udp/9000/quic`).
-    pub async fn connect_peer(&self, address: &str) -> Result<String> {
+    /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
+    /// return [`NetworkError::InvalidAddress`].
+    pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
         // Check production limits if resource manager is enabled
         let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
             Some(resource_manager.acquire_connection().await?)
@@ -569,17 +578,12 @@ impl TransportHandle {
             None
         };
 
-        // Parse via MultiAddr and require a dialable (QUIC) transport.
-        let parsed = address.parse::<MultiAddr>().map_err(|e| {
-            P2PError::Network(NetworkError::InvalidAddress(
-                format!("{}: {}", address, e).into(),
-            ))
-        })?;
-        let socket_addr = parsed.dialable_socket_addr().ok_or_else(|| {
+        // Require a dialable (QUIC) transport.
+        let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
             P2PError::Network(NetworkError::InvalidAddress(
                 format!(
                     "only QUIC transport is supported for connect, got {}: {}",
-                    parsed.transport().kind(),
+                    address.transport().kind(),
                     address
                 )
                 .into(),
@@ -638,7 +642,7 @@ impl TransportHandle {
 
         let peer_info = PeerInfo {
             channel_id: peer_id.clone(),
-            addresses: vec![parsed.clone()],
+            addresses: vec![address.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -1270,14 +1274,15 @@ impl TransportHandle {
     /// Start network listeners on the dual-stack transport.
     pub async fn start_network_listeners(&self) -> Result<()> {
         info!("Starting dual-stack listeners (saorsa-transport)...");
-        let addrs = self.dual_node.local_addrs().await.map_err(|e| {
+        let socket_addrs = self.dual_node.local_addrs().await.map_err(|e| {
             P2PError::Transport(crate::error::TransportError::SetupFailed(
                 format!("Failed to get local addresses: {}", e).into(),
             ))
         })?;
+        let addrs: Vec<SocketAddr> = socket_addrs.clone();
         {
             let mut la = self.listen_addrs.write().await;
-            *la = addrs.clone();
+            *la = socket_addrs.into_iter().map(MultiAddr::quic).collect();
         }
 
         let peers = self.peers.clone();

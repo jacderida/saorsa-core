@@ -8,6 +8,7 @@
 //! - is_peer_connected() validates authenticated peer state
 //! - send_message() checks connection state before sending
 
+use saorsa_core::MultiAddr;
 use saorsa_core::network::{NodeConfig, P2PNode};
 use tracing::info;
 
@@ -26,10 +27,10 @@ async fn test_connection_lifecycle_infrastructure_exists() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };

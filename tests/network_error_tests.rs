@@ -15,6 +15,7 @@
 
 //! Network module error handling tests
 
+use saorsa_core::MultiAddr;
 use saorsa_core::Result;
 use saorsa_core::error::{NetworkError, P2PError};
 use saorsa_core::network::{NodeConfig as P2PNodeConfig, P2PNode};
@@ -50,8 +51,8 @@ async fn test_network_config_with_invalid_addresses() {
     // Test that config creation handles invalid addresses gracefully
     let _config = P2PNodeConfig::default();
 
-    // This should not panic
-    let result = P2PNodeConfig::with_listen_addr("invalid:address");
+    // This should not panic — parsing an invalid address into MultiAddr fails
+    let result = "invalid:address".parse::<MultiAddr>();
     assert!(result.is_err());
 }
 
@@ -60,7 +61,7 @@ async fn test_bind_error_handling() {
     // Test that binding to an invalid address returns proper error
     // Try to bind to a privileged port (should fail without root)
     let config = P2PNodeConfig {
-        listen_addr: "127.0.0.1:80".parse().expect("valid test address"),
+        listen_addr: MultiAddr::quic("127.0.0.1:80".parse().expect("valid socket address")),
         ..Default::default()
     };
 
@@ -84,7 +85,8 @@ async fn test_connection_failure_handling() {
     };
 
     // Try to connect to non-existent peer
-    let result = node.connect_peer("192.168.255.255:9999").await;
+    let addr: MultiAddr = "/ip4/192.168.255.255/udp/9999/quic".parse().unwrap();
+    let result = node.connect_peer(&addr).await;
     assert!(result.is_err());
 }
 

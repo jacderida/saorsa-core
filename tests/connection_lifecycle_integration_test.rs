@@ -13,6 +13,7 @@
 //! - Keepalive messages every 15 seconds to prevent 30-second idle timeout
 //! - Automatic stale connection cleanup
 
+use saorsa_core::MultiAddr;
 use saorsa_core::network::{NodeConfig, P2PNode};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -47,18 +48,18 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Create two P2P nodes with different ports (port 0 = OS-assigned)
     let config1 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
@@ -80,11 +81,10 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Connect node1 to node2
     let addr2 = addrs2.first().expect("Node2 should have an address");
-    let addr2_str = addr2.to_string();
-    debug!("Connecting node1 to node2 at {}", addr2_str);
+    debug!("Connecting node1 to node2 at {}", addr2);
 
     let channel_id = node1
-        .connect_peer(&addr2_str)
+        .connect_peer(addr2)
         .await
         .expect("Failed to connect to node2");
 
@@ -174,18 +174,18 @@ async fn test_send_message_validates_connection_state() {
 
     // Create two P2P nodes with OS-assigned ports (port 0)
     let config1 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
@@ -198,10 +198,8 @@ async fn test_send_message_validates_connection_state() {
     // Get addresses and connect
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Node2 should have an address");
-    let addr2_str = addr2.to_string();
-
     let channel_id = node1
-        .connect_peer(&addr2_str)
+        .connect_peer(addr2)
         .await
         .expect("Failed to connect to node2");
 
@@ -264,18 +262,18 @@ async fn test_multiple_message_exchanges() {
 
     // Create two P2P nodes with OS-assigned ports (port 0)
     let config1 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addr: "0.0.0.0:0".parse().expect("Invalid address"),
+        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
-            "0.0.0.0:0".parse().expect("Invalid address"),
-            "[::]:0".parse().expect("Invalid address"),
+            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
+            MultiAddr::quic("[::]:0".parse().unwrap()),
         ],
         ..Default::default()
     };
@@ -288,10 +286,8 @@ async fn test_multiple_message_exchanges() {
     // Connect nodes
     let addrs2 = node2.listen_addrs().await;
     let addr2 = addrs2.first().expect("Node2 should have an address");
-    let addr2_str = addr2.to_string();
-
     let channel_id = node1
-        .connect_peer(&addr2_str)
+        .connect_peer(addr2)
         .await
         .expect("Failed to connect to node2");
 

@@ -37,6 +37,7 @@
 //! node IDs), not raw transport-level channel IDs.
 
 use anyhow::Result;
+use saorsa_core::MultiAddr;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use saorsa_core::identity::node_identity::NodeIdentity;
@@ -117,7 +118,10 @@ async fn create_test_manager(name: &str) -> Result<(Arc<DhtNetworkManager>, Arc<
 /// need to connect and wait for the announces to propagate.
 ///
 /// Returns the channel ID from the initial connection.
-async fn authenticate_bidirectional(manager_a: &DhtNetworkManager, addr_b: &str) -> Result<String> {
+async fn authenticate_bidirectional(
+    manager_a: &DhtNetworkManager,
+    addr_b: &MultiAddr,
+) -> Result<String> {
     let channel_id_b = manager_a.connect_to_peer(addr_b).await?;
     // Auto identity announce handles bidirectional authentication.
     sleep(AUTH_PROPAGATION_DELAY).await;

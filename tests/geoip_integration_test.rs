@@ -1,3 +1,4 @@
+use saorsa_core::MultiAddr;
 use saorsa_core::control::RejectionMessage;
 use saorsa_core::identity::rejection::RejectionReason;
 use saorsa_core::network::{NodeConfig, P2PNode};
@@ -9,15 +10,15 @@ use tokio::time::Duration;
 async fn test_geoip_rejection_flow() {
     // 1. Setup Node A (The Rejector)
     let mut config_a = NodeConfig::new().unwrap();
-    config_a.listen_addr = "127.0.0.1:0".parse().unwrap();
+    config_a.listen_addr = MultiAddr::quic("127.0.0.1:0".parse().unwrap());
     config_a.enable_ipv6 = false;
     let node_a = P2PNode::new(config_a).await.unwrap();
     node_a.start().await.unwrap();
-    let addr_a = node_a.listen_addrs().await[0];
+    let addr_a = node_a.listen_addrs().await[0].clone();
 
     // 2. Setup Node B (The Victim)
     let mut config_b = NodeConfig::new().unwrap();
-    config_b.listen_addr = "127.0.0.1:0".parse().unwrap();
+    config_b.listen_addr = MultiAddr::quic("127.0.0.1:0".parse().unwrap());
     config_b.enable_ipv6 = false;
     let node_b = P2PNode::new(config_b).await.unwrap();
     node_b.start().await.unwrap();
@@ -41,7 +42,7 @@ async fn test_geoip_rejection_flow() {
     let mut event_rx = node_b.subscribe_events();
 
     // 3. Connect Node B to Node A
-    let channel_id_a = node_b.connect_peer(&addr_a.to_string()).await.unwrap();
+    let channel_id_a = node_b.connect_peer(&addr_a).await.unwrap();
 
     // Wait for identity exchange to complete (bidirectional). Once Node B sees
     // Node A's identity, Node A should also know Node B's PeerId.

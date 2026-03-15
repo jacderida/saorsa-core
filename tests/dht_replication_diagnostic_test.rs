@@ -91,7 +91,10 @@ async fn test_cross_node_replication_diagnostic() -> Result<()> {
     info!("\nStarting all nodes...");
     for (i, node) in nodes.iter().enumerate() {
         node.start().await?;
-        let addr = node.local_addr().unwrap_or_else(|| "unknown".to_string());
+        let addr = node
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         info!("  Node {} started at {}", i, addr);
     }
 

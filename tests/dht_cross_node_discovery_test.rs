@@ -266,7 +266,12 @@ async fn test_three_node_peer_discovery() -> Result<()> {
         .local_addr()
         .ok_or_else(|| anyhow::anyhow!("Node A has no listen address"))?;
 
-    register_peer_in_dht(&manager_a, manager_a.peer_id(), vec![node_a_addr.clone()]).await?;
+    register_peer_in_dht(
+        &manager_a,
+        manager_a.peer_id(),
+        vec![node_a_addr.to_string()],
+    )
+    .await?;
 
     // Wait for DHT propagation
     info!("Waiting for DHT propagation...");
@@ -285,7 +290,7 @@ async fn test_three_node_peer_discovery() -> Result<()> {
                 addresses
             );
             assert!(
-                addresses.contains(&node_a_addr),
+                addresses.contains(&node_a_addr.to_string()),
                 "Discovered addresses should include Node A's actual address"
             );
         }
@@ -477,7 +482,7 @@ async fn test_concurrent_peer_registration() -> Result<()> {
         };
 
         let handle = tokio::spawn(async move {
-            register_peer_in_dht(&manager_clone, &peer_id, vec![addr]).await
+            register_peer_in_dht(&manager_clone, &peer_id, vec![addr.to_string()]).await
         });
         registration_handles.push(handle);
     }
@@ -611,7 +616,7 @@ async fn test_node_discovery_after_join() -> Result<()> {
         let addr = manager
             .local_addr()
             .ok_or_else(|| anyhow::anyhow!("Manager {} has no local address", manager.peer_id()))?;
-        register_peer_in_dht(manager, manager.peer_id(), vec![addr]).await?;
+        register_peer_in_dht(manager, manager.peer_id(), vec![addr.to_string()]).await?;
     }
 
     // Wait for DHT propagation
@@ -714,7 +719,7 @@ async fn test_discovery_with_node_departure() -> Result<()> {
         let addr = manager
             .local_addr()
             .ok_or_else(|| anyhow::anyhow!("Manager {} has no local address", manager.peer_id()))?;
-        register_peer_in_dht(manager, manager.peer_id(), vec![addr]).await?;
+        register_peer_in_dht(manager, manager.peer_id(), vec![addr.to_string()]).await?;
     }
 
     // Wait for DHT propagation

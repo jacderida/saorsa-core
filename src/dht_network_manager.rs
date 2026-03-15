@@ -1403,7 +1403,7 @@ impl DhtNetworkManager {
     fn local_dht_node(&self) -> DHTNode {
         DHTNode {
             peer_id: self.config.peer_id,
-            address: MultiAddr::quic(self.config.node_config.listen_addr),
+            address: self.config.node_config.listen_addr.clone(),
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1783,8 +1783,7 @@ impl DhtNetworkManager {
             .transport
             .connection_timeout()
             .min(self.config.request_timeout);
-        let address_str = address.to_string();
-        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(&address_str)).await {
+        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(address)).await {
             Ok(Ok(channel_id)) => {
                 debug!(
                     "dial_candidate: connected to {} at {} (channel {})",
@@ -2615,7 +2614,7 @@ impl DhtNetworkManager {
     /// Get the local listen address of this node's P2P network
     ///
     /// Returns the address other nodes can use to connect to this node.
-    pub fn local_addr(&self) -> Option<String> {
+    pub fn local_addr(&self) -> Option<MultiAddr> {
         self.transport.local_addr()
     }
 
@@ -2643,7 +2642,7 @@ impl DhtNetworkManager {
     /// Connect to a specific peer by address.
     ///
     /// This is useful for manually building network topology in tests.
-    pub async fn connect_to_peer(&self, address: &str) -> Result<String> {
+    pub async fn connect_to_peer(&self, address: &MultiAddr) -> Result<String> {
         self.transport.connect_peer(address).await
     }
 

@@ -5,11 +5,12 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 
+use saorsa_core::MultiAddr;
 use saorsa_core::config::Config;
 use saorsa_core::network::P2PNode as Node;
 
@@ -48,26 +49,30 @@ impl NetworkTestFramework {
         })
     }
 
-    async fn node_peer_addr(&self, node_index: usize) -> Result<String> {
+    async fn node_peer_addr(&self, node_index: usize) -> Result<MultiAddr> {
         let listen_addrs = self.nodes[node_index].listen_addrs().await;
-        let addr: SocketAddr = listen_addrs
+        let addr = listen_addrs
             .iter()
-            .copied()
-            .find(|a| a.ip().is_ipv4())
-            .or_else(|| listen_addrs.first().copied())
+            .find(|a| a.ip().map_or(false, |ip| ip.is_ipv4()))
+            .or_else(|| listen_addrs.first())
+            .cloned()
             .with_context(|| format!("Node {} has no listen addresses", node_index))?;
 
-        let normalized = match addr.ip() {
+        // Normalize unspecified addresses to localhost
+        let sa = addr
+            .socket_addr()
+            .with_context(|| "MultiAddr has no socket address")?;
+        let normalized_sa = match sa.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+                std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sa.port())
             }
             IpAddr::V6(ip) if ip.is_unspecified() => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port())
+                std::net::SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), sa.port())
             }
-            _ => addr,
+            _ => sa,
         };
 
-        Ok(normalized.to_string())
+        Ok(MultiAddr::quic(normalized_sa))
     }
 
     async fn start_all_nodes(&self) -> Result<()> {
