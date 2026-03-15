@@ -1498,13 +1498,13 @@ impl DhtCoreEngine {
                 let cfg = &self.ip_diversity_config;
                 let limit_32 = cfg
                     .max_nodes_per_ipv4_32
-                    .map_or(per_ip, |cap| cap.min(per_ip));
+                    .map_or(per_ip, |cap| cap.max(per_ip));
                 let limit_24 = cfg
                     .max_nodes_per_ipv4_24
-                    .map_or(per_ip * 3, |cap| cap.min(per_ip * 3));
+                    .map_or(per_ip * 3, |cap| cap.max(per_ip * 3));
                 let limit_16 = cfg
                     .max_nodes_per_ipv4_16
-                    .map_or(per_ip * 10, |cap| cap.min(per_ip * 10));
+                    .map_or(per_ip * 10, |cap| cap.max(per_ip * 10));
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
