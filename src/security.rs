@@ -236,17 +236,21 @@ pub struct IPDiversityConfig {
     pub max_nodes_per_32: usize,
 
     // === IPv4 subnet limits ===
-    /// Optional hard cap on nodes per single IPv4 address (/32).
+    /// Optional guaranteed minimum for nodes per single IPv4 address (/32).
     /// When `None` (default), the dynamic per-IP limit is used alone.
-    /// When `Some(n)`, the effective limit is `min(n, dynamic_per_ip)`.
+    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip)`,
+    /// ensuring at least `n` nodes are allowed even when the dynamic
+    /// formula yields a lower value (e.g. during bootstrap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_32: Option<usize>,
-    /// Optional hard cap on nodes per /24 subnet (Class C).
+    /// Optional guaranteed minimum for nodes per /24 subnet (Class C).
     /// When `None` (default), `dynamic_per_ip * 3` is used alone.
+    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip * 3)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_24: Option<usize>,
-    /// Optional hard cap on nodes per /16 subnet (Class B).
+    /// Optional guaranteed minimum for nodes per /16 subnet (Class B).
     /// When `None` (default), `dynamic_per_ip * 10` is used alone.
+    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip * 10)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_16: Option<usize>,
 
@@ -383,10 +387,15 @@ impl IPDiversityConfig {
             max_nodes_per_64: 100,  // Allow many nodes per /64 subnet
             max_nodes_per_48: 500,  // Allow many nodes per /48 allocation
             max_nodes_per_32: 1000, // Allow many nodes per /32 region
-            // IPv4 — no static caps for testnet (dynamic limits suffice)
-            max_nodes_per_ipv4_32: None,
-            max_nodes_per_ipv4_24: None,
-            max_nodes_per_ipv4_16: None,
+            // IPv4 — guaranteed minimums prevent bootstrap deadlock when
+            // many nodes share few public IPs (e.g. 10 nodes per VM).
+            // Without these, the dynamic per-IP formula starts at 1 for
+            // small networks and never grows past the number of unique IPs.
+            // The merge logic uses max(static, dynamic) so these act as
+            // floors, not ceilings.
+            max_nodes_per_ipv4_32: Some(100),
+            max_nodes_per_ipv4_24: Some(500),
+            max_nodes_per_ipv4_16: Some(1000),
             // Network-relative limits (relaxed for testnet)
             max_per_ip_cap: 100,       // Higher cap for testing
             max_network_fraction: 0.1, // Allow 10% of network from one IP (relaxed from 0.5%)
@@ -1024,15 +1033,15 @@ impl IPDiversityEnforcer {
         let limit_32 = self
             .config
             .max_nodes_per_ipv4_32
-            .map_or(per_ip_limit, |cap| cap.min(per_ip_limit));
+            .map_or(per_ip_limit, |floor| floor.max(per_ip_limit));
         let limit_24 = self
             .config
             .max_nodes_per_ipv4_24
-            .map_or(per_ip_limit * 3, |cap| cap.min(per_ip_limit * 3));
+            .map_or(per_ip_limit * 3, |floor| floor.max(per_ip_limit * 3));
         let limit_16 = self
             .config
             .max_nodes_per_ipv4_16
-            .map_or(per_ip_limit * 10, |cap| cap.min(per_ip_limit * 10));
+            .map_or(per_ip_limit * 10, |floor| floor.max(per_ip_limit * 10));
 
         // Apply stricter limits for hosting/VPN providers
         let (limit_32, limit_24, limit_16) =
