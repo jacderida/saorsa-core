@@ -8,7 +8,7 @@ async fn verify_security_dashboard_wiring() {
     // 1. configuration
     let mut config = NodeConfig::new().expect("Failed to create default config");
     // Use ephemeral port to avoid conflicts
-    config.listen_addr = MultiAddr::quic("127.0.0.1:0".parse().unwrap());
+    config.listen_addrs = vec![MultiAddr::quic("127.0.0.1:0".parse().unwrap())];
     // Ensure DHT is enabled (it is by default in my simpler if true block, but good to be safe)
     config.dht_config.k_value = 8;
 

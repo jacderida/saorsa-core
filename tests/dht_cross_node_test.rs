@@ -39,7 +39,6 @@ async fn create_test_dht_config(
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .listen_port(port)
-        .ipv6(false)
         .allow_loopback(true)
         .build()
         .expect("Failed to build NodeConfig");
@@ -194,7 +193,6 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     let arch_peer = saorsa_core::PeerId::from_name("architecture_test_node");
     let node_config = NodeConfig::builder()
         .listen_port(0)
-        .ipv6(false)
         .allow_loopback(true)
         .build()?;
 
@@ -255,7 +253,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
 #[tokio::test]
 async fn test_p2p_node_local_dht_only() -> Result<()> {
     // Create P2PNode (transport layer only)
-    let node_config = NodeConfig::builder().listen_port(0).ipv6(false).build()?;
+    let node_config = NodeConfig::builder().listen_port(0).build()?;
 
     let node = P2PNode::new(node_config).await?;
 

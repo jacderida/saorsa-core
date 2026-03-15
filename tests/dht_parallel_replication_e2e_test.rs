@@ -40,7 +40,6 @@ async fn create_test_dht_config(
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .listen_port(port)
-        .ipv6(false)
         .allow_loopback(true)
         .build()
         .expect("Failed to build NodeConfig");

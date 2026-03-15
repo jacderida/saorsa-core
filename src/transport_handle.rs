@@ -56,10 +56,9 @@ const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
-    /// Primary listen address.
-    pub listen_addr: SocketAddr,
-    /// Whether IPv6 dual-stack is enabled.
-    pub enable_ipv6: bool,
+    /// Addresses to bind on. The transport partitions these into at most
+    /// one IPv4 and one IPv6 QUIC endpoint.
+    pub listen_addrs: Vec<MultiAddr>,
     /// Connection timeout for outbound dials and sends.
     pub connection_timeout: Duration,
     /// Maximum concurrent connections.
@@ -90,18 +89,8 @@ impl TransportConfig {
         event_channel_capacity: usize,
         node_identity: Arc<NodeIdentity>,
     ) -> Self {
-        // Extract SocketAddr at the transport boundary — saorsa-transport
-        // binds on SocketAddr. Fallback to unspecified if non-IP (shouldn't
-        // happen with QUIC-only listen addrs, but safe to handle).
-        let listen_addr = config
-            .listen_addr
-            .dialable_socket_addr()
-            .unwrap_or_else(|| {
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-            });
         Self {
-            listen_addr,
-            enable_ipv6: config.enable_ipv6,
+            listen_addrs: config.listen_addrs.clone(),
             connection_timeout: config.connection_timeout,
             max_connections: config.max_connections,
             production_config: config.production_config.clone(),
@@ -168,33 +157,19 @@ impl TransportHandle {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
 
         // Initialize dual-stack saorsa-transport nodes
-        let (v6_opt, v4_opt) = {
-            let port = config.listen_addr.port();
-            let ip = config.listen_addr.ip();
-
-            let v4_addr = if ip.is_ipv4() {
-                Some(SocketAddr::new(ip, port))
-            } else {
-                Some(SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    port,
-                ))
-            };
-
-            let v6_addr = if config.enable_ipv6 {
-                if ip.is_ipv6() {
-                    Some(SocketAddr::new(ip, port))
-                } else {
-                    Some(SocketAddr::new(
-                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                        port,
-                    ))
+        // Partition listen addresses into first IPv4 and first IPv6 for
+        // dual-stack binding. Non-IP addresses are skipped.
+        let mut v4_opt: Option<SocketAddr> = None;
+        let mut v6_opt: Option<SocketAddr> = None;
+        for addr in &config.listen_addrs {
+            if let Some(sa) = addr.dialable_socket_addr() {
+                match sa.ip() {
+                    std::net::IpAddr::V4(_) if v4_opt.is_none() => v4_opt = Some(sa),
+                    std::net::IpAddr::V6(_) if v6_opt.is_none() => v6_opt = Some(sa),
+                    _ => {} // already have one for this family
                 }
-            } else {
-                None
-            };
-            (v6_addr, v4_addr)
-        };
+            }
+        }
 
         let dual_node = Arc::new(
             DualStackNetworkNode::new_with_options(

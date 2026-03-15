@@ -44,7 +44,6 @@ async fn create_node_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtN
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
         .listen_port(0) // Ephemeral port
-        .ipv6(false)
         .allow_loopback(true)
         .build()?;
 

@@ -1401,9 +1401,21 @@ impl DhtNetworkManager {
     /// K-closest results. The local node always participates in distance
     /// ranking but is never queried over the network.
     fn local_dht_node(&self) -> DHTNode {
+        let address = self
+            .config
+            .node_config
+            .listen_addrs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                MultiAddr::quic(std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    0,
+                ))
+            });
         DHTNode {
             peer_id: self.config.peer_id,
-            address: self.config.node_config.listen_addr.clone(),
+            address,
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }

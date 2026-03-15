@@ -21,7 +21,6 @@ async fn create_node_with_transport(
     let identity = Arc::new(NodeIdentity::generate().unwrap());
     let node_config = NodeConfig::builder()
         .listen_port(0)
-        .ipv6(false)
         .allow_loopback(true)
         .build()
         .expect("Failed to build NodeConfig");

@@ -46,7 +46,6 @@ fn create_test_node_config() -> NodeConfig {
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        listen_addr: MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
         listen_addrs: vec![
             MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
             MultiAddr::quic("[::]:0".parse().unwrap()),

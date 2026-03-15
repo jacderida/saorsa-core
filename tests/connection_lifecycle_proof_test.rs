@@ -27,7 +27,6 @@ async fn test_connection_lifecycle_infrastructure_exists() {
 
     // Create a P2P node with OS-assigned ports (port 0)
     let config = NodeConfig {
-        listen_addr: MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
         listen_addrs: vec![
             MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
             MultiAddr::quic("[::]:0".parse().unwrap()),

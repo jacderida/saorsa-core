@@ -73,7 +73,6 @@ async fn create_test_dht_config(
 
     let node_config = NodeConfig::builder()
         .listen_port(0) // Random port
-        .ipv6(false)
         .allow_loopback(true)
         .build()?;
 

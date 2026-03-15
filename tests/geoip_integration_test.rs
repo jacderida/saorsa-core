@@ -10,16 +10,14 @@ use tokio::time::Duration;
 async fn test_geoip_rejection_flow() {
     // 1. Setup Node A (The Rejector)
     let mut config_a = NodeConfig::new().unwrap();
-    config_a.listen_addr = MultiAddr::quic("127.0.0.1:0".parse().unwrap());
-    config_a.enable_ipv6 = false;
+    config_a.listen_addrs = vec![MultiAddr::quic("127.0.0.1:0".parse().unwrap())];
     let node_a = P2PNode::new(config_a).await.unwrap();
     node_a.start().await.unwrap();
     let addr_a = node_a.listen_addrs().await[0].clone();
 
     // 2. Setup Node B (The Victim)
     let mut config_b = NodeConfig::new().unwrap();
-    config_b.listen_addr = MultiAddr::quic("127.0.0.1:0".parse().unwrap());
-    config_b.enable_ipv6 = false;
+    config_b.listen_addrs = vec![MultiAddr::quic("127.0.0.1:0".parse().unwrap())];
     let node_b = P2PNode::new(config_b).await.unwrap();
     node_b.start().await.unwrap();
 
