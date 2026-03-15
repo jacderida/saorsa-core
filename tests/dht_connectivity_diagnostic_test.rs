@@ -6,6 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+use saorsa_core::ListenMode;
 use saorsa_core::dht::DHTConfig;
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
 use saorsa_core::identity::node_identity::NodeIdentity;
@@ -20,8 +21,7 @@ async fn create_node_with_transport(
 ) -> saorsa_core::Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let identity = Arc::new(NodeIdentity::generate().unwrap());
     let node_config = NodeConfig::builder()
-        .listen_port(0)
-        .allow_loopback(true)
+        .listen_mode(ListenMode::Local)
         .build()
         .expect("Failed to build NodeConfig");
 

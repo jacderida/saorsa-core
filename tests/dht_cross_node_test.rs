@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+use saorsa_core::ListenMode;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
 use saorsa_core::identity::node_identity::NodeIdentity;
@@ -38,8 +39,8 @@ async fn create_test_dht_config(
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .listen_port(port)
-        .allow_loopback(true)
+        .quic_port(port)
+        .listen_mode(ListenMode::Local)
         .build()
         .expect("Failed to build NodeConfig");
 
@@ -192,8 +193,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
     // The caller creates a TransportHandle (transport layer) and passes it in
     let arch_peer = saorsa_core::PeerId::from_name("architecture_test_node");
     let node_config = NodeConfig::builder()
-        .listen_port(0)
-        .allow_loopback(true)
+        .listen_mode(ListenMode::Local)
         .build()?;
 
     let transport = Arc::new(
@@ -253,7 +253,7 @@ async fn test_correct_architecture_dht_owns_transport() -> Result<()> {
 #[tokio::test]
 async fn test_p2p_node_local_dht_only() -> Result<()> {
     // Create P2PNode (transport layer only)
-    let node_config = NodeConfig::builder().listen_port(0).build()?;
+    let node_config = NodeConfig::builder().build()?;
 
     let node = P2PNode::new(node_config).await?;
 

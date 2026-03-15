@@ -37,6 +37,7 @@
 //! node IDs), not raw transport-level channel IDs.
 
 use anyhow::Result;
+use saorsa_core::ListenMode;
 use saorsa_core::MultiAddr;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
@@ -72,8 +73,7 @@ async fn create_test_dht_config(
     );
 
     let node_config = NodeConfig::builder()
-        .listen_port(0) // Random port
-        .allow_loopback(true)
+        .listen_mode(ListenMode::Local)
         .build()?;
 
     let transport = Arc::new(

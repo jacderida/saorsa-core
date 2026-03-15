@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+use saorsa_core::ListenMode;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
 use saorsa_core::identity::node_identity::NodeIdentity;
@@ -39,8 +40,8 @@ async fn create_test_dht_config(
 ) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
     let node_config = NodeConfig::builder()
-        .listen_port(port)
-        .allow_loopback(true)
+        .quic_port(port)
+        .listen_mode(ListenMode::Local)
         .build()
         .expect("Failed to build NodeConfig");
 

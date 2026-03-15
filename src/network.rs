@@ -79,6 +79,20 @@ pub enum NodeMode {
     Client,
 }
 
+/// Listen mode controlling which network interfaces the node binds to.
+///
+/// - `Public` binds to all interfaces (`0.0.0.0` / `::`), suitable for production.
+/// - `Local` binds to loopback only (`127.0.0.1` / `::1`), suitable for testing
+///   and local development.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ListenMode {
+    /// Bind to all interfaces (`0.0.0.0` / `::`).
+    #[default]
+    Public,
+    /// Bind to loopback only (`127.0.0.1` / `::1`).
+    Local,
+}
+
 /// Returns the default user agent string for the given mode.
 ///
 /// - `Node` → `"node/<saorsa-core-version>"`
@@ -262,22 +276,32 @@ pub enum TrustLevel {
 // Address Construction Helpers
 // ============================================================================
 
-/// Build listen addresses based on port and IPv6 preference
+/// Build listen addresses based on port, IPv6 preference, and listen mode.
 ///
 /// This helper consolidates the duplicated address construction logic.
+/// `ListenMode::Public` uses unspecified (all-interface) addresses;
+/// `ListenMode::Local` uses loopback addresses.
 #[inline]
-fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<MultiAddr> {
+fn build_listen_addrs(port: u16, ipv6_enabled: bool, mode: ListenMode) -> Vec<MultiAddr> {
     let mut addrs = Vec::with_capacity(if ipv6_enabled { 2 } else { 1 });
+
+    let (v4, v6) = match mode {
+        ListenMode::Public => (
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv6Addr::UNSPECIFIED,
+        ),
+        ListenMode::Local => (std::net::Ipv4Addr::LOCALHOST, std::net::Ipv6Addr::LOCALHOST),
+    };
 
     if ipv6_enabled {
         addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            std::net::IpAddr::V6(v6),
             port,
         )));
     }
 
     addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        std::net::IpAddr::V4(v4),
         port,
     )));
 
@@ -305,7 +329,11 @@ impl NodeConfig {
         let listen_sa = config.listen_socket_addr()?;
 
         Ok(Self {
-            listen_addrs: build_listen_addrs(listen_sa.port(), config.network.ipv6_enabled),
+            listen_addrs: build_listen_addrs(
+                listen_sa.port(),
+                config.network.ipv6_enabled,
+                ListenMode::Public,
+            ),
             bootstrap_peers: config
                 .network
                 .bootstrap_nodes
@@ -339,10 +367,29 @@ impl NodeConfig {
 // NodeConfig Builder Pattern
 // ============================================================================
 
-/// Builder for constructing NodeConfig with fluent API
-#[derive(Debug, Clone, Default)]
+/// Builder for constructing [`NodeConfig`] with a transport-aware fluent API.
+///
+/// Defaults are chosen for quick local development:
+/// - QUIC on a random free port (`0`)
+/// - IPv6 enabled (dual-stack)
+/// - `ListenMode::Public` (all interfaces)
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Simplest — QUIC on random port, IPv6 on, all interfaces
+/// let config = NodeConfig::builder().build()?;
+///
+/// // Local dev/test mode (loopback, auto-enables allow_loopback)
+/// let config = NodeConfig::builder()
+///     .listen_mode(ListenMode::Local)
+///     .build()?;
+/// ```
+#[derive(Debug, Clone)]
 pub struct NodeConfigBuilder {
-    listen_port: Option<u16>,
+    quic_port: u16,
+    ipv6: bool,
+    listen_mode: ListenMode,
     bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
@@ -356,10 +403,46 @@ pub struct NodeConfigBuilder {
     allow_loopback: Option<bool>,
 }
 
+impl Default for NodeConfigBuilder {
+    fn default() -> Self {
+        Self {
+            quic_port: 0,
+            ipv6: true,
+            listen_mode: ListenMode::Public,
+            bootstrap_peers: Vec::new(),
+            max_connections: None,
+            connection_timeout: None,
+            keep_alive_interval: None,
+            dht_config: None,
+            security_config: None,
+            production_config: None,
+            max_message_size: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
+            allow_loopback: None,
+        }
+    }
+}
+
 impl NodeConfigBuilder {
-    /// Set the listen port
-    pub fn listen_port(mut self, port: u16) -> Self {
-        self.listen_port = Some(port);
+    /// Set the QUIC listen port. Default: `0` (random free port).
+    pub fn quic_port(mut self, port: u16) -> Self {
+        self.quic_port = port;
+        self
+    }
+
+    /// Enable or disable IPv6 dual-stack. Default: `true`.
+    pub fn ipv6(mut self, enabled: bool) -> Self {
+        self.ipv6 = enabled;
+        self
+    }
+
+    /// Set the listen mode (public vs loopback). Default: [`ListenMode::Public`].
+    ///
+    /// `ListenMode::Local` automatically enables `allow_loopback` unless
+    /// explicitly overridden via [`Self::allow_loopback`].
+    pub fn listen_mode(mut self, mode: ListenMode) -> Self {
+        self.listen_mode = mode;
         self
     }
 
@@ -369,37 +452,37 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Set maximum connections
+    /// Set maximum connections.
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = Some(max);
         self
     }
 
-    /// Set connection timeout
+    /// Set connection timeout.
     pub fn connection_timeout(mut self, timeout: Duration) -> Self {
         self.connection_timeout = Some(timeout);
         self
     }
 
-    /// Set keep-alive interval
+    /// Set keep-alive interval.
     pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = Some(interval);
         self
     }
 
-    /// Set DHT configuration
+    /// Set DHT configuration.
     pub fn dht_config(mut self, config: DHTConfig) -> Self {
         self.dht_config = Some(config);
         self
     }
 
-    /// Set security configuration
+    /// Set security configuration.
     pub fn security_config(mut self, config: SecurityConfig) -> Self {
         self.security_config = Some(config);
         self
     }
 
-    /// Set production configuration
+    /// Set production configuration.
     pub fn production_config(mut self, config: ProductionConfig) -> Self {
         self.production_config = Some(config);
         self
@@ -425,31 +508,30 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Allow loopback addresses in the transport layer.
-    ///
-    /// Enable for devnet/testnet modes where multiple nodes run on the same
-    /// machine. Default: `false`.
+    /// Explicitly control whether loopback addresses are allowed in the
+    /// transport layer. When not called, `ListenMode::Local` auto-enables
+    /// this; `ListenMode::Public` defaults to `false`.
     pub fn allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = Some(allow);
         self
     }
 
-    /// Build the NodeConfig
+    /// Build the [`NodeConfig`].
     ///
     /// # Errors
     ///
-    /// Returns an error if address construction fails
+    /// Returns an error if address construction fails.
     pub fn build(self) -> Result<NodeConfig> {
         let base_config = Config::default();
-        let default_port = base_config
-            .listen_socket_addr()
-            .map(|addr| addr.port())
-            .unwrap_or(DEFAULT_LISTEN_PORT);
-        let port = self.listen_port.unwrap_or(default_port);
+
+        // ListenMode::Local auto-enables allow_loopback unless explicitly overridden
+        let allow_loopback = self
+            .allow_loopback
+            .unwrap_or(matches!(self.listen_mode, ListenMode::Local));
 
         Ok(NodeConfig {
-            listen_addrs: build_listen_addrs(port, base_config.network.ipv6_enabled),
-            bootstrap_peers: self.bootstrap_peers.clone(),
+            listen_addrs: build_listen_addrs(self.quic_port, self.ipv6, self.listen_mode),
+            bootstrap_peers: self.bootstrap_peers,
             connection_timeout: self
                 .connection_timeout
                 .unwrap_or(Duration::from_secs(base_config.network.connection_timeout)),
@@ -471,9 +553,7 @@ impl NodeConfigBuilder {
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
-            allow_loopback: self
-                .allow_loopback
-                .unwrap_or(base_config.network.allow_loopback),
+            allow_loopback,
         })
     }
 }
@@ -489,7 +569,11 @@ impl Default for NodeConfig {
         });
 
         Self {
-            listen_addrs: build_listen_addrs(listen_sa.port(), config.network.ipv6_enabled),
+            listen_addrs: build_listen_addrs(
+                listen_sa.port(),
+                config.network.ipv6_enabled,
+                ListenMode::Public,
+            ),
             bootstrap_peers: Vec::new(),
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -514,8 +598,12 @@ impl NodeConfig {
     pub fn from_config(config: &Config) -> Result<Self> {
         let listen_sa = config.listen_socket_addr()?;
 
-        let mut node_config = Self {
-            listen_addrs: vec![MultiAddr::quic(listen_sa)],
+        let node_config = Self {
+            listen_addrs: build_listen_addrs(
+                listen_sa.port(),
+                config.network.ipv6_enabled,
+                ListenMode::Public,
+            ),
             bootstrap_peers: config
                 .network
                 .bootstrap_nodes
@@ -554,16 +642,6 @@ impl NodeConfig {
             custom_user_agent: None,
             allow_loopback: config.network.allow_loopback,
         };
-
-        // Add IPv6 listen address if enabled
-        if config.network.ipv6_enabled {
-            node_config
-                .listen_addrs
-                .push(MultiAddr::quic(std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                    listen_sa.port(),
-                )));
-        }
 
         Ok(node_config)
     }
@@ -2177,18 +2255,9 @@ mod tests {
 
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
-        let ipv4_listen = MultiAddr::quic(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            0,
-        ));
-        let ipv6_listen = MultiAddr::quic(std::net::SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            0,
-        ));
         NodeConfig {
-            listen_addrs: vec![ipv6_listen, ipv4_listen],
+            listen_addrs: build_listen_addrs(0, true, ListenMode::Local),
             bootstrap_peers: vec![],
-
             connection_timeout: Duration::from_secs(2),
             keep_alive_interval: Duration::from_secs(30),
             max_connections: 100,

@@ -38,7 +38,7 @@ pub use crate::address::{AddressBook, MultiAddr, TransportAddr};
 
 /// Node configuration and management
 pub use crate::network::{
-    ConnectionStatus, NodeConfig, NodeConfigBuilder, P2PEvent, P2PNode, PeerInfo,
+    ConnectionStatus, ListenMode, NodeConfig, NodeConfigBuilder, P2PEvent, P2PNode, PeerInfo,
 };
 
 /// Bootstrap management
