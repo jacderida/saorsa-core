@@ -323,6 +323,15 @@ const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 /// Periodic refresh of buckets and eviction of stale nodes
 const MAINTENANCE_INTERVAL_SECS: u64 = 60;
 
+/// Subnet diversity multiplier: /24 (IPv4) or /64 (IPv6) limit = per-IP * this.
+const SUBNET_NARROW_MULTIPLIER: usize = 3;
+
+/// Subnet diversity multiplier: /16 (IPv4) or /48 (IPv6) limit = per-IP * this.
+const SUBNET_MEDIUM_MULTIPLIER: usize = 10;
+
+/// Subnet diversity multiplier for IPv6 /32 (widest prefix tier).
+const SUBNET_WIDE_MULTIPLIER: usize = 30;
+
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
     node_id: PeerId,

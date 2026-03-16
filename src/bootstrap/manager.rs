@@ -71,10 +71,6 @@ pub struct BootstrapManager {
     diversity_enforcer: Mutex<IPDiversityEnforcer>,
     diversity_config: IPDiversityConfig,
     maintenance_handle: Option<JoinHandle<()>>,
-    /// Maps socket addresses to their original transport kind so that
-    /// round-trips through the `SocketAddr`-only cache preserve the
-    /// transport type (e.g. TCP vs QUIC).
-    transport_kinds: Mutex<HashMap<SocketAddr, crate::address::TransportAddr>>,
 }
 
 impl BootstrapManager {
@@ -103,7 +99,6 @@ impl BootstrapManager {
             )),
             diversity_config: config.diversity,
             maintenance_handle: None,
-            transport_kinds: Mutex::new(HashMap::new()),
         })
     }
 

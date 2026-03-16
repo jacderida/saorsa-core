@@ -420,7 +420,6 @@ impl Default for NodeConfigBuilder {
             keep_alive_interval: None,
             dht_config: None,
             security_config: None,
-            production_config: None,
             max_message_size: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
@@ -1614,13 +1613,15 @@ impl P2PNode {
         latency_ms: Option<u64>,
         _error: Option<String>,
     ) -> Result<()> {
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
+        if let Some(ref bootstrap_manager) = self.bootstrap_manager
+            && let Some(sa) = addr.socket_addr()
+        {
             let manager = bootstrap_manager.read().await;
             if success {
                 let rtt_ms = latency_ms.unwrap_or(0) as u32;
-                manager.record_success(addr, rtt_ms).await;
+                manager.record_success(&sa, rtt_ms).await;
             } else {
-                manager.record_failure(addr).await;
+                manager.record_failure(&sa).await;
             }
         }
         Ok(())
@@ -1684,7 +1685,7 @@ impl P2PNode {
                     let new_addresses: Vec<MultiAddr> = addrs
                         .into_iter()
                         .filter(|a| !seen_addresses.contains(a))
-                        .map(|sa| MultiAddr::quic(sa))
+                        .map(MultiAddr::quic)
                         .collect();
 
                     if !new_addresses.is_empty() {

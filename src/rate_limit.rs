@@ -111,6 +111,7 @@ use thiserror::Error;
 
 /// Error types for join rate limiting
 #[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum JoinRateLimitError {
     /// Global join limit exceeded (network is under high load)
     #[error("global join rate limit exceeded: max {max_per_minute} joins per minute")]
