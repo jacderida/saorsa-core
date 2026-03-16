@@ -1498,13 +1498,13 @@ impl DhtCoreEngine {
                 let cfg = &self.ip_diversity_config;
                 let limit_32 = cfg
                     .max_nodes_per_ipv4_32
-                    .map_or(per_ip, |cap| cap.min(per_ip));
+                    .map_or(per_ip, |floor| floor.max(per_ip));
                 let limit_24 = cfg
                     .max_nodes_per_ipv4_24
-                    .map_or(per_ip * 3, |cap| cap.min(per_ip * 3));
+                    .map_or(per_ip * 3, |floor| floor.max(per_ip * 3));
                 let limit_16 = cfg
                     .max_nodes_per_ipv4_16
-                    .map_or(per_ip * 10, |cap| cap.min(per_ip * 10));
+                    .map_or(per_ip * 10, |floor| floor.max(per_ip * 10));
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
@@ -1889,5 +1889,35 @@ mod tests {
             "non-loopback should be accepted: {:?}",
             result
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv4 diversity: static floor overrides low dynamic limit
+    // -----------------------------------------------------------------------
+
+    /// When the network is small the dynamic per-IP formula yields 1, which
+    /// would block additional same-IP nodes.  A configured static floor
+    /// (e.g. `max_nodes_per_ipv4_32 = Some(100)`) must override the dynamic
+    /// value so that bootstrap can proceed.
+    #[tokio::test]
+    async fn test_ipv4_static_floor_overrides_dynamic_limit() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Testnet-like config: static floor of 100 per /32
+        let mut config = IPDiversityConfig::testnet();
+        config.max_nodes_per_ipv4_32 = Some(100);
+        dht.set_ip_diversity_config(config);
+
+        // Add multiple nodes from the same IP — the dynamic formula alone
+        // would cap at 1, but the static floor of 100 must allow these.
+        for i in 1..=10u8 {
+            let node = make_node(i, "203.0.113.1:9000");
+            let result = dht.add_node(node).await;
+            assert!(
+                result.is_ok(),
+                "node {i} from same IP should be accepted with static floor: {:?}",
+                result
+            );
+        }
     }
 }
