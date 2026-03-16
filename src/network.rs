@@ -1632,6 +1632,22 @@ impl P2PNode {
         self.transport.subscribe_events()
     }
 
+    /// Subscribe to metric events for external monitoring.
+    ///
+    /// Returns a receiver for [`MetricEvent`](crate::metric_event::MetricEvent)s
+    /// emitted by internal subsystems. If the receiver falls behind, older events
+    /// are dropped (lossy by design).
+    pub fn subscribe_metric_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::metric_event::MetricEvent> {
+        self.transport.subscribe_metric_events()
+    }
+
+    /// Get current transport statistics for monitoring.
+    pub async fn transport_stats(&self) -> crate::transport_handle::TransportStats {
+        self.transport.transport_stats().await
+    }
+
     /// Backwards-compat event stream accessor for tests
     pub fn events(&self) -> broadcast::Receiver<P2PEvent> {
         self.subscribe_events()

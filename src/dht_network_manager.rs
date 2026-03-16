@@ -274,6 +274,8 @@ pub struct DhtNetworkManager {
     maintenance_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the network event handler task
     event_handler_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Metric event sender for emitting DHT operation metrics
+    metric_tx: broadcast::Sender<crate::metric_event::MetricEvent>,
 }
 
 /// DHT operation context
@@ -413,6 +415,8 @@ impl DhtNetworkManager {
                 .max(MIN_CONCURRENT_OPERATIONS),
         ));
 
+        let metric_tx = transport.metric_sender();
+
         Ok(Self {
             dht,
             transport,
@@ -426,6 +430,7 @@ impl DhtNetworkManager {
             shutdown: CancellationToken::new(),
             maintenance_handle: Arc::new(RwLock::new(None)),
             event_handler_handle: Arc::new(RwLock::new(None)),
+            metric_tx,
         })
     }
 
@@ -668,6 +673,7 @@ impl DhtNetworkManager {
     /// Reserved for potential future use beyond peer phonebook/routing.
     #[allow(dead_code)]
     pub async fn put(&self, key: Key, value: Vec<u8>) -> Result<DhtNetworkResult> {
+        let put_start = Instant::now();
         info!(
             "Putting value for key: {} ({} bytes)",
             hex::encode(key),
@@ -702,6 +708,13 @@ impl DhtNetworkManager {
             );
             self.store_local_in_core(key, value, "Local PUT storage")
                 .await?;
+
+            let _ = self
+                .metric_tx
+                .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                    duration: put_start.elapsed(),
+                    success: true,
+                });
 
             return Ok(DhtNetworkResult::PutSuccess {
                 key,
@@ -745,6 +758,14 @@ impl DhtNetworkManager {
             successful_peers,
             outcomes: peer_outcomes.clone(),
         });
+
+        let put_duration = put_start.elapsed();
+        let _ = self
+            .metric_tx
+            .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                duration: put_duration,
+                success: true,
+            });
 
         info!(
             "PUT operation completed: key={}, replicated_to={}/{}",
@@ -821,6 +842,7 @@ impl DhtNetworkManager {
     /// Reserved for potential future use beyond peer phonebook/routing.
     #[allow(dead_code)]
     pub async fn get(&self, key: &Key) -> Result<DhtNetworkResult> {
+        let get_start = Instant::now();
         info!("Getting value for key: {}", hex::encode(key));
 
         // Check local storage first
@@ -833,6 +855,12 @@ impl DhtNetworkManager {
         {
             Ok(Some(value)) => {
                 info!("Found value locally for key: {}", hex::encode(key));
+                let _ = self
+                    .metric_tx
+                    .send(crate::metric_event::MetricEvent::DhtGetCompleted {
+                        duration: get_start.elapsed(),
+                        success: true,
+                    });
                 return Ok(DhtNetworkResult::GetSuccess {
                     key: *key,
                     value,
@@ -970,6 +998,13 @@ impl DhtNetworkManager {
                             warn!("Failed to cache retrieved value: {}", e);
                         }
 
+                        let _ = self.metric_tx.send(
+                            crate::metric_event::MetricEvent::DhtGetCompleted {
+                                duration: get_start.elapsed(),
+                                success: true,
+                            },
+                        );
+
                         return Ok(DhtNetworkResult::GetSuccess {
                             key: *key,
                             value,
@@ -1046,6 +1081,12 @@ impl DhtNetworkManager {
         }
 
         // Not found after exhausting all paths
+        let _ = self
+            .metric_tx
+            .send(crate::metric_event::MetricEvent::DhtGetCompleted {
+                duration: get_start.elapsed(),
+                success: false,
+            });
         info!(
             "Value not found for key {} after iterative lookup ({} nodes queried)",
             hex::encode(key),

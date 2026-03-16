@@ -163,6 +163,23 @@ pub struct MABMetrics {
     pub last_cleanup: u64,
 }
 
+/// Per-strategy performance summary for monitoring.
+#[derive(Debug, Clone)]
+pub struct StrategyStats {
+    /// Strategy name (e.g. "Kademlia", "Hyperbolic")
+    pub name: String,
+    /// Number of times this strategy was selected
+    pub selections: u64,
+    /// Number of successful outcomes
+    pub successes: u64,
+    /// Thompson Sampling alpha parameter (successes + prior), summed across destinations
+    pub alpha: f64,
+    /// Thompson Sampling beta parameter (failures + prior), summed across destinations
+    pub beta: f64,
+    /// Estimated win probability (alpha / (alpha + beta))
+    pub estimated_success_rate: f64,
+}
+
 impl MultiArmedBandit {
     /// Create a new Multi-Armed Bandit instance
     pub async fn new(config: MABConfig) -> Result<Self> {
@@ -406,6 +423,46 @@ impl MultiArmedBandit {
     /// Get current metrics
     pub async fn get_metrics(&self) -> MABMetrics {
         self.metrics.read().await.clone()
+    }
+
+    /// Get per-strategy performance summary for monitoring.
+    ///
+    /// Aggregates [`RouteStatistics`] across all destinations, grouped by
+    /// strategy type. This gives a high-level view of which routing strategies
+    /// are being selected and how they're performing.
+    pub async fn get_strategy_stats(&self) -> Vec<StrategyStats> {
+        let statistics = self.statistics.read().await;
+
+        // Accumulate per-strategy
+        let mut by_strategy: HashMap<StrategyChoice, (u64, u64, f64, f64)> = HashMap::new();
+        for ((route_id, _content_type), route_stats) in statistics.iter() {
+            let entry = by_strategy
+                .entry(route_id.strategy)
+                .or_insert((0, 0, 0.0, 0.0));
+            entry.0 += route_stats.attempts; // selections
+            entry.1 += route_stats.successes; // successes
+            entry.2 += route_stats.alpha; // sum alpha
+            entry.3 += route_stats.beta; // sum beta
+        }
+
+        by_strategy
+            .into_iter()
+            .map(|(strategy, (selections, successes, alpha, beta))| {
+                let estimated_success_rate = if alpha + beta > 0.0 {
+                    alpha / (alpha + beta)
+                } else {
+                    0.0
+                };
+                StrategyStats {
+                    name: format!("{:?}", strategy),
+                    selections,
+                    successes,
+                    alpha,
+                    beta,
+                    estimated_success_rate,
+                }
+            })
+            .collect()
     }
 
     /// Reset statistics for a specific route
