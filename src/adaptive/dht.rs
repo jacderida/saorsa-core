@@ -31,6 +31,15 @@ use std::time::Duration;
 use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
 
+/// Default weight for trust in blended distance/trust peer selection
+const DEFAULT_ROUTING_WEIGHT: f64 = 0.3;
+
+/// Default trust score threshold below which a peer may be evicted
+const DEFAULT_EVICTION_THRESHOLD: f64 = 0.15;
+
+/// Default interval between background trust recomputations (seconds)
+const DEFAULT_RECOMPUTE_INTERVAL_SECS: u64 = 300;
+
 /// Configuration for the AdaptiveDHT layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,9 +66,9 @@ impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
             trust_weighted_routing: false,
-            routing_weight: 0.3,
-            eviction_threshold: 0.15,
-            recompute_interval: Duration::from_secs(300),
+            routing_weight: DEFAULT_ROUTING_WEIGHT,
+            eviction_threshold: DEFAULT_EVICTION_THRESHOLD,
+            recompute_interval: Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS),
         }
     }
 }
@@ -268,8 +277,11 @@ mod tests {
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
         assert!(!config.trust_weighted_routing);
-        assert!((config.routing_weight - 0.3).abs() < f64::EPSILON);
-        assert!((config.eviction_threshold - 0.15).abs() < f64::EPSILON);
-        assert_eq!(config.recompute_interval, Duration::from_secs(300));
+        assert!((config.routing_weight - DEFAULT_ROUTING_WEIGHT).abs() < f64::EPSILON);
+        assert!((config.eviction_threshold - DEFAULT_EVICTION_THRESHOLD).abs() < f64::EPSILON);
+        assert_eq!(
+            config.recompute_interval,
+            Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS)
+        );
     }
 }

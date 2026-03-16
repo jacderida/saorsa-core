@@ -7,6 +7,15 @@ use std::time::Duration;
 
 use crate::dht::DHTConfig;
 
+/// Default bucket refresh interval (1 hour)
+const DEFAULT_BUCKET_REFRESH_INTERVAL_SECS: u64 = 3600;
+
+/// Default maximum consecutive failures before eviction
+const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Default minimum trust threshold for eviction
+const DEFAULT_MIN_TRUST_THRESHOLD: f64 = 0.15;
+
 /// Configuration for routing table maintenance (peer phonebook only)
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
@@ -21,9 +30,9 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
-            bucket_refresh_interval: Duration::from_secs(3600),
-            max_consecutive_failures: 3,
-            min_trust_threshold: 0.15,
+            bucket_refresh_interval: Duration::from_secs(DEFAULT_BUCKET_REFRESH_INTERVAL_SECS),
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            min_trust_threshold: DEFAULT_MIN_TRUST_THRESHOLD,
         }
     }
 }
