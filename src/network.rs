@@ -1011,12 +1011,8 @@ impl P2PNode {
     ) -> Result<PeerResponse> {
         // Fail fast for blocked peers
         if self.adaptive_dht.peer_trust(peer_id) < self.adaptive_dht.config().block_threshold {
-            return Err(P2PError::Network(crate::error::NetworkError::PeerNotFound(
-                format!(
-                    "Peer {} is blocked (trust below threshold)",
-                    peer_id.to_hex()
-                )
-                .into(),
+            return Err(P2PError::Network(crate::error::NetworkError::PeerBlocked(
+                *peer_id,
             )));
         }
 

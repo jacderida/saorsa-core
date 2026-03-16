@@ -930,13 +930,7 @@ impl DhtNetworkManager {
     ) -> Result<DhtNetworkResult> {
         // Fail fast for blocked peers — don't waste resources connecting/sending
         if self.is_peer_blocked(peer_id) {
-            return Err(P2PError::Network(NetworkError::PeerNotFound(
-                format!(
-                    "Peer {} is blocked (trust below threshold)",
-                    peer_id.to_hex()
-                )
-                .into(),
-            )));
+            return Err(P2PError::Network(NetworkError::PeerBlocked(*peer_id)));
         }
 
         // Sweep stale entries left by dropped futures before adding a new one
