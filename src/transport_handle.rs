@@ -70,9 +70,9 @@ pub struct TransportStats {
     pub total_connections_established: u64,
     /// Total connection failures since startup
     pub connection_failures: u64,
-    /// Total bytes sent at the application layer
+    /// Total bytes sent on the wire (includes serialization overhead)
     pub bytes_sent_total: u64,
-    /// Total bytes received at the application layer
+    /// Total bytes received on the wire (includes serialization overhead)
     pub bytes_received_total: u64,
     /// Total NAT traversal attempts
     pub nat_traversal_attempts: u64,
@@ -1353,23 +1353,29 @@ impl TransportHandle {
         let mut ipv4 = 0usize;
         let mut ipv6 = 0usize;
         for peer_info in peers.values() {
+            // Count per-peer: a peer with at least one address of a given
+            // family contributes 1 to that counter (not per-address).
+            let mut has_ipv4 = false;
+            let mut has_ipv6 = false;
             for addr in &peer_info.addresses {
-                // Parse the address to reliably determine the address family.
-                // Addresses may be SocketAddr strings ("1.2.3.4:9000" or "[::1]:9000")
-                // or multiaddr-style strings ("/ip4/..." or "/ip6/...").
                 if addr.starts_with("/ip6/") {
-                    ipv6 += 1;
+                    has_ipv6 = true;
                 } else if addr.starts_with("/ip4/") {
-                    ipv4 += 1;
+                    has_ipv4 = true;
                 } else if let Ok(sa) = addr.parse::<SocketAddr>() {
                     if sa.is_ipv6() {
-                        ipv6 += 1;
+                        has_ipv6 = true;
                     } else {
-                        ipv4 += 1;
+                        has_ipv4 = true;
                     }
                 }
-                // Unparseable addresses are silently skipped rather than
-                // attributed to IPv4; they do not represent a known family.
+                // Unparseable addresses are silently skipped.
+            }
+            if has_ipv4 {
+                ipv4 += 1;
+            }
+            if has_ipv6 {
+                ipv6 += 1;
             }
         }
         let known_peers = peers.len();
@@ -1468,6 +1474,7 @@ impl TransportHandle {
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
         let bytes_received_counter = Arc::clone(&self.transport_bytes_received);
+        let recv_metric_tx = self.metric_tx.clone();
         let self_peer_id = *self.node_identity.peer_id();
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
@@ -1513,6 +1520,10 @@ impl TransportHandle {
                                     &event_tx,
                                     P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
                                 );
+                                // Identity verified — emit HandshakeCompleted now
+                                // that the ML-DSA identity exchange is done.
+                                let _ = recv_metric_tx
+                                    .send(MetricEvent::HandshakeCompleted { duration: None });
                             }
                         }
 
@@ -1730,14 +1741,13 @@ impl TransportHandle {
                                 // PeerConnected is emitted when the remote receives and
                                 // verifies our identity announce — not at transport level.
 
-                                // Emit transport metric events
+                                // Emit transport metric event.
+                                // HandshakeCompleted is emitted later, after identity
+                                // verification succeeds (in the message receiving system).
                                 connections_established.fetch_add(1, Ordering::Relaxed);
                                 let _ = metric_tx.send(MetricEvent::ConnectionEstablished {
                                     duration: None, // Per-connection timing not available at this layer
                                     nat_type: crate::metric_event::ConnectionNatType::Unknown,
-                                });
-                                let _ = metric_tx.send(MetricEvent::HandshakeCompleted {
-                                    duration: None, // Per-handshake timing not available at this layer
                                 });
                             }
                             ConnectionEvent::Lost { remote_address, reason } => {

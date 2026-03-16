@@ -14,8 +14,9 @@
 //! Bridges internal telemetry recording with the metric event channel.
 //!
 //! Each method records to [`TelemetryCollector`] (internal health checks) AND
-//! broadcasts a [`MetricEvent`]. If no subscriber is listening, the broadcast
-//! is silently dropped (zero overhead).
+//! broadcasts a [`MetricEvent`]. If no subscriber is listening, the send
+//! returns an error that is silently ignored (minimal overhead — the event
+//! is still constructed, but no receiver processing occurs).
 
 use crate::metric_event::MetricEvent;
 use crate::telemetry::{StreamClass, TelemetryCollector};
@@ -27,7 +28,7 @@ use tokio::sync::broadcast;
 ///
 /// Each method records to [`TelemetryCollector`] (for internal health checks)
 /// AND broadcasts a [`MetricEvent`] (for external monitoring). If no subscriber
-/// is listening, the broadcast is silently dropped.
+/// is listening, the send error is silently ignored.
 #[allow(dead_code)]
 pub(crate) struct MetricsEmitter {
     telemetry: Arc<TelemetryCollector>,

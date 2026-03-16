@@ -24,10 +24,12 @@ use tokio::sync::broadcast;
 
 #[test]
 fn test_metric_event_subscribe_via_transport() {
-    // new_for_tests() uses block_on internally, so cannot run inside tokio::test
+    // Validates that subscribing via TransportHandle's public API returns a
+    // working receiver. End-to-end event delivery (emit → receive) requires
+    // a full P2PNode with peer connections, which is covered by e2e tests.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let handle = rt.block_on(async {
-        // Use spawn_blocking to allow the inner block_on in new_for_tests
+        // new_for_tests() uses block_on internally, so use spawn_blocking
         tokio::task::spawn_blocking(|| saorsa_core::TransportHandle::new_for_tests().unwrap())
             .await
             .unwrap()
