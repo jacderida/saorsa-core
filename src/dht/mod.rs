@@ -7,7 +7,6 @@
 pub mod core_engine;
 pub mod geographic_routing;
 pub mod network_integration;
-pub mod routing_maintenance;
 
 // Re-export core engine types
 pub use core_engine::{DhtCoreEngine, DhtKey};

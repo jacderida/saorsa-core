@@ -114,8 +114,9 @@ pub struct AdaptiveDHT {
 impl AdaptiveDHT {
     /// Create a new AdaptiveDHT instance.
     ///
-    /// This creates the `TrustEngine`, starts its background updates, and
-    /// creates the `DhtNetworkManager` with the trust engine injected.
+    /// This creates the `TrustEngine` and the `DhtNetworkManager` with the
+    /// trust engine injected. Call [`start`](Self::start) to begin DHT
+    /// operations and the background trust recomputation + sweep loop.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
         mut dht_config: DhtNetworkConfig,
@@ -125,7 +126,6 @@ impl AdaptiveDHT {
 
         let pre_trusted: HashSet<PeerId> = HashSet::new();
         let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
-        trust_engine.clone().start_background_updates();
 
         let dht_manager = Arc::new(
             DhtNetworkManager::new(transport, Some(trust_engine.clone()), dht_config).await?,
@@ -182,9 +182,26 @@ impl AdaptiveDHT {
         &self.dht_manager
     }
 
-    /// Start the DHT manager (network event handler + maintenance tasks).
+    /// Start the DHT manager and the background trust recomputation loop.
+    ///
+    /// The trust loop periodically recomputes global trust scores and sweeps
+    /// the routing table to remove peers that have fallen below the block threshold.
     pub async fn start(&self) -> Result<()> {
-        Arc::clone(&self.dht_manager).start().await
+        Arc::clone(&self.dht_manager).start().await?;
+
+        // Background: recompute trust scores → sweep blocked peers from RT
+        let engine = self.trust_engine.clone();
+        let manager = self.dht_manager.clone();
+        let interval = self.config.recompute_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = engine.compute_global_trust().await;
+                manager.sweep_blocked_peers().await;
+            }
+        });
+
+        Ok(())
     }
 
     /// Stop the DHT manager gracefully.
@@ -197,8 +214,6 @@ impl AdaptiveDHT {
 mod tests {
     use super::*;
     use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
-    use crate::dht::routing_maintenance::config::MaintenanceConfig;
-    use crate::dht::routing_maintenance::eviction::EvictionManager;
 
     #[test]
     fn test_trust_event_mapping() {
@@ -265,43 +280,32 @@ mod tests {
         assert!(score_after_success > 0.0);
     }
 
-    /// Test: failures reduce trust and can trigger eviction
+    /// Test: failures reduce trust below block threshold
     #[tokio::test]
-    async fn test_failures_reduce_trust_and_trigger_eviction() {
+    async fn test_failures_reduce_trust_below_block_threshold() {
         let engine = Arc::new(TrustEngine::new(HashSet::new()));
         let bad_peer = PeerId::random();
 
-        // Record many failures (protocol violations = 2x penalty each)
+        // Record many failures
         for _ in 0..20 {
             engine
                 .update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update())
                 .await;
         }
 
-        // Add a local trust edge
+        // Add a local trust edge so the node appears in computation
         let other = PeerId::random();
         engine.update_local_trust(&other, &bad_peer, true).await;
 
         // Recompute
         let _ = engine.compute_global_trust().await;
 
-        // Wire eviction manager to this engine
-        let config = MaintenanceConfig {
-            min_trust_threshold: DEFAULT_BLOCK_THRESHOLD,
-            ..Default::default()
-        };
-        let mut eviction_mgr = EvictionManager::new(config);
-        eviction_mgr.set_trust_engine(engine.clone());
-
-        // The bad peer should have a trust score below the eviction threshold
+        // The bad peer should have a trust score below the block threshold
         let trust = engine.score(&bad_peer);
-        let should_evict = trust < DEFAULT_BLOCK_THRESHOLD;
-
-        // Eviction manager should agree
-        let reason = eviction_mgr.get_eviction_reason(&bad_peer);
-        if should_evict {
-            assert!(reason.is_some(), "Bad peer should be evictable");
-        }
+        assert!(
+            trust < DEFAULT_BLOCK_THRESHOLD,
+            "Bad peer trust {trust} should be below block threshold {DEFAULT_BLOCK_THRESHOLD}"
+        );
     }
 
     /// Test: TrustEngine scores are bounded 0.0-1.0

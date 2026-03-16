@@ -6,18 +6,12 @@
 use crate::PeerId;
 use crate::address::MultiAddr;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::routing_maintenance::close_group_validator::{
-    CloseGroupEnforcementMode, CloseGroupValidator, CloseGroupValidatorConfig,
-};
-use crate::dht::routing_maintenance::{
-    BucketRefreshManager, EvictionManager, EvictionReason, MaintenanceConfig,
-};
 use crate::security::IPDiversityConfig;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -253,6 +247,11 @@ impl KademliaRoutingTable {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
+    /// Get all peer IDs in the routing table.
+    pub fn all_peer_ids(&self) -> Vec<PeerId> {
+        self.iter_nodes().map(|n| n.id).collect()
+    }
+
     /// Iterate over every node in the routing table.
     fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
         self.buckets.iter().flat_map(|b| b.get_nodes().iter())
@@ -319,10 +318,6 @@ const KADEMLIA_BUCKET_COUNT: usize = 256;
 /// Collect 2x requested count before early exit to ensure good selection
 const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 
-/// DHT routing table maintenance interval in seconds
-/// Periodic refresh of buckets and eviction of stale nodes
-const MAINTENANCE_INTERVAL_SECS: u64 = 60;
-
 /// Subnet diversity multiplier: /24 (IPv4) or /64 (IPv6) limit = per-IP * this.
 const SUBNET_NARROW_MULTIPLIER: usize = 3;
 
@@ -336,11 +331,6 @@ const SUBNET_WIDE_MULTIPLIER: usize = 30;
 pub struct DhtCoreEngine {
     node_id: PeerId,
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
-
-    // Security Components
-    bucket_refresh_manager: Arc<RwLock<BucketRefreshManager>>,
-    close_group_validator: Arc<RwLock<CloseGroupValidator>>,
-    eviction_manager: Arc<RwLock<EvictionManager>>,
 
     /// IP diversity limits — checked against the live routing table on each
     /// `add_node` call rather than maintained as incremental counters.
@@ -359,10 +349,22 @@ pub struct DhtCoreEngine {
 }
 
 impl DhtCoreEngine {
-    /// Create new DHT engine for testing (permissive validation)
+    /// Create new DHT engine for testing
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly, false)
+        Self::new(node_id, false)
+    }
+
+    /// Create a new DHT core engine.
+    pub(crate) fn new(node_id: PeerId, allow_loopback: bool) -> Result<Self> {
+        Ok(Self {
+            node_id,
+            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
+            ip_diversity_config: IPDiversityConfig::default(),
+            allow_loopback,
+            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
+            shutdown: CancellationToken::new(),
+        })
     }
 
     /// Override the IP diversity configuration.
@@ -371,58 +373,9 @@ impl DhtCoreEngine {
     }
 
     /// Set whether loopback addresses are allowed in the routing table.
-    /// Only available in test builds — production code sets this at construction.
     #[cfg(test)]
     pub fn set_allow_loopback(&mut self, allow: bool) {
         self.allow_loopback = allow;
-    }
-
-    /// Create new DHT engine with specified validation mode
-    pub(crate) fn new_with_validation_mode(
-        node_id: PeerId,
-        enforcement_mode: CloseGroupEnforcementMode,
-        allow_loopback: bool,
-    ) -> Result<Self> {
-        // Initialize security components
-        let validator_config =
-            CloseGroupValidatorConfig::default().with_enforcement_mode(enforcement_mode);
-        let close_group_validator = Arc::new(RwLock::new(CloseGroupValidator::new(
-            validator_config.clone(),
-        )));
-
-        let mut bucket_refresh_manager =
-            BucketRefreshManager::new_with_validation(node_id, validator_config.clone());
-        // Link validator to refresh manager
-        bucket_refresh_manager.set_validator(close_group_validator.clone());
-        let bucket_refresh_manager = Arc::new(RwLock::new(bucket_refresh_manager));
-
-        let eviction_manager = Arc::new(RwLock::new(EvictionManager::new(
-            MaintenanceConfig::default(),
-        )));
-
-        Ok(Self {
-            node_id,
-            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
-            bucket_refresh_manager,
-            close_group_validator,
-            eviction_manager,
-            ip_diversity_config: IPDiversityConfig::default(),
-            allow_loopback,
-            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
-            shutdown: CancellationToken::new(),
-        })
-    }
-
-    /// Set the trust engine on the eviction manager for live trust score queries.
-    ///
-    /// Must be called before `start_maintenance_tasks()` to ensure
-    /// the eviction manager has access to trust scores.
-    pub fn set_trust_engine(&mut self, trust_engine: Arc<crate::adaptive::trust::TrustEngine>) {
-        // Get_mut is safe here because we're the sole owner before sharing.
-        // Arc::get_mut returns Some if no other Arc references exist.
-        if let Some(lock) = Arc::get_mut(&mut self.eviction_manager) {
-            lock.get_mut().set_trust_engine(trust_engine);
-        }
     }
 
     /// Number of peers currently in the routing table.
@@ -430,148 +383,19 @@ impl DhtCoreEngine {
         self.routing_table.read().await.node_count()
     }
 
-    /// Signal background maintenance tasks to stop
-    pub fn signal_shutdown(&self) {
-        self.shutdown.cancel();
+    /// Get all peer IDs currently in the routing table.
+    pub async fn all_peer_ids(&self) -> Vec<PeerId> {
+        self.routing_table.read().await.all_peer_ids()
     }
 
-    /// Start background maintenance tasks for security and health
-    pub fn start_maintenance_tasks(&self) {
-        let routing_table = self.routing_table.clone();
-        let refresh_manager = self.bucket_refresh_manager.clone();
-        let eviction_manager = self.eviction_manager.clone();
-        let close_group_validator = self.close_group_validator.clone();
-        let shutdown = self.shutdown.clone();
+    /// Remove a peer from the routing table by ID.
+    pub async fn remove_node_by_id(&mut self, peer_id: &PeerId) {
+        self.routing_table.write().await.remove_node(peer_id);
+    }
 
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    () = shutdown.cancelled() => {
-                        tracing::info!("DHT core maintenance task shutting down");
-                        break;
-                    }
-                }
-
-                // 1. Run Bucket Refresh Logic with Validation Integration
-                {
-                    let mut mgr = refresh_manager.write().await;
-
-                    // Check for attack mode escalation based on validation failures
-                    if mgr.should_trigger_attack_mode() {
-                        if let Some(validator) = mgr.validator() {
-                            validator.write().await.escalate_to_bft();
-                            tracing::warn!(
-                                "Escalating to BFT mode due to validation failures (rate: {:.2}%)",
-                                mgr.overall_validation_rate() * 100.0
-                            );
-                        }
-                    } else if let Some(validator) = mgr.validator() {
-                        // De-escalate if validation rate recovers above 85%
-                        if mgr.overall_validation_rate() > 0.85 {
-                            validator.write().await.deescalate_from_bft();
-                        }
-                    }
-
-                    // Get buckets needing refresh
-                    let buckets = mgr.get_buckets_needing_refresh();
-                    if !buckets.is_empty() {
-                        // Get buckets that also need validation
-                        let validation_buckets = mgr.get_buckets_needing_validation();
-                        let mut total_validated = 0usize;
-                        let mut total_evicted = 0usize;
-
-                        for bucket in buckets {
-                            // Record refresh (in a real impl, trigger network lookups first)
-                            mgr.record_refresh_success(bucket, 0);
-
-                            // Perform trust-based validation during refresh
-                            if validation_buckets.contains(&bucket) {
-                                // Get nodes that need validation from the refresh manager
-                                let nodes_to_validate = mgr.get_nodes_in_bucket(bucket);
-
-                                // Validate each node using trust-based validation
-                                let validator = close_group_validator.read().await;
-                                let mut evict_list = Vec::new();
-
-                                for node_id in &nodes_to_validate {
-                                    // Query trust score live from TrustEngine via EvictionManager
-                                    let trust_score = {
-                                        let evict_mgr = eviction_manager.read().await;
-                                        evict_mgr.get_trust_score(node_id)
-                                    };
-
-                                    let (is_valid, failure_reason) =
-                                        validator.validate_trust_only(node_id, trust_score);
-
-                                    if !is_valid && let Some(reason) = failure_reason {
-                                        tracing::info!(
-                                            node_id = ?node_id,
-                                            bucket = bucket,
-                                            reason = ?reason,
-                                            "Node failed validation during refresh"
-                                        );
-                                        evict_list
-                                            .push((*node_id, EvictionReason::CloseGroupRejection));
-                                    }
-                                }
-                                drop(validator);
-
-                                total_validated += nodes_to_validate.len();
-
-                                // Queue evictions
-                                if !evict_list.is_empty() {
-                                    let mut evict_mgr = eviction_manager.write().await;
-                                    for (node_id, reason) in evict_list {
-                                        evict_mgr.record_eviction(&node_id, reason);
-                                        total_evicted += 1;
-                                    }
-                                }
-
-                                // Record validation metrics
-                                let nodes_count = nodes_to_validate.len();
-                                mgr.record_validation_result(bucket, nodes_count, 0);
-
-                                tracing::debug!(
-                                    bucket = bucket,
-                                    nodes_validated = nodes_count,
-                                    "Bucket validation completed during refresh"
-                                );
-                            }
-                        }
-
-                        if total_validated > 0 || total_evicted > 0 {
-                            tracing::info!(
-                                total_validated = total_validated,
-                                total_evicted = total_evicted,
-                                "Refresh validation cycle completed"
-                            );
-                        }
-                    }
-                }
-
-                // 2. Active Eviction Enforcement — remove candidates from both
-                //    the eviction tracker and the routing table.
-                {
-                    let mut eviction_mgr = eviction_manager.write().await;
-                    let candidates = eviction_mgr.get_eviction_candidates();
-                    if !candidates.is_empty() {
-                        let mut routing = routing_table.write().await;
-                        for (node_id, reason) in candidates {
-                            tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
-                            routing.remove_node(&node_id);
-                            eviction_mgr.remove_node(&node_id);
-                        }
-                    }
-                }
-
-                // 4. Update Metrics
-                // (Example: update churn rate)
-                // metrics.update_churn(...)
-            }
-        });
+    /// Signal background tasks to stop
+    pub fn signal_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Find nodes closest to a key
@@ -608,15 +432,6 @@ impl DhtCoreEngine {
     /// live routing table contents on every call, so counts are always accurate
     /// regardless of evictions, reconnections, or address changes.
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
-        // 1. Security Check: Close Group Validator
-        {
-            let validator = self.close_group_validator.read().await;
-            if !validator.validate(&node.id) {
-                tracing::warn!("Node failed close group validation: {:?}", node.id);
-                return Err(anyhow::anyhow!("Node failed close group validation"));
-            }
-        }
-
         // IP-based transports always have an IP; non-IP transports skip diversity.
         let candidate_ip = match node.ip() {
             Some(ip) => ip,

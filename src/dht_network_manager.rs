@@ -23,7 +23,6 @@ use crate::{
     adaptive::TrustEngine,
     address::MultiAddr,
     dht::core_engine::{NodeCapacity, NodeInfo},
-    dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -198,14 +197,10 @@ pub struct DhtNetworkManager {
     event_tx: broadcast::Sender<DhtNetworkEvent>,
     /// Operation statistics
     stats: Arc<RwLock<DhtNetworkStats>>,
-    /// Maintenance scheduler for periodic security and DHT tasks
-    maintenance_scheduler: Arc<RwLock<MaintenanceScheduler>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
-    /// Handle for the maintenance task so it can be joined on stop
-    maintenance_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the network event handler task
     event_handler_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -289,17 +284,8 @@ pub struct DhtNetworkStats {
 
 impl DhtNetworkManager {
     fn init_dht_core(local_peer_id: &PeerId, allow_loopback: bool) -> Result<DhtCoreEngine> {
-        // Use LogOnly mode so nodes can join the routing table without prior validation.
-        // Strict mode rejects every unknown node, making it impossible to bootstrap a
-        // fresh network (chicken-and-egg: no node can be validated until it's in the RT).
-        let dht_instance = DhtCoreEngine::new_with_validation_mode(
-            *local_peer_id,
-            crate::dht::routing_maintenance::close_group_validator::CloseGroupEnforcementMode::LogOnly,
-            allow_loopback,
-        )
-            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
-        dht_instance.start_maintenance_tasks();
-        Ok(dht_instance)
+        DhtCoreEngine::new(*local_peer_id, allow_loopback)
+            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))
     }
 
     fn new_from_components(
@@ -317,17 +303,9 @@ impl DhtNetworkManager {
             dht_instance.set_ip_diversity_config(diversity.clone());
         }
 
-        // Wire trust engine into the eviction manager for live trust score queries
-        if let Some(ref engine) = trust_engine {
-            dht_instance.set_trust_engine(engine.clone());
-        }
-
         let dht = Arc::new(RwLock::new(dht_instance));
 
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
-        let maintenance_config = MaintenanceConfig::from(&config.dht_config);
-        let maintenance_scheduler =
-            Arc::new(RwLock::new(MaintenanceScheduler::new(maintenance_config)));
         let message_handler_semaphore = Arc::new(Semaphore::new(
             config
                 .max_concurrent_operations
@@ -342,10 +320,8 @@ impl DhtNetworkManager {
             active_operations: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
-            maintenance_scheduler,
             message_handler_semaphore,
             shutdown: CancellationToken::new(),
-            maintenance_handle: Arc::new(RwLock::new(None)),
             event_handler_handle: Arc::new(RwLock::new(None)),
         })
     }
@@ -419,9 +395,6 @@ impl DhtNetworkManager {
         // Reconcile peers that may have connected before event subscription.
         self.reconcile_connected_peers().await;
 
-        // Start DHT maintenance tasks
-        self.start_maintenance_tasks().await?;
-
         info!("DHT Network Manager started successfully");
         Ok(())
     }
@@ -466,17 +439,8 @@ impl DhtNetworkManager {
         // Signal all background tasks to stop
         self.shutdown.cancel();
 
-        // Signal the DHT core engine's maintenance task to stop
+        // Signal background tasks to stop
         self.dht.read().await.signal_shutdown();
-
-        // Join the maintenance task
-        if let Some(handle) = self.maintenance_handle.write().await.take() {
-            match handle.await {
-                Ok(()) => debug!("Maintenance task stopped cleanly"),
-                Err(e) if e.is_cancelled() => debug!("Maintenance task was cancelled"),
-                Err(e) => warn!("Maintenance task panicked: {}", e),
-            }
-        }
 
         // Join the event handler task
         if let Some(handle) = self.event_handler_handle.write().await.take() {
@@ -914,6 +878,42 @@ impl DhtNetworkManager {
             engine.score(peer_id) < self.config.block_threshold
         } else {
             false
+        }
+    }
+
+    /// Remove peers from the routing table whose trust has fallen below the block threshold.
+    ///
+    /// Called by AdaptiveDHT after trust score recomputation to reactively evict
+    /// peers that have become untrustworthy.
+    pub async fn sweep_blocked_peers(&self) {
+        if self.config.block_threshold <= 0.0 {
+            return;
+        }
+        let Some(ref engine) = self.trust_engine else {
+            return;
+        };
+
+        // Collect blocked peers under a read lock
+        let blocked: Vec<PeerId> = {
+            let dht = self.dht.read().await;
+            dht.all_peer_ids()
+                .await
+                .into_iter()
+                .filter(|id| engine.score(id) < self.config.block_threshold)
+                .collect()
+        };
+
+        // Remove under a single write lock
+        if !blocked.is_empty() {
+            let mut dht = self.dht.write().await;
+            for peer_id in &blocked {
+                dht.remove_node_by_id(peer_id).await;
+            }
+            tracing::info!(
+                removed = blocked.len(),
+                threshold = self.config.block_threshold,
+                "Swept blocked peers from routing table"
+            );
         }
     }
 
@@ -1821,113 +1821,6 @@ impl DhtNetworkManager {
 
         *self.event_handler_handle.write().await = Some(handle);
 
-        Ok(())
-    }
-
-    /// Start maintenance tasks using the MaintenanceScheduler
-    async fn start_maintenance_tasks(&self) -> Result<()> {
-        info!("Starting DHT maintenance tasks with scheduler...");
-
-        // Start the scheduler
-        {
-            let mut scheduler = self.maintenance_scheduler.write().await;
-            scheduler.start();
-        }
-
-        // Main scheduler loop
-        let scheduler = Arc::clone(&self.maintenance_scheduler);
-        let dht = Arc::clone(&self.dht);
-        let transport = Arc::clone(&self.transport);
-        let stats = Arc::clone(&self.stats);
-        let event_tx = self.event_tx.clone();
-        let shutdown = self.shutdown.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut check_interval = tokio::time::interval(Duration::from_secs(5));
-
-            loop {
-                tokio::select! {
-                    _ = check_interval.tick() => {}
-                    () = shutdown.cancelled() => {
-                        info!("DHT maintenance task shutting down");
-                        break;
-                    }
-                }
-
-                // Get due tasks from scheduler
-                let due_tasks = {
-                    let scheduler_guard = scheduler.read().await;
-                    scheduler_guard.get_due_tasks()
-                };
-
-                for task in due_tasks {
-                    // Mark task as started
-                    {
-                        let mut scheduler_guard = scheduler.write().await;
-                        scheduler_guard.mark_started(task);
-                    }
-
-                    let task_result: std::result::Result<(), &'static str> = match task {
-                        MaintenanceTask::BucketRefresh => {
-                            debug!("Running BucketRefresh maintenance task");
-                            // Refresh k-buckets by looking up random IDs in each bucket
-                            // This helps discover new nodes and keep routing table fresh
-                            Ok(())
-                        }
-                        MaintenanceTask::CloseGroupValidation => {
-                            debug!("Running CloseGroupValidation maintenance task");
-                            // Validate close group membership and detect anomalies
-                            // This helps detect Sybil attacks on close groups
-                            Ok(())
-                        }
-                    };
-
-                    // Mark task completed or failed
-                    {
-                        let mut scheduler_guard = scheduler.write().await;
-                        match task_result {
-                            Ok(()) => {
-                                scheduler_guard.mark_completed(task);
-                                if event_tx.receiver_count() > 0 {
-                                    let _ = event_tx.send(DhtNetworkEvent::OperationCompleted {
-                                        operation: format!("{task:?}"),
-                                        success: true,
-                                        duration: Duration::from_millis(1),
-                                    });
-                                }
-                            }
-                            Err(_) => {
-                                scheduler_guard.mark_failed(task);
-                                if event_tx.receiver_count() > 0 {
-                                    let _ = event_tx.send(DhtNetworkEvent::OperationCompleted {
-                                        operation: format!("{task:?}"),
-                                        success: false,
-                                        duration: Duration::from_millis(1),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Update stats periodically
-                let connected_peers = transport.peer_count().await;
-                let routing_table_size = dht.read().await.routing_table_size().await;
-
-                {
-                    let mut stats_guard = stats.write().await;
-                    stats_guard.connected_peers = connected_peers;
-                    stats_guard.routing_table_size = routing_table_size;
-                }
-            }
-        });
-
-        *self.maintenance_handle.write().await = Some(handle);
-
-        info!(
-            "DHT maintenance scheduler started with {} task types",
-            MaintenanceTask::all().len()
-        );
         Ok(())
     }
 

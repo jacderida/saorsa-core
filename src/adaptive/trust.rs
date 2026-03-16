@@ -39,9 +39,6 @@ const EIGENTRUST_ALPHA: f64 = 0.4;
 /// Trust decay rate per hour. Applied as `decay_rate^elapsed_hours`.
 const TRUST_DECAY_RATE: f64 = 0.99;
 
-/// Interval between background trust recomputations
-const TRUST_RECOMPUTE_INTERVAL_SECS: u64 = 300;
-
 /// Maximum power iterations for global trust convergence
 const MAX_POWER_ITERATIONS: usize = 50;
 
@@ -94,9 +91,6 @@ pub struct TrustEngine {
     /// Last trust recomputation timestamp
     last_update: RwLock<Instant>,
 
-    /// Background recomputation interval
-    update_interval: Duration,
-
     /// Cached trust scores for fast synchronous access
     trust_cache: Arc<RwLock<HashMap<PeerId, f64>>>,
 }
@@ -146,19 +140,8 @@ impl TrustEngine {
             alpha: EIGENTRUST_ALPHA,
             decay_rate: TRUST_DECAY_RATE,
             last_update: RwLock::new(Instant::now()),
-            update_interval: Duration::from_secs(TRUST_RECOMPUTE_INTERVAL_SECS),
             trust_cache: Arc::new(RwLock::new(initial_cache)),
         }
-    }
-
-    /// Start background trust computation task (runs every `update_interval`)
-    pub fn start_background_updates(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(self.update_interval).await;
-                let _ = self.compute_global_trust().await;
-            }
-        });
     }
 
     /// Update local trust based on a pairwise interaction outcome
