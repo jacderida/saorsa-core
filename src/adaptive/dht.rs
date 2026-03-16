@@ -295,4 +295,165 @@ mod tests {
             let _update = event.to_stats_update();
         }
     }
+
+    // =========================================================================
+    // End-to-end: peer lifecycle from trusted to blocked to unblocked
+    // =========================================================================
+
+    /// Full lifecycle: good peer → fails → blocked → time passes → unblocked
+    #[tokio::test]
+    async fn test_peer_lifecycle_block_and_recovery() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Phase 1: Peer starts at neutral
+        assert!(
+            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
+            "New peer should not be blocked"
+        );
+
+        // Phase 2: Some successes — peer is trusted
+        for _ in 0..20 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+                .await;
+        }
+        let good_score = engine.score(&peer);
+        assert!(
+            good_score > DEFAULT_NEUTRAL_TRUST,
+            "Trusted peer: {good_score}"
+        );
+
+        // Phase 3: Peer starts failing — score drops
+        for _ in 0..200 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+        let bad_score = engine.score(&peer);
+        assert!(
+            bad_score < DEFAULT_BLOCK_THRESHOLD,
+            "After many failures, peer should be blocked: {bad_score}"
+        );
+
+        // Phase 4: Time passes (3+ days) — score decays back toward neutral
+        let three_days = std::time::Duration::from_secs(3 * 24 * 3600);
+        engine.simulate_elapsed(&peer, three_days).await;
+        let recovered_score = engine.score(&peer);
+        assert!(
+            recovered_score >= DEFAULT_BLOCK_THRESHOLD,
+            "After 3 days idle, peer should be unblocked: {recovered_score}"
+        );
+    }
+
+    /// Verify the block threshold works as a binary gate
+    #[tokio::test]
+    async fn test_block_threshold_is_binary() {
+        let engine = TrustEngine::new();
+        let threshold = DEFAULT_BLOCK_THRESHOLD;
+
+        let peer_above = PeerId::random();
+        let peer_below = PeerId::random();
+
+        // Peer with some successes — above threshold
+        for _ in 0..5 {
+            engine
+                .update_node_stats(&peer_above, NodeStatisticsUpdate::CorrectResponse)
+                .await;
+        }
+        assert!(
+            engine.score(&peer_above) >= threshold,
+            "Peer with successes should be above threshold"
+        );
+
+        // Peer with only failures — below threshold
+        for _ in 0..50 {
+            engine
+                .update_node_stats(&peer_below, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+        assert!(
+            engine.score(&peer_below) < threshold,
+            "Peer with only failures should be below threshold"
+        );
+
+        // Unknown peer — at neutral, which is above threshold
+        let unknown = PeerId::random();
+        assert!(
+            engine.score(&unknown) >= threshold,
+            "Unknown peer at neutral should not be blocked"
+        );
+    }
+
+    /// Verify that a single failure doesn't immediately block a peer
+    #[tokio::test]
+    async fn test_single_failure_does_not_block() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+            .await;
+
+        // A single failure from neutral (0.5) should give ~0.45, still above 0.15
+        assert!(
+            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
+            "One failure from neutral should not block: {}",
+            engine.score(&peer)
+        );
+    }
+
+    /// Verify that a previously-trusted peer needs many failures to get blocked
+    #[tokio::test]
+    async fn test_trusted_peer_resilient_to_occasional_failures() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Build up trust
+        for _ in 0..50 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+                .await;
+        }
+        let trusted_score = engine.score(&peer);
+
+        // A few failures shouldn't block
+        for _ in 0..3 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+
+        assert!(
+            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
+            "3 failures after 50 successes should not block: {}",
+            engine.score(&peer)
+        );
+        assert!(
+            engine.score(&peer) < trusted_score,
+            "Score should have decreased"
+        );
+    }
+
+    /// Verify removing a peer resets their state completely
+    #[tokio::test]
+    async fn test_removed_peer_starts_fresh() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Block the peer
+        for _ in 0..100 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+        assert!(engine.score(&peer) < DEFAULT_BLOCK_THRESHOLD);
+
+        // Remove and check — should be back to neutral
+        engine.remove_node(&peer).await;
+        assert!(
+            (engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
+            "Removed peer should return to neutral"
+        );
+    }
 }

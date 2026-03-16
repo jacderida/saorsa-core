@@ -167,6 +167,20 @@ impl TrustEngine {
         let mut peers = self.peers.write().await;
         peers.remove(node_id);
     }
+
+    /// Simulate time passing for a peer (test only).
+    ///
+    /// Shifts the peer's `last_updated` timestamp backward by the given duration,
+    /// so the next `score()` call applies the corresponding decay.
+    #[cfg(test)]
+    pub async fn simulate_elapsed(&self, node_id: &PeerId, elapsed: std::time::Duration) {
+        let mut peers = self.peers.write().await;
+        if let Some(trust) = peers.get_mut(node_id) {
+            if let Some(past) = Instant::now().checked_sub(elapsed) {
+                trust.last_updated = past;
+            }
+        }
+    }
 }
 
 impl Default for TrustEngine {
