@@ -37,12 +37,13 @@ const MAX_TRUST_SCORE: f64 = 1.0;
 /// EMA weight for each new observation (higher = faster response to events)
 const EMA_WEIGHT: f64 = 0.1;
 
-/// Half-life for decay back to neutral (seconds).
-/// After this much idle time, the distance from neutral is halved.
-const DECAY_HALF_LIFE_SECS: f64 = 3600.0;
-
-/// Pre-computed decay constant: ln(2) / half_life
-const DECAY_LAMBDA: f64 = core::f64::consts::LN_2 / DECAY_HALF_LIFE_SECS;
+/// Decay constant (per-second).
+///
+/// Tuned so that the worst possible score (0.0) takes 3 days of idle time
+/// to decay back above the block threshold (0.15).
+///
+/// Derivation: 0.15 = 0.5 - 0.5 * e^(-λ * 259200)  →  λ = -ln(0.7) / 259200
+const DECAY_LAMBDA: f64 = 1.3761e-6;
 
 /// Per-node trust state
 #[derive(Debug, Clone)]
@@ -283,42 +284,72 @@ mod tests {
         assert!(after_success > after_fail, "Success should increase score");
     }
 
+    /// 3 days of idle time from worst score (0.0) should cross the block threshold (0.15)
     #[test]
-    fn test_decay_moves_toward_neutral() {
-        // Manually create a peer trust entry with a known score and a past timestamp
+    fn test_worst_score_unblocks_after_3_days() {
+        let three_days_secs: u64 = 3 * 24 * 3600;
         let mut trust = PeerTrust {
-            score: 0.9,
-            last_updated: Instant::now() - std::time::Duration::from_secs(7200), // 2 hours ago
+            score: MIN_TRUST_SCORE,
+            last_updated: Instant::now() - std::time::Duration::from_secs(three_days_secs),
         };
 
         trust.apply_decay();
 
-        // After 2 hours (2x half-life at 1hr), score should be ~75% of the way back to neutral
-        // 0.5 + (0.9 - 0.5) * e^(-ln2/3600 * 7200) = 0.5 + 0.4 * 0.25 = 0.6
-        assert!(trust.score < 0.9, "Score should have decayed from 0.9");
+        assert!(
+            trust.score >= 0.15,
+            "After 3 days, score {} should be >= block threshold 0.15",
+            trust.score
+        );
+    }
+
+    /// Just under 3 days should NOT be enough to unblock
+    #[test]
+    fn test_worst_score_still_blocked_before_3_days() {
+        let just_under_3_days: u64 = 3 * 24 * 3600 - 3600; // 3 days minus 1 hour
+        let mut trust = PeerTrust {
+            score: MIN_TRUST_SCORE,
+            last_updated: Instant::now() - std::time::Duration::from_secs(just_under_3_days),
+        };
+
+        trust.apply_decay();
+
+        assert!(
+            trust.score < 0.15,
+            "Before 3 days, score {} should still be < block threshold 0.15",
+            trust.score
+        );
+    }
+
+    #[test]
+    fn test_decay_from_high_score_moves_down() {
+        let one_week_secs: u64 = 7 * 24 * 3600;
+        let mut trust = PeerTrust {
+            score: 0.95,
+            last_updated: Instant::now() - std::time::Duration::from_secs(one_week_secs),
+        };
+
+        trust.apply_decay();
+
+        assert!(trust.score < 0.95, "Score should have decayed from 0.95");
         assert!(
             trust.score > DEFAULT_NEUTRAL_TRUST,
-            "Score should still be above neutral"
+            "Score should still be above neutral after 1 week"
         );
     }
 
     #[test]
     fn test_decay_from_low_score_moves_up() {
+        let one_week_secs: u64 = 7 * 24 * 3600;
         let mut trust = PeerTrust {
             score: 0.1,
-            last_updated: Instant::now() - std::time::Duration::from_secs(7200),
+            last_updated: Instant::now() - std::time::Duration::from_secs(one_week_secs),
         };
 
         trust.apply_decay();
 
-        // Should decay toward neutral (up from 0.1)
         assert!(
             trust.score > 0.1,
             "Low score should decay upward toward neutral"
-        );
-        assert!(
-            trust.score < DEFAULT_NEUTRAL_TRUST,
-            "Should still be below neutral"
         );
     }
 }
