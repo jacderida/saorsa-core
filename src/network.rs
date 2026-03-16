@@ -1009,6 +1009,17 @@ impl P2PNode {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<PeerResponse> {
+        // Fail fast for blocked peers
+        if self.adaptive_dht.peer_trust(peer_id) < self.adaptive_dht.config().block_threshold {
+            return Err(P2PError::Network(crate::error::NetworkError::PeerNotFound(
+                format!(
+                    "Peer {} is blocked (trust below threshold)",
+                    peer_id.to_hex()
+                )
+                .into(),
+            )));
+        }
+
         match self
             .transport
             .send_request(peer_id, protocol, data, timeout)

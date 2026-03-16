@@ -928,6 +928,17 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
         address_hint: Option<&MultiAddr>,
     ) -> Result<DhtNetworkResult> {
+        // Fail fast for blocked peers — don't waste resources connecting/sending
+        if self.is_peer_blocked(peer_id) {
+            return Err(P2PError::Network(NetworkError::PeerNotFound(
+                format!(
+                    "Peer {} is blocked (trust below threshold)",
+                    peer_id.to_hex()
+                )
+                .into(),
+            )));
+        }
+
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
 
@@ -1144,6 +1155,10 @@ impl DhtNetworkManager {
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
     async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
+        if self.is_peer_blocked(peer_id) {
+            return None;
+        }
+
         let peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
