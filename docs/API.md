@@ -160,19 +160,17 @@ while let Some(event) = subscription.recv().await {
 Create and run a P2P node.
 
 ```rust
-use saorsa_core::{P2PNode, NodeConfig, NodeBuilder};
+use saorsa_core::{P2PNode, NodeConfig};
 
 // Using builder pattern
-let node = P2PNode::builder()
-    .listen_on("0.0.0.0:9000".parse()?)
-    .with_bootstrap_nodes(vec![
-        "192.168.1.1:9000".parse()?,
-    ])
-    .build()
-    .await?;
+let config = NodeConfig::builder()
+    .port(9000)
+    .bootstrap_peer("192.168.1.1:9000".parse()?)
+    .build()?;
+let node = P2PNode::new(config).await?;
 
 // Start the node
-node.run().await?;
+node.start().await?;
 ```
 
 ### Connection Events

@@ -53,7 +53,7 @@ impl NetworkTestFramework {
         let listen_addrs = self.nodes[node_index].listen_addrs().await;
         let addr = listen_addrs
             .iter()
-            .find(|a| a.ip().map_or(false, |ip| ip.is_ipv4()))
+            .find(|a| a.ip().is_some_and(|ip| ip.is_ipv4()))
             .or_else(|| listen_addrs.first())
             .cloned()
             .with_context(|| format!("Node {} has no listen addresses", node_index))?;

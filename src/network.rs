@@ -79,15 +79,10 @@ pub enum NodeMode {
     Client,
 }
 
-/// Listen mode controlling which network interfaces the node binds to.
-///
-/// - `Public` binds to all interfaces (`0.0.0.0` / `::`), suitable for production.
-/// - `Local` binds to loopback only (`127.0.0.1` / `::1`), suitable for testing
-///   and local development.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ListenMode {
+/// Internal listen mode controlling which network interfaces the node binds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenMode {
     /// Bind to all interfaces (`0.0.0.0` / `::`).
-    #[default]
     Public,
     /// Bind to loopback only (`127.0.0.1` / `::1`).
     Local,
@@ -149,15 +144,32 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 
+/// Serde helper — returns `true`.
+const fn default_true() -> bool {
+    true
+}
+
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Addresses to listen on for incoming connections.
+    /// Bind to loopback only (`127.0.0.1` / `::1`).
     ///
-    /// IPv6 support is implicit: include an IPv6 [`MultiAddr`] to enable
-    /// dual-stack. The transport layer partitions this list into at most
-    /// one IPv4 and one IPv6 bind.
-    pub listen_addrs: Vec<MultiAddr>,
+    /// When `true`, the node listens on loopback addresses suitable for
+    /// local development and testing. When `false` (the default), the node
+    /// listens on all interfaces (`0.0.0.0` / `::`).
+    #[serde(default)]
+    pub local: bool,
+
+    /// Listen port. `0` means OS-assigned ephemeral port.
+    #[serde(default)]
+    pub port: u16,
+
+    /// Enable IPv6 dual-stack binding.
+    ///
+    /// When `true` (the default), both an IPv4 and an IPv6 address are
+    /// bound. When `false`, only IPv4 is used.
+    #[serde(default = "default_true")]
+    pub ipv6: bool,
 
     /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<crate::MultiAddr>,
@@ -319,6 +331,19 @@ impl NodeConfig {
             .unwrap_or_else(|| user_agent_for_mode(self.mode))
     }
 
+    /// Compute the listen addresses from the configuration fields.
+    ///
+    /// The returned addresses are derived from [`local`](Self::local),
+    /// [`port`](Self::port), and [`ipv6`](Self::ipv6).
+    pub fn listen_addrs(&self) -> Vec<MultiAddr> {
+        let mode = if self.local {
+            ListenMode::Local
+        } else {
+            ListenMode::Public
+        };
+        build_listen_addrs(self.port, self.ipv6, mode)
+    }
+
     /// Create a new NodeConfig with default values
     ///
     /// # Errors
@@ -329,11 +354,9 @@ impl NodeConfig {
         let listen_sa = config.listen_socket_addr()?;
 
         Ok(Self {
-            listen_addrs: build_listen_addrs(
-                listen_sa.port(),
-                config.network.ipv6_enabled,
-                ListenMode::Public,
-            ),
+            local: false,
+            port: listen_sa.port(),
+            ipv6: config.network.ipv6_enabled,
             bootstrap_peers: config
                 .network
                 .bootstrap_nodes
@@ -372,7 +395,7 @@ impl NodeConfig {
 /// Defaults are chosen for quick local development:
 /// - QUIC on a random free port (`0`)
 /// - IPv6 enabled (dual-stack)
-/// - `ListenMode::Public` (all interfaces)
+/// - All interfaces (not local-only)
 ///
 /// # Examples
 ///
@@ -382,14 +405,14 @@ impl NodeConfig {
 ///
 /// // Local dev/test mode (loopback, auto-enables allow_loopback)
 /// let config = NodeConfig::builder()
-///     .listen_mode(ListenMode::Local)
+///     .local(true)
 ///     .build()?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct NodeConfigBuilder {
-    quic_port: u16,
+    port: u16,
     ipv6: bool,
-    listen_mode: ListenMode,
+    local: bool,
     bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
@@ -406,9 +429,9 @@ pub struct NodeConfigBuilder {
 impl Default for NodeConfigBuilder {
     fn default() -> Self {
         Self {
-            quic_port: 0,
+            port: 0,
             ipv6: true,
-            listen_mode: ListenMode::Public,
+            local: false,
             bootstrap_peers: Vec::new(),
             max_connections: None,
             connection_timeout: None,
@@ -425,9 +448,9 @@ impl Default for NodeConfigBuilder {
 }
 
 impl NodeConfigBuilder {
-    /// Set the QUIC listen port. Default: `0` (random free port).
-    pub fn quic_port(mut self, port: u16) -> Self {
-        self.quic_port = port;
+    /// Set the listen port. Default: `0` (random free port).
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
         self
     }
 
@@ -437,12 +460,14 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Set the listen mode (public vs loopback). Default: [`ListenMode::Public`].
+    /// Bind to loopback only (`true`) or all interfaces (`false`).
     ///
-    /// `ListenMode::Local` automatically enables `allow_loopback` unless
-    /// explicitly overridden via [`Self::allow_loopback`].
-    pub fn listen_mode(mut self, mode: ListenMode) -> Self {
-        self.listen_mode = mode;
+    /// When `true`, automatically enables `allow_loopback` unless explicitly
+    /// overridden via [`Self::allow_loopback`].
+    ///
+    /// Default: `false` (all interfaces).
+    pub fn local(mut self, local: bool) -> Self {
+        self.local = local;
         self
     }
 
@@ -509,8 +534,8 @@ impl NodeConfigBuilder {
     }
 
     /// Explicitly control whether loopback addresses are allowed in the
-    /// transport layer. When not called, `ListenMode::Local` auto-enables
-    /// this; `ListenMode::Public` defaults to `false`.
+    /// transport layer. When not called, `local(true)` auto-enables this;
+    /// `local(false)` defaults to `false`.
     pub fn allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = Some(allow);
         self
@@ -524,13 +549,13 @@ impl NodeConfigBuilder {
     pub fn build(self) -> Result<NodeConfig> {
         let base_config = Config::default();
 
-        // ListenMode::Local auto-enables allow_loopback unless explicitly overridden
-        let allow_loopback = self
-            .allow_loopback
-            .unwrap_or(matches!(self.listen_mode, ListenMode::Local));
+        // local mode auto-enables allow_loopback unless explicitly overridden
+        let allow_loopback = self.allow_loopback.unwrap_or(self.local);
 
         Ok(NodeConfig {
-            listen_addrs: build_listen_addrs(self.quic_port, self.ipv6, self.listen_mode),
+            local: self.local,
+            port: self.port,
+            ipv6: self.ipv6,
             bootstrap_peers: self.bootstrap_peers,
             connection_timeout: self
                 .connection_timeout
@@ -569,11 +594,9 @@ impl Default for NodeConfig {
         });
 
         Self {
-            listen_addrs: build_listen_addrs(
-                listen_sa.port(),
-                config.network.ipv6_enabled,
-                ListenMode::Public,
-            ),
+            local: false,
+            port: listen_sa.port(),
+            ipv6: config.network.ipv6_enabled,
             bootstrap_peers: Vec::new(),
             connection_timeout: Duration::from_secs(config.network.connection_timeout),
             keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
@@ -599,11 +622,9 @@ impl NodeConfig {
         let listen_sa = config.listen_socket_addr()?;
 
         let node_config = Self {
-            listen_addrs: build_listen_addrs(
-                listen_sa.port(),
-                config.network.ipv6_enabled,
-                ListenMode::Public,
-            ),
+            local: false,
+            port: listen_sa.port(),
+            ipv6: config.network.ipv6_enabled,
             bootstrap_peers: config
                 .network
                 .bootstrap_nodes
@@ -644,30 +665,6 @@ impl NodeConfig {
         };
 
         Ok(node_config)
-    }
-
-    /// Build a [`NodeConfig`] from a QUIC [`MultiAddr`].
-    ///
-    /// Returns [`NetworkError::InvalidAddress`] if the address is not a
-    /// dialable (QUIC) transport.
-    pub fn with_listen_addr(addr: &MultiAddr) -> Result<Self> {
-        // Validate this is a dialable transport
-        addr.dialable_socket_addr().ok_or_else(|| {
-            P2PError::Network(NetworkError::InvalidAddress(
-                format!(
-                    "only QUIC addresses are supported for listen, got {}: {}",
-                    addr.transport().kind(),
-                    addr
-                )
-                .into(),
-            ))
-        })?;
-        let cfg = NodeConfig {
-            listen_addrs: vec![addr.clone()],
-            diversity_config: None,
-            ..Default::default()
-        };
-        Ok(cfg)
     }
 }
 
@@ -1041,11 +1038,6 @@ impl P2PNode {
         );
 
         Ok(node)
-    }
-
-    /// Create a new node builder
-    pub fn builder() -> NodeBuilder {
-        NodeBuilder::new()
     }
 
     /// Get the peer ID of this node.
@@ -2056,135 +2048,7 @@ pub trait NetworkSender: Send + Sync {
 }
 
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
-
-/// Builder pattern for creating P2P nodes
-pub struct NodeBuilder {
-    config: NodeConfig,
-}
-
-impl Default for NodeBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NodeBuilder {
-    /// Create a new node builder.
-    ///
-    /// Starts with an empty `listen_addrs` list — callers must add at
-    /// least one via [`listen_on`](Self::listen_on).
-    pub fn new() -> Self {
-        Self {
-            config: NodeConfig {
-                listen_addrs: Vec::new(),
-                ..NodeConfig::default()
-            },
-        }
-    }
-
-    /// Add a listen address.
-    ///
-    /// Only QUIC addresses are accepted — non-QUIC addresses are skipped
-    /// with a warning. Use [`MultiAddr::quic`] to construct a QUIC address.
-    pub fn listen_on(mut self, addr: &MultiAddr) -> Self {
-        if addr.dialable_socket_addr().is_some() {
-            self.config.listen_addrs.push(addr.clone());
-        } else {
-            tracing::warn!(
-                "NodeBuilder::listen_on: skipping non-QUIC address: {}",
-                addr
-            );
-        }
-        self
-    }
-
-    /// Add a bootstrap peer.
-    pub fn with_bootstrap_peer(mut self, addr: &MultiAddr) -> Self {
-        self.config.bootstrap_peers.push(addr.clone());
-        self
-    }
-
-    /// Set the operating mode (Node or Client).
-    ///
-    /// This determines the default user agent and DHT participation.
-    pub fn with_mode(mut self, mode: NodeMode) -> Self {
-        self.config.mode = mode;
-        self
-    }
-
-    /// Set a custom user agent string, overriding the mode-derived default.
-    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
-        self.config.custom_user_agent = Some(user_agent.into());
-        self
-    }
-
-    /// Set connection timeout
-    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
-        self.config.connection_timeout = timeout;
-        self
-    }
-
-    /// Set maximum connections
-    pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.config.max_connections = max;
-        self
-    }
-
-    /// Set maximum application-layer message size in bytes.
-    ///
-    /// If this method is not called, saorsa-transport's built-in default is used.
-    pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
-        self.config.max_message_size = Some(max_message_size);
-        self
-    }
-
-    /// Enable production mode with default configuration
-    pub fn with_production_mode(mut self) -> Self {
-        self.config.production_config = Some(ProductionConfig::default());
-        self
-    }
-
-    /// Configure production settings
-    pub fn with_production_config(mut self, production_config: ProductionConfig) -> Self {
-        self.config.production_config = Some(production_config);
-        self
-    }
-
-    /// Allow loopback addresses in the transport layer.
-    ///
-    /// Enable for devnet/testnet modes where multiple nodes run on the same
-    /// machine. Default: `false`.
-    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
-        self.config.allow_loopback = allow;
-        self
-    }
-
-    /// Configure IP diversity limits for Sybil protection.
-    pub fn with_diversity_config(
-        mut self,
-        diversity_config: crate::security::IPDiversityConfig,
-    ) -> Self {
-        self.config.diversity_config = Some(diversity_config);
-        self
-    }
-
-    /// Configure DHT settings
-    pub fn with_dht(mut self, dht_config: DHTConfig) -> Self {
-        self.config.dht_config = dht_config;
-        self
-    }
-
-    /// Enable DHT with default configuration
-    pub fn with_default_dht(mut self) -> Self {
-        self.config.dht_config = DHTConfig::default();
-        self
-    }
-
-    /// Build the P2P node
-    pub async fn build(self) -> Result<P2PNode> {
-        P2PNode::new(self.config).await
-    }
-}
+// NodeBuilder removed — use NodeConfigBuilder + P2PNode::new() instead.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2256,7 +2120,9 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            listen_addrs: build_listen_addrs(0, true, ListenMode::Local),
+            local: true,
+            port: 0,
+            ipv6: true,
             bootstrap_peers: vec![],
             connection_timeout: Duration::from_secs(2),
             keep_alive_interval: Duration::from_secs(30),
@@ -2282,7 +2148,7 @@ mod tests {
     async fn test_node_config_default() {
         let config = NodeConfig::default();
 
-        assert_eq!(config.listen_addrs.len(), 2); // IPv4 + IPv6
+        assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
         assert_eq!(config.max_connections, 10000); // Fixed: matches actual default
         assert_eq!(config.max_incoming_connections, 100);
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
@@ -2464,23 +2330,18 @@ mod tests {
         // PeerConnected/PeerDisconnected only fire for authenticated peers
         // (nodes with node_identity that send signed messages).
         // Configure both nodes with identities so the event subscription test works.
-        let ipv4_localhost = MultiAddr::quic(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            0,
-        ));
-
         let identity1 =
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node1"));
         let identity2 =
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node2"));
 
         let mut config1 = create_test_node_config();
-        config1.listen_addrs = vec![ipv4_localhost.clone()];
+        config1.ipv6 = false;
         config1.node_identity = Some(identity1);
 
         let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
-        config2.listen_addrs = vec![ipv4_localhost];
+        config2.ipv6 = false;
         config2.node_identity = Some(identity2);
 
         let node1 = P2PNode::new(config1).await?;
@@ -2557,18 +2418,14 @@ mod tests {
     #[cfg_attr(target_os = "windows", ignore)]
     #[tokio::test]
     async fn test_message_sending() -> Result<()> {
-        // Create two nodes
-        let localhost_quic = MultiAddr::quic(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            0,
-        ));
+        // Create two nodes (IPv4-only loopback)
         let mut config1 = create_test_node_config();
-        config1.listen_addrs = vec![localhost_quic.clone()];
+        config1.ipv6 = false;
         let node1 = P2PNode::new(config1).await?;
         node1.start().await?;
 
         let mut config2 = create_test_node_config();
-        config2.listen_addrs = vec![localhost_quic];
+        config2.ipv6 = false;
         let node2 = P2PNode::new(config2).await?;
         node2.start().await?;
 
@@ -2702,27 +2559,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_node_builder() -> Result<()> {
-        let listen_v4: MultiAddr = "/ip4/127.0.0.1/udp/0/quic".parse().unwrap();
-        let listen_v6: MultiAddr = "/ip6/::1/udp/0/quic".parse().unwrap();
+    async fn test_node_config_builder() -> Result<()> {
         let bootstrap: MultiAddr = "/ip4/127.0.0.1/udp/9000/quic".parse().unwrap();
 
-        // Create a config using the builder but don't actually build a real node
-        let builder = P2PNode::builder()
-            .listen_on(&listen_v4)
-            .listen_on(&listen_v6)
-            .with_bootstrap_peer(&bootstrap)
-            .with_connection_timeout(Duration::from_secs(15))
-            .with_max_connections(200)
-            .with_max_message_size(TEST_MAX_MESSAGE_SIZE);
+        let config = NodeConfig::builder()
+            .local(true)
+            .ipv6(true)
+            .bootstrap_peer(bootstrap)
+            .connection_timeout(Duration::from_secs(15))
+            .max_connections(200)
+            .max_message_size(TEST_MAX_MESSAGE_SIZE)
+            .build()?;
 
-        // Test the configuration that was built
-        let config = builder.config;
-        assert_eq!(config.listen_addrs.len(), 2); // IPv4 + IPv6 QUIC addrs
+        assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
+        assert!(config.local);
+        assert!(config.ipv6);
         assert_eq!(config.bootstrap_peers.len(), 1);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.max_connections, 200);
         assert_eq!(config.max_message_size, Some(TEST_MAX_MESSAGE_SIZE));
+        assert!(config.allow_loopback); // auto-enabled by local(true)
 
         Ok(())
     }
@@ -2829,7 +2685,9 @@ mod tests {
         let serialized = serde_json::to_string(&config)?;
         let deserialized: NodeConfig = serde_json::from_str(&serialized)?;
 
-        assert_eq!(config.listen_addrs, deserialized.listen_addrs);
+        assert_eq!(config.local, deserialized.local);
+        assert_eq!(config.port, deserialized.port);
+        assert_eq!(config.ipv6, deserialized.ipv6);
         assert_eq!(config.bootstrap_peers, deserialized.bootstrap_peers);
 
         Ok(())

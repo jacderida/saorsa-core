@@ -23,7 +23,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
-use saorsa_core::ListenMode;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
 use saorsa_core::identity::node_identity::NodeIdentity;
@@ -51,9 +50,7 @@ fn key_from_str(s: &str) -> Key {
 /// Creates a DhtNetworkConfig and TransportHandle for testing with automatic port allocation
 async fn create_test_dht_config(peer_id: &str) -> Result<(Arc<TransportHandle>, DhtNetworkConfig)> {
     let peer = saorsa_core::PeerId::from_name(peer_id);
-    let node_config = NodeConfig::builder()
-        .listen_mode(ListenMode::Local)
-        .build()?;
+    let node_config = NodeConfig::builder().local(true).build()?;
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig::from_node_config(

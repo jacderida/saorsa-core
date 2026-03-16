@@ -19,7 +19,6 @@
 //!
 //! Run with: cargo test --test network_wiring_e2e_test -- --nocapture
 
-use saorsa_core::MultiAddr;
 use saorsa_core::PeerId;
 use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::{NodeConfig, P2PEvent, P2PNode};
@@ -46,10 +45,9 @@ fn create_test_node_config() -> NodeConfig {
     let identity =
         Arc::new(NodeIdentity::generate().expect("Test setup: identity generation should succeed"));
     NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("127.0.0.1:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         bootstrap_peers: vec![],
         node_identity: Some(identity),
         ..Default::default()

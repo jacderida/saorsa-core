@@ -61,9 +61,9 @@ async fn test_bind_error_handling() {
     // Test that binding to an invalid address returns proper error
     // Try to bind to a privileged port (should fail without root)
     let config = P2PNodeConfig {
-        listen_addrs: vec![MultiAddr::quic(
-            "127.0.0.1:80".parse().expect("valid socket address"),
-        )],
+        local: true,
+        port: 80,
+        ipv6: false,
         ..Default::default()
     };
 

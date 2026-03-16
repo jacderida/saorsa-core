@@ -13,7 +13,6 @@
 //! - Keepalive messages every 15 seconds to prevent 30-second idle timeout
 //! - Automatic stale connection cleanup
 
-use saorsa_core::MultiAddr;
 use saorsa_core::network::{NodeConfig, P2PNode};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -48,17 +47,15 @@ async fn test_connection_lifecycle_with_keepalive() {
 
     // Create two P2P nodes with different ports (port 0 = OS-assigned)
     let config1 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
 
@@ -172,17 +169,15 @@ async fn test_send_message_validates_connection_state() {
 
     // Create two P2P nodes with OS-assigned ports (port 0)
     let config1 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
 
@@ -258,17 +253,15 @@ async fn test_multiple_message_exchanges() {
 
     // Create two P2P nodes with OS-assigned ports (port 0)
     let config1 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
     let config2 = NodeConfig {
-        listen_addrs: vec![
-            MultiAddr::quic("0.0.0.0:0".parse().unwrap()),
-            MultiAddr::quic("[::]:0".parse().unwrap()),
-        ],
+        local: true,
+        port: 0,
+        ipv6: false,
         ..Default::default()
     };
 

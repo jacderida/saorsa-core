@@ -1404,7 +1404,7 @@ impl DhtNetworkManager {
         let address = self
             .config
             .node_config
-            .listen_addrs
+            .listen_addrs()
             .first()
             .cloned()
             .unwrap_or_else(|| {

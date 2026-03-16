@@ -33,7 +33,7 @@ impl SaorsaNode {
     pub async fn new(config: SaorsaNodeConfig) -> Result<Self, Error> {
         // P2PNode automatically initializes EigenTrust with bootstrap peers as pre-trusted
         let node_config = NodeConfig::builder()
-            .quic_port(config.port)
+            .port(config.port)
             .bootstrap_peer(config.bootstrap_addr)
             .build()?;
 

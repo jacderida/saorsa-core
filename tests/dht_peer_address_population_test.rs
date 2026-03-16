@@ -37,7 +37,6 @@
 //! node IDs), not raw transport-level channel IDs.
 
 use anyhow::Result;
-use saorsa_core::ListenMode;
 use saorsa_core::MultiAddr;
 use saorsa_core::dht::{DHTConfig, Key};
 use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
@@ -72,9 +71,7 @@ async fn create_test_dht_config(
         NodeIdentity::generate().map_err(|e| anyhow::anyhow!("identity generation failed: {e}"))?,
     );
 
-    let node_config = NodeConfig::builder()
-        .listen_mode(ListenMode::Local)
-        .build()?;
+    let node_config = NodeConfig::builder().local(true).build()?;
 
     let transport = Arc::new(
         TransportHandle::new(TransportConfig::from_node_config(

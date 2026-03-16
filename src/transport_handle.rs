@@ -90,7 +90,7 @@ impl TransportConfig {
         node_identity: Arc<NodeIdentity>,
     ) -> Self {
         Self {
-            listen_addrs: config.listen_addrs.clone(),
+            listen_addrs: config.listen_addrs(),
             connection_timeout: config.connection_timeout,
             max_connections: config.max_connections,
             production_config: config.production_config.clone(),

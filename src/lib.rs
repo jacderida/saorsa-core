@@ -199,8 +199,8 @@ pub use monotonic_counter::{
 #[allow(deprecated)]
 pub use network::default_node_user_agent;
 pub use network::{
-    ConnectionStatus, ListenMode, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent,
-    P2PNode, PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
+    ConnectionStatus, NetworkSender, NodeConfig, NodeConfigBuilder, NodeMode, P2PEvent, P2PNode,
+    PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
 };
 pub use transport_handle::TransportHandle;
 // Trust system exports for saorsa-node integration
