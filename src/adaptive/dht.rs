@@ -147,9 +147,13 @@ impl AdaptiveDHT {
     /// creates the `DhtNetworkManager` with the trust engine injected.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
-        dht_config: DhtNetworkConfig,
+        mut dht_config: DhtNetworkConfig,
         adaptive_config: AdaptiveDhtConfig,
     ) -> Result<Self> {
+        // Propagate trust routing settings into DHT network config
+        dht_config.trust_weighted_routing = adaptive_config.trust_weighted_routing;
+        dht_config.trust_routing_weight = adaptive_config.routing_weight;
+
         let pre_trusted: HashSet<PeerId> = HashSet::new();
         let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
         trust_engine.clone().start_background_updates();

@@ -870,6 +870,9 @@ impl P2PNode {
             request_timeout: config.connection_timeout,
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
             enable_security: true,
+            // Trust routing defaults — overridden by AdaptiveDHT::new()
+            trust_weighted_routing: false,
+            trust_routing_weight: 0.0,
         };
         let adaptive_dht = AdaptiveDHT::new(
             transport.clone(),

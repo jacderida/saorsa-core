@@ -96,6 +96,12 @@ pub struct DhtNetworkConfig {
     pub max_concurrent_operations: usize,
     /// Enable enhanced security features
     pub enable_security: bool,
+    /// Enable trust-weighted peer selection in iterative lookups.
+    /// When true, candidates are sorted by a blend of XOR distance and trust score.
+    pub trust_weighted_routing: bool,
+    /// Weight given to trust in blended peer selection (0.0–1.0).
+    /// Only used when `trust_weighted_routing` is true.
+    pub trust_routing_weight: f64,
 }
 
 /// DHT network operation types
@@ -756,7 +762,18 @@ impl DhtNetworkManager {
             }
 
             // Sort, deduplicate, and truncate once per iteration instead of per result
-            best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+            if self.config.trust_weighted_routing {
+                if let Some(ref engine) = self.trust_engine {
+                    let weight = self.config.trust_routing_weight;
+                    best_nodes.sort_by(|a, b| {
+                        Self::compare_node_trust_weighted(a, b, key, engine, weight)
+                    });
+                } else {
+                    best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+                }
+            } else {
+                best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+            }
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
@@ -800,14 +817,67 @@ impl DhtNetworkManager {
     }
 
     /// Compare two nodes by their XOR distance to a target key.
-    ///
-    /// Uses cached DHT keys when available, falls back to the peer ID directly
-    /// (which is now the same keyspace).
     fn compare_node_distance(a: &DHTNode, b: &DHTNode, key: &Key) -> std::cmp::Ordering {
         let target_key = DhtKey::from_bytes(*key);
         a.peer_id
             .distance(&target_key)
             .cmp(&b.peer_id.distance(&target_key))
+    }
+
+    /// Compare two nodes by blended distance + trust score.
+    ///
+    /// Blends XOR distance rank with trust score: lower is better.
+    /// `trust_weight` controls how much trust influences the ranking (0.0–1.0).
+    fn compare_node_trust_weighted(
+        a: &DHTNode,
+        b: &DHTNode,
+        key: &Key,
+        trust_engine: &crate::adaptive::trust::TrustEngine,
+        trust_weight: f64,
+    ) -> std::cmp::Ordering {
+        let target_key = DhtKey::from_bytes(*key);
+        let dist_a = a.peer_id.distance(&target_key);
+        let dist_b = b.peer_id.distance(&target_key);
+
+        // Compare distance first
+        let dist_ord = dist_a.cmp(&dist_b);
+
+        // If distances are equal, prefer higher trust
+        if dist_ord == std::cmp::Ordering::Equal {
+            let trust_a = trust_engine.score(&a.peer_id);
+            let trust_b = trust_engine.score(&b.peer_id);
+            // Higher trust = better, so reverse comparison
+            return trust_b
+                .partial_cmp(&trust_a)
+                .unwrap_or(std::cmp::Ordering::Equal);
+        }
+
+        // Blend: use trust as a tiebreaker within the same distance "tier"
+        // Only reorder when the trust difference is significant enough
+        // to overcome the distance difference within `trust_weight` tolerance
+        let trust_a = trust_engine.score(&a.peer_id);
+        let trust_b = trust_engine.score(&b.peer_id);
+        let trust_diff = trust_b - trust_a; // positive if b is more trusted
+
+        // If trust difference is large enough and trust_weight is high,
+        // promote the more trusted peer even if slightly farther
+        if trust_diff > trust_weight && dist_ord == std::cmp::Ordering::Less {
+            // a is closer but b is significantly more trusted — keep a closer
+            return dist_ord;
+        }
+        if trust_diff < -trust_weight && dist_ord == std::cmp::Ordering::Greater {
+            // b is closer but a is significantly more trusted — keep b closer
+            return dist_ord;
+        }
+
+        // For significant trust advantages, promote the trusted peer
+        if trust_diff.abs() > trust_weight {
+            return trust_b
+                .partial_cmp(&trust_a)
+                .unwrap_or(std::cmp::Ordering::Equal);
+        }
+
+        dist_ord
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -1953,15 +2023,23 @@ impl DhtNetworkManager {
     }
 }
 
+/// Default request timeout for DHT operations (seconds)
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Default maximum concurrent DHT operations
+const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
+
 impl Default for DhtNetworkConfig {
     fn default() -> Self {
         Self {
             peer_id: PeerId::from_bytes([0u8; 32]),
             dht_config: DHTConfig::default(),
             node_config: NodeConfig::default(),
-            request_timeout: Duration::from_secs(30),
-            max_concurrent_operations: 100,
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
             enable_security: true,
+            trust_weighted_routing: false,
+            trust_routing_weight: 0.0,
         }
     }
 }
