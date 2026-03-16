@@ -73,34 +73,27 @@ impl Default for AdaptiveDhtConfig {
     }
 }
 
-/// Trust-relevant events that can be reported by application-level consumers.
+/// Trust-relevant events observable by the saorsa-core network layer.
 ///
 /// Each variant maps to an internal [`NodeStatisticsUpdate`] with appropriate severity.
-/// DHT-internal events (iterative lookup success/failure) are recorded automatically
-/// by `DhtNetworkManager` — this enum is for **application-level** signals only.
+/// Only events that saorsa-core can directly observe are included here.
+/// Application-level events (data verification, storage checks) belong in
+/// the consuming application and should be added when that layer exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustEvent {
     // === Positive signals ===
-    /// Peer provided a correct, verified response
+    /// Peer provided a correct response to a request
     SuccessfulResponse,
-    /// Peer connection was established successfully
+    /// Peer connection was established and authenticated
     SuccessfulConnection,
 
-    // === Negative signals (varying severity) ===
-    /// Generic response failure
-    FailedResponse,
-    /// Could not establish a connection
+    // === Negative signals ===
+    /// Could not establish a connection to the peer
     ConnectionFailed,
     /// Connection attempt timed out
     ConnectionTimeout,
-    /// Peer did not have requested data
-    DataUnavailable,
-    /// Peer returned data that failed integrity verification (severe — 2x penalty)
-    CorruptedData,
     /// Peer violated the wire protocol (severe — 2x penalty)
     ProtocolViolation,
-    /// Peer explicitly refused the request
-    Refused,
     /// Peer disconnected unexpectedly
     UnexpectedDisconnect,
 }
@@ -112,13 +105,9 @@ impl TrustEvent {
             TrustEvent::SuccessfulResponse | TrustEvent::SuccessfulConnection => {
                 NodeStatisticsUpdate::CorrectResponse
             }
-            TrustEvent::FailedResponse
-            | TrustEvent::ConnectionFailed
+            TrustEvent::ConnectionFailed
             | TrustEvent::ConnectionTimeout
-            | TrustEvent::Refused
             | TrustEvent::UnexpectedDisconnect => NodeStatisticsUpdate::FailedResponse,
-            TrustEvent::DataUnavailable => NodeStatisticsUpdate::DataUnavailable,
-            TrustEvent::CorruptedData => NodeStatisticsUpdate::CorruptedData,
             TrustEvent::ProtocolViolation => NodeStatisticsUpdate::ProtocolViolation,
         }
     }
@@ -243,11 +232,7 @@ mod tests {
             NodeStatisticsUpdate::CorrectResponse
         ));
 
-        // Generic failures map to FailedResponse
-        assert!(matches!(
-            TrustEvent::FailedResponse.to_stats_update(),
-            NodeStatisticsUpdate::FailedResponse
-        ));
+        // Failure events map to FailedResponse
         assert!(matches!(
             TrustEvent::ConnectionFailed.to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
@@ -257,23 +242,11 @@ mod tests {
             NodeStatisticsUpdate::FailedResponse
         ));
         assert!(matches!(
-            TrustEvent::Refused.to_stats_update(),
-            NodeStatisticsUpdate::FailedResponse
-        ));
-        assert!(matches!(
             TrustEvent::UnexpectedDisconnect.to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
         ));
 
-        // Severity-specific mappings
-        assert!(matches!(
-            TrustEvent::DataUnavailable.to_stats_update(),
-            NodeStatisticsUpdate::DataUnavailable
-        ));
-        assert!(matches!(
-            TrustEvent::CorruptedData.to_stats_update(),
-            NodeStatisticsUpdate::CorruptedData
-        ));
+        // Severe failure — 2x penalty
         assert!(matches!(
             TrustEvent::ProtocolViolation.to_stats_update(),
             NodeStatisticsUpdate::ProtocolViolation
@@ -330,10 +303,10 @@ mod tests {
         let engine = Arc::new(TrustEngine::new(HashSet::new()));
         let bad_peer = PeerId::random();
 
-        // Record many failures (including severe ones)
+        // Record many failures (protocol violations = 2x penalty each)
         for _ in 0..20 {
             engine
-                .update_node_stats(&bad_peer, TrustEvent::CorruptedData.to_stats_update())
+                .update_node_stats(&bad_peer, TrustEvent::ProtocolViolation.to_stats_update())
                 .await;
         }
 
@@ -390,13 +363,9 @@ mod tests {
         let events = [
             TrustEvent::SuccessfulResponse,
             TrustEvent::SuccessfulConnection,
-            TrustEvent::FailedResponse,
             TrustEvent::ConnectionFailed,
             TrustEvent::ConnectionTimeout,
-            TrustEvent::DataUnavailable,
-            TrustEvent::CorruptedData,
             TrustEvent::ProtocolViolation,
-            TrustEvent::Refused,
             TrustEvent::UnexpectedDisconnect,
         ];
 

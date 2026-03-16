@@ -1250,6 +1250,7 @@ impl DhtNetworkManager {
                     "dial_candidate: failed to connect to {} at {}: {}",
                     peer_hex, address, e
                 );
+                self.record_peer_failure(peer_id).await;
                 None
             }
             Err(_) => {
@@ -1257,6 +1258,7 @@ impl DhtNetworkManager {
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
                     peer_hex, address, dial_timeout
                 );
+                self.record_peer_failure(peer_id).await;
                 None
             }
         }
@@ -1714,6 +1716,9 @@ impl DhtNetworkManager {
             }
         }
 
+        // Record successful connection for trust scoring
+        self.record_peer_success(&node_id).await;
+
         if self.event_tx.receiver_count() > 0 {
             let _ = self.event_tx.send(DhtNetworkEvent::PeerDiscovered {
                 peer_id: node_id,
@@ -1751,6 +1756,9 @@ impl DhtNetworkManager {
                                         "DHT peer fully disconnected: app_id={}",
                                         peer_id.to_hex()
                                     );
+
+                                    // Record unexpected disconnect for trust scoring
+                                    self_arc.record_peer_failure(&peer_id).await;
 
                                     if self_arc.event_tx.receiver_count() > 0
                                         && let Err(e) = self_arc

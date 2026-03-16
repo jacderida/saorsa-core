@@ -61,32 +61,18 @@ pub fn trust_engine(&self) -> Arc<TrustEngine>
 
 ## TrustEvent Enum
 
-All trust-relevant outcomes are expressed as `TrustEvent` variants:
+Only events observable by the saorsa-core network layer are included.
+Application-level events (data verification, storage checks) should be added
+when the consuming application layer exists.
 
-| Event | Severity | Description |
-|-------|----------|-------------|
-| `SuccessfulResponse` | Positive | Peer provided a correct, verified response |
-| `SuccessfulConnection` | Positive | Peer connection established successfully |
-| `FailedResponse` | 1x penalty | Generic response failure |
-| `ConnectionFailed` | 1x penalty | Could not establish connection |
-| `ConnectionTimeout` | 1x penalty | Connection attempt timed out |
-| `DataUnavailable` | 1x penalty | Peer did not have requested data |
-| `Refused` | 1x penalty | Peer explicitly refused the request |
-| `UnexpectedDisconnect` | 1x penalty | Peer disconnected unexpectedly |
-| `CorruptedData` | 2x penalty | Data failed integrity verification |
-| `ProtocolViolation` | 2x penalty | Peer violated wire protocol |
-
-## When to Report Trust Events
-
-| Scenario | TrustEvent | Notes |
-|----------|------------|-------|
-| Chunk retrieved and verified | `SuccessfulResponse` | Data integrity confirmed |
-| Chunk hash mismatch | `CorruptedData` | 2x penalty — severe |
-| Request timeout | `ConnectionTimeout` | May be transient |
-| Connection refused | `Refused` | Peer explicitly refused |
-| Peer returned empty response | `DataUnavailable` | Data not found |
-| Storage verification passed | `SuccessfulResponse` | Peer maintains data |
-| Storage verification failed | `CorruptedData` | Peer lost/corrupted data |
+| Event | Severity | Description | Where it fires |
+|-------|----------|-------------|----------------|
+| `SuccessfulResponse` | Positive | Peer responded to a request | `send_request()` success |
+| `SuccessfulConnection` | Positive | Peer connected and authenticated | `handle_peer_connected()` |
+| `ConnectionFailed` | 1x penalty | Could not establish connection | `send_request()` error, `dial_candidate()` error |
+| `ConnectionTimeout` | 1x penalty | Connection attempt timed out | `send_request()` timeout, `dial_candidate()` timeout |
+| `ProtocolViolation` | 2x penalty | Peer violated wire protocol | Future: DHT message validation |
+| `UnexpectedDisconnect` | 1x penalty | Peer disconnected unexpectedly | `PeerDisconnected` event |
 
 ## Trust-Weighted Routing
 
