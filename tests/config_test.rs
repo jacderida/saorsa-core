@@ -148,19 +148,39 @@ fn test_config_validation() {
 #[test]
 fn test_node_config_from_config() {
     let config = Config::development();
+    let listen_sa = config.listen_socket_addr().unwrap();
     let node_config = NodeConfig::from_config(&config).unwrap();
 
-    // Development config has ipv6_enabled=true, so expect both IPv4 and IPv6 addrs
-    assert!(
-        !node_config.listen_addrs().is_empty(),
-        "listen_addrs should not be empty"
-    );
+    let addrs = node_config.listen_addrs();
+    assert!(!addrs.is_empty(), "listen_addrs should not be empty");
     assert_eq!(node_config.max_connections, config.network.max_connections);
-    // IPv6 is implicit: when ipv6_enabled is true in Config, from_config adds an IPv6 addr
+
+    // Every listen address must use QUIC transport.
+    for addr in &addrs {
+        assert!(addr.is_quic(), "expected QUIC address, got {addr}");
+    }
+
+    // The port must match the Config listen address port.
+    for addr in &addrs {
+        assert_eq!(
+            addr.port(),
+            Some(listen_sa.port()),
+            "expected port {} on {addr}",
+            listen_sa.port()
+        );
+    }
+
+    // At least one IPv4 address must be present.
+    assert!(
+        addrs.iter().any(|a| a.is_ipv4()),
+        "expected at least one IPv4 listen address"
+    );
+
+    // When ipv6_enabled is true in Config, expect an IPv6 address too.
     if config.network.ipv6_enabled {
         assert!(
-            node_config.listen_addrs().len() >= 2,
-            "expected IPv6 addr in listen_addrs"
+            addrs.iter().any(|a| a.is_ipv6()),
+            "expected an IPv6 listen address when ipv6 is enabled"
         );
     }
 }

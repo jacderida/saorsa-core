@@ -288,9 +288,12 @@ pub enum TrustLevel {
 // Address Construction Helpers
 // ============================================================================
 
-/// Build listen addresses based on port, IPv6 preference, and listen mode.
+/// Build QUIC listen addresses based on port, IPv6 preference, and listen mode.
 ///
-/// This helper consolidates the duplicated address construction logic.
+/// All returned addresses use the QUIC transport — the only transport
+/// currently supported for dialing. When additional transports are added,
+/// extend this function to produce addresses for those transports as well.
+///
 /// `ListenMode::Public` uses unspecified (all-interface) addresses;
 /// `ListenMode::Local` uses loopback addresses.
 #[inline]

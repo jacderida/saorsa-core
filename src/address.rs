@@ -54,6 +54,12 @@ pub struct MultiAddr {
     peer_id: Option<PeerId>,
 }
 
+impl From<TransportAddr> for MultiAddr {
+    fn from(transport: TransportAddr) -> Self {
+        Self::new(transport)
+    }
+}
+
 impl MultiAddr {
     /// Create a `MultiAddr` from a [`TransportAddr`].
     #[must_use]
@@ -624,9 +630,62 @@ mod tests {
 
     #[test]
     fn test_invalid_format_rejected() {
+        // Bare "ip:port" is no longer accepted — canonical format required.
         assert!("127.0.0.1:8080".parse::<MultiAddr>().is_err());
         assert!("garbage".parse::<MultiAddr>().is_err());
         assert!("/ip4/not-an-ip/tcp/80".parse::<MultiAddr>().is_err());
         assert!("".parse::<MultiAddr>().is_err());
+    }
+
+    /// T2: Serde roundtrip for a `MultiAddr` that includes a `/p2p/<id>` suffix.
+    #[test]
+    fn test_serde_roundtrip_with_peer_id() {
+        let peer_id = PeerId::from_bytes([0xBB; 32]);
+        let addr = MultiAddr::from_ipv4(Ipv4Addr::new(10, 0, 0, 1), 9000).with_peer_id(peer_id);
+
+        let json = serde_json::to_string(&addr).unwrap();
+        assert!(
+            json.contains("/p2p/"),
+            "serialized form must contain /p2p/ suffix"
+        );
+
+        let recovered: MultiAddr = serde_json::from_str(&json).unwrap();
+        assert_eq!(addr, recovered, "serde roundtrip must be lossless");
+        assert_eq!(recovered.peer_id(), Some(&peer_id));
+    }
+
+    /// T3: `dialable_socket_addr()` returns `None` for TCP (not currently dialable).
+    #[test]
+    fn test_dialable_socket_addr_none_for_tcp() {
+        let tcp_addr = MultiAddr::tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80));
+        assert!(
+            tcp_addr.dialable_socket_addr().is_none(),
+            "TCP addresses should not be dialable (QUIC-only policy)"
+        );
+
+        // Sanity: QUIC *is* dialable.
+        let quic_addr = MultiAddr::quic(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80));
+        assert!(quic_addr.dialable_socket_addr().is_some());
+    }
+
+    /// T4: Standalone `/p2p/<id>` without a transport prefix is rejected.
+    #[test]
+    fn test_standalone_peer_id_rejected() {
+        let peer_hex = "aa".repeat(32); // 64 hex chars
+        let input = format!("/p2p/{peer_hex}");
+        let result = input.parse::<MultiAddr>();
+        assert!(
+            result.is_err(),
+            "standalone /p2p/<id> without transport must be rejected"
+        );
+    }
+
+    /// L2: `From<TransportAddr>` enables idiomatic `.into()` conversion.
+    #[test]
+    fn test_from_transport_addr() {
+        let transport = TransportAddr::Quic(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000));
+        let addr: MultiAddr = transport.clone().into();
+        assert_eq!(addr.transport(), &transport);
+        assert_eq!(addr.peer_id(), None);
     }
 }

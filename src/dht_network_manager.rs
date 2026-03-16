@@ -2699,4 +2699,43 @@ mod tests {
             "address selection should prefer a dialable IP transport over a preceding non-IP entry"
         );
     }
+
+    #[test]
+    fn test_first_dialable_address_returns_none_for_all_non_dialable() {
+        let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            psm: 128,
+        });
+        let tcp = MultiAddr::tcp("10.0.0.1:80".parse().unwrap());
+        let lora = MultiAddr::new(crate::address::TransportAddr::LoRa {
+            dev_addr: [0xDE, 0xAD, 0xBE, 0xEF],
+            freq_hz: 868_000_000,
+        });
+
+        assert_eq!(
+            DhtNetworkManager::first_dialable_address(&[ble, tcp, lora]),
+            None,
+            "should return None when no QUIC address is present"
+        );
+    }
+
+    #[test]
+    fn test_first_dialable_address_rejects_unspecified_ip() {
+        let unspecified = MultiAddr::quic("0.0.0.0:9000".parse().unwrap());
+
+        assert_eq!(
+            DhtNetworkManager::first_dialable_address(&[unspecified]),
+            None,
+            "should reject unspecified (0.0.0.0) addresses"
+        );
+    }
+
+    #[test]
+    fn test_first_dialable_address_returns_none_for_empty_slice() {
+        assert_eq!(
+            DhtNetworkManager::first_dialable_address(&[]),
+            None,
+            "should return None for empty address list"
+        );
+    }
 }
