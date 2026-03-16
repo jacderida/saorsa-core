@@ -13,41 +13,95 @@
 
 //! Local trust scoring based on direct peer interactions.
 //!
-//! `TrustEngine` is the **sole authority** on peer trust scores.
-//! Scores are computed as the response rate (successes / total interactions)
-//! from direct observations — no transitive trust propagation yet.
+//! Scores use an exponential moving average (EMA) that blends each new
+//! observation and decays toward neutral when idle. No background task
+//! needed — decay is applied lazily on each read or write.
 //!
 //! Future: full EigenTrust with peer-to-peer trust gossip.
 
 use crate::PeerId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
-/// Default trust score for unknown peers (no interactions recorded)
+/// Default trust score for unknown peers
 pub const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
 
-/// Per-node interaction statistics
-#[derive(Debug, Clone, Default)]
-struct NodeStatistics {
-    /// Number of successful responses
-    correct_responses: u64,
-    /// Number of failed responses
-    failed_responses: u64,
+/// Minimum trust score a peer can reach
+const MIN_TRUST_SCORE: f64 = 0.0;
+
+/// Maximum trust score a peer can reach
+const MAX_TRUST_SCORE: f64 = 1.0;
+
+/// EMA weight for each new observation (higher = faster response to events)
+const EMA_WEIGHT: f64 = 0.1;
+
+/// Half-life for decay back to neutral (seconds).
+/// After this much idle time, the distance from neutral is halved.
+const DECAY_HALF_LIFE_SECS: f64 = 3600.0;
+
+/// Pre-computed decay constant: ln(2) / half_life
+const DECAY_LAMBDA: f64 = core::f64::consts::LN_2 / DECAY_HALF_LIFE_SECS;
+
+/// Per-node trust state
+#[derive(Debug, Clone)]
+struct PeerTrust {
+    /// Current trust score (between MIN and MAX)
+    score: f64,
+    /// When the score was last updated (for decay calculation)
+    last_updated: Instant,
 }
 
-impl NodeStatistics {
-    /// Response rate as a fraction (0.0 to 1.0).
-    /// Returns `DEFAULT_NEUTRAL_TRUST` if no interactions have been recorded.
-    fn response_rate(&self) -> f64 {
-        let total = self.correct_responses + self.failed_responses;
-        if total > 0 {
-            self.correct_responses as f64 / total as f64
+impl PeerTrust {
+    fn new() -> Self {
+        Self {
+            score: DEFAULT_NEUTRAL_TRUST,
+            last_updated: Instant::now(),
+        }
+    }
+
+    /// Apply time-based decay toward neutral, then clamp to bounds.
+    ///
+    /// Uses exponential decay: `score = neutral + (score - neutral) * e^(-λt)`
+    /// This smoothly pulls the score back toward 0.5 over time.
+    fn apply_decay(&mut self) {
+        let elapsed_secs = self.last_updated.elapsed().as_secs_f64();
+        if elapsed_secs > 0.0 {
+            let decay_factor = (-DECAY_LAMBDA * elapsed_secs).exp();
+            self.score =
+                DEFAULT_NEUTRAL_TRUST + (self.score - DEFAULT_NEUTRAL_TRUST) * decay_factor;
+            self.score = self.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE);
+            self.last_updated = Instant::now();
+        }
+    }
+
+    /// Apply a new observation via EMA, after first applying decay.
+    fn record(&mut self, observation: f64) {
+        self.apply_decay();
+        self.score = (1.0 - EMA_WEIGHT) * self.score + EMA_WEIGHT * observation;
+        self.score = self.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE);
+        self.last_updated = Instant::now();
+    }
+
+    /// Get the current score with decay applied (does not mutate).
+    fn decayed_score(&self) -> f64 {
+        let elapsed_secs = self.last_updated.elapsed().as_secs_f64();
+        if elapsed_secs > 0.0 {
+            let decay_factor = (-DECAY_LAMBDA * elapsed_secs).exp();
+            let score = DEFAULT_NEUTRAL_TRUST + (self.score - DEFAULT_NEUTRAL_TRUST) * decay_factor;
+            score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE)
         } else {
-            DEFAULT_NEUTRAL_TRUST
+            self.score
         }
     }
 }
+
+/// Observation value for a successful interaction
+const SUCCESS_OBSERVATION: f64 = 1.0;
+
+/// Observation value for a failed interaction
+const FAILURE_OBSERVATION: f64 = 0.0;
 
 /// Statistics update type for recording peer interaction outcomes
 #[derive(Debug, Clone)]
@@ -60,46 +114,47 @@ pub enum NodeStatisticsUpdate {
 
 /// Local trust engine based on direct peer observations.
 ///
-/// Scores are the response rate (successes / total) for each peer.
-/// Unknown peers default to `DEFAULT_NEUTRAL_TRUST` (0.5).
+/// Scores are an exponential moving average of success/failure observations
+/// that decays toward neutral (0.5) when idle. Bounded by `MIN_TRUST_SCORE`
+/// and `MAX_TRUST_SCORE`.
 ///
 /// This is the **sole authority** on peer trust scores in the system.
-/// Future versions will add EigenTrust power iteration with peer gossip
-/// for transitive trust propagation.
 #[derive(Debug)]
 pub struct TrustEngine {
-    /// Per-node interaction statistics
-    node_stats: Arc<RwLock<HashMap<PeerId, NodeStatistics>>>,
+    /// Per-node trust state
+    peers: Arc<RwLock<HashMap<PeerId, PeerTrust>>>,
 }
 
 impl TrustEngine {
     /// Create a new TrustEngine
     pub fn new() -> Self {
         Self {
-            node_stats: Arc::new(RwLock::new(HashMap::new())),
+            peers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Record a peer interaction outcome
     pub async fn update_node_stats(&self, node_id: &PeerId, update: NodeStatisticsUpdate) {
-        let mut stats = self.node_stats.write().await;
-        let entry = stats.entry(*node_id).or_default();
+        let mut peers = self.peers.write().await;
+        let entry = peers.entry(*node_id).or_insert_with(PeerTrust::new);
 
-        match update {
-            NodeStatisticsUpdate::CorrectResponse => entry.correct_responses += 1,
-            NodeStatisticsUpdate::FailedResponse => entry.failed_responses += 1,
-        }
+        let observation = match update {
+            NodeStatisticsUpdate::CorrectResponse => SUCCESS_OBSERVATION,
+            NodeStatisticsUpdate::FailedResponse => FAILURE_OBSERVATION,
+        };
+
+        entry.record(observation);
     }
 
     /// Get current trust score for a peer (synchronous).
     ///
-    /// Returns the response rate (successes / total interactions),
-    /// or `DEFAULT_NEUTRAL_TRUST` (0.5) for unknown peers.
+    /// Applies time decay lazily — no background task needed.
+    /// Returns `DEFAULT_NEUTRAL_TRUST` (0.5) for unknown peers.
     pub fn score(&self, node_id: &PeerId) -> f64 {
-        if let Ok(stats) = self.node_stats.try_read() {
-            stats
+        if let Ok(peers) = self.peers.try_read() {
+            peers
                 .get(node_id)
-                .map(|s| s.response_rate())
+                .map(|p| p.decayed_score())
                 .unwrap_or(DEFAULT_NEUTRAL_TRUST)
         } else {
             DEFAULT_NEUTRAL_TRUST
@@ -108,8 +163,8 @@ impl TrustEngine {
 
     /// Remove a peer from the trust system entirely
     pub async fn remove_node(&self, node_id: &PeerId) {
-        let mut stats = self.node_stats.write().await;
-        stats.remove(node_id);
+        let mut peers = self.peers.write().await;
+        peers.remove(node_id);
     }
 }
 
@@ -135,13 +190,18 @@ mod tests {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        for _ in 0..10 {
+        for _ in 0..50 {
             engine
                 .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
                 .await;
         }
 
-        assert!((engine.score(&peer) - 1.0).abs() < f64::EPSILON);
+        let score = engine.score(&peer);
+        assert!(
+            score > DEFAULT_NEUTRAL_TRUST,
+            "Score {score} should be above neutral"
+        );
+        assert!(score <= MAX_TRUST_SCORE, "Score {score} should be <= max");
     }
 
     #[tokio::test]
@@ -149,33 +209,44 @@ mod tests {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        for _ in 0..10 {
+        for _ in 0..50 {
             engine
                 .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
                 .await;
         }
 
-        assert!(engine.score(&peer).abs() < f64::EPSILON);
+        let score = engine.score(&peer);
+        assert!(
+            score < DEFAULT_NEUTRAL_TRUST,
+            "Score {score} should be below neutral"
+        );
+        assert!(score >= MIN_TRUST_SCORE, "Score {score} should be >= min");
     }
 
     #[tokio::test]
-    async fn test_mixed_interactions() {
+    async fn test_scores_clamped_to_bounds() {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        // 7 successes, 3 failures → 70% response rate
-        for _ in 0..7 {
+        // Many successes — should not exceed MAX
+        for _ in 0..1000 {
             engine
                 .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
                 .await;
         }
-        for _ in 0..3 {
+        let score = engine.score(&peer);
+        assert!(score >= MIN_TRUST_SCORE, "Score {score} below min");
+        assert!(score <= MAX_TRUST_SCORE, "Score {score} above max");
+
+        // Many failures — should not go below MIN
+        for _ in 0..2000 {
             engine
                 .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
                 .await;
         }
-
-        assert!((engine.score(&peer) - 0.7).abs() < f64::EPSILON);
+        let score = engine.score(&peer);
+        assert!(score >= MIN_TRUST_SCORE, "Score {score} below min");
+        assert!(score <= MAX_TRUST_SCORE, "Score {score} above max");
     }
 
     #[tokio::test]
@@ -193,18 +264,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scores_bounded() {
+    async fn test_ema_blends_observations() {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        for _ in 0..1000 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
-        }
+        // First failure moves score below neutral
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+            .await;
+        let after_fail = engine.score(&peer);
+        assert!(after_fail < DEFAULT_NEUTRAL_TRUST);
 
-        let score = engine.score(&peer);
-        assert!(score >= 0.0);
-        assert!(score <= 1.0);
+        // A success moves it back up (but not all the way to neutral)
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+            .await;
+        let after_success = engine.score(&peer);
+        assert!(after_success > after_fail, "Success should increase score");
+    }
+
+    #[test]
+    fn test_decay_moves_toward_neutral() {
+        // Manually create a peer trust entry with a known score and a past timestamp
+        let mut trust = PeerTrust {
+            score: 0.9,
+            last_updated: Instant::now() - std::time::Duration::from_secs(7200), // 2 hours ago
+        };
+
+        trust.apply_decay();
+
+        // After 2 hours (2x half-life at 1hr), score should be ~75% of the way back to neutral
+        // 0.5 + (0.9 - 0.5) * e^(-ln2/3600 * 7200) = 0.5 + 0.4 * 0.25 = 0.6
+        assert!(trust.score < 0.9, "Score should have decayed from 0.9");
+        assert!(
+            trust.score > DEFAULT_NEUTRAL_TRUST,
+            "Score should still be above neutral"
+        );
+    }
+
+    #[test]
+    fn test_decay_from_low_score_moves_up() {
+        let mut trust = PeerTrust {
+            score: 0.1,
+            last_updated: Instant::now() - std::time::Duration::from_secs(7200),
+        };
+
+        trust.apply_decay();
+
+        // Should decay toward neutral (up from 0.1)
+        assert!(
+            trust.score > 0.1,
+            "Low score should decay upward toward neutral"
+        );
+        assert!(
+            trust.score < DEFAULT_NEUTRAL_TRUST,
+            "Should still be below neutral"
+        );
     }
 }

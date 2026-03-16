@@ -233,14 +233,14 @@ mod tests {
         // Unknown peer starts at neutral trust
         assert!((engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON);
 
-        // Record 10 successes — score should be 1.0 immediately (no recompute needed)
+        // Record successes — score should rise above neutral
         for _ in 0..10 {
             engine
                 .update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update())
                 .await;
         }
 
-        assert!((engine.score(&peer) - 1.0).abs() < f64::EPSILON);
+        assert!(engine.score(&peer) > DEFAULT_NEUTRAL_TRUST);
     }
 
     /// Test: failures reduce trust below block threshold
