@@ -581,7 +581,7 @@ impl TransportHandle {
                 // addresses (dual-stack nodes may have both IPv4 and IPv6).
                 let is_self = {
                     let addrs = self.listen_addrs.read().await;
-                    addrs.iter().any(|a| a.to_string() == connected_peer_id)
+                    addrs.iter().any(|a| a.socket_addr() == Some(addr))
                 };
                 if is_self {
                     warn!(
