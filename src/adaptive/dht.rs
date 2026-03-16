@@ -24,7 +24,6 @@ use crate::PeerId;
 use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,8 +33,8 @@ use serde::{Deserialize, Serialize};
 /// Default trust score threshold below which a peer is evicted and blocked
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
 
-/// Default interval between background trust recomputations (seconds)
-const DEFAULT_RECOMPUTE_INTERVAL_SECS: u64 = 300;
+/// Default interval between blocked-peer sweeps of the routing table (seconds)
+const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 300;
 
 /// Configuration for the AdaptiveDHT layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,16 +45,16 @@ pub struct AdaptiveDhtConfig {
     /// Default: 0.15
     pub block_threshold: f64,
 
-    /// Interval between background trust recomputations.
+    /// How often to sweep the routing table and remove blocked peers.
     /// Default: 300 seconds (5 minutes)
-    pub recompute_interval: Duration,
+    pub sweep_interval: Duration,
 }
 
 impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
             block_threshold: DEFAULT_BLOCK_THRESHOLD,
-            recompute_interval: Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS),
+            sweep_interval: Duration::from_secs(DEFAULT_SWEEP_INTERVAL_SECS),
         }
     }
 }
@@ -116,7 +115,7 @@ impl AdaptiveDHT {
     ///
     /// This creates the `TrustEngine` and the `DhtNetworkManager` with the
     /// trust engine injected. Call [`start`](Self::start) to begin DHT
-    /// operations and the background trust recomputation + sweep loop.
+    /// operations and the periodic blocked-peer sweep.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
         mut dht_config: DhtNetworkConfig,
@@ -124,8 +123,7 @@ impl AdaptiveDHT {
     ) -> Result<Self> {
         dht_config.block_threshold = adaptive_config.block_threshold;
 
-        let pre_trusted: HashSet<PeerId> = HashSet::new();
-        let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
+        let trust_engine = Arc::new(TrustEngine::new());
 
         let dht_manager = Arc::new(
             DhtNetworkManager::new(transport, Some(trust_engine.clone()), dht_config).await?,
@@ -182,21 +180,20 @@ impl AdaptiveDHT {
         &self.dht_manager
     }
 
-    /// Start the DHT manager and the background trust recomputation loop.
+    /// Start the DHT manager and the periodic blocked-peer sweep.
     ///
-    /// The trust loop periodically recomputes global trust scores and sweeps
-    /// the routing table to remove peers that have fallen below the block threshold.
+    /// Trust scores are computed live from direct observations (no background
+    /// recomputation needed). The sweep periodically removes peers from the
+    /// routing table whose score has dropped below the block threshold.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await?;
 
-        // Background: recompute trust scores → sweep blocked peers from RT
-        let engine = self.trust_engine.clone();
+        // Periodic sweep: remove blocked peers from the routing table
         let manager = self.dht_manager.clone();
-        let interval = self.config.recompute_interval;
+        let interval = self.config.sweep_interval;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let _ = engine.compute_global_trust().await;
                 manager.sweep_blocked_peers().await;
             }
         });
@@ -243,8 +240,8 @@ mod tests {
         let config = AdaptiveDhtConfig::default();
         assert!((config.block_threshold - DEFAULT_BLOCK_THRESHOLD).abs() < f64::EPSILON);
         assert_eq!(
-            config.recompute_interval,
-            Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS)
+            config.sweep_interval,
+            Duration::from_secs(DEFAULT_SWEEP_INTERVAL_SECS)
         );
     }
 
@@ -252,55 +249,38 @@ mod tests {
     // Integration tests: full trust signal flow
     // =========================================================================
 
-    /// Test: trust events flow through to TrustEngine and change scores
+    /// Test: trust events flow through to TrustEngine and change scores immediately
     #[tokio::test]
     async fn test_trust_events_affect_scores() {
-        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let engine = Arc::new(TrustEngine::new());
         let peer = PeerId::random();
 
         // Unknown peer starts at neutral trust
         assert!((engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON);
 
-        // Record positive events directly via the engine (simulating what AdaptiveDHT does)
+        // Record 10 successes — score should be 1.0 immediately (no recompute needed)
         for _ in 0..10 {
             engine
                 .update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update())
                 .await;
         }
 
-        // Add a local trust edge so the node appears in computation
-        let other = PeerId::random();
-        engine.update_local_trust(&other, &peer, true).await;
-
-        // Force recomputation
-        let _ = engine.compute_global_trust().await;
-
-        // Score should now be > neutral (peer has 100% success rate)
-        let score_after_success = engine.score(&peer);
-        assert!(score_after_success > 0.0);
+        assert!((engine.score(&peer) - 1.0).abs() < f64::EPSILON);
     }
 
     /// Test: failures reduce trust below block threshold
     #[tokio::test]
     async fn test_failures_reduce_trust_below_block_threshold() {
-        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let engine = Arc::new(TrustEngine::new());
         let bad_peer = PeerId::random();
 
-        // Record many failures
+        // Record only failures — score should be 0.0 immediately
         for _ in 0..20 {
             engine
                 .update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update())
                 .await;
         }
 
-        // Add a local trust edge so the node appears in computation
-        let other = PeerId::random();
-        engine.update_local_trust(&other, &bad_peer, true).await;
-
-        // Recompute
-        let _ = engine.compute_global_trust().await;
-
-        // The bad peer should have a trust score below the block threshold
         let trust = engine.score(&bad_peer);
         assert!(
             trust < DEFAULT_BLOCK_THRESHOLD,
@@ -311,18 +291,14 @@ mod tests {
     /// Test: TrustEngine scores are bounded 0.0-1.0
     #[tokio::test]
     async fn test_trust_scores_bounded() {
-        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let engine = Arc::new(TrustEngine::new());
         let peer = PeerId::random();
-        let other = PeerId::random();
 
-        // Many successes
         for _ in 0..100 {
             engine
                 .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
                 .await;
         }
-        engine.update_local_trust(&other, &peer, true).await;
-        let _ = engine.compute_global_trust().await;
 
         let score = engine.score(&peer);
         assert!(score >= 0.0, "Score must be >= 0.0, got {score}");
