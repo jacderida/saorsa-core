@@ -134,6 +134,8 @@ pub enum DhtNetworkResult {
     },
     /// Leave confirmation
     LeaveSuccess,
+    /// The remote peer has blocked us — do not penalise their trust score
+    PeerRejected,
     /// Operation failed
     Error { operation: String, error: String },
 }
@@ -708,6 +710,17 @@ impl DhtNetworkManager {
                             }
                         }
                     }
+                    Ok(DhtNetworkResult::PeerRejected) => {
+                        // Remote peer has us blocked — remove them from our routing
+                        // table (no point retrying) but do NOT penalise their trust
+                        // score; the rejection is an honest signal, not misbehaviour.
+                        info!(
+                            "[NETWORK] Peer {} rejected us (blocked) — removing from routing table",
+                            peer_id.to_hex()
+                        );
+                        let mut dht = self.dht.write().await;
+                        dht.remove_node_by_id(&peer_id).await;
+                    }
                     Ok(_) => {
                         self.record_peer_success(&peer_id).await;
                         // Add successful node to best_nodes
@@ -1255,13 +1268,6 @@ impl DhtNetworkManager {
         data: &[u8],
         sender: &PeerId,
     ) -> Result<Option<Vec<u8>>> {
-        // SEC: Block peers whose trust score has fallen below threshold
-        if self.is_peer_blocked(sender) {
-            info!("Rejecting message from blocked peer {}", sender.to_hex());
-            let _ = self.transport.disconnect_peer(sender).await;
-            return Ok(None);
-        }
-
         // SEC: Reject oversized messages before deserialization to prevent memory exhaustion
         if data.len() > MAX_MESSAGE_SIZE {
             warn!(
@@ -1277,9 +1283,23 @@ impl DhtNetworkManager {
             ));
         }
 
-        // Deserialize message
+        // Deserialize message (needed before block check so we can send a rejection response)
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+
+        // SEC: Block peers whose trust score has fallen below threshold.
+        // Send an explicit rejection so the remote peer knows not to penalise
+        // our trust score (avoiding mutual-block loops from silent timeouts).
+        if self.is_peer_blocked(sender) {
+            info!("Rejecting message from blocked peer {}", sender.to_hex());
+            let _ = self.transport.disconnect_peer(sender).await;
+            let response =
+                self.create_response_message(&message, DhtNetworkResult::PeerRejected)?;
+            return Ok(Some(
+                postcard::to_stdvec(&response)
+                    .map_err(|e| P2PError::Serialization(e.to_string().into()))?,
+            ));
+        }
 
         debug!(
             "[STEP 3] {}: Received {:?} from {} (msg_id: {})",
@@ -1507,6 +1527,7 @@ impl DhtNetworkManager {
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
+            DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
                     "Cannot create response for error result".to_string().into(),
@@ -1959,6 +1980,60 @@ mod tests {
             DhtNetworkManager::first_dialable_address(&[]),
             None,
             "should return None for empty address list"
+        );
+    }
+
+    #[test]
+    fn test_peer_rejected_round_trips_through_serialization() {
+        let result = DhtNetworkResult::PeerRejected;
+        let bytes = postcard::to_stdvec(&result).expect("serialization should succeed");
+        let deserialized: DhtNetworkResult =
+            postcard::from_bytes(&bytes).expect("deserialization should succeed");
+        assert!(
+            matches!(deserialized, DhtNetworkResult::PeerRejected),
+            "round-tripped result should be PeerRejected, got: {deserialized:?}"
+        );
+    }
+
+    #[test]
+    fn test_peer_rejected_response_message_preserves_request_payload() {
+        let request = DhtNetworkMessage {
+            message_id: "test-123".to_string(),
+            source: PeerId::random(),
+            target: Some(PeerId::random()),
+            message_type: DhtMessageType::Request,
+            payload: DhtNetworkOperation::Ping,
+            result: None,
+            timestamp: 0,
+            ttl: 10,
+            hop_count: 0,
+        };
+
+        // Serialize & deserialize the full response message to verify
+        // PeerRejected survives a wire round-trip inside a DhtNetworkMessage.
+        let response = DhtNetworkMessage {
+            message_id: request.message_id.clone(),
+            source: PeerId::random(),
+            target: Some(request.source),
+            message_type: DhtMessageType::Response,
+            payload: request.payload.clone(),
+            result: Some(DhtNetworkResult::PeerRejected),
+            timestamp: 0,
+            ttl: request.ttl.saturating_sub(1),
+            hop_count: request.hop_count.saturating_add(1),
+        };
+
+        let bytes = postcard::to_stdvec(&response).expect("serialize response");
+        let decoded: DhtNetworkMessage =
+            postcard::from_bytes(&bytes).expect("deserialize response");
+
+        assert!(
+            matches!(decoded.result, Some(DhtNetworkResult::PeerRejected)),
+            "response result should be PeerRejected"
+        );
+        assert!(
+            matches!(decoded.payload, DhtNetworkOperation::Ping),
+            "response should echo the request's Ping payload"
         );
     }
 }
