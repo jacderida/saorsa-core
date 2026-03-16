@@ -64,6 +64,10 @@ pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 // Bootstrap
 pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
 
+// Trust & Adaptive DHT
+pub use adaptive::dht::{AdaptiveDhtConfig, TrustEvent};
+pub use adaptive::trust::TrustEngine;
+
 // Security
 pub use security::IPDiversityConfig;
 

@@ -113,15 +113,16 @@ all application data and business logic in **saorsa-node**. In practice:
 - **DHT is a peer phonebook only** (peer records, routing, discovery).
 - **Chunk storage/retrieval is done via `send_message`** in saorsa-node.
 - **Trust updates remain in saorsa-core**: saorsa-node reports data availability
-  outcomes so EigenTrust can downscore nodes that fail to serve expected data.
+  outcomes so the TrustEngine can downscore nodes that fail to serve expected data.
+  All trust signals flow through `AdaptiveDHT`.
 
 Example trust signal hook:
 ```rust
-use saorsa_core::adaptive::{EigenTrustEngine, NodeStatisticsUpdate};
+use saorsa_core::TrustEvent;
 
-trust_engine
-    .update_node_stats(&peer_id, NodeStatisticsUpdate::CorrectResponse)
-    .await;
+// Report application-level outcomes via P2PNode
+node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+node.report_trust_event(&peer_id, TrustEvent::CorruptedData).await;
 ```
 
 ### Multi-Layer P2P Architecture
@@ -133,17 +134,17 @@ The system combines a DHT peer phonebook with machine learning for optimal routi
 - **Security**: Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
 
 #### 2. Adaptive Network Layer (`src/adaptive/`)
-Central to the system's intelligence, using ML for dynamic strategy selection:
-- **Multi-Armed Bandit**: Thompson Sampling for strategy selection
-- **Routing Strategies**: Kademlia DHT, Hyperbolic routing, Trust-based routing
-- **ML Components**: Q-Learning cache optimization, Churn prediction
+Trust boundary and adaptive routing:
+- **AdaptiveDHT**: Sole owner of TrustEngine and DhtNetworkManager — all trust signals flow through here
+- **TrustEngine**: EigenTrust++ for decentralized reputation (response rate + time decay)
+- **TrustEvent**: Unified enum for all trust-relevant outcomes (reported via `P2PNode::report_trust_event`)
+- **Trust-weighted routing**: Optional blending of XOR distance with trust scores (behind config flag)
 
 #### 3. DHT Layer (`src/dht/`)
 Peer phonebook with geographic awareness (no data storage):
 - **Core Engine**: Kademlia-based routing table and peer discovery
 - **Geographic Routing**: Region-aware peer selection
-- **Trust-Weighted Selection**: EigenTrust-integrated peer scoring
-- **Security**: S/Kademlia extensions, Sybil detection, authenticated sibling broadcast
+- **Trust-Weighted Eviction**: Peers below trust threshold are evicted (live TrustEngine queries)
 
 #### 4. Identity System (`src/identity/`)
 - **Cryptography**: ML-DSA-65 for post-quantum signatures
