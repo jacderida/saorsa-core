@@ -92,8 +92,6 @@ pub enum TrustEvent {
     ConnectionFailed,
     /// Connection attempt timed out
     ConnectionTimeout,
-    /// Peer violated the wire protocol (severe — 2x penalty)
-    ProtocolViolation,
 }
 
 impl TrustEvent {
@@ -106,7 +104,6 @@ impl TrustEvent {
             TrustEvent::ConnectionFailed | TrustEvent::ConnectionTimeout => {
                 NodeStatisticsUpdate::FailedResponse
             }
-            TrustEvent::ProtocolViolation => NodeStatisticsUpdate::ProtocolViolation,
         }
     }
 }
@@ -239,12 +236,6 @@ mod tests {
             TrustEvent::ConnectionTimeout.to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
         ));
-
-        // Severe failure — 2x penalty
-        assert!(matches!(
-            TrustEvent::ProtocolViolation.to_stats_update(),
-            NodeStatisticsUpdate::ProtocolViolation
-        ));
     }
 
     #[test]
@@ -300,7 +291,7 @@ mod tests {
         // Record many failures (protocol violations = 2x penalty each)
         for _ in 0..20 {
             engine
-                .update_node_stats(&bad_peer, TrustEvent::ProtocolViolation.to_stats_update())
+                .update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update())
                 .await;
         }
 
@@ -359,7 +350,6 @@ mod tests {
             TrustEvent::SuccessfulConnection,
             TrustEvent::ConnectionFailed,
             TrustEvent::ConnectionTimeout,
-            TrustEvent::ProtocolViolation,
         ];
 
         for event in events {

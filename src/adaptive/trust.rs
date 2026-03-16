@@ -126,14 +126,9 @@ pub struct NodeStatistics {
 pub enum NodeStatisticsUpdate {
     /// Peer provided a correct response
     CorrectResponse,
-    /// Peer failed to provide a response (single failure)
+    /// Peer failed to provide a response
     FailedResponse,
-    /// Peer violated the expected wire protocol (severe — 2x penalty)
-    ProtocolViolation,
 }
-
-/// Severity multiplier for protocol violations
-const SEVERE_FAILURE_MULTIPLIER: u64 = 2;
 
 impl TrustEngine {
     /// Create a new TrustEngine with the given set of pre-trusted (bootstrap) nodes
@@ -195,9 +190,6 @@ impl TrustEngine {
         match stats_update {
             NodeStatisticsUpdate::CorrectResponse => node_stats.correct_responses += 1,
             NodeStatisticsUpdate::FailedResponse => node_stats.failed_responses += 1,
-            NodeStatisticsUpdate::ProtocolViolation => {
-                node_stats.failed_responses += SEVERE_FAILURE_MULTIPLIER;
-            }
         }
     }
 
