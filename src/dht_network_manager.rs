@@ -313,6 +313,11 @@ impl DhtNetworkManager {
             dht_instance.set_ip_diversity_config(diversity.clone());
         }
 
+        // Wire trust engine into the eviction manager for live trust score queries
+        if let Some(ref engine) = trust_engine {
+            dht_instance.set_trust_engine(engine.clone());
+        }
+
         let dht = Arc::new(RwLock::new(dht_instance));
 
         let (event_tx, _) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);

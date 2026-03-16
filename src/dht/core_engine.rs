@@ -413,6 +413,18 @@ impl DhtCoreEngine {
         })
     }
 
+    /// Set the trust engine on the eviction manager for live trust score queries.
+    ///
+    /// Must be called before `start_maintenance_tasks()` to ensure
+    /// the eviction manager has access to trust scores.
+    pub fn set_trust_engine(&mut self, trust_engine: Arc<crate::adaptive::trust::TrustEngine>) {
+        // Get_mut is safe here because we're the sole owner before sharing.
+        // Arc::get_mut returns Some if no other Arc references exist.
+        if let Some(lock) = Arc::get_mut(&mut self.eviction_manager) {
+            lock.get_mut().set_trust_engine(trust_engine);
+        }
+    }
+
     /// Number of peers currently in the routing table.
     pub async fn routing_table_size(&self) -> usize {
         self.routing_table.read().await.node_count()
@@ -485,8 +497,7 @@ impl DhtCoreEngine {
                                 let mut evict_list = Vec::new();
 
                                 for node_id in &nodes_to_validate {
-                                    // Query trust score from eviction manager's trust cache
-                                    // This cache is populated by EigenTrust updates via update_trust_score()
+                                    // Query trust score live from TrustEngine via EvictionManager
                                     let trust_score = {
                                         let evict_mgr = eviction_manager.read().await;
                                         evict_mgr.get_trust_score(node_id)
