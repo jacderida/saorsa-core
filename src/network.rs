@@ -17,18 +17,17 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::PeerId;
-use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
-use crate::adaptive::{NodeStatisticsUpdate, TrustEngine};
+use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
-use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
+use crate::error::{NetworkError, P2PError, P2pResult as Result};
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -780,8 +779,9 @@ pub struct P2PNode {
     /// Shutdown token — cancelled when the node should stop
     shutdown: CancellationToken,
 
-    /// DHT manager for distributed hash table operations (peer discovery and routing)
-    dht_manager: Arc<DhtNetworkManager>,
+    /// Adaptive DHT layer — owns both the DHT manager and the trust engine.
+    /// All DHT operations and trust signals go through this component.
+    adaptive_dht: AdaptiveDHT,
 
     /// Bootstrap cache manager for peer discovery
     bootstrap_manager: Option<Arc<RwLock<BootstrapManager>>>,
@@ -791,13 +791,6 @@ pub struct P2PNode {
 
     /// Whether `start()` has been called (and `stop()` has not yet completed)
     is_started: Arc<AtomicBool>,
-
-    /// EigenTrust engine for reputation management
-    ///
-    /// Used to track peer reliability based on data availability outcomes.
-    /// Consumers (like saorsa-node) should report successes and failures
-    /// via `report_peer_success()` and `report_peer_failure()` methods.
-    trust_engine: Option<Arc<TrustEngine>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -854,14 +847,6 @@ impl P2PNode {
                 }
             };
 
-        // Initialize EigenTrust engine for reputation management.
-        // The pre-trusted set starts empty — real PeerIds are learned
-        // via identity exchange after connecting to bootstrap peers.
-        let pre_trusted: HashSet<PeerId> = HashSet::new();
-        let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
-        trust_engine.clone().start_background_updates();
-        let trust_engine = Some(trust_engine);
-
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig::from_node_config(
             &config,
@@ -871,7 +856,7 @@ impl P2PNode {
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
 
-        // Initialize DHT manager (owns local DHT core and network DHT behavior)
+        // Initialize AdaptiveDHT — creates the trust engine and DHT manager
         let manager_dht_config = crate::dht::DHTConfig {
             bucket_size: config.dht_config.k_value,
             alpha: config.dht_config.alpha_value,
@@ -886,10 +871,12 @@ impl P2PNode {
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
             enable_security: true,
         };
-        let dht_manager = Arc::new(
-            DhtNetworkManager::new(transport.clone(), trust_engine.clone(), dht_manager_config)
-                .await?,
-        );
+        let adaptive_dht = AdaptiveDHT::new(
+            transport.clone(),
+            dht_manager_config,
+            AdaptiveDhtConfig::default(),
+        )
+        .await?;
 
         let node = Self {
             config,
@@ -897,11 +884,10 @@ impl P2PNode {
             transport,
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
-            dht_manager,
+            adaptive_dht,
             bootstrap_manager,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
-            trust_engine,
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -943,162 +929,44 @@ impl P2PNode {
     }
 
     // =========================================================================
-    // Trust API - EigenTrust Reputation System
+    // Trust API — delegates to AdaptiveDHT
     // =========================================================================
 
-    /// Get the EigenTrust engine for direct trust operations
-    ///
-    /// This provides access to the underlying trust engine for advanced use cases.
-    /// For simple success/failure reporting, prefer `report_peer_success()` and
-    /// `report_peer_failure()`.
-    ///
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if let Some(engine) = node.trust_engine() {
-    ///     // Update node statistics directly
-    ///     engine.update_node_stats(&peer_id, NodeStatisticsUpdate::CorrectResponse).await;
-    ///
-    ///     // Get global trust scores
-    ///     let scores = engine.compute_global_trust().await;
-    /// }
-    /// ```
-    pub fn trust_engine(&self) -> Option<Arc<TrustEngine>> {
-        self.trust_engine.clone()
+    /// Get the trust engine for advanced use cases
+    pub fn trust_engine(&self) -> Arc<TrustEngine> {
+        self.adaptive_dht.trust_engine().clone()
     }
 
-    /// Report a successful interaction with a peer
+    /// Report an application-level trust event for a peer.
     ///
-    /// Call this after successful data operations to increase the peer's trust score.
-    /// This is the primary method for saorsa-node to report positive outcomes.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID (as a string) of the node that performed well
+    /// Use this for outcomes the DHT layer cannot observe directly,
+    /// such as data verification results.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // After a successful request to a peer
-    /// if let Ok(response) = node.send_request(&peer_id, "my_protocol", payload, timeout).await {
-    ///     node.report_peer_success(&peer_id).await?;
-    /// }
+    /// use saorsa_core::adaptive::TrustEvent;
+    ///
+    /// // After verifying data from a peer
+    /// node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+    ///
+    /// // After detecting corrupted data
+    /// node.report_trust_event(&peer_id, TrustEvent::CorruptedData).await;
     /// ```
-    pub async fn report_peer_success(&self, peer_id: &PeerId) -> Result<()> {
-        if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(peer_id, NodeStatisticsUpdate::CorrectResponse)
-                .await;
-            Ok(())
-        } else {
-            // Trust engine not initialized - this is not an error, just a no-op
-            Ok(())
-        }
+    pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
+        self.adaptive_dht.report_app_event(peer_id, event).await;
     }
 
-    /// Report a failed interaction with a peer
+    /// Get the current trust score for a peer (0.0 to 1.0).
     ///
-    /// Call this after failed data operations to decrease the peer's trust score.
-    /// This includes timeouts, corrupted data, or refused connections.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID (as a string) of the node that failed
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // After a request to a peer fails
-    /// match node.send_request(&peer_id, "my_protocol", payload, timeout).await {
-    ///     Ok(_) => node.report_peer_success(&peer_id).await?,
-    ///     Err(_) => node.report_peer_failure(&peer_id).await?,
-    /// }
-    /// ```
-    pub async fn report_peer_failure(&self, peer_id: &PeerId) -> Result<()> {
-        // Delegate to the enriched version with a generic transport-level reason
-        self.report_peer_failure_with_reason(peer_id, PeerFailureReason::ConnectionFailed)
-            .await
-    }
-
-    /// Report a failed interaction with a peer, providing a specific failure reason.
-    ///
-    /// This is the enriched version of [`P2PNode::report_peer_failure`] that maps the failure
-    /// reason to the appropriate trust penalty. Use this when you know *why* the
-    /// interaction failed to give the trust engine more accurate data.
-    ///
-    /// - Transport-level failures (`Timeout`, `ConnectionFailed`) map to `FailedResponse`
-    /// - `DataUnavailable` maps to `DataUnavailable`
-    /// - `CorruptedData` maps to `CorruptedData` (counts as 2 failures)
-    /// - `ProtocolError` maps to `ProtocolViolation` (counts as 2 failures)
-    /// - `Refused` maps to `FailedResponse`
-    ///
-    /// Requires the `adaptive-ml` feature to be enabled.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID of the node that failed
-    /// * `reason` - Why the interaction failed
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use saorsa_core::error::PeerFailureReason;
-    ///
-    /// // After a peer returns corrupted data
-    /// node.report_peer_failure_with_reason(&peer_id, PeerFailureReason::CorruptedData).await?;
-    /// ```
-    pub async fn report_peer_failure_with_reason(
-        &self,
-        peer_id: &PeerId,
-        reason: PeerFailureReason,
-    ) -> Result<()> {
-        if let Some(ref engine) = self.trust_engine {
-            let update = match reason {
-                PeerFailureReason::Timeout | PeerFailureReason::ConnectionFailed => {
-                    NodeStatisticsUpdate::FailedResponse
-                }
-                PeerFailureReason::DataUnavailable => NodeStatisticsUpdate::DataUnavailable,
-                PeerFailureReason::CorruptedData => NodeStatisticsUpdate::CorruptedData,
-                PeerFailureReason::ProtocolError => NodeStatisticsUpdate::ProtocolViolation,
-                PeerFailureReason::Refused => NodeStatisticsUpdate::FailedResponse,
-            };
-
-            engine.update_node_stats(peer_id, update).await;
-            Ok(())
-        } else {
-            // Trust engine not initialized - this is not an error, just a no-op
-            Ok(())
-        }
-    }
-
-    /// Get the current trust score for a peer
-    ///
-    /// Returns a value between 0.0 (untrusted) and 1.0 (fully trusted).
-    /// Unknown peers return 0.0 by default.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID to query
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let trust = node.peer_trust(&peer_id);
-    /// if trust < 0.3 {
-    ///     tracing::warn!("Low trust peer: {}", peer_id);
-    /// }
-    /// ```
+    /// Returns 0.5 (neutral) for unknown peers.
     pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
-        if let Some(ref engine) = self.trust_engine {
-            engine.score(peer_id)
-        } else {
-            // Trust engine not initialized - return neutral trust
-            DEFAULT_NEUTRAL_TRUST
-        }
+        self.adaptive_dht.peer_trust(peer_id)
+    }
+
+    /// Get the AdaptiveDHT component for direct access
+    pub fn adaptive_dht(&self) -> &AdaptiveDHT {
+        &self.adaptive_dht
     }
 
     // =========================================================================
@@ -1146,17 +1014,17 @@ impl P2PNode {
             .await
         {
             Ok(resp) => {
-                let _ = self.report_peer_success(peer_id).await;
+                self.report_trust_event(peer_id, TrustEvent::SuccessfulResponse)
+                    .await;
                 Ok(resp)
             }
             Err(e) => {
-                // Choose the right failure reason based on the error type
-                let reason = if matches!(&e, P2PError::Timeout(_)) {
-                    PeerFailureReason::Timeout
+                let event = if matches!(&e, P2PError::Timeout(_)) {
+                    TrustEvent::ConnectionTimeout
                 } else {
-                    PeerFailureReason::ConnectionFailed
+                    TrustEvent::ConnectionFailed
                 };
-                let _ = self.report_peer_failure_with_reason(peer_id, reason).await;
+                self.report_trust_event(peer_id, event).await;
                 Err(e)
             }
         }
@@ -1207,8 +1075,8 @@ impl P2PNode {
         // Start transport listeners and message receiving
         self.transport.start_network_listeners().await?;
 
-        // Start the attached DHT manager.
-        Arc::clone(&self.dht_manager).start().await?;
+        // Start the adaptive DHT layer (DHT manager + trust engine)
+        self.adaptive_dht.start().await?;
 
         // Log current listen addresses
         let listen_addrs = self.transport.listen_addrs().await;
@@ -1253,8 +1121,8 @@ impl P2PNode {
         // Signal the run loop to exit
         self.shutdown.cancel();
 
-        // Stop DHT manager first so leave messages can be sent while transport is still active.
-        self.dht_manager.stop().await?;
+        // Stop DHT layer first so leave messages can be sent while transport is still active.
+        self.adaptive_dht.stop().await?;
 
         // Stop the transport layer (shutdown endpoints, join tasks, disconnect peers)
         self.transport.stop().await?;
@@ -1571,7 +1439,7 @@ impl P2PNode {
 
     /// Get the attached DHT manager.
     pub fn dht_manager(&self) -> &Arc<DhtNetworkManager> {
-        &self.dht_manager
+        self.adaptive_dht.dht_manager()
     }
 
     /// Backwards-compatible alias for `dht_manager()`.
@@ -1782,7 +1650,7 @@ impl P2PNode {
 
         // Perform DHT peer discovery from connected bootstrap peers.
         match self
-            .dht_manager
+            .dht_manager()
             .bootstrap_from_peers(&connected_peer_ids)
             .await
         {

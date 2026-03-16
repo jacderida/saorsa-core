@@ -86,7 +86,6 @@
 //! // let value = some_option.ok_or_else(|| P2PError::Internal("Missing value".into()))?;
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io;
 use std::net::SocketAddr;
@@ -549,80 +548,6 @@ impl Default for GeographicConfig {
     }
 }
 
-/// Categorizes why a peer interaction failed.
-///
-/// Used by consumers (like saorsa-node) to provide rich context when reporting
-/// failures to the trust/reputation system. Each variant carries a severity
-/// that the trust engine uses to weight the penalty.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use saorsa_core::error::PeerFailureReason;
-///
-/// let reason = PeerFailureReason::Timeout;
-/// assert!(reason.is_transient());
-/// assert!(reason.trust_severity() < 0.5);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PeerFailureReason {
-    /// The peer did not respond within the expected time window.
-    Timeout,
-    /// Could not establish or maintain a connection to the peer.
-    ConnectionFailed,
-    /// The peer was reachable but did not have the requested data.
-    DataUnavailable,
-    /// The peer returned data that failed integrity/hash verification.
-    CorruptedData,
-    /// The peer violated the expected wire protocol.
-    ProtocolError,
-    /// The peer explicitly refused the request.
-    Refused,
-}
-
-impl PeerFailureReason {
-    /// Whether this failure is transient (likely to succeed on retry).
-    ///
-    /// Transient failures (timeout, connection issues) should not be penalized
-    /// as heavily as persistent ones (corrupted data, protocol errors).
-    pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            PeerFailureReason::Timeout | PeerFailureReason::ConnectionFailed
-        )
-    }
-
-    /// Trust severity score in the range `[0.0, 1.0]`.
-    ///
-    /// Higher values indicate more severe trust violations:
-    /// - `0.2` — transient issues (timeout, connection)
-    /// - `0.5` — data unavailable / refused
-    /// - `1.0` — data corruption or protocol violation
-    pub fn trust_severity(&self) -> f64 {
-        match self {
-            PeerFailureReason::Timeout => 0.2,
-            PeerFailureReason::ConnectionFailed => 0.2,
-            PeerFailureReason::DataUnavailable => 0.5,
-            PeerFailureReason::CorruptedData => 1.0,
-            PeerFailureReason::ProtocolError => 1.0,
-            PeerFailureReason::Refused => 0.5,
-        }
-    }
-}
-
-impl std::fmt::Display for PeerFailureReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerFailureReason::Timeout => write!(f, "timeout"),
-            PeerFailureReason::ConnectionFailed => write!(f, "connection_failed"),
-            PeerFailureReason::DataUnavailable => write!(f, "data_unavailable"),
-            PeerFailureReason::CorruptedData => write!(f, "corrupted_data"),
-            PeerFailureReason::ProtocolError => write!(f, "protocol_error"),
-            PeerFailureReason::Refused => write!(f, "refused"),
-        }
-    }
-}
-
 /// Result type alias for P2P operations
 pub type P2pResult<T> = Result<T, P2PError>;
 
@@ -756,6 +681,4 @@ mod tests {
             "Cryptography error: Invalid key length: expected 32, got 16"
         );
     }
-
-    // PeerFailureReason transient/severity tests are in tests/request_response_trust_test.rs
 }

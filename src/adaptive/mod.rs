@@ -17,9 +17,11 @@
 
 #![allow(missing_docs)]
 
+pub mod dht;
 pub mod trust;
 
-// Re-export essential trust types
+// Re-export essential types
+pub use dht::{AdaptiveDHT, AdaptiveDhtConfig, TrustEvent};
 pub use trust::{NodeStatisticsUpdate, TrustEngine};
 
 /// Core error type for the adaptive network

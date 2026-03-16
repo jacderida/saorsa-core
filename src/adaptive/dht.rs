@@ -1,0 +1,275 @@
+// Copyright 2024 Saorsa Labs Limited
+//
+// This software is dual-licensed under:
+// - GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
+// - Commercial License
+//
+// For AGPL-3.0 license, see LICENSE-AGPL-3.0
+// For commercial licensing, contact: david@saorsalabs.com
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under these licenses is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+//! AdaptiveDHT — the trust boundary for all DHT operations.
+//!
+//! `AdaptiveDHT` is the **sole component** that creates and owns the [`TrustEngine`].
+//! All DHT operations flow through it, and all trust signals originate from it.
+//!
+//! Internal DHT operations (iterative lookups) record trust via the `TrustEngine`
+//! reference passed to `DhtNetworkManager`. Application-level trust signals
+//! (data verification outcomes) are reported through [`AdaptiveDHT::report_app_event`].
+
+use crate::PeerId;
+use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
+use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::error::P2pResult as Result;
+use serde::{Deserialize, Serialize};
+
+/// Configuration for the AdaptiveDHT layer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdaptiveDhtConfig {
+    /// Enable trust-weighted routing (reorder candidates by trust before querying).
+    /// Default: false — pure Kademlia distance ordering.
+    pub trust_weighted_routing: bool,
+
+    /// Weight given to trust in peer selection (0.0–1.0).
+    /// Only used when `trust_weighted_routing` is true.
+    /// Default: 0.3 (30% trust, 70% distance)
+    pub routing_weight: f64,
+
+    /// Trust score below which a peer may be evicted.
+    /// Default: 0.15
+    pub eviction_threshold: f64,
+
+    /// Interval between background trust recomputations.
+    /// Default: 300 seconds (5 minutes)
+    pub recompute_interval: Duration,
+}
+
+impl Default for AdaptiveDhtConfig {
+    fn default() -> Self {
+        Self {
+            trust_weighted_routing: false,
+            routing_weight: 0.3,
+            eviction_threshold: 0.15,
+            recompute_interval: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Trust-relevant events that can be reported by application-level consumers.
+///
+/// Each variant maps to an internal [`NodeStatisticsUpdate`] with appropriate severity.
+/// DHT-internal events (iterative lookup success/failure) are recorded automatically
+/// by `DhtNetworkManager` — this enum is for **application-level** signals only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrustEvent {
+    // === Positive signals ===
+    /// Peer provided a correct, verified response
+    SuccessfulResponse,
+    /// Peer connection was established successfully
+    SuccessfulConnection,
+
+    // === Negative signals (varying severity) ===
+    /// Generic response failure
+    FailedResponse,
+    /// Could not establish a connection
+    ConnectionFailed,
+    /// Connection attempt timed out
+    ConnectionTimeout,
+    /// Peer did not have requested data
+    DataUnavailable,
+    /// Peer returned data that failed integrity verification (severe — 2x penalty)
+    CorruptedData,
+    /// Peer violated the wire protocol (severe — 2x penalty)
+    ProtocolViolation,
+    /// Peer explicitly refused the request
+    Refused,
+    /// Peer disconnected unexpectedly
+    UnexpectedDisconnect,
+}
+
+impl TrustEvent {
+    /// Convert a TrustEvent to the internal NodeStatisticsUpdate
+    fn to_stats_update(self) -> NodeStatisticsUpdate {
+        match self {
+            TrustEvent::SuccessfulResponse | TrustEvent::SuccessfulConnection => {
+                NodeStatisticsUpdate::CorrectResponse
+            }
+            TrustEvent::FailedResponse
+            | TrustEvent::ConnectionFailed
+            | TrustEvent::ConnectionTimeout
+            | TrustEvent::Refused
+            | TrustEvent::UnexpectedDisconnect => NodeStatisticsUpdate::FailedResponse,
+            TrustEvent::DataUnavailable => NodeStatisticsUpdate::DataUnavailable,
+            TrustEvent::CorruptedData => NodeStatisticsUpdate::CorruptedData,
+            TrustEvent::ProtocolViolation => NodeStatisticsUpdate::ProtocolViolation,
+        }
+    }
+}
+
+/// AdaptiveDHT — the trust boundary for all DHT operations.
+///
+/// Owns the `TrustEngine` and `DhtNetworkManager`. All DHT operations
+/// should go through this component. Application-level trust signals
+/// are reported via [`report_app_event`](Self::report_app_event).
+pub struct AdaptiveDHT {
+    /// The underlying DHT network manager (handles raw DHT operations)
+    dht_manager: Arc<DhtNetworkManager>,
+
+    /// The trust engine — sole authority on peer trust scores
+    trust_engine: Arc<TrustEngine>,
+
+    /// Configuration for trust-weighted behavior
+    config: AdaptiveDhtConfig,
+}
+
+impl AdaptiveDHT {
+    /// Create a new AdaptiveDHT instance.
+    ///
+    /// This creates the `TrustEngine`, starts its background updates, and
+    /// creates the `DhtNetworkManager` with the trust engine injected.
+    pub async fn new(
+        transport: Arc<crate::transport_handle::TransportHandle>,
+        dht_config: DhtNetworkConfig,
+        adaptive_config: AdaptiveDhtConfig,
+    ) -> Result<Self> {
+        let pre_trusted: HashSet<PeerId> = HashSet::new();
+        let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
+        trust_engine.clone().start_background_updates();
+
+        let dht_manager = Arc::new(
+            DhtNetworkManager::new(transport, Some(trust_engine.clone()), dht_config).await?,
+        );
+
+        Ok(Self {
+            dht_manager,
+            trust_engine,
+            config: adaptive_config,
+        })
+    }
+
+    // =========================================================================
+    // Trust API — the only place where external callers record trust events
+    // =========================================================================
+
+    /// Report an application-level trust event for a peer.
+    ///
+    /// Use this for outcomes that the DHT layer cannot observe directly,
+    /// such as data verification results from saorsa-node.
+    pub async fn report_app_event(&self, peer_id: &PeerId, event: TrustEvent) {
+        self.trust_engine
+            .update_node_stats(peer_id, event.to_stats_update())
+            .await;
+    }
+
+    /// Get the current trust score for a peer (synchronous).
+    ///
+    /// Returns `DEFAULT_NEUTRAL_TRUST` (0.5) for unknown peers.
+    pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
+        self.trust_engine.score(peer_id)
+    }
+
+    /// Get a reference to the underlying trust engine for advanced use cases.
+    pub fn trust_engine(&self) -> &Arc<TrustEngine> {
+        &self.trust_engine
+    }
+
+    /// Get the adaptive DHT configuration.
+    pub fn config(&self) -> &AdaptiveDhtConfig {
+        &self.config
+    }
+
+    // =========================================================================
+    // DHT operations — delegates to DhtNetworkManager
+    // =========================================================================
+
+    /// Get the underlying DHT network manager.
+    ///
+    /// All DHT operations are accessible through this reference.
+    /// The DHT manager records trust internally for per-peer outcomes
+    /// during iterative lookups.
+    pub fn dht_manager(&self) -> &Arc<DhtNetworkManager> {
+        &self.dht_manager
+    }
+
+    /// Start the DHT manager (network event handler + maintenance tasks).
+    pub async fn start(&self) -> Result<()> {
+        Arc::clone(&self.dht_manager).start().await
+    }
+
+    /// Stop the DHT manager gracefully.
+    pub async fn stop(&self) -> Result<()> {
+        self.dht_manager.stop().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trust_event_mapping() {
+        // Positive events map to CorrectResponse
+        assert!(matches!(
+            TrustEvent::SuccessfulResponse.to_stats_update(),
+            NodeStatisticsUpdate::CorrectResponse
+        ));
+        assert!(matches!(
+            TrustEvent::SuccessfulConnection.to_stats_update(),
+            NodeStatisticsUpdate::CorrectResponse
+        ));
+
+        // Generic failures map to FailedResponse
+        assert!(matches!(
+            TrustEvent::FailedResponse.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+        assert!(matches!(
+            TrustEvent::ConnectionFailed.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+        assert!(matches!(
+            TrustEvent::ConnectionTimeout.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+        assert!(matches!(
+            TrustEvent::Refused.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+        assert!(matches!(
+            TrustEvent::UnexpectedDisconnect.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+
+        // Severity-specific mappings
+        assert!(matches!(
+            TrustEvent::DataUnavailable.to_stats_update(),
+            NodeStatisticsUpdate::DataUnavailable
+        ));
+        assert!(matches!(
+            TrustEvent::CorruptedData.to_stats_update(),
+            NodeStatisticsUpdate::CorruptedData
+        ));
+        assert!(matches!(
+            TrustEvent::ProtocolViolation.to_stats_update(),
+            NodeStatisticsUpdate::ProtocolViolation
+        ));
+    }
+
+    #[test]
+    fn test_adaptive_dht_config_defaults() {
+        let config = AdaptiveDhtConfig::default();
+        assert!(!config.trust_weighted_routing);
+        assert!((config.routing_weight - 0.3).abs() < f64::EPSILON);
+        assert!((config.eviction_threshold - 0.15).abs() < f64::EPSILON);
+        assert_eq!(config.recompute_interval, Duration::from_secs(300));
+    }
+}
