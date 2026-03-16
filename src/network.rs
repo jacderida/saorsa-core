@@ -1050,12 +1050,6 @@ impl P2PNode {
         &self.transport
     }
 
-    /// Get the hex-encoded channel ID (QUIC connection identifier).
-    #[allow(dead_code)]
-    pub(crate) fn channel_id(&self) -> Option<String> {
-        self.transport.channel_id()
-    }
-
     pub fn local_addr(&self) -> Option<MultiAddr> {
         self.transport.local_addr()
     }

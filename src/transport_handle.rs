@@ -341,14 +341,6 @@ impl TransportHandle {
         &self.node_identity
     }
 
-    /// Get the channel ID (local listen address as a string).
-    ///
-    /// This is the transport-level connection identifier. It differs from
-    /// `peer_id()` which is the app-level cryptographic identity.
-    pub(crate) fn channel_id(&self) -> Option<String> {
-        self.local_addr().map(|a| a.to_string())
-    }
-
     /// Get the first listen address as a string.
     pub fn local_addr(&self) -> Option<MultiAddr> {
         self.listen_addrs

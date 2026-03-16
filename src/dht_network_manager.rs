@@ -2614,15 +2614,6 @@ impl DhtNetworkManager {
         &self.config.peer_id
     }
 
-    /// Get this node's QUIC channel ID (cryptographic hex ID).
-    ///
-    /// This identifies the transport channel, not the peer.
-    /// It differs from `peer_id()` which returns the human-readable config name.
-    #[allow(dead_code)]
-    pub(crate) fn channel_id(&self) -> Option<String> {
-        self.transport.channel_id()
-    }
-
     /// Get the local listen address of this node's P2P network
     ///
     /// Returns the address other nodes can use to connect to this node.
