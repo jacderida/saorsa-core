@@ -72,7 +72,8 @@ when the consuming application layer exists.
 | `ConnectionFailed` | 1x penalty | Could not establish connection | `send_request()` error, `dial_candidate()` error |
 | `ConnectionTimeout` | 1x penalty | Connection attempt timed out | `send_request()` timeout, `dial_candidate()` timeout |
 | `ProtocolViolation` | 2x penalty | Peer violated wire protocol | Future: DHT message validation |
-| `UnexpectedDisconnect` | 1x penalty | Peer disconnected unexpectedly | `PeerDisconnected` event |
+
+Note: Peer disconnects are normal connection lifecycle — they do not affect trust.
 
 ## Trust-Weighted Routing
 

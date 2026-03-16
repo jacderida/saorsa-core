@@ -94,8 +94,6 @@ pub enum TrustEvent {
     ConnectionTimeout,
     /// Peer violated the wire protocol (severe — 2x penalty)
     ProtocolViolation,
-    /// Peer disconnected unexpectedly
-    UnexpectedDisconnect,
 }
 
 impl TrustEvent {
@@ -105,9 +103,9 @@ impl TrustEvent {
             TrustEvent::SuccessfulResponse | TrustEvent::SuccessfulConnection => {
                 NodeStatisticsUpdate::CorrectResponse
             }
-            TrustEvent::ConnectionFailed
-            | TrustEvent::ConnectionTimeout
-            | TrustEvent::UnexpectedDisconnect => NodeStatisticsUpdate::FailedResponse,
+            TrustEvent::ConnectionFailed | TrustEvent::ConnectionTimeout => {
+                NodeStatisticsUpdate::FailedResponse
+            }
             TrustEvent::ProtocolViolation => NodeStatisticsUpdate::ProtocolViolation,
         }
     }
@@ -241,10 +239,6 @@ mod tests {
             TrustEvent::ConnectionTimeout.to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
         ));
-        assert!(matches!(
-            TrustEvent::UnexpectedDisconnect.to_stats_update(),
-            NodeStatisticsUpdate::FailedResponse
-        ));
 
         // Severe failure — 2x penalty
         assert!(matches!(
@@ -366,7 +360,6 @@ mod tests {
             TrustEvent::ConnectionFailed,
             TrustEvent::ConnectionTimeout,
             TrustEvent::ProtocolViolation,
-            TrustEvent::UnexpectedDisconnect,
         ];
 
         for event in events {

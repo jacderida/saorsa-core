@@ -1757,9 +1757,6 @@ impl DhtNetworkManager {
                                         peer_id.to_hex()
                                     );
 
-                                    // Record unexpected disconnect for trust scoring
-                                    self_arc.record_peer_failure(&peer_id).await;
-
                                     if self_arc.event_tx.receiver_count() > 0
                                         && let Err(e) = self_arc
                                             .event_tx
