@@ -20,7 +20,7 @@
 
 use crate::{
     P2PError, PeerId, Result,
-    adaptive::EigenTrustEngine,
+    adaptive::TrustEngine,
     address::MultiAddr,
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
@@ -185,7 +185,7 @@ pub struct DhtNetworkManager {
     /// Transport handle for QUIC connections, peer registry, and message I/O
     transport: Arc<crate::transport_handle::TransportHandle>,
     /// EigenTrust engine for reputation management (optional)
-    trust_engine: Option<Arc<EigenTrustEngine>>,
+    trust_engine: Option<Arc<TrustEngine>>,
     /// Configuration
     config: DhtNetworkConfig,
     /// Active DHT operations
@@ -300,7 +300,7 @@ impl DhtNetworkManager {
 
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
-        trust_engine: Option<Arc<EigenTrustEngine>>,
+        trust_engine: Option<Arc<TrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
         let mut dht_instance =
@@ -369,7 +369,7 @@ impl DhtNetworkManager {
     /// transport after stopping this manager.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
-        trust_engine: Option<Arc<EigenTrustEngine>>,
+        trust_engine: Option<Arc<TrustEngine>>,
         mut config: DhtNetworkConfig,
     ) -> Result<Self> {
         let transport_app_peer_id = transport.peer_id();
@@ -1943,7 +1943,7 @@ impl DhtNetworkManager {
     }
 
     /// Get the optional trust engine used by this manager.
-    pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
+    pub fn trust_engine(&self) -> Option<Arc<TrustEngine>> {
         self.trust_engine.clone()
     }
 }

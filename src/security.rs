@@ -17,7 +17,6 @@
 //! It implements IPv6-based node ID generation and IP diversity enforcement to prevent
 //! large-scale Sybil attacks while maintaining network openness.
 
-use crate::PeerId;
 use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, ml_dsa_sign, ml_dsa_verify,
 };
@@ -325,28 +324,6 @@ pub enum UnifiedIPAnalysis {
     IPv4(IPv4Analysis),
     /// IPv6 address analysis
     IPv6(IPAnalysis),
-}
-
-/// Node reputation tracking for security-aware routing
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct NodeReputation {
-    /// Peer ID
-    pub peer_id: PeerId,
-    /// Fraction of queries answered successfully
-    pub response_rate: f64,
-    /// Average response time
-    pub response_time: Duration,
-    /// Consistency of provided data (0.0-1.0)
-    pub consistency_score: f64,
-    /// Estimated continuous uptime
-    pub uptime_estimate: Duration,
-    /// Accuracy of routing information provided
-    pub routing_accuracy: f64,
-    /// Last time this node was seen
-    pub last_seen: SystemTime,
-    /// Total number of interactions
-    pub interaction_count: u64,
 }
 
 impl Default for IPDiversityConfig {
@@ -1300,87 +1277,6 @@ pub struct DiversityStats {
     pub total_countries: usize,
 }
 
-/// Reputation manager for tracking node behavior
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct ReputationManager {
-    reputations: HashMap<PeerId, NodeReputation>,
-    reputation_decay: f64,
-    min_reputation: f64,
-}
-
-#[allow(dead_code)]
-impl ReputationManager {
-    /// Create a new reputation manager
-    pub fn new(reputation_decay: f64, min_reputation: f64) -> Self {
-        Self {
-            reputations: HashMap::new(),
-            reputation_decay,
-            min_reputation,
-        }
-    }
-
-    /// Get reputation for a peer
-    pub fn get_reputation(&self, peer_id: &PeerId) -> Option<&NodeReputation> {
-        self.reputations.get(peer_id)
-    }
-
-    /// Update reputation based on interaction
-    pub fn update_reputation(&mut self, peer_id: &PeerId, success: bool, response_time: Duration) {
-        let reputation = self
-            .reputations
-            .entry(*peer_id)
-            .or_insert_with(|| NodeReputation {
-                peer_id: *peer_id,
-                response_rate: 0.5,
-                response_time: Duration::from_millis(500),
-                consistency_score: 0.5,
-                uptime_estimate: Duration::from_secs(0),
-                routing_accuracy: 0.5,
-                last_seen: SystemTime::now(),
-                interaction_count: 0,
-            });
-
-        // Use higher learning rate for faster convergence in tests
-        let alpha = 0.3; // Increased from 0.1 for better test convergence
-
-        if success {
-            reputation.response_rate = reputation.response_rate * (1.0 - alpha) + alpha;
-        } else {
-            reputation.response_rate *= 1.0 - alpha;
-        }
-
-        // Update response time
-        let response_time_ms = response_time.as_millis() as f64;
-        let current_response_ms = reputation.response_time.as_millis() as f64;
-        let new_response_ms = current_response_ms * (1.0 - alpha) + response_time_ms * alpha;
-        reputation.response_time = Duration::from_millis(new_response_ms as u64);
-
-        reputation.last_seen = SystemTime::now();
-        reputation.interaction_count += 1;
-    }
-
-    /// Apply time-based reputation decay
-    pub fn apply_decay(&mut self) {
-        let now = SystemTime::now();
-
-        self.reputations.retain(|_, reputation| {
-            if let Ok(elapsed) = now.duration_since(reputation.last_seen) {
-                // Decay reputation over time
-                let decay_factor = (-elapsed.as_secs_f64() / 3600.0 * self.reputation_decay).exp();
-                reputation.response_rate *= decay_factor;
-                reputation.consistency_score *= decay_factor;
-                reputation.routing_accuracy *= decay_factor;
-
-                // Remove nodes with very low reputation
-                reputation.response_rate > self.min_reputation / 10.0
-            } else {
-                true
-            }
-        });
-    }
-}
-
 // Ed25519 compatibility removed
 
 #[cfg(test)]
@@ -1862,131 +1758,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reputation_manager_creation() {
-        let manager = ReputationManager::new(0.1, 0.1);
-        assert_eq!(manager.reputation_decay, 0.1);
-        assert_eq!(manager.min_reputation, 0.1);
-        assert_eq!(manager.reputations.len(), 0);
-    }
-
-    #[test]
-    fn test_reputation_get_nonexistent() {
-        let manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        let reputation = manager.get_reputation(&peer_id);
-        assert!(reputation.is_none());
-    }
-
-    #[test]
-    fn test_reputation_update_creates_entry() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-
-        let reputation = manager.get_reputation(&peer_id);
-        assert!(reputation.is_some());
-
-        let rep = reputation.unwrap();
-        assert_eq!(rep.peer_id, peer_id);
-        assert!(rep.response_rate > 0.5); // Should increase from initial 0.5
-        assert_eq!(rep.interaction_count, 1);
-    }
-
-    #[test]
-    fn test_reputation_update_success_improves_rate() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Multiple successful interactions
-        for _ in 0..15 {
-            manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        assert!(reputation.response_rate > 0.85); // Should be very high with higher learning rate
-        assert_eq!(reputation.interaction_count, 15);
-    }
-
-    #[test]
-    fn test_reputation_update_failure_decreases_rate() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Multiple failed interactions
-        for _ in 0..15 {
-            manager.update_reputation(&peer_id, false, Duration::from_millis(1000));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        assert!(reputation.response_rate < 0.15); // Should be very low with higher learning rate
-        assert_eq!(reputation.interaction_count, 15);
-    }
-
-    #[test]
-    fn test_reputation_response_time_tracking() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Update with specific response time
-        manager.update_reputation(&peer_id, true, Duration::from_millis(200));
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        // Response time should be between initial 500ms and new 200ms
-        assert!(reputation.response_time.as_millis() > 200);
-        assert!(reputation.response_time.as_millis() < 500);
-    }
-
-    #[test]
-    fn test_reputation_decay() {
-        let mut manager = ReputationManager::new(1.0, 0.01); // High decay rate
-        let peer_id = PeerId::random();
-
-        // Create a reputation entry
-        manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-
-        // Manually set last_seen to past
-        if let Some(reputation) = manager.reputations.get_mut(&peer_id) {
-            reputation.last_seen = SystemTime::now() - Duration::from_secs(7200); // 2 hours ago
-        }
-
-        let original_rate = manager.get_reputation(&peer_id).unwrap().response_rate;
-
-        // Apply decay
-        manager.apply_decay();
-
-        let reputation = manager.get_reputation(&peer_id);
-        if let Some(rep) = reputation {
-            // Should have decayed
-            assert!(rep.response_rate < original_rate);
-        } // else the reputation was removed due to low score
-    }
-
-    #[test]
-    fn test_reputation_decay_removes_low_reputation() {
-        let mut manager = ReputationManager::new(0.1, 0.5); // High min reputation
-        let peer_id = PeerId::random();
-
-        // Create a low reputation entry
-        for _ in 0..10 {
-            manager.update_reputation(&peer_id, false, Duration::from_millis(1000));
-        }
-
-        // Manually set last_seen to past
-        if let Some(reputation) = manager.reputations.get_mut(&peer_id) {
-            reputation.last_seen = SystemTime::now() - Duration::from_secs(3600); // 1 hour ago
-            reputation.response_rate = 0.01; // Very low
-        }
-
-        // Apply decay
-        manager.apply_decay();
-
-        // Should be removed
-        assert!(manager.get_reputation(&peer_id).is_none());
-    }
-
-    #[test]
     fn test_security_types_keypair() {
         let (public_key, secret_key) =
             generate_ml_dsa_keypair().expect("Failed to generate keypair");
@@ -2000,29 +1771,6 @@ mod tests {
 
         // Verify the signature
         assert!(ml_dsa_verify(&public_key, message, &signature).is_ok());
-    }
-
-    #[test]
-    fn test_node_reputation_structure() {
-        let peer_id = PeerId::random();
-        let reputation = NodeReputation {
-            peer_id,
-            response_rate: 0.85,
-            response_time: Duration::from_millis(150),
-            consistency_score: 0.9,
-            uptime_estimate: Duration::from_secs(86400),
-            routing_accuracy: 0.8,
-            last_seen: SystemTime::now(),
-            interaction_count: 42,
-        };
-
-        assert_eq!(reputation.peer_id, peer_id);
-        assert_eq!(reputation.response_rate, 0.85);
-        assert_eq!(reputation.response_time, Duration::from_millis(150));
-        assert_eq!(reputation.consistency_score, 0.9);
-        assert_eq!(reputation.uptime_estimate, Duration::from_secs(86400));
-        assert_eq!(reputation.routing_accuracy, 0.8);
-        assert_eq!(reputation.interaction_count, 42);
     }
 
     #[test]
@@ -2143,24 +1891,5 @@ mod tests {
         assert!(!enforcer.country_counts.contains("US"));
 
         Ok(())
-    }
-
-    #[test]
-    fn test_reputation_mixed_interactions() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Mix of successful and failed interactions
-        for i in 0..15 {
-            let success = i % 3 != 0; // 2/3 success rate
-            manager.update_reputation(&peer_id, success, Duration::from_millis(100 + i * 10));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        // Should converge closer to 2/3 with more iterations and higher learning rate
-        // With alpha=0.3 and 2/3 success rate, convergence may be higher
-        assert!(reputation.response_rate > 0.55);
-        assert!(reputation.response_rate < 0.85);
-        assert_eq!(reputation.interaction_count, 15);
     }
 }

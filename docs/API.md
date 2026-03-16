@@ -288,21 +288,11 @@ let password = SecureString::from("my-secret-password");
 
 ### EigenTrust Scores
 
-Query reputation scores for peers.
+Query reputation scores for peers via P2PNode.
 
 ```rust
-use saorsa_core::security::ReputationManager;
-
-let reputation = ReputationManager::new(config);
-
 // Get trust score (0.0 - 1.0)
-let score = reputation.get_score(&peer_id);
-
-// Record successful interaction
-reputation.record_success(&peer_id);
-
-// Record failed interaction
-reputation.record_failure(&peer_id);
+let score = node.peer_trust(&peer_id);
 ```
 
 ### Node Age Verification

@@ -101,21 +101,6 @@ pub struct DhtConfig {
     pub beta: u8,
     /// Enable adaptive routing
     pub adaptive_routing: bool,
-
-    // Trust-weighted peer selection configuration
-    /// Enable trust-weighted peer selection
-    /// When enabled, peer selection combines XOR distance with EigenTrust scores
-    pub trust_selection_enabled: bool,
-
-    /// Weight given to trust in peer selection (0.0-1.0)
-    /// Higher values = prefer trusted nodes over closer nodes
-    /// Default: 0.3 (30% weight to trust factor)
-    pub trust_weight: f64,
-
-    /// Minimum trust threshold for peer selection
-    /// Nodes below this trust score are deprioritized
-    /// Default: 0.1
-    pub min_trust_threshold: f64,
 }
 
 /// Transport configuration
@@ -190,10 +175,6 @@ impl Default for DhtConfig {
             alpha: 3,
             beta: 1,
             adaptive_routing: true,
-            // Trust selection defaults
-            trust_selection_enabled: true,
-            trust_weight: 0.3,
-            min_trust_threshold: 0.1,
         }
     }
 }

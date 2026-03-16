@@ -26,16 +26,6 @@
 //! The `accept()` method accepts all incoming connections regardless of protocol.
 //! Applications must validate the protocol on received connections.
 //!
-//! ## Quality-Based Peer Selection
-//!
-//! The adapter tracks peer quality scores from saorsa-transport's `Capabilities.quality_score()`
-//! (range 0.0 to 1.0, where higher is better). Methods available:
-//! - `get_peer_quality(addr)` - Get quality for a specific peer
-//! - `get_peers_by_quality()` - Get all peers sorted by quality (descending)
-//! - `get_top_peers_by_quality(n)` - Get top N peers by quality
-//! - `get_peers_above_quality_threshold(threshold)` - Filter peers by minimum quality
-//! - `get_average_peer_quality()` - Get average quality of all peers
-//!
 //! ## NAT Traversal Configuration
 //!
 //! NAT traversal behavior is configured via `NetworkConfig`:
@@ -748,72 +738,6 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         self.peer_regions.read().await.clone()
     }
 
-    /// Get the quality score for a specific peer (0.0 to 1.0)
-    ///
-    /// Returns None if the peer is not connected or quality score is not available.
-    /// Quality scores come from saorsa-transport's Capabilities.quality_score() method.
-    pub async fn get_peer_quality(&self, addr: &SocketAddr) -> Option<f32> {
-        let quality_map = self.peer_quality.read().await;
-        quality_map.get(addr).copied()
-    }
-
-    /// Get all connected peers sorted by quality score (highest first)
-    ///
-    /// Returns peers with their quality scores, sorted from highest to lowest quality.
-    /// Peers without quality scores are excluded from the results.
-    pub async fn get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)> {
-        let peers = self.peers.read().await;
-        let quality_map = self.peer_quality.read().await;
-
-        let mut peer_qualities: Vec<(SocketAddr, f32)> = peers
-            .iter()
-            .filter_map(|addr| quality_map.get(addr).map(|quality| (*addr, *quality)))
-            .collect();
-
-        // Sort by quality descending (highest first)
-        peer_qualities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        peer_qualities
-    }
-
-    /// Get the top N peers by quality score
-    ///
-    /// Returns at most `n` peers with highest quality scores.
-    /// Useful for selecting the best peers for operations like storage or routing.
-    pub async fn get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)> {
-        let mut peers = self.get_peers_by_quality().await;
-        peers.truncate(n);
-        peers
-    }
-
-    /// Get peers with quality score above a threshold
-    ///
-    /// Returns only peers whose quality score is >= the given threshold.
-    /// Useful for filtering out low-quality peers.
-    pub async fn get_peers_above_quality_threshold(
-        &self,
-        threshold: f32,
-    ) -> Vec<(SocketAddr, f32)> {
-        self.get_peers_by_quality()
-            .await
-            .into_iter()
-            .filter(|(_, quality)| *quality >= threshold)
-            .collect()
-    }
-
-    /// Get the average quality score of all connected peers
-    ///
-    /// Returns None if no peers have quality scores.
-    pub async fn get_average_peer_quality(&self) -> Option<f32> {
-        let quality_map = self.peer_quality.read().await;
-        if quality_map.is_empty() {
-            return None;
-        }
-
-        let sum: f32 = quality_map.values().sum();
-        Some(sum / quality_map.len() as f32)
-    }
-
     /// Send data to a peer.
     pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         self.send_to_peer_raw(addr, data).await
@@ -1245,16 +1169,4 @@ mod tests {
         // - test_send_to_peer_string: Exercises connect_to_peer with add_peer call
         // Integration tests verify the ConnectionEvent broadcasts work correctly.
     }
-
-    // TDD Phase 4: Quality-based peer selection implementation notes
-    //
-    // The following methods were added in Phase 4:
-    // - get_peer_quality(&self, addr: &SocketAddr) -> Option<f32>
-    // - get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)>
-    // - get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)>
-    // - get_peers_above_quality_threshold(&self, threshold: f32) -> Vec<(SocketAddr, f32)>
-    // - get_average_peer_quality(&self) -> Option<f32>
-    //
-    // These methods are tested by integration tests in the test suite that
-    // actually create connections and verify quality-based peer selection.
 }

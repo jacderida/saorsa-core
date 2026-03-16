@@ -17,12 +17,10 @@
 
 #![allow(missing_docs)]
 
-use crate::PeerId;
-
 pub mod trust;
 
 // Re-export essential trust types
-pub use trust::{EigenTrustEngine, NodeStatisticsUpdate};
+pub use trust::{NodeStatisticsUpdate, TrustEngine};
 
 /// Core error type for the adaptive network
 #[derive(Debug, thiserror::Error)]
@@ -59,26 +57,4 @@ impl From<crate::error::P2PError> for AdaptiveNetworkError {
     fn from(e: crate::error::P2PError) -> Self {
         AdaptiveNetworkError::Network(std::io::Error::other(e.to_string()))
     }
-}
-
-/// Trust provider trait for reputation queries
-///
-/// Provides a unified interface for trust scoring and management.
-/// Implementations should maintain a global trust vector that can be
-/// queried for individual nodes or in aggregate.
-pub trait TrustProvider: Send + Sync {
-    /// Get trust score for a node (0.0 = untrusted, 1.0 = fully trusted)
-    fn get_trust(&self, node: &PeerId) -> f64;
-
-    /// Update trust based on interaction outcome
-    #[allow(dead_code)]
-    fn update_trust(&self, from: &PeerId, to: &PeerId, success: bool);
-
-    /// Get global trust vector for all known nodes
-    #[allow(dead_code)]
-    fn get_global_trust(&self) -> std::collections::HashMap<PeerId, f64>;
-
-    /// Remove a node from the trust system
-    #[allow(dead_code)]
-    fn remove_node(&self, node: &PeerId);
 }

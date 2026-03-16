@@ -17,7 +17,8 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::PeerId;
-use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
+use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
+use crate::adaptive::{NodeStatisticsUpdate, TrustEngine};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
@@ -118,9 +119,6 @@ const DEFAULT_LISTEN_PORT: u16 = 9000;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
-
-/// Default neutral trust score when trust engine is unavailable.
-const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
 
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
@@ -799,7 +797,7 @@ pub struct P2PNode {
     /// Used to track peer reliability based on data availability outcomes.
     /// Consumers (like saorsa-node) should report successes and failures
     /// via `report_peer_success()` and `report_peer_failure()` methods.
-    trust_engine: Option<Arc<EigenTrustEngine>>,
+    trust_engine: Option<Arc<TrustEngine>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -860,7 +858,7 @@ impl P2PNode {
         // The pre-trusted set starts empty — real PeerIds are learned
         // via identity exchange after connecting to bootstrap peers.
         let pre_trusted: HashSet<PeerId> = HashSet::new();
-        let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
+        let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
         trust_engine.clone().start_background_updates();
         let trust_engine = Some(trust_engine);
 
@@ -966,7 +964,7 @@ impl P2PNode {
     ///     let scores = engine.compute_global_trust().await;
     /// }
     /// ```
-    pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
+    pub fn trust_engine(&self) -> Option<Arc<TrustEngine>> {
         self.trust_engine.clone()
     }
 
@@ -1096,7 +1094,7 @@ impl P2PNode {
     /// ```
     pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
         if let Some(ref engine) = self.trust_engine {
-            engine.get_trust(peer_id)
+            engine.score(peer_id)
         } else {
             // Trust engine not initialized - return neutral trust
             DEFAULT_NEUTRAL_TRUST
