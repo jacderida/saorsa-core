@@ -295,6 +295,30 @@ impl SecurityDashboard {
         self
     }
 
+    /// Get the security metrics collector.
+    #[must_use]
+    pub fn security_collector(&self) -> Arc<SecurityMetricsCollector> {
+        Arc::clone(&self.security_collector)
+    }
+
+    /// Get the DHT health metrics collector.
+    #[must_use]
+    pub fn dht_collector(&self) -> Arc<DhtMetricsCollector> {
+        Arc::clone(&self.dht_collector)
+    }
+
+    /// Get the trust metrics collector.
+    #[must_use]
+    pub fn trust_collector(&self) -> Arc<TrustMetricsCollector> {
+        Arc::clone(&self.trust_collector)
+    }
+
+    /// Get the placement metrics collector.
+    #[must_use]
+    pub fn placement_collector(&self) -> Arc<PlacementMetricsCollector> {
+        Arc::clone(&self.placement_collector)
+    }
+
     /// Update data integrity metrics
     pub async fn update_data_integrity(&self, metrics: DataIntegrityMetrics) {
         let mut guard = self.data_integrity_metrics.write().await;
