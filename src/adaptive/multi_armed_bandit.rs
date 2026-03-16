@@ -166,8 +166,8 @@ pub struct MABMetrics {
 /// Per-strategy performance summary for monitoring.
 #[derive(Debug, Clone)]
 pub struct StrategyStats {
-    /// Strategy name (e.g. "Kademlia", "Hyperbolic")
-    pub name: String,
+    /// The strategy this entry describes.
+    pub strategy: StrategyChoice,
     /// Number of times this strategy was selected
     pub selections: u64,
     /// Number of successful outcomes
@@ -454,7 +454,7 @@ impl MultiArmedBandit {
                     0.0
                 };
                 StrategyStats {
-                    name: format!("{:?}", strategy),
+                    strategy,
                     selections,
                     successes,
                     alpha,

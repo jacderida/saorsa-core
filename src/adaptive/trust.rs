@@ -141,9 +141,7 @@ impl EigenTrustEngine {
             loop {
                 tokio::time::sleep(self.update_interval).await;
                 let scores = self.compute_global_trust().await;
-                if !scores.is_empty() {
-                    *self.cached_scores.write().await = Some(scores);
-                }
+                *self.cached_scores.write().await = Some(scores);
             }
         });
     }

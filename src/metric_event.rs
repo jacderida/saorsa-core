@@ -26,7 +26,7 @@ use std::time::Duration;
 /// Classifies the NAT situation for a connection.
 ///
 /// This is a simplified classification for metrics purposes, distinct from
-/// [`peer_record::NatType`] which provides detailed NAT type detection.
+/// [`crate::peer_record::NatType`] which provides detailed NAT type detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectionNatType {
     /// Direct connection — no NAT traversal needed
@@ -117,8 +117,9 @@ pub enum MetricEvent {
     // --- Transport ---
     /// A transport-level connection was established (includes PQ handshake).
     ConnectionEstablished {
-        /// Time taken to establish the connection
-        duration: Duration,
+        /// Time taken to establish the connection, if measurable.
+        /// `None` when per-connection timing is not available at this layer.
+        duration: Option<Duration>,
         /// NAT classification for this connection
         nat_type: ConnectionNatType,
     },
@@ -129,10 +130,20 @@ pub enum MetricEvent {
         reason: ConnectionFailureReason,
     },
 
+    /// A previously-established connection was lost (remote disconnected or timed out).
+    ///
+    /// Distinct from [`ConnectionFailed`](MetricEvent::ConnectionFailed), which indicates
+    /// that a connection attempt never succeeded.
+    ConnectionLost {
+        /// Human-readable reason for the disconnection
+        reason: String,
+    },
+
     /// The post-quantum handshake (ML-DSA identity exchange) completed.
     HandshakeCompleted {
-        /// Time taken for the handshake
-        duration: Duration,
+        /// Time taken for the handshake, if measurable.
+        /// `None` when per-handshake timing is not available at this layer.
+        duration: Option<Duration>,
     },
 
     // --- Replication ---
@@ -167,8 +178,12 @@ mod tests {
     fn new_transport_variants_clone_and_debug() {
         let events: Vec<MetricEvent> = vec![
             MetricEvent::ConnectionEstablished {
-                duration: Duration::from_millis(42),
+                duration: Some(Duration::from_millis(42)),
                 nat_type: ConnectionNatType::Direct,
+            },
+            MetricEvent::ConnectionEstablished {
+                duration: None,
+                nat_type: ConnectionNatType::Unknown,
             },
             MetricEvent::ConnectionFailed {
                 reason: ConnectionFailureReason::Timeout,
@@ -176,9 +191,13 @@ mod tests {
             MetricEvent::ConnectionFailed {
                 reason: ConnectionFailureReason::Other("test".into()),
             },
-            MetricEvent::HandshakeCompleted {
-                duration: Duration::from_millis(10),
+            MetricEvent::ConnectionLost {
+                reason: "peer disconnected".into(),
             },
+            MetricEvent::HandshakeCompleted {
+                duration: Some(Duration::from_millis(10)),
+            },
+            MetricEvent::HandshakeCompleted { duration: None },
             MetricEvent::ReplicationStarted { keys_to_repair: 5 },
             MetricEvent::ReplicationCompleted {
                 duration: Duration::from_secs(3),
@@ -226,14 +245,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<MetricEvent>(16);
 
         let _ = tx.send(MetricEvent::ConnectionEstablished {
-            duration: Duration::from_millis(100),
+            duration: Some(Duration::from_millis(100)),
             nat_type: ConnectionNatType::NatTraversal,
         });
         let _ = tx.send(MetricEvent::ConnectionFailed {
             reason: ConnectionFailureReason::GeoBlocked,
         });
+        let _ = tx.send(MetricEvent::ConnectionLost {
+            reason: "timeout".into(),
+        });
         let _ = tx.send(MetricEvent::HandshakeCompleted {
-            duration: Duration::from_millis(50),
+            duration: Some(Duration::from_millis(50)),
         });
         let _ = tx.send(MetricEvent::ReplicationStarted { keys_to_repair: 3 });
         let _ = tx.send(MetricEvent::ReplicationCompleted {
@@ -247,6 +269,6 @@ mod tests {
         while rx.try_recv().is_ok() {
             count += 1;
         }
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
     }
 }

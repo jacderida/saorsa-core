@@ -680,7 +680,15 @@ impl DhtNetworkManager {
             value.len()
         );
 
-        Self::validate_put_value_size(value.len(), "local put")?;
+        if let Err(e) = Self::validate_put_value_size(value.len(), "local put") {
+            let _ = self
+                .metric_tx
+                .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                    duration: put_start.elapsed(),
+                    success: false,
+                });
+            return Err(e);
+        }
 
         let operation = DhtNetworkOperation::Put {
             key,
@@ -688,9 +696,21 @@ impl DhtNetworkManager {
         };
 
         // Find closest nodes for replication using network lookup
-        let closest_nodes = self
+        let closest_nodes = match self
             .find_closest_nodes_network(&key, self.config.replication_factor)
-            .await?;
+            .await
+        {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                let _ = self
+                    .metric_tx
+                    .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                        duration: put_start.elapsed(),
+                        success: false,
+                    });
+                return Err(e);
+            }
+        };
 
         debug!(
             "find_closest_nodes returned {} nodes for key: {}",
@@ -706,8 +726,18 @@ impl DhtNetworkManager {
                 "No nodes found for key: {}, storing locally only",
                 hex::encode(key)
             );
-            self.store_local_in_core(key, value, "Local PUT storage")
-                .await?;
+            if let Err(e) = self
+                .store_local_in_core(key, value, "Local PUT storage")
+                .await
+            {
+                let _ = self
+                    .metric_tx
+                    .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                        duration: put_start.elapsed(),
+                        success: false,
+                    });
+                return Err(e);
+            }
 
             let _ = self
                 .metric_tx
@@ -723,8 +753,18 @@ impl DhtNetworkManager {
             });
         }
 
-        self.store_local_in_core(key, value.clone(), "Local PUT storage")
-            .await?;
+        if let Err(e) = self
+            .store_local_in_core(key, value.clone(), "Local PUT storage")
+            .await
+        {
+            let _ = self
+                .metric_tx
+                .send(crate::metric_event::MetricEvent::DhtPutCompleted {
+                    duration: put_start.elapsed(),
+                    success: false,
+                });
+            return Err(e);
+        }
 
         // Replicate to closest nodes in parallel for better performance
         let mut replicated_count = 1; // Local storage

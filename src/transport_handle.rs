@@ -1341,26 +1341,43 @@ impl TransportHandle {
     }
 
     /// Get current transport statistics for monitoring.
+    ///
+    /// Locks are acquired and released individually to avoid holding multiple
+    /// locks across `.await` boundaries (prevents potential deadlocks with code
+    /// that acquires these locks in a different order).
     pub async fn transport_stats(&self) -> TransportStats {
-        let active = self.active_connections.read().await;
-        let peers = self.peers.read().await;
+        // Read active_connections first, then drop before acquiring peers lock.
+        let active_count = self.active_connections.read().await.len();
 
+        let peers = self.peers.read().await;
         let mut ipv4 = 0usize;
         let mut ipv6 = 0usize;
         for peer_info in peers.values() {
             for addr in &peer_info.addresses {
-                if addr.contains(':') && addr.contains('[') {
+                // Parse the address to reliably determine the address family.
+                // Addresses may be SocketAddr strings ("1.2.3.4:9000" or "[::1]:9000")
+                // or multiaddr-style strings ("/ip4/..." or "/ip6/...").
+                if addr.starts_with("/ip6/") {
                     ipv6 += 1;
-                } else {
+                } else if addr.starts_with("/ip4/") {
                     ipv4 += 1;
+                } else if let Ok(sa) = addr.parse::<SocketAddr>() {
+                    if sa.is_ipv6() {
+                        ipv6 += 1;
+                    } else {
+                        ipv4 += 1;
+                    }
                 }
+                // Unparseable addresses are silently skipped rather than
+                // attributed to IPv4; they do not represent a known family.
             }
         }
+        let known_peers = peers.len();
+        drop(peers);
 
-        let active_count = active.len();
         TransportStats {
             active_connections: active_count,
-            known_peers: peers.len(),
+            known_peers,
             ipv4_connections: ipv4,
             ipv6_connections: ipv6,
             total_connections_established: self
@@ -1672,25 +1689,28 @@ impl TransportHandle {
 
                                 active_connections.write().await.insert(channel_id.clone());
 
-                                let mut peers_lock = peers.write().await;
-                                if let Some(peer_info) = peers_lock.get_mut(&channel_id) {
-                                    peer_info.status = ConnectionStatus::Connected;
-                                    peer_info.connected_at = Instant::now();
-                                } else {
-                                    debug!("Registering new incoming channel: {}", channel_id);
-                                    peers_lock.insert(
-                                        channel_id.clone(),
-                                        PeerInfo {
-                                            channel_id: channel_id.clone(),
-                                            addresses: vec![remote_address.to_string()],
-                                            status: ConnectionStatus::Connected,
-                                            last_seen: Instant::now(),
-                                            connected_at: Instant::now(),
-                                            protocols: Vec::new(),
-                                            heartbeat_count: 0,
-                                        },
-                                    );
+                                {
+                                    let mut peers_lock = peers.write().await;
+                                    if let Some(peer_info) = peers_lock.get_mut(&channel_id) {
+                                        peer_info.status = ConnectionStatus::Connected;
+                                        peer_info.connected_at = Instant::now();
+                                    } else {
+                                        debug!("Registering new incoming channel: {}", channel_id);
+                                        peers_lock.insert(
+                                            channel_id.clone(),
+                                            PeerInfo {
+                                                channel_id: channel_id.clone(),
+                                                addresses: vec![remote_address.to_string()],
+                                                status: ConnectionStatus::Connected,
+                                                last_seen: Instant::now(),
+                                                connected_at: Instant::now(),
+                                                protocols: Vec::new(),
+                                                heartbeat_count: 0,
+                                            },
+                                        );
+                                    }
                                 }
+                                // peers_lock is dropped here before any awaited I/O.
 
                                 // Send identity announce so the remote peer can authenticate us.
                                 match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
@@ -1713,17 +1733,34 @@ impl TransportHandle {
                                 // Emit transport metric events
                                 connections_established.fetch_add(1, Ordering::Relaxed);
                                 let _ = metric_tx.send(MetricEvent::ConnectionEstablished {
-                                    duration: Duration::ZERO, // No per-connection timing at transport event level
+                                    duration: None, // Per-connection timing not available at this layer
                                     nat_type: crate::metric_event::ConnectionNatType::Unknown,
                                 });
                                 let _ = metric_tx.send(MetricEvent::HandshakeCompleted {
-                                    duration: Duration::ZERO,
+                                    duration: None, // Per-handshake timing not available at this layer
                                 });
                             }
-                            ConnectionEvent::Lost { remote_address, reason }
-                            | ConnectionEvent::Failed { remote_address, reason } => {
+                            ConnectionEvent::Lost { remote_address, reason } => {
                                 let channel_id = remote_address.to_string();
-                                debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
+                                debug!("Connection lost: channel={channel_id}, reason={reason}");
+
+                                let _ = metric_tx.send(MetricEvent::ConnectionLost {
+                                    reason: reason.clone(),
+                                });
+
+                                active_connections.write().await.remove(&channel_id);
+                                peers.write().await.remove(&channel_id);
+                                Self::remove_channel_mappings_static(
+                                    &channel_id,
+                                    &peer_to_channel,
+                                    &channel_to_peers,
+                                    &peer_user_agents,
+                                    &event_tx,
+                                ).await;
+                            }
+                            ConnectionEvent::Failed { remote_address, reason } => {
+                                let channel_id = remote_address.to_string();
+                                debug!("Connection failed: channel={channel_id}, reason={reason}");
 
                                 connection_failures.fetch_add(1, Ordering::Relaxed);
                                 let _ = metric_tx.send(MetricEvent::ConnectionFailed {
@@ -1734,8 +1771,6 @@ impl TransportHandle {
 
                                 active_connections.write().await.remove(&channel_id);
                                 peers.write().await.remove(&channel_id);
-                                // Remove channel mappings and emit PeerDisconnected
-                                // when the peer's last channel is closed.
                                 Self::remove_channel_mappings_static(
                                     &channel_id,
                                     &peer_to_channel,

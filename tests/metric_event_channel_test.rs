@@ -91,9 +91,11 @@ async fn test_metric_event_broadcast_channel_basics() {
 
 #[tokio::test]
 async fn test_metric_event_all_variants() {
+    use saorsa_core::metric_event::{ConnectionFailureReason, ConnectionNatType};
+
     let (tx, mut rx) = broadcast::channel::<MetricEvent>(64);
 
-    // Send each variant
+    // Send every variant
     tx.send(MetricEvent::LookupCompleted {
         duration: Duration::from_millis(10),
         hops: 2,
@@ -121,13 +123,40 @@ async fn test_metric_event_all_variants() {
         rtt: Duration::from_millis(5),
     })
     .unwrap();
+    // Transport variants
+    tx.send(MetricEvent::ConnectionEstablished {
+        duration: Some(Duration::from_millis(50)),
+        nat_type: ConnectionNatType::Direct,
+    })
+    .unwrap();
+    tx.send(MetricEvent::ConnectionFailed {
+        reason: ConnectionFailureReason::Timeout,
+    })
+    .unwrap();
+    tx.send(MetricEvent::ConnectionLost {
+        reason: "peer disconnected".into(),
+    })
+    .unwrap();
+    tx.send(MetricEvent::HandshakeCompleted { duration: None })
+        .unwrap();
+    // Replication variants
+    tx.send(MetricEvent::ReplicationStarted { keys_to_repair: 5 })
+        .unwrap();
+    tx.send(MetricEvent::ReplicationCompleted {
+        duration: Duration::from_secs(1),
+        keys_repaired: 3,
+        bytes_transferred: 1024,
+    })
+    .unwrap();
+    tx.send(MetricEvent::GracePeriodExpired { keys_affected: 10 })
+        .unwrap();
 
-    // Verify we receive all 7 events
+    // Verify we receive all 14 events
     let mut count = 0;
     while rx.try_recv().is_ok() {
         count += 1;
     }
-    assert_eq!(count, 7);
+    assert_eq!(count, 14);
 }
 
 #[tokio::test]
@@ -187,7 +216,8 @@ async fn test_strategy_stats_after_decisions() {
 
     // Verify all stats have valid fields
     for s in &stats {
-        assert!(!s.name.is_empty());
+        // strategy field is an enum — always valid if present
+        let _ = s.strategy;
         assert!(s.alpha > 0.0);
         assert!(s.beta > 0.0);
         assert!(s.estimated_success_rate >= 0.0);
