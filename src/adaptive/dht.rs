@@ -24,37 +24,28 @@ use crate::PeerId;
 use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Default trust score threshold below which a peer is evicted and blocked
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
-
-/// Default interval between blocked-peer sweeps of the routing table (seconds)
-const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 300;
 
 /// Configuration for the AdaptiveDHT layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdaptiveDhtConfig {
     /// Trust score below which a peer is evicted from the routing table
-    /// and blocked from sending DHT messages or reconnecting.
+    /// and blocked from sending DHT messages or being re-added to the RT.
+    /// Eviction is immediate when a peer's score crosses this threshold.
     /// Default: 0.15
     pub block_threshold: f64,
-
-    /// How often to sweep the routing table and remove blocked peers.
-    /// Default: 300 seconds (5 minutes)
-    pub sweep_interval: Duration,
 }
 
 impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
             block_threshold: DEFAULT_BLOCK_THRESHOLD,
-            sweep_interval: Duration::from_secs(DEFAULT_SWEEP_INTERVAL_SECS),
         }
     }
 }
@@ -180,25 +171,13 @@ impl AdaptiveDHT {
         &self.dht_manager
     }
 
-    /// Start the DHT manager and the periodic blocked-peer sweep.
+    /// Start the DHT manager.
     ///
-    /// Trust scores are computed live from direct observations (no background
-    /// recomputation needed). The sweep periodically removes peers from the
-    /// routing table whose score has dropped below the block threshold.
+    /// Trust scores are computed live — no background tasks needed.
+    /// Peers are evicted from the routing table immediately when their
+    /// trust drops below the block threshold.
     pub async fn start(&self) -> Result<()> {
-        Arc::clone(&self.dht_manager).start().await?;
-
-        // Periodic sweep: remove blocked peers from the routing table
-        let manager = self.dht_manager.clone();
-        let interval = self.config.sweep_interval;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                manager.sweep_blocked_peers().await;
-            }
-        });
-
-        Ok(())
+        Arc::clone(&self.dht_manager).start().await
     }
 
     /// Stop the DHT manager gracefully.
@@ -239,10 +218,6 @@ mod tests {
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
         assert!((config.block_threshold - DEFAULT_BLOCK_THRESHOLD).abs() < f64::EPSILON);
-        assert_eq!(
-            config.sweep_interval,
-            Duration::from_secs(DEFAULT_SWEEP_INTERVAL_SECS)
-        );
     }
 
     // =========================================================================

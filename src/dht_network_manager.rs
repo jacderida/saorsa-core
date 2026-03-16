@@ -863,6 +863,20 @@ impl DhtNetworkManager {
                     crate::adaptive::NodeStatisticsUpdate::FailedResponse,
                 )
                 .await;
+
+            // Immediately evict from RT if trust has crossed the block threshold
+            if self.config.block_threshold > 0.0
+                && engine.score(peer_id) < self.config.block_threshold
+            {
+                let mut dht = self.dht.write().await;
+                dht.remove_node_by_id(peer_id).await;
+                tracing::info!(
+                    peer = peer_id.to_hex(),
+                    score = engine.score(peer_id),
+                    threshold = self.config.block_threshold,
+                    "Evicted peer from routing table — trust below block threshold"
+                );
+            }
         }
     }
 
@@ -878,42 +892,6 @@ impl DhtNetworkManager {
             engine.score(peer_id) < self.config.block_threshold
         } else {
             false
-        }
-    }
-
-    /// Remove peers from the routing table whose trust has fallen below the block threshold.
-    ///
-    /// Called by AdaptiveDHT after trust score recomputation to reactively evict
-    /// peers that have become untrustworthy.
-    pub async fn sweep_blocked_peers(&self) {
-        if self.config.block_threshold <= 0.0 {
-            return;
-        }
-        let Some(ref engine) = self.trust_engine else {
-            return;
-        };
-
-        // Collect blocked peers under a read lock
-        let blocked: Vec<PeerId> = {
-            let dht = self.dht.read().await;
-            dht.all_peer_ids()
-                .await
-                .into_iter()
-                .filter(|id| engine.score(id) < self.config.block_threshold)
-                .collect()
-        };
-
-        // Remove under a single write lock
-        if !blocked.is_empty() {
-            let mut dht = self.dht.write().await;
-            for peer_id in &blocked {
-                dht.remove_node_by_id(peer_id).await;
-            }
-            tracing::info!(
-                removed = blocked.len(),
-                threshold = self.config.block_threshold,
-                "Swept blocked peers from routing table"
-            );
         }
     }
 

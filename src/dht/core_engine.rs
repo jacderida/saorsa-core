@@ -247,11 +247,6 @@ impl KademliaRoutingTable {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
-    /// Get all peer IDs in the routing table.
-    pub fn all_peer_ids(&self) -> Vec<PeerId> {
-        self.iter_nodes().map(|n| n.id).collect()
-    }
-
     /// Iterate over every node in the routing table.
     fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
         self.buckets.iter().flat_map(|b| b.get_nodes().iter())
@@ -381,11 +376,6 @@ impl DhtCoreEngine {
     /// Number of peers currently in the routing table.
     pub async fn routing_table_size(&self) -> usize {
         self.routing_table.read().await.node_count()
-    }
-
-    /// Get all peer IDs currently in the routing table.
-    pub async fn all_peer_ids(&self) -> Vec<PeerId> {
-        self.routing_table.read().await.all_peer_ids()
     }
 
     /// Remove a peer from the routing table by ID.
