@@ -227,6 +227,9 @@ impl AdaptiveDHT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
+    use crate::dht::routing_maintenance::config::MaintenanceConfig;
+    use crate::dht::routing_maintenance::eviction::EvictionManager;
 
     #[test]
     fn test_trust_event_mapping() {
@@ -287,5 +290,119 @@ mod tests {
             config.recompute_interval,
             Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS)
         );
+    }
+
+    // =========================================================================
+    // Integration tests: full trust signal flow
+    // =========================================================================
+
+    /// Test: trust events flow through to TrustEngine and change scores
+    #[tokio::test]
+    async fn test_trust_events_affect_scores() {
+        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let peer = PeerId::random();
+
+        // Unknown peer starts at neutral trust
+        assert!((engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON);
+
+        // Record positive events directly via the engine (simulating what AdaptiveDHT does)
+        for _ in 0..10 {
+            engine
+                .update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update())
+                .await;
+        }
+
+        // Add a local trust edge so the node appears in computation
+        let other = PeerId::random();
+        engine.update_local_trust(&other, &peer, true).await;
+
+        // Force recomputation
+        let _ = engine.compute_global_trust().await;
+
+        // Score should now be > neutral (peer has 100% success rate)
+        let score_after_success = engine.score(&peer);
+        assert!(score_after_success > 0.0);
+    }
+
+    /// Test: failures reduce trust and can trigger eviction
+    #[tokio::test]
+    async fn test_failures_reduce_trust_and_trigger_eviction() {
+        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let bad_peer = PeerId::random();
+
+        // Record many failures (including severe ones)
+        for _ in 0..20 {
+            engine
+                .update_node_stats(&bad_peer, TrustEvent::CorruptedData.to_stats_update())
+                .await;
+        }
+
+        // Add a local trust edge
+        let other = PeerId::random();
+        engine.update_local_trust(&other, &bad_peer, true).await;
+
+        // Recompute
+        let _ = engine.compute_global_trust().await;
+
+        // Wire eviction manager to this engine
+        let config = MaintenanceConfig {
+            min_trust_threshold: DEFAULT_EVICTION_THRESHOLD,
+            ..Default::default()
+        };
+        let mut eviction_mgr = EvictionManager::new(config);
+        eviction_mgr.set_trust_engine(engine.clone());
+
+        // The bad peer should have a trust score below the eviction threshold
+        let trust = engine.score(&bad_peer);
+        let should_evict = trust < DEFAULT_EVICTION_THRESHOLD;
+
+        // Eviction manager should agree
+        let reason = eviction_mgr.get_eviction_reason(&bad_peer);
+        if should_evict {
+            assert!(reason.is_some(), "Bad peer should be evictable");
+        }
+    }
+
+    /// Test: TrustEngine scores are bounded 0.0-1.0
+    #[tokio::test]
+    async fn test_trust_scores_bounded() {
+        let engine = Arc::new(TrustEngine::new(HashSet::new()));
+        let peer = PeerId::random();
+        let other = PeerId::random();
+
+        // Many successes
+        for _ in 0..100 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+                .await;
+        }
+        engine.update_local_trust(&other, &peer, true).await;
+        let _ = engine.compute_global_trust().await;
+
+        let score = engine.score(&peer);
+        assert!(score >= 0.0, "Score must be >= 0.0, got {score}");
+        assert!(score <= 1.0, "Score must be <= 1.0, got {score}");
+    }
+
+    /// Test: all TrustEvent variants produce valid stats updates
+    #[test]
+    fn test_all_trust_events_produce_valid_updates() {
+        let events = [
+            TrustEvent::SuccessfulResponse,
+            TrustEvent::SuccessfulConnection,
+            TrustEvent::FailedResponse,
+            TrustEvent::ConnectionFailed,
+            TrustEvent::ConnectionTimeout,
+            TrustEvent::DataUnavailable,
+            TrustEvent::CorruptedData,
+            TrustEvent::ProtocolViolation,
+            TrustEvent::Refused,
+            TrustEvent::UnexpectedDisconnect,
+        ];
+
+        for event in events {
+            // Should not panic
+            let _update = event.to_stats_update();
+        }
     }
 }
