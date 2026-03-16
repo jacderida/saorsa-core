@@ -864,17 +864,19 @@ impl DhtNetworkManager {
                 )
                 .await;
 
-            // Immediately evict from RT if trust has crossed the block threshold
+            // Immediately evict and disconnect if trust has crossed the block threshold
             if self.config.block_threshold > 0.0
                 && engine.score(peer_id) < self.config.block_threshold
             {
                 let mut dht = self.dht.write().await;
                 dht.remove_node_by_id(peer_id).await;
+                drop(dht); // Release write lock before disconnect
+                let _ = self.transport.disconnect_peer(peer_id).await;
                 tracing::info!(
                     peer = peer_id.to_hex(),
                     score = engine.score(peer_id),
                     threshold = self.config.block_threshold,
-                    "Evicted peer from routing table — trust below block threshold"
+                    "Blocked peer — evicted from RT and disconnected"
                 );
             }
         }
@@ -1246,7 +1248,8 @@ impl DhtNetworkManager {
     ) -> Result<Option<Vec<u8>>> {
         // SEC: Block peers whose trust score has fallen below threshold
         if self.is_peer_blocked(sender) {
-            trace!("Dropping DHT message from blocked peer {}", sender.to_hex());
+            info!("Rejecting message from blocked peer {}", sender.to_hex());
+            let _ = self.transport.disconnect_peer(sender).await;
             return Ok(None);
         }
 
@@ -1686,6 +1689,15 @@ impl DhtNetworkManager {
                         match recv {
                             Ok(event) => match event {
                                 crate::network::P2PEvent::PeerConnected(peer_id, ref user_agent) => {
+                                    // Disconnect blocked peers immediately
+                                    if self_arc.is_peer_blocked(&peer_id) {
+                                        info!(
+                                            "Disconnecting blocked peer {}",
+                                            peer_id.to_hex()
+                                        );
+                                        let _ = self_arc.transport.disconnect_peer(&peer_id).await;
+                                        continue;
+                                    }
                                     self_arc.handle_peer_connected(peer_id, user_agent).await;
                                 }
                                 crate::network::P2PEvent::PeerDisconnected(peer_id) => {
