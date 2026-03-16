@@ -96,12 +96,10 @@ pub struct DhtNetworkConfig {
     pub max_concurrent_operations: usize,
     /// Enable enhanced security features
     pub enable_security: bool,
-    /// Enable trust-weighted peer selection in iterative lookups.
-    /// When true, candidates are sorted by a blend of XOR distance and trust score.
-    pub trust_weighted_routing: bool,
-    /// Weight given to trust in blended peer selection (0.0–1.0).
-    /// Only used when `trust_weighted_routing` is true.
-    pub trust_routing_weight: f64,
+    /// Trust score below which a peer is blocked from DHT operations.
+    /// Messages from blocked peers are silently dropped and they cannot
+    /// be added to the routing table. Default: 0.0 (disabled).
+    pub block_threshold: f64,
 }
 
 /// DHT network operation types
@@ -762,18 +760,7 @@ impl DhtNetworkManager {
             }
 
             // Sort, deduplicate, and truncate once per iteration instead of per result
-            if self.config.trust_weighted_routing {
-                if let Some(ref engine) = self.trust_engine {
-                    let weight = self.config.trust_routing_weight;
-                    best_nodes.sort_by(|a, b| {
-                        Self::compare_node_trust_weighted(a, b, key, engine, weight)
-                    });
-                } else {
-                    best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-                }
-            } else {
-                best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-            }
+            best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
@@ -822,62 +809,6 @@ impl DhtNetworkManager {
         a.peer_id
             .distance(&target_key)
             .cmp(&b.peer_id.distance(&target_key))
-    }
-
-    /// Compare two nodes by blended distance + trust score.
-    ///
-    /// Blends XOR distance rank with trust score: lower is better.
-    /// `trust_weight` controls how much trust influences the ranking (0.0–1.0).
-    fn compare_node_trust_weighted(
-        a: &DHTNode,
-        b: &DHTNode,
-        key: &Key,
-        trust_engine: &crate::adaptive::trust::TrustEngine,
-        trust_weight: f64,
-    ) -> std::cmp::Ordering {
-        let target_key = DhtKey::from_bytes(*key);
-        let dist_a = a.peer_id.distance(&target_key);
-        let dist_b = b.peer_id.distance(&target_key);
-
-        // Compare distance first
-        let dist_ord = dist_a.cmp(&dist_b);
-
-        // If distances are equal, prefer higher trust
-        if dist_ord == std::cmp::Ordering::Equal {
-            let trust_a = trust_engine.score(&a.peer_id);
-            let trust_b = trust_engine.score(&b.peer_id);
-            // Higher trust = better, so reverse comparison
-            return trust_b
-                .partial_cmp(&trust_a)
-                .unwrap_or(std::cmp::Ordering::Equal);
-        }
-
-        // Blend: use trust as a tiebreaker within the same distance "tier"
-        // Only reorder when the trust difference is significant enough
-        // to overcome the distance difference within `trust_weight` tolerance
-        let trust_a = trust_engine.score(&a.peer_id);
-        let trust_b = trust_engine.score(&b.peer_id);
-        let trust_diff = trust_b - trust_a; // positive if b is more trusted
-
-        // If trust difference is large enough and trust_weight is high,
-        // promote the more trusted peer even if slightly farther
-        if trust_diff > trust_weight && dist_ord == std::cmp::Ordering::Less {
-            // a is closer but b is significantly more trusted — keep a closer
-            return dist_ord;
-        }
-        if trust_diff < -trust_weight && dist_ord == std::cmp::Ordering::Greater {
-            // b is closer but a is significantly more trusted — keep b closer
-            return dist_ord;
-        }
-
-        // For significant trust advantages, promote the trusted peer
-        if trust_diff.abs() > trust_weight {
-            return trust_b
-                .partial_cmp(&trust_a)
-                .unwrap_or(std::cmp::Ordering::Equal);
-        }
-
-        dist_ord
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -968,6 +899,21 @@ impl DhtNetworkManager {
                     crate::adaptive::NodeStatisticsUpdate::FailedResponse,
                 )
                 .await;
+        }
+    }
+
+    /// Check if a peer's trust score is below the block threshold.
+    ///
+    /// Returns `true` if the peer should be blocked (trust too low).
+    /// Returns `false` if blocking is disabled (threshold == 0) or no trust engine.
+    fn is_peer_blocked(&self, peer_id: &PeerId) -> bool {
+        if self.config.block_threshold <= 0.0 {
+            return false;
+        }
+        if let Some(ref engine) = self.trust_engine {
+            engine.score(peer_id) < self.config.block_threshold
+        } else {
+            false
         }
     }
 
@@ -1320,6 +1266,12 @@ impl DhtNetworkManager {
         data: &[u8],
         sender: &PeerId,
     ) -> Result<Option<Vec<u8>>> {
+        // SEC: Block peers whose trust score has fallen below threshold
+        if self.is_peer_blocked(sender) {
+            trace!("Dropping DHT message from blocked peer {}", sender.to_hex());
+            return Ok(None);
+        }
+
         // SEC: Reject oversized messages before deserialization to prevent memory exhaustion
         if data.len() > MAX_MESSAGE_SIZE {
             warn!(
@@ -1665,6 +1617,16 @@ impl DhtNetworkManager {
     /// only fires after identity verification.
     async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
+
+        // Block peers whose trust score has fallen below threshold
+        if self.is_peer_blocked(&node_id) {
+            info!(
+                "Rejecting blocked peer {} from DHT (trust below threshold)",
+                app_peer_id_hex
+            );
+            return;
+        }
+
         info!(
             "DHT peer connected: app_id={}, user_agent={}",
             app_peer_id_hex, user_agent
@@ -2043,8 +2005,7 @@ impl Default for DhtNetworkConfig {
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
             enable_security: true,
-            trust_weighted_routing: false,
-            trust_routing_weight: 0.0,
+            block_threshold: 0.0,
         }
     }
 }

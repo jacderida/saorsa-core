@@ -74,21 +74,23 @@ when the consuming application layer exists.
 
 Note: Peer disconnects are normal connection lifecycle — they do not affect trust.
 
-## Trust-Weighted Routing
+## Peer Blocking
 
-Trust-weighted routing is disabled by default. Enable it via `AdaptiveDhtConfig`:
+Peers whose trust score falls below `block_threshold` are:
+- **Evicted** from the DHT routing table (via EvictionManager)
+- **Blocked** from sending DHT messages (silently dropped)
+- **Rejected** from re-entering the routing table on reconnect
 
 ```rust
 use saorsa_core::AdaptiveDhtConfig;
 
 let config = AdaptiveDhtConfig {
-    trust_weighted_routing: true,  // Enable blended distance+trust selection
-    routing_weight: 0.3,           // 30% trust, 70% distance
+    block_threshold: 0.15,  // Block peers below 15% trust
     ..Default::default()
 };
 ```
 
-When enabled, iterative DHT lookups prefer higher-trust peers at similar XOR distances.
+DHT routing uses pure Kademlia XOR distance — trust does not influence peer selection order.
 
 ## Architecture
 

@@ -31,11 +31,8 @@ use std::time::Duration;
 use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
 
-/// Default weight for trust in blended distance/trust peer selection
-const DEFAULT_ROUTING_WEIGHT: f64 = 0.3;
-
-/// Default trust score threshold below which a peer may be evicted
-const DEFAULT_EVICTION_THRESHOLD: f64 = 0.15;
+/// Default trust score threshold below which a peer is evicted and blocked
+const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
 
 /// Default interval between background trust recomputations (seconds)
 const DEFAULT_RECOMPUTE_INTERVAL_SECS: u64 = 300;
@@ -44,18 +41,10 @@ const DEFAULT_RECOMPUTE_INTERVAL_SECS: u64 = 300;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdaptiveDhtConfig {
-    /// Enable trust-weighted routing (reorder candidates by trust before querying).
-    /// Default: false — pure Kademlia distance ordering.
-    pub trust_weighted_routing: bool,
-
-    /// Weight given to trust in peer selection (0.0–1.0).
-    /// Only used when `trust_weighted_routing` is true.
-    /// Default: 0.3 (30% trust, 70% distance)
-    pub routing_weight: f64,
-
-    /// Trust score below which a peer may be evicted.
+    /// Trust score below which a peer is evicted from the routing table
+    /// and blocked from sending DHT messages or reconnecting.
     /// Default: 0.15
-    pub eviction_threshold: f64,
+    pub block_threshold: f64,
 
     /// Interval between background trust recomputations.
     /// Default: 300 seconds (5 minutes)
@@ -65,9 +54,7 @@ pub struct AdaptiveDhtConfig {
 impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
-            trust_weighted_routing: false,
-            routing_weight: DEFAULT_ROUTING_WEIGHT,
-            eviction_threshold: DEFAULT_EVICTION_THRESHOLD,
+            block_threshold: DEFAULT_BLOCK_THRESHOLD,
             recompute_interval: Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS),
         }
     }
@@ -134,9 +121,7 @@ impl AdaptiveDHT {
         mut dht_config: DhtNetworkConfig,
         adaptive_config: AdaptiveDhtConfig,
     ) -> Result<Self> {
-        // Propagate trust routing settings into DHT network config
-        dht_config.trust_weighted_routing = adaptive_config.trust_weighted_routing;
-        dht_config.trust_routing_weight = adaptive_config.routing_weight;
+        dht_config.block_threshold = adaptive_config.block_threshold;
 
         let pre_trusted: HashSet<PeerId> = HashSet::new();
         let trust_engine = Arc::new(TrustEngine::new(pre_trusted));
@@ -241,9 +226,7 @@ mod tests {
     #[test]
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
-        assert!(!config.trust_weighted_routing);
-        assert!((config.routing_weight - DEFAULT_ROUTING_WEIGHT).abs() < f64::EPSILON);
-        assert!((config.eviction_threshold - DEFAULT_EVICTION_THRESHOLD).abs() < f64::EPSILON);
+        assert!((config.block_threshold - DEFAULT_BLOCK_THRESHOLD).abs() < f64::EPSILON);
         assert_eq!(
             config.recompute_interval,
             Duration::from_secs(DEFAULT_RECOMPUTE_INTERVAL_SECS)
@@ -304,7 +287,7 @@ mod tests {
 
         // Wire eviction manager to this engine
         let config = MaintenanceConfig {
-            min_trust_threshold: DEFAULT_EVICTION_THRESHOLD,
+            min_trust_threshold: DEFAULT_BLOCK_THRESHOLD,
             ..Default::default()
         };
         let mut eviction_mgr = EvictionManager::new(config);
@@ -312,7 +295,7 @@ mod tests {
 
         // The bad peer should have a trust score below the eviction threshold
         let trust = engine.score(&bad_peer);
-        let should_evict = trust < DEFAULT_EVICTION_THRESHOLD;
+        let should_evict = trust < DEFAULT_BLOCK_THRESHOLD;
 
         // Eviction manager should agree
         let reason = eviction_mgr.get_eviction_reason(&bad_peer);
