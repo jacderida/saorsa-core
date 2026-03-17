@@ -175,10 +175,10 @@ impl TrustEngine {
     #[cfg(test)]
     pub async fn simulate_elapsed(&self, node_id: &PeerId, elapsed: std::time::Duration) {
         let mut peers = self.peers.write().await;
-        if let Some(trust) = peers.get_mut(node_id) {
-            if let Some(past) = Instant::now().checked_sub(elapsed) {
-                trust.last_updated = past;
-            }
+        if let Some(trust) = peers.get_mut(node_id)
+            && let Some(past) = Instant::now().checked_sub(elapsed)
+        {
+            trust.last_updated = past;
         }
     }
 }

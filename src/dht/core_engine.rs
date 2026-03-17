@@ -299,6 +299,20 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
     Ipv6Addr::from(bits & mask)
 }
 
+/// Apply optional floor/ceiling overrides to a computed subnet limit.
+/// Floor is applied first (raising the value), then ceiling (lowering it).
+/// When both are set, ceiling wins if floor > ceiling.
+fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> usize {
+    let mut result = limit;
+    if let Some(f) = floor {
+        result = result.max(f);
+    }
+    if let Some(c) = ceiling {
+        result = result.min(c);
+    }
+    result
+}
+
 /// Default maximum nodes per geographic region. Matches
 /// `GeographicRoutingConfig::max_nodes_per_region` default.
 const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
@@ -546,19 +560,28 @@ impl DhtCoreEngine {
         match candidate_ip {
             IpAddr::V4(v4) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_32 = cfg
-                    .max_nodes_per_ipv4_32
-                    .map_or(per_ip, |cap| cap.min(per_ip));
-                let limit_24 = cfg
-                    .max_nodes_per_ipv4_24
-                    .map_or(per_ip * SUBNET_NARROW_MULTIPLIER, |cap| {
-                        cap.min(per_ip * SUBNET_NARROW_MULTIPLIER)
-                    });
-                let limit_16 = cfg
-                    .max_nodes_per_ipv4_16
-                    .map_or(per_ip * SUBNET_MEDIUM_MULTIPLIER, |cap| {
-                        cap.min(per_ip * SUBNET_MEDIUM_MULTIPLIER)
-                    });
+                let limit_32 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_32
+                        .map_or(per_ip, |cap| cap.min(per_ip)),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
+                let limit_24 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_24
+                        .map_or(per_ip * SUBNET_NARROW_MULTIPLIER, |cap| {
+                            cap.min(per_ip * SUBNET_NARROW_MULTIPLIER)
+                        }),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
+                let limit_16 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_16
+                        .map_or(per_ip * SUBNET_MEDIUM_MULTIPLIER, |cap| {
+                            cap.min(per_ip * SUBNET_MEDIUM_MULTIPLIER)
+                        }),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
@@ -580,11 +603,21 @@ impl DhtCoreEngine {
             }
             IpAddr::V6(_) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_64 =
-                    std::cmp::min(cfg.max_nodes_per_64, per_ip * SUBNET_NARROW_MULTIPLIER);
-                let limit_48 =
-                    std::cmp::min(cfg.max_nodes_per_48, per_ip * SUBNET_MEDIUM_MULTIPLIER);
-                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * SUBNET_WIDE_MULTIPLIER);
+                let limit_64 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_64, per_ip * SUBNET_NARROW_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
+                let limit_48 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_48, per_ip * SUBNET_MEDIUM_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
+                let limit_32 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_32, per_ip * SUBNET_WIDE_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
 
                 if v6_counts.slash_64 >= limit_64 {
                     return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));

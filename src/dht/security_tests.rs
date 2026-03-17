@@ -1,5 +1,6 @@
 use crate::PeerId;
 use crate::dht::core_engine::{DhtCoreEngine, NodeCapacity, NodeInfo};
+use crate::security::IPDiversityConfig;
 use std::time::SystemTime;
 
 #[tokio::test]
@@ -239,5 +240,183 @@ async fn test_geographic_diversity_counts_region_nodes() -> anyhow::Result<()> {
     engine.add_node(node3).await?;
 
     // All should succeed since geographic limit is 50 and we're only adding 3
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ipv4_floor_override_raises_limit() -> anyhow::Result<()> {
+    // Default dynamic limit for a small network is 1 per /32.
+    // Setting ipv4_limit_floor = 3 should allow 3 nodes on the same IP.
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::random())?;
+    engine.set_ip_diversity_config(IPDiversityConfig {
+        ipv4_limit_floor: Some(3),
+        ..IPDiversityConfig::default()
+    });
+
+    for i in 0..3u8 {
+        let node = NodeInfo {
+            id: PeerId::random(),
+            address: format!("/ip4/192.168.1.1/udp/{}/quic", 9000 + u16::from(i))
+                .parse()
+                .unwrap(),
+            last_seen: SystemTime::now(),
+            capacity: NodeCapacity::default(),
+        };
+        engine.add_node(node).await?;
+    }
+
+    // Fourth node should fail (floor is 3, so limit is 3)
+    let node4 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip4/192.168.1.1/udp/9003/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    let result = engine.add_node(node4).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("IP diversity:"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ipv4_ceiling_override_lowers_limit() -> anyhow::Result<()> {
+    // With a large network, dynamic per-IP would be high.
+    // Setting ipv4_limit_ceiling = 1 should cap all subnet limits at 1.
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::random())?;
+    engine.set_ip_diversity_config(IPDiversityConfig {
+        ipv4_limit_ceiling: Some(1),
+        // Raise the dynamic limit so ceiling actually constrains it
+        max_per_ip_cap: 100,
+        max_network_fraction: 1.0,
+        ..IPDiversityConfig::default()
+    });
+
+    // First node on 10.0.1.1
+    let node1 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip4/10.0.1.1/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    engine.add_node(node1).await?;
+
+    // Second node on different IP but same /24 — should fail because ceiling=1
+    let node2 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip4/10.0.1.2/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    let result = engine.add_node(node2).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("IP diversity:"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ipv6_floor_override_raises_limit() -> anyhow::Result<()> {
+    // Default IPv6 /64 limit is 1. Setting ipv6_limit_floor = 5 should allow
+    // 5 nodes in the same /64 subnet.
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::random())?;
+    engine.set_ip_diversity_config(IPDiversityConfig {
+        ipv6_limit_floor: Some(5),
+        ..IPDiversityConfig::default()
+    });
+
+    for i in 1..=5u128 {
+        let node = NodeInfo {
+            id: PeerId::random(),
+            address: format!("/ip6/2001:db8::{i}/udp/9000/quic").parse().unwrap(),
+            last_seen: SystemTime::now(),
+            capacity: NodeCapacity::default(),
+        };
+        engine.add_node(node).await?;
+    }
+
+    // Sixth node should fail
+    let node6 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip6/2001:db8::6/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    let result = engine.add_node(node6).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("IP diversity:"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ipv6_ceiling_override_lowers_limit() -> anyhow::Result<()> {
+    // With permissive IPv6 config (max_nodes_per_ipv6_64 = usize::MAX),
+    // setting ipv6_limit_ceiling = 2 should cap at 2.
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::random())?;
+    engine.set_ip_diversity_config(IPDiversityConfig {
+        max_nodes_per_ipv6_64: usize::MAX,
+        max_nodes_per_ipv6_48: usize::MAX,
+        max_nodes_per_ipv6_32: usize::MAX,
+        max_per_ip_cap: 100,
+        max_network_fraction: 1.0,
+        ipv6_limit_ceiling: Some(2),
+        ..IPDiversityConfig::default()
+    });
+
+    let node1 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip6/2001:db8::1/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    engine.add_node(node1).await?;
+
+    let node2 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip6/2001:db8::2/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    engine.add_node(node2).await?;
+
+    // Third should fail due to ceiling
+    let node3 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip6/2001:db8::3/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    let result = engine.add_node(node3).await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("IP diversity:"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_no_override_preserves_dynamic_behavior() -> anyhow::Result<()> {
+    // When no overrides are set, behavior should be identical to before.
+    // Default dynamic limit for small network = 1 per /32, 3 per /24.
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::random())?;
+
+    let node1 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip4/192.168.1.1/udp/9000/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    engine.add_node(node1).await?;
+
+    // Same IP should fail (dynamic limit = 1)
+    let node2 = NodeInfo {
+        id: PeerId::random(),
+        address: "/ip4/192.168.1.1/udp/9001/quic".parse().unwrap(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+    let result = engine.add_node(node2).await;
+    assert!(result.is_err());
+
     Ok(())
 }
