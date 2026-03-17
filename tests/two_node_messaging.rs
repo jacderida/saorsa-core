@@ -190,7 +190,8 @@ async fn peer_connected_event_emitted() {
                 }
             }
             Ok(Ok(_)) => continue,
-            _ => break,
+            Ok(Err(_)) => break, // channel closed
+            Err(_) => {}         // inner timeout elapsed — retry within deadline
         }
     }
 

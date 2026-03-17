@@ -397,7 +397,7 @@ async fn default_config_matches_expected_threshold() {
 /// Invalid block threshold values are rejected during node creation.
 #[tokio::test]
 async fn invalid_block_threshold_rejected() {
-    for bad_threshold in [f64::NAN, -0.1, 1.1, f64::INFINITY] {
+    for bad_threshold in [f64::NAN, f64::NEG_INFINITY, -0.1, 1.1, f64::INFINITY] {
         let config = NodeConfig::builder()
             .local(true)
             .port(0)
@@ -405,13 +405,18 @@ async fn invalid_block_threshold_rejected() {
             .adaptive_dht_config(AdaptiveDhtConfig {
                 block_threshold: bad_threshold,
             })
-            .build()
-            .unwrap();
+            .build();
 
-        let result = P2PNode::new(config).await;
-        assert!(
-            result.is_err(),
-            "Block threshold {bad_threshold} should be rejected"
-        );
+        // Validation may happen at build() or at P2PNode::new() — either is acceptable
+        match config {
+            Err(_) => {}
+            Ok(config) => {
+                let result = P2PNode::new(config).await;
+                assert!(
+                    result.is_err(),
+                    "Block threshold {bad_threshold} should be rejected"
+                );
+            }
+        }
     }
 }
