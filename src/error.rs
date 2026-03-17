@@ -525,9 +525,6 @@ pub enum GeoEnforcementMode {
     /// Strict mode - reject connections that violate rules
     #[default]
     Strict,
-    /// Log-only mode - log violations but allow connections
-    #[allow(dead_code)]
-    LogOnly,
 }
 
 /// Configuration for geographic diversity enforcement

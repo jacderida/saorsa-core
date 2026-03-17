@@ -193,48 +193,6 @@ impl P2PNetworkNode<P2pLinkTransport> {
         Self::with_transport(Arc::new(transport), actual_addr).await
     }
 
-    /// Create a new P2P network node from NetworkConfig with an optional
-    /// message-size override.
-    ///
-    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
-    pub async fn from_network_config(
-        bind_addr: SocketAddr,
-        net_config: &crate::transport::NetworkConfig,
-        max_msg_size: Option<usize>,
-        allow_loopback: bool,
-    ) -> Result<Self> {
-        // Build P2pConfig based on NetworkConfig
-        let mut builder = P2pConfig::builder()
-            .bind_addr(bind_addr)
-            .max_connections(DEFAULT_MAX_CONNECTIONS)
-            .conservative_timeouts()
-            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
-        if let Some(max_msg_size) = max_msg_size {
-            builder = builder.max_message_size(max_msg_size);
-        }
-
-        // Apply NAT traversal settings if present, merging allow_loopback.
-        if let Some(mut nat_config) = net_config.to_ant_config() {
-            if allow_loopback {
-                nat_config.allow_loopback = true;
-            }
-            builder = builder.nat(nat_config);
-        } else if allow_loopback {
-            builder = builder.nat(NatConfig {
-                allow_loopback: true,
-                ..NatConfig::default()
-            });
-        }
-
-        let config = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build P2P config: {}", e))?;
-
-        tracing::info!("Creating P2P network node at {}", bind_addr);
-
-        Self::new_with_config(bind_addr, config).await
-    }
-
     /// Send data to a peer using P2pEndpoint's send method
     ///
     /// This method is specialized for P2pLinkTransport and uses the underlying

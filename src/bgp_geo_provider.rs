@@ -83,34 +83,6 @@ pub struct AsnInfo {
     pub rir: String,
 }
 
-/// Configuration for BgpGeoProvider
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct BgpGeoConfig {
-    /// Path to IPv4 prefix file (optional, uses embedded data if not set)
-    pub ipv4_prefix_file: Option<String>,
-    /// Path to IPv6 prefix file (optional)
-    pub ipv6_prefix_file: Option<String>,
-    /// Path to ASN info file (optional)
-    pub asn_info_file: Option<String>,
-    /// Enable automatic updates from public sources
-    pub auto_update: bool,
-    /// Update interval in hours
-    pub update_interval_hours: u32,
-}
-
-impl Default for BgpGeoConfig {
-    fn default() -> Self {
-        Self {
-            ipv4_prefix_file: None,
-            ipv6_prefix_file: None,
-            asn_info_file: None,
-            auto_update: false,
-            update_interval_hours: 24,
-        }
-    }
-}
-
 impl BgpGeoProvider {
     /// Create a new BgpGeoProvider with default embedded data
     pub fn new() -> Self {
@@ -125,14 +97,6 @@ impl BgpGeoProvider {
         // Load embedded data
         provider.load_embedded_data();
         provider
-    }
-
-    /// Create with custom configuration
-    #[allow(dead_code)]
-    pub fn with_config(_config: BgpGeoConfig) -> Self {
-        // For now, just use default embedded data
-        // Future: load from specified files
-        Self::new()
     }
 
     /// Load embedded BGP data (curated list of major networks)

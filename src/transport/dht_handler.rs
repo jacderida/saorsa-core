@@ -191,16 +191,6 @@ impl ProtocolHandler for DhtStreamHandler {
     }
 }
 
-/// Message wrapper for typed DHT stream transmission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct TypedDhtMessage {
-    /// The stream type to use for this message.
-    pub stream_type: DhtStreamType,
-    /// The underlying DHT message.
-    pub message: DhtMessage,
-}
-
 /// DHT-specific stream type mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DhtStreamType {
