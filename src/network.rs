@@ -121,12 +121,6 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 /// Default connection timeout in seconds.
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
-/// Default keep-alive interval in seconds.
-const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 60;
-
-/// Default maximum incoming connections per IP.
-const DEFAULT_MAX_INCOMING_CONNECTIONS: usize = 100;
-
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
 
@@ -170,20 +164,11 @@ pub struct NodeConfig {
     /// Connection timeout duration
     pub connection_timeout: Duration,
 
-    /// Keep-alive interval for connections
-    pub keep_alive_interval: Duration,
-
     /// Maximum number of concurrent connections
     pub max_connections: usize,
 
-    /// Maximum number of incoming connections
-    pub max_incoming_connections: usize,
-
     /// DHT configuration
     pub dht_config: DHTConfig,
-
-    /// Security configuration
-    pub security_config: SecurityConfig,
 
     /// Bootstrap cache configuration
     pub bootstrap_cache_config: Option<BootstrapConfig>,
@@ -252,35 +237,8 @@ pub struct DHTConfig {
     /// Kademlia alpha parameter (parallelism)
     pub alpha_value: usize,
 
-    /// DHT record TTL
-    pub record_ttl: Duration,
-
     /// DHT refresh interval
     pub refresh_interval: Duration,
-}
-
-/// Security configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityConfig {
-    /// Enable noise protocol for encryption
-    pub enable_noise: bool,
-
-    /// Enable TLS for secure transport
-    pub enable_tls: bool,
-
-    /// Trust level for peer verification
-    pub trust_level: TrustLevel,
-}
-
-/// Trust level for peer verification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TrustLevel {
-    /// No verification required
-    None,
-    /// Basic peer ID verification
-    Basic,
-    /// Full cryptographic verification
-    Full,
 }
 
 // ============================================================================
@@ -391,9 +349,7 @@ pub struct NodeConfigBuilder {
     bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
-    keep_alive_interval: Option<Duration>,
     dht_config: Option<DHTConfig>,
-    security_config: Option<SecurityConfig>,
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
@@ -410,9 +366,7 @@ impl Default for NodeConfigBuilder {
             bootstrap_peers: Vec::new(),
             max_connections: None,
             connection_timeout: None,
-            keep_alive_interval: None,
             dht_config: None,
-            security_config: None,
             max_message_size: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
@@ -464,21 +418,9 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Set keep-alive interval.
-    pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
-        self.keep_alive_interval = Some(interval);
-        self
-    }
-
     /// Set DHT configuration.
     pub fn dht_config(mut self, config: DHTConfig) -> Self {
         self.dht_config = Some(config);
-        self
-    }
-
-    /// Set security configuration.
-    pub fn security_config(mut self, config: SecurityConfig) -> Self {
-        self.security_config = Some(config);
         self
     }
 
@@ -558,13 +500,8 @@ impl NodeConfigBuilder {
             connection_timeout: self
                 .connection_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS)),
-            keep_alive_interval: self
-                .keep_alive_interval
-                .unwrap_or(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS)),
             max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-            max_incoming_connections: DEFAULT_MAX_INCOMING_CONNECTIONS,
             dht_config: self.dht_config.unwrap_or_default(),
-            security_config: self.security_config.unwrap_or_default(),
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: self.max_message_size,
@@ -585,11 +522,8 @@ impl Default for NodeConfig {
             ipv6: true,
             bootstrap_peers: Vec::new(),
             connection_timeout: Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS),
-            keep_alive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS),
             max_connections: DEFAULT_MAX_CONNECTIONS,
-            max_incoming_connections: DEFAULT_MAX_INCOMING_CONNECTIONS,
             dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
@@ -605,7 +539,6 @@ impl Default for NodeConfig {
 impl DHTConfig {
     const DEFAULT_K_VALUE: usize = 20;
     const DEFAULT_ALPHA_VALUE: usize = 5;
-    const DEFAULT_RECORD_TTL_SECS: u64 = 3600;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
 }
 
@@ -614,18 +547,7 @@ impl Default for DHTConfig {
         Self {
             k_value: Self::DEFAULT_K_VALUE,
             alpha_value: Self::DEFAULT_ALPHA_VALUE,
-            record_ttl: Duration::from_secs(Self::DEFAULT_RECORD_TTL_SECS),
             refresh_interval: Duration::from_secs(Self::DEFAULT_REFRESH_INTERVAL_SECS),
-        }
-    }
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            enable_noise: true,
-            enable_tls: true,
-            trust_level: TrustLevel::Basic,
         }
     }
 }
@@ -1741,11 +1663,8 @@ mod tests {
             ipv6: true,
             bootstrap_peers: vec![],
             connection_timeout: Duration::from_secs(2),
-            keep_alive_interval: Duration::from_secs(30),
             max_connections: 100,
-            max_incoming_connections: 50,
             dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
@@ -1765,8 +1684,7 @@ mod tests {
         let config = NodeConfig::default();
 
         assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
-        assert_eq!(config.max_connections, 10000); // Fixed: matches actual default
-        assert_eq!(config.max_incoming_connections, 100);
+        assert_eq!(config.max_connections, 10000);
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
     }
 
@@ -1776,31 +1694,7 @@ mod tests {
 
         assert_eq!(config.k_value, 20);
         assert_eq!(config.alpha_value, 5);
-        assert_eq!(config.record_ttl, Duration::from_secs(3600));
         assert_eq!(config.refresh_interval, Duration::from_secs(600));
-    }
-
-    #[tokio::test]
-    async fn test_security_config_default() {
-        let config = SecurityConfig::default();
-
-        assert!(config.enable_noise);
-        assert!(config.enable_tls);
-        assert_eq!(config.trust_level, TrustLevel::Basic);
-    }
-
-    #[test]
-    fn test_trust_level_variants() {
-        // Test that all trust level variants can be created
-        let _none = TrustLevel::None;
-        let _basic = TrustLevel::Basic;
-        let _full = TrustLevel::Full;
-
-        // Test equality
-        assert_eq!(TrustLevel::None, TrustLevel::None);
-        assert_eq!(TrustLevel::Basic, TrustLevel::Basic);
-        assert_eq!(TrustLevel::Full, TrustLevel::Full);
-        assert_ne!(TrustLevel::None, TrustLevel::Basic);
     }
 
     #[test]
