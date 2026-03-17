@@ -388,14 +388,15 @@ impl IPDiversityConfig {
             max_nodes_per_ipv6_64: 100,  // Allow many nodes per /64 subnet
             max_nodes_per_ipv6_48: 500,  // Allow many nodes per /48 allocation
             max_nodes_per_ipv6_32: 1000, // Allow many nodes per /32 region
-            // IPv4 — no static caps for testnet (dynamic limits suffice)
-            max_nodes_per_ipv4_32: None,
-            max_nodes_per_ipv4_24: None,
-            max_nodes_per_ipv4_16: None,
-            // Per-protocol overrides — None = no override
-            ipv4_limit_floor: None,
+            // IPv4 caps — match IPv6 tiers for consistency
+            max_nodes_per_ipv4_32: Some(100),
+            max_nodes_per_ipv4_24: Some(500),
+            max_nodes_per_ipv4_16: Some(1000),
+            // Floors ensure small testnets (< 100 nodes) aren't bottlenecked
+            // by the dynamic per-IP formula, which yields 1 for tiny networks.
+            ipv4_limit_floor: Some(5),
             ipv4_limit_ceiling: None,
-            ipv6_limit_floor: None,
+            ipv6_limit_floor: Some(5),
             ipv6_limit_ceiling: None,
             // Network-relative limits (relaxed for testnet)
             max_per_ip_cap: 100,       // Higher cap for testing
