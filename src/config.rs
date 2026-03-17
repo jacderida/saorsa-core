@@ -13,15 +13,14 @@
 
 //! # Configuration Management System
 //!
-//! This module provides comprehensive configuration management for the P2P network,
+//! This module provides configuration management for the P2P network,
 //! supporting layered configuration (environment > file > defaults) with validation.
 //!
 //! ## Features
 //! - Environment variable override support
 //! - TOML/JSON configuration file support
-//! - Production and development profiles
 //! - IPv4/IPv6 address validation
-//! - Secure defaults for production
+//! - Secure defaults
 
 use crate::address::MultiAddr;
 use crate::error::ConfigError;
@@ -44,13 +43,8 @@ pub struct Config {
     pub network: NetworkConfig,
     /// Security configuration
     pub security: SecurityConfig,
-
-    /// DHT configuration
-    pub dht: DhtConfig,
     /// Transport configuration
     pub transport: TransportConfig,
-    /// Identity configuration
-    pub identity: IdentityConfig,
 }
 
 /// Network configuration
@@ -61,8 +55,6 @@ pub struct NetworkConfig {
     pub bootstrap_nodes: Vec<String>,
     /// Local listen address (0.0.0.0:9000 for all interfaces)
     pub listen_address: String,
-    /// Public address for external connections (auto-detected if empty)
-    pub public_address: Option<String>,
     /// Enable IPv6 support
     pub ipv6_enabled: bool,
     /// Maximum concurrent connections
@@ -79,67 +71,27 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
-    /// Rate limit (requests per second)
-    pub rate_limit: u32,
     /// Connection limit per IP
     pub connection_limit: u32,
-    /// Enable TLS/encryption
-    pub encryption_enabled: bool,
-    /// Minimum TLS version (e.g., "1.3")
-    pub min_tls_version: String,
-    /// Security level for identity management
-    pub identity_security_level: String,
-}
-
-/// DHT configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DhtConfig {
-    /// Alpha value for parallel queries
-    pub alpha: u8,
-    /// Beta value for routing
-    pub beta: u8,
-    /// Enable adaptive routing
-    pub adaptive_routing: bool,
 }
 
 /// Transport configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransportConfig {
-    /// Preferred transport protocol
-    pub protocol: String,
-    /// Enable QUIC transport
-    pub quic_enabled: bool,
-    /// Enable TCP transport
-    pub tcp_enabled: bool,
-    /// Enable WebRTC transport
-    pub webrtc_enabled: bool,
-    /// Transport buffer size
-    pub buffer_size: usize,
-    /// Server name for TLS (SNI)
-    pub server_name: String,
     /// Optional override for maximum application-layer message size in bytes.
     ///
     /// When `None`, transport-layer defaults are used.
     pub max_message_size: Option<usize>,
 }
 
-/// Identity configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct IdentityConfig {
-    /// Default key derivation path
-    pub derivation_path: String,
-    /// Key rotation interval in days
-    pub rotation_interval: u32,
-    /// Enable automatic backups
-    pub backup_enabled: bool,
-    /// Backup interval in hours
-    pub backup_interval: u32,
-}
-
 // Default implementations
+
+const DEFAULT_MAX_CONNECTIONS: usize = 10000;
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+const DEFAULT_CONNECTION_LIMIT: u32 = 100;
+const MAX_CONNECTIONS_UPPER_BOUND: usize = 100_000;
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -147,11 +99,10 @@ impl Default for NetworkConfig {
             bootstrap_nodes: vec![],
             // Bind all interfaces by default; env can override via Config::load()
             listen_address: "0.0.0.0:9000".to_string(),
-            public_address: None,
             ipv6_enabled: true,
-            max_connections: 10000,
-            connection_timeout: 30,
-            keepalive_interval: 60,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT_SECS,
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL_SECS,
             allow_loopback: false,
         }
     }
@@ -160,46 +111,7 @@ impl Default for NetworkConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            rate_limit: 1000,
-            connection_limit: 100,
-            encryption_enabled: true,
-            min_tls_version: "1.3".to_string(),
-            identity_security_level: "High".to_string(),
-        }
-    }
-}
-
-impl Default for DhtConfig {
-    fn default() -> Self {
-        Self {
-            alpha: 3,
-            beta: 1,
-            adaptive_routing: true,
-        }
-    }
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self {
-            protocol: "quic".to_string(),
-            quic_enabled: true,
-            tcp_enabled: true,
-            webrtc_enabled: false,
-            buffer_size: 65536,
-            server_name: "p2p.local".to_string(),
-            max_message_size: None,
-        }
-    }
-}
-
-impl Default for IdentityConfig {
-    fn default() -> Self {
-        Self {
-            derivation_path: "m/44'/0'/0'/0/0".to_string(),
-            rotation_interval: 90,
-            backup_enabled: true,
-            backup_interval: 24,
+            connection_limit: DEFAULT_CONNECTION_LIMIT,
         }
     }
 }
@@ -209,39 +121,11 @@ impl Config {
     /// 1. Environment variables (highest)
     /// 2. Configuration file
     /// 3. Default values (lowest)
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use saorsa_core::config::Config;
-    ///
-    /// // Load with default locations
-    /// let config = Config::load()?;
-    ///
-    /// // Access configuration values
-    /// println!("Listen address: {}", config.network.listen_address);
-    /// println!("Rate limit: {}", config.security.rate_limit);
-    /// # Ok::<(), saorsa_core::P2PError>(())
-    /// ```
     pub fn load() -> Result<Self> {
         Self::load_with_path::<&str>(None)
     }
 
     /// Load configuration with a specific config file path
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use saorsa_core::config::Config;
-    ///
-    /// // Load from specific file
-    /// let config = Config::load_with_path(Some("custom.toml"))?;
-    ///
-    /// // Load from optional path
-    /// let path = std::env::var("CONFIG_PATH").ok();
-    /// let config = Config::load_with_path(path.as_ref())?;
-    /// # Ok::<(), saorsa_core::P2PError>(())
-    /// ```
     pub fn load_with_path<P: AsRef<Path>>(path: Option<P>) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
@@ -299,12 +183,8 @@ impl Config {
 
     /// Apply environment variable overrides
     fn apply_env_overrides(&mut self) -> Result<()> {
-        // Network overrides
         if let Ok(val) = env::var("SAORSA_LISTEN_ADDRESS") {
             self.network.listen_address = val;
-        }
-        if let Ok(val) = env::var("SAORSA_PUBLIC_ADDRESS") {
-            self.network.public_address = Some(val);
         }
         if let Ok(val) = env::var("SAORSA_BOOTSTRAP_NODES") {
             self.network.bootstrap_nodes = val.split(',').map(String::from).collect();
@@ -313,24 +193,6 @@ impl Config {
             self.network.max_connections = val.parse().map_err(|_| {
                 P2PError::Config(ConfigError::InvalidValue {
                     field: "max_connections".to_string().into(),
-                    reason: "Invalid value".to_string().into(),
-                })
-            })?;
-        }
-
-        // Security overrides
-        if let Ok(val) = env::var("SAORSA_RATE_LIMIT") {
-            self.security.rate_limit = val.parse().map_err(|_| {
-                P2PError::Config(ConfigError::InvalidValue {
-                    field: "rate_limit".to_string().into(),
-                    reason: "Invalid value".to_string().into(),
-                })
-            })?;
-        }
-        if let Ok(val) = env::var("SAORSA_ENCRYPTION_ENABLED") {
-            self.security.encryption_enabled = val.parse().map_err(|_| {
-                P2PError::Config(ConfigError::InvalidValue {
-                    field: "encryption_enabled".to_string().into(),
                     reason: "Invalid value".to_string().into(),
                 })
             })?;
@@ -348,12 +210,6 @@ impl Config {
             errors.push(e);
         }
 
-        if let Some(addr) = &self.network.public_address
-            && let Err(e) = self.validate_address(addr, "public_address")
-        {
-            errors.push(e);
-        }
-
         for (i, node) in self.network.bootstrap_nodes.iter().enumerate() {
             if let Err(e) = self.validate_address(node, &format!("bootstrap_node[{}]", i)) {
                 errors.push(e);
@@ -364,32 +220,12 @@ impl Config {
         if let Err(e) = validate_config_value(
             &self.network.max_connections.to_string(),
             Some(1_usize),
-            Some(100_000_usize),
+            Some(MAX_CONNECTIONS_UPPER_BOUND),
         ) {
             errors.push(P2PError::Config(ConfigError::InvalidValue {
                 field: "max_connections".to_string().into(),
                 reason: e.to_string().into(),
             }));
-        }
-
-        if let Err(e) = validate_config_value(
-            &self.security.rate_limit.to_string(),
-            Some(1_u32),
-            Some(1_000_000_u32),
-        ) {
-            errors.push(P2PError::Config(ConfigError::InvalidValue {
-                field: "rate_limit".to_string().into(),
-                reason: e.to_string().into(),
-            }));
-        }
-
-        // Validate transport protocol
-        match self.transport.protocol.as_str() {
-            "quic" | "tcp" | "webrtc" => {}
-            _ => errors.push(P2PError::Config(ConfigError::InvalidValue {
-                field: "protocol".to_string().into(),
-                reason: format!("Invalid transport protocol: {}", self.transport.protocol).into(),
-            })),
         }
 
         if let Some(max_message_size) = self.transport.max_message_size
@@ -447,21 +283,7 @@ impl Config {
     pub fn development() -> Self {
         let mut config = Self::default();
         config.network.listen_address = "127.0.0.1:9000".to_string();
-        config.security.rate_limit = 10000;
         config.security.connection_limit = 1000;
-        config
-    }
-
-    /// Create production configuration with secure defaults
-    pub fn production() -> Self {
-        let mut config = Self::default();
-        // Use environment variable or fallback to secure default
-        config.network.listen_address =
-            env::var("SAORSA_LISTEN_ADDRESS").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
-        config.security.rate_limit = 1000;
-        config.security.connection_limit = 100;
-        // Larger buffers in production
-        config.transport.buffer_size = 131072;
         config
     }
 
@@ -501,8 +323,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.network.listen_address, "0.0.0.0:9000");
-        assert_eq!(config.security.rate_limit, 1000);
-        assert!(config.security.encryption_enabled);
+        assert_eq!(config.security.connection_limit, DEFAULT_CONNECTION_LIMIT);
         assert_eq!(config.transport.max_message_size, None);
     }
 
@@ -510,16 +331,7 @@ mod tests {
     fn test_development_config() {
         let config = Config::development();
         assert_eq!(config.network.listen_address, "127.0.0.1:9000");
-        assert_eq!(config.security.rate_limit, 10000);
-    }
-
-    #[test]
-    fn test_production_config() {
-        let config = Config::production();
-        // Production config should have larger buffer size
-        assert_eq!(config.transport.buffer_size, 131072);
-        // Listen address should contain a port
-        assert!(config.network.listen_address.contains(':'));
+        assert_eq!(config.security.connection_limit, 1000);
     }
 
     #[test]
@@ -564,29 +376,22 @@ mod tests {
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
         let _guard = ENV_MUTEX.lock().unwrap();
 
-        // Save original values
+        // Save original value
         let orig_listen = env::var("SAORSA_LISTEN_ADDRESS").ok();
-        let orig_rate = env::var("SAORSA_RATE_LIMIT").ok();
 
-        // Set test values - unsafe blocks required in Rust 2024
+        // Set test value - unsafe block required in Rust 2024
         unsafe {
             env::set_var("SAORSA_LISTEN_ADDRESS", "127.0.0.1:8000");
-            env::set_var("SAORSA_RATE_LIMIT", "5000");
         }
 
         let config = Config::load().unwrap();
         assert_eq!(config.network.listen_address, "127.0.0.1:8000");
-        assert_eq!(config.security.rate_limit, 5000);
 
-        // Restore original values
+        // Restore original value
         unsafe {
             match orig_listen {
                 Some(val) => env::set_var("SAORSA_LISTEN_ADDRESS", val),
                 None => env::remove_var("SAORSA_LISTEN_ADDRESS"),
-            }
-            match orig_rate {
-                Some(val) => env::set_var("SAORSA_RATE_LIMIT", val),
-                None => env::remove_var("SAORSA_RATE_LIMIT"),
             }
         }
     }
