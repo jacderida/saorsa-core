@@ -109,7 +109,7 @@ let node = Arc::new(P2PNode::new(node_config).await?);
 let dht_net = DhtNetworkConfig::default();
 
 // Dependencies can be provided from your adaptive stack
-let deps = AdaptiveDhtDependencies::with_defaults(identity, trust_provider, router);
+let deps = AdaptiveDhtDependencies::with_defaults(identity, trust_provider);
 
 // Attach AdaptiveDHT to the running node
 let dht = AdaptiveDHT::attach_to_node(node, dht_net, AdaptiveDhtConfig::default(), deps).await?;
@@ -160,19 +160,17 @@ while let Some(event) = subscription.recv().await {
 Create and run a P2P node.
 
 ```rust
-use saorsa_core::{P2PNode, NodeConfig, NodeBuilder};
+use saorsa_core::{P2PNode, NodeConfig};
 
 // Using builder pattern
-let node = P2PNode::builder()
-    .listen_on("0.0.0.0:9000".parse()?)
-    .with_bootstrap_nodes(vec![
-        "192.168.1.1:9000".parse()?,
-    ])
-    .build()
-    .await?;
+let config = NodeConfig::builder()
+    .port(9000)
+    .bootstrap_peer("192.168.1.1:9000".parse()?)
+    .build()?;
+let node = P2PNode::new(config).await?;
 
 // Start the node
-node.run().await?;
+node.start().await?;
 ```
 
 ### Connection Events
@@ -290,21 +288,11 @@ let password = SecureString::from("my-secret-password");
 
 ### EigenTrust Scores
 
-Query reputation scores for peers.
+Query reputation scores for peers via P2PNode.
 
 ```rust
-use saorsa_core::security::ReputationManager;
-
-let reputation = ReputationManager::new(config);
-
 // Get trust score (0.0 - 1.0)
-let score = reputation.get_score(&peer_id);
-
-// Record successful interaction
-reputation.record_success(&peer_id);
-
-// Record failed interaction
-reputation.record_failure(&peer_id);
+let score = node.peer_trust(&peer_id);
 ```
 
 ### Node Age Verification
@@ -317,7 +305,7 @@ use saorsa_core::{NodeAgeVerifier, NodeAgeConfig, OperationType};
 let verifier = NodeAgeVerifier::new(NodeAgeConfig::default());
 
 // Check if node can perform operation
-let result = verifier.verify_operation(&peer_id, OperationType::Replication)?;
+let result = verifier.verify_operation(&peer_id, OperationType::FullRouting)?;
 
 match result {
     AgeVerificationResult::Allowed => println!("Operation permitted"),

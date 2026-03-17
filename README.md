@@ -11,7 +11,6 @@ Core P2P networking library for Saorsa platform with DHT, QUIC transport, dual-s
 - **API Reference**: see [docs/API.md](docs/API.md) - Comprehensive API documentation with examples
 - **Architecture Decision Records**: see [docs/adr/](docs/adr/) - Design decisions and rationale
 - **Security Model**: see [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) - Network security and anti-Sybil protections
-- **Auto-Upgrade System**: see [docs/AUTO_UPGRADE.md](docs/AUTO_UPGRADE.md) - Cross-platform binary updates
 - Architecture overview: see [ARCHITECTURE.md](ARCHITECTURE.md)
 - Contributor guide: see [AGENTS.md](AGENTS.md)
 
@@ -24,25 +23,18 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | [ADR-001](docs/adr/ADR-001-multi-layer-architecture.md) | Multi-Layer P2P Architecture | Layered design separating transport, DHT, identity, and application concerns |
 | [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
 | [ADR-003](docs/adr/ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
-| [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | EigenTrust Reputation | Iterative trust computation for Sybil resistance |
-| [ADR-007](docs/adr/ADR-007-adaptive-networking.md) | Adaptive Networking | Machine learning for dynamic routing optimization |
+| [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | Trust System | Response-rate scoring for Sybil resistance |
 | [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Delegating bootstrap to saorsa-transport with Sybil protection |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
-| [ADR-011](docs/adr/ADR-011-geographic-placement.md) | Geographic Placement | Region-aware storage for regulatory compliance |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
 
 ## Features
 
 - **P2P NAT Traversal**: True peer-to-peer connectivity with automatic NAT traversal (saorsa-transport 0.21.x)
-- **DHT (Distributed Hash Table)**: Peer phonebook and routing with adaptive scoring and geographic awareness
-- **Placement System**: Intelligent shard placement with EigenTrust integration
+- **DHT (Distributed Hash Table)**: Peer phonebook and routing with geographic awareness
 - **QUIC Transport**: High-performance networking with saorsa-transport
-- **Post-Quantum Cryptography**: Future-ready cryptographic algorithms
-- **Geographic Routing**: Location-aware networking
-- **Identity Management**: Post-quantum ML-DSA-65 signatures (NIST Level 3). No PoW; identities hold only required keys.
-- **Auto-Upgrade System**: Cross-platform binary updates with ML-DSA-65 signatures, rollback support, and configurable policies
-- **Persistence**: Database-backed internal state (telemetry, caches, coordination)
-- **Monitoring**: Prometheus metrics integration
+- **Post-Quantum Cryptography**: Future-ready cryptographic algorithms (ML-DSA-65, ML-KEM-768)
+- **Trust System**: Response-rate scoring with time decay and binary peer blocking
 
 ## Quick Start
 
@@ -50,7 +42,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-core = "0.11.0"
+saorsa-core = "0.16.0"
 ```
 
 ### Basic P2P Node
@@ -65,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig::default();
     let node = P2PNode::new(config).await?;
     node.run().await?;
-    
+
     Ok(())
 }
 ```
@@ -78,41 +70,23 @@ saorsa-core includes full NAT traversal support in the transport and network lay
 
 saorsa-core does **not** replicate application data. saorsa-node:
 - Stores chunks locally and tracks replica sets.
-- Selects target peers using saorsa-core’s adaptive routing outputs.
-- Replicates via `send_message` and reports success/failure back to EigenTrust.
-- Reacts to churn events from `DhtNetworkManager::subscribe_events()` and re‑replicates.
-
-Minimal wiring helper:
-```rust
-use saorsa_core::adaptive::ReplicaPlanner;
-use saorsa_core::DhtNetworkEvent;
-
-let planner = ReplicaPlanner::new(adaptive_dht, dht_manager);
-let mut events = planner.subscribe_churn();
-tokio::spawn(async move {
-    while let Ok(DhtNetworkEvent::PeerDisconnected { peer_id }) = events.recv().await {
-        // re-replicate any data that had replicas on peer_id
-    }
-});
-```
+- Selects target peers using saorsa-core's adaptive routing outputs.
+- Replicates via `send_message` and reports success/failure back to the TrustEngine.
+- Reacts to churn events from `DhtNetworkManager::subscribe_events()` and re-replicates.
 
 ## Architecture
 
 ### Core Components
 
-1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.21.x)
-2. **DHT**: S/Kademlia-based peer phonebook with adaptive routing and geographic awareness
-3. **Placement System**: Intelligent shard placement with weighted selection algorithms
-4. **Identity**: Post‑quantum cryptographic identities with ML‑DSA‑65 signatures (no PoW)
-5. **Application Storage**: Implemented in saorsa-node; saorsa-core tracks trust signals
-6. **Geographic Routing**: Location-aware message routing
-
+1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.26)
+2. **DHT**: Kademlia-based peer phonebook with geographic awareness
+3. **Trust System**: Response-rate scoring with time decay and binary peer blocking
 
 ### Cryptographic Architecture
 
 Saorsa Core implements a pure post-quantum cryptographic approach for maximum security:
 
-- **Post‑quantum signatures**: ML‑DSA‑65 (FIPS 204) for quantum‑resistant digital signatures (~128‑bit quantum security)
+- **Post-quantum signatures**: ML-DSA-65 (FIPS 204) for quantum-resistant digital signatures (~128-bit quantum security)
 - **PQC Encryption**: saorsa-pqc primitives for key encapsulation and signatures
 - **Key Exchange**: ML-KEM-768 (FIPS 203) for quantum-resistant key encapsulation (~128-bit quantum security)
 - **Hashing**: BLAKE3 for fast, secure content addressing
@@ -121,8 +95,9 @@ Saorsa Core implements a pure post-quantum cryptographic approach for maximum se
 
 ### Recent Changes
 
-- Removed all Proof‑of‑Work (PoW) usage (identity, adaptive, placement/DHT, error types, CLI).
-- Implemented dual‑stack listeners (IPv6 + IPv4) and Happy Eyeballs dialing.
+- Removed all Proof-of-Work (PoW) usage (identity, adaptive, DHT, error types, CLI).
+- Removed placement/storage orchestration system (now a phonebook-only DHT).
+- Implemented dual-stack listeners (IPv6 + IPv4) and Happy Eyeballs dialing.
 
 ### Data Flow
 
@@ -131,68 +106,12 @@ Application
     ↓
 Network API
     ↓
-Placement Engine → DHT + Geographic Routing
-    ↓              ↓
-    ↓         Audit & Repair
-    ↓              ↓
+DHT Phonebook + Geographic Routing
+    ↓
 QUIC Transport (saorsa-transport)
     ↓
 Internet
 ```
-
-### Placement System
-
-Saorsa Core includes an advanced placement system for optimal distribution of erasure-coded shards across the network:
-
-```rust
-use saorsa_core::placement::{
-    PlacementEngine, PlacementConfig, GeographicLocation, NetworkRegion
-};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure placement system
-    let config = PlacementConfig {
-        replication_factor: (3, 8).into(), // Min 3, target 8 replicas
-        byzantine_tolerance: 2.into(),      // Tolerate up to 2 Byzantine nodes
-        placement_timeout: Duration::from_secs(30),
-        geographic_diversity: true,
-        weights: OptimizationWeights {
-            trust_weight: 0.4,        // EigenTrust reputation
-            performance_weight: 0.3,   // Node performance metrics
-            capacity_weight: 0.2,      // Available storage capacity
-            diversity_bonus: 0.1,      // Geographic/network diversity
-        },
-    };
-    
-    // Create placement engine
-    let mut engine = PlacementEngine::new(config);
-    
-    // Place data with optimal shard distribution
-    let data = b"important data to store";
-    let decision = placement_orchestrator.place_data(
-        data.to_vec(),
-        8, // replication factor
-        Some(NetworkRegion::NorthAmerica),
-    ).await?;
-    
-    println!("Placed {} shards across {} nodes", 
-             decision.shard_count, 
-             decision.selected_nodes.len());
-    
-    Ok(())
-}
-```
-
-#### Key Features
-
-- **EigenTrust Integration**: Uses reputation scores for node selection
-- **Weighted Selection**: Balances trust, performance, capacity, and diversity
-- **Byzantine Fault Tolerance**: Configurable f-out-of-3f+1 security model
-- **Geographic Diversity**: Ensures shards are distributed across regions
-- **Continuous Monitoring**: Audit system with automatic repair
-- **DHT Record Types**: Efficient ≤512B records with cryptographic validation
-- **Hysteresis Control**: Prevents repair storms with smart cooldown
 
 ## Configuration
 
@@ -205,21 +124,14 @@ let config = NetworkConfig {
         "bootstrap1.example.com:9000".parse()?,
         "bootstrap2.example.com:9000".parse()?,
     ],
-    dht_replication: 20,
-    storage_capacity: 1024 * 1024 * 1024, // 1GB
     ..Default::default()
 };
 ```
 
 ## Feature Flags
 
-- `default` - Metrics and Prometheus integration
-- `metrics` - Prometheus metrics and monitoring
-- `mocks` - Test/dummy helpers for development (off by default)
-- `h2_greedy` - Hyperbolic greedy routing helpers in API
-- `test-utils` - Test utilities including mock DHT for integration tests
-
-Note: DHT, saorsa-transport QUIC transport, and post-quantum cryptography are always enabled.
+No feature flags — all functionality is always enabled. DHT, QUIC transport (saorsa-transport),
+and post-quantum cryptography are included unconditionally.
 
 ## Performance
 
@@ -228,23 +140,6 @@ Saorsa Core is designed for high performance:
 - **Concurrent Operations**: Tokio-based async runtime
 - **Memory Efficiency**: Zero-copy operations where possible
 - **Network Optimization**: QUIC with congestion control
-- **Caching**: Multi-level caching with Q-learning optimization
-
-### Benchmarks
-
-Run benchmarks with:
-
-```bash
-cargo bench
-```
-
-Key benchmarks:
-- DHT operations: ~10,000 ops/sec
-- Storage throughput: ~100 MB/sec
-- Geographic routing: <10ms latency
-- Placement decisions: <1s for 8-node selection
-- Shard repair: Automatic with <1h detection
-- Cryptographic operations: Hardware-accelerated
 
 ## Security
 
@@ -265,10 +160,10 @@ Saorsa Core implements defense-in-depth security designed for adversarial decent
 | Protection | Implementation |
 |------------|----------------|
 | **Node Monitoring** | Automatic eviction after 3 consecutive failures |
-| **Reputation System** | EigenTrust++ with multi-factor trust scoring |
+| **Reputation System** | Response-rate scoring with time decay |
 | **Sybil Resistance** | IP diversity limits (/64: 1, /48: 3, /32: 10, ASN: 20) |
-| **Geographic Diversity** | Regional diversity in routing and placement |
-| **Routing Validation** | Close-group validation and security coordinator checks |
+| **Geographic Diversity** | Regional diversity in routing |
+| **Routing Validation** | Trust-based peer blocking and eviction |
 
 ### Anti-Centralization
 
@@ -292,20 +187,6 @@ The network enforces geographic and infrastructure diversity to prevent centrali
 - **Hosting Provider Limits**: Stricter limits (halved) for known VPS/cloud providers
 - **Eclipse Detection**: Continuous routing table diversity monitoring
 
-## Persistence
-
-Persistence lives in `src/persistence/` with pluggable backends and configuration-driven
-storage policies. See `src/persistence/SPECIFICATION.md` for current settings.
-
-## Geographic Features
-
-Location-aware networking:
-
-- Geographic distance calculations
-- Location-based routing
-- Regional content distribution
-- Privacy-preserving location services
-
 ## Development
 
 ### Building
@@ -316,9 +197,6 @@ cargo build --release
 
 # With all features
 cargo build --all-features
-
-# Feature-specific build
-cargo build --features "dht,quantum-resistant"
 ```
 
 ### Testing
@@ -329,15 +207,12 @@ cargo test
 
 # Integration tests
 cargo test --test '*'
-
-# Property-based tests
-cargo test --features "proptest"
 ```
 
 ### Linting
 
 ```bash
-cargo clippy --all-features -- -D warnings
+cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 cargo fmt --all
 ```
 
@@ -377,16 +252,12 @@ For commercial licensing, contact: david@saorsalabs.com
 - `tracing` - Logging
 
 ### Networking
-- `saorsa-transport` (0.21.x) - QUIC transport with P2P NAT traversal
+- `saorsa-transport` (0.26) - QUIC transport with P2P NAT traversal
 
 ### Cryptography
 - `saorsa-pqc` - Post-quantum cryptography (ML-DSA, ML-KEM)
 - `blake3` - Hashing
 - `rand` - Random number generation
-
-### Storage & Database
-- `rusqlite` - Database operations
-- `lru` - LRU caching
 
 See `Cargo.toml` for complete dependency list.
 

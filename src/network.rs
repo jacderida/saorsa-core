@@ -17,18 +17,16 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::PeerId;
-use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
-use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
-use crate::config::Config;
+use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
+use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
-use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
+use crate::error::{NetworkError, P2PError, P2pResult as Result};
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
-use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -72,11 +70,20 @@ pub(crate) struct WireMessage {
 /// are treated as ephemeral and excluded from routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NodeMode {
-    /// Full DHT-participant node that stores data and routes messages.
+    /// Full DHT-participant node that maintains routing state and routes messages.
     #[default]
     Node,
     /// Ephemeral client that connects to perform operations without joining the DHT.
     Client,
+}
+
+/// Internal listen mode controlling which network interfaces the node binds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenMode {
+    /// Bind to all interfaces (`0.0.0.0` / `::`).
+    Public,
+    /// Bind to loopback only (`127.0.0.1` / `::1`).
+    Local,
 }
 
 /// Returns the default user agent string for the given mode.
@@ -89,12 +96,6 @@ pub fn user_agent_for_mode(mode: NodeMode) -> String {
         NodeMode::Client => "client",
     };
     format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
-}
-
-/// Default user agent for full DHT-participant nodes.
-#[deprecated(note = "Use `user_agent_for_mode(NodeMode::Node)` instead")]
-pub fn default_node_user_agent() -> String {
-    user_agent_for_mode(NodeMode::Node)
 }
 
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
@@ -111,23 +112,17 @@ pub(crate) const MAX_ACTIVE_REQUESTS: usize = 256;
 /// Maximum allowed timeout for a single request (5 minutes).
 pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default port when config parsing fails.
+/// Default listen port for the P2P node.
 const DEFAULT_LISTEN_PORT: u16 = 9000;
+
+/// Default maximum number of concurrent connections.
+const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// Default connection timeout in seconds.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
-
-/// Quality score for successful bootstrap connections.
-const BOOTSTRAP_QUALITY_SCORE_SUCCESS: f64 = 0.8;
-/// Quality score for failed bootstrap connections.
-const BOOTSTRAP_QUALITY_SCORE_FAILURE: f64 = 0.2;
-/// Default uptime score for new bootstrap contacts.
-const BOOTSTRAP_DEFAULT_UPTIME_SCORE: f64 = 0.5;
-/// Penalty duration for failed bootstrap connections.
-const BOOTSTRAP_FAILURE_PENALTY_HOURS: i64 = 1;
-
-/// Default neutral trust score when trust engine is unavailable.
-const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
 
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
@@ -135,45 +130,48 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 
+/// Serde helper — returns `true`.
+const fn default_true() -> bool {
+    true
+}
+
 /// Configuration for a P2P node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Addresses to listen on for incoming connections
-    pub listen_addrs: Vec<std::net::SocketAddr>,
+    /// Bind to loopback only (`127.0.0.1` / `::1`).
+    ///
+    /// When `true`, the node listens on loopback addresses suitable for
+    /// local development and testing. When `false` (the default), the node
+    /// listens on all interfaces (`0.0.0.0` / `::`).
+    #[serde(default)]
+    pub local: bool,
 
-    /// Primary listen address (for compatibility)
-    pub listen_addr: std::net::SocketAddr,
+    /// Listen port. `0` means OS-assigned ephemeral port.
+    #[serde(default)]
+    pub port: u16,
+
+    /// Enable IPv6 dual-stack binding.
+    ///
+    /// When `true` (the default), both an IPv4 and an IPv6 address are
+    /// bound. When `false`, only IPv4 is used.
+    #[serde(default = "default_true")]
+    pub ipv6: bool,
 
     /// Bootstrap peers to connect to on startup.
     pub bootstrap_peers: Vec<crate::MultiAddr>,
-
-    /// Enable IPv6 support
-    pub enable_ipv6: bool,
 
     // MCP removed; will be redesigned later
     /// Connection timeout duration
     pub connection_timeout: Duration,
 
-    /// Keep-alive interval for connections
-    pub keep_alive_interval: Duration,
-
     /// Maximum number of concurrent connections
     pub max_connections: usize,
-
-    /// Maximum number of incoming connections
-    pub max_incoming_connections: usize,
 
     /// DHT configuration
     pub dht_config: DHTConfig,
 
-    /// Security configuration
-    pub security_config: SecurityConfig,
-
-    /// Production hardening configuration
-    pub production_config: Option<ProductionConfig>,
-
     /// Bootstrap cache configuration
-    pub bootstrap_cache_config: Option<crate::bootstrap::CacheConfig>,
+    pub bootstrap_cache_config: Option<BootstrapConfig>,
 
     /// Optional IP diversity configuration for Sybil protection tuning.
     ///
@@ -218,6 +216,16 @@ pub struct NodeConfig {
     /// Default: `false`
     #[serde(default)]
     pub allow_loopback: bool,
+
+    /// Adaptive DHT configuration (trust-based blocking and eviction).
+    ///
+    /// Controls whether peers with low trust scores are evicted from the
+    /// routing table and blocked from DHT operations. Use
+    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
+    ///
+    /// Default: enabled with a block threshold of 0.15.
+    #[serde(default)]
+    pub adaptive_dht_config: AdaptiveDhtConfig,
 }
 
 /// DHT-specific configuration
@@ -229,59 +237,45 @@ pub struct DHTConfig {
     /// Kademlia alpha parameter (parallelism)
     pub alpha_value: usize,
 
-    /// DHT record TTL
-    pub record_ttl: Duration,
-
     /// DHT refresh interval
     pub refresh_interval: Duration,
-}
-
-/// Security configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityConfig {
-    /// Enable noise protocol for encryption
-    pub enable_noise: bool,
-
-    /// Enable TLS for secure transport
-    pub enable_tls: bool,
-
-    /// Trust level for peer verification
-    pub trust_level: TrustLevel,
-}
-
-/// Trust level for peer verification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TrustLevel {
-    /// No verification required
-    None,
-    /// Basic peer ID verification
-    Basic,
-    /// Full cryptographic verification
-    Full,
 }
 
 // ============================================================================
 // Address Construction Helpers
 // ============================================================================
 
-/// Build listen addresses based on port and IPv6 preference
+/// Build QUIC listen addresses based on port, IPv6 preference, and listen mode.
 ///
-/// This helper consolidates the duplicated address construction logic.
+/// All returned addresses use the QUIC transport — the only transport
+/// currently supported for dialing. When additional transports are added,
+/// extend this function to produce addresses for those transports as well.
+///
+/// `ListenMode::Public` uses unspecified (all-interface) addresses;
+/// `ListenMode::Local` uses loopback addresses.
 #[inline]
-fn build_listen_addrs(port: u16, ipv6_enabled: bool) -> Vec<std::net::SocketAddr> {
+fn build_listen_addrs(port: u16, ipv6_enabled: bool, mode: ListenMode) -> Vec<MultiAddr> {
     let mut addrs = Vec::with_capacity(if ipv6_enabled { 2 } else { 1 });
 
+    let (v4, v6) = match mode {
+        ListenMode::Public => (
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv6Addr::UNSPECIFIED,
+        ),
+        ListenMode::Local => (std::net::Ipv4Addr::LOCALHOST, std::net::Ipv6Addr::LOCALHOST),
+    };
+
     if ipv6_enabled {
-        addrs.push(std::net::SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(v6),
             port,
-        ));
+        )));
     }
 
-    addrs.push(std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    addrs.push(MultiAddr::quic(std::net::SocketAddr::new(
+        std::net::IpAddr::V4(v4),
         port,
-    ));
+    )));
 
     addrs
 }
@@ -297,40 +291,26 @@ impl NodeConfig {
             .unwrap_or_else(|| user_agent_for_mode(self.mode))
     }
 
+    /// Compute the listen addresses from the configuration fields.
+    ///
+    /// The returned addresses are derived from [`local`](Self::local),
+    /// [`port`](Self::port), and [`ipv6`](Self::ipv6).
+    pub fn listen_addrs(&self) -> Vec<MultiAddr> {
+        let mode = if self.local {
+            ListenMode::Local
+        } else {
+            ListenMode::Public
+        };
+        build_listen_addrs(self.port, self.ipv6, mode)
+    }
+
     /// Create a new NodeConfig with default values
     ///
     /// # Errors
     ///
     /// Returns an error if default addresses cannot be parsed
     pub fn new() -> Result<Self> {
-        let config = Config::default();
-        let listen_addr = config.listen_socket_addr()?;
-
-        Ok(Self {
-            listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
-            listen_addr,
-            bootstrap_peers: config
-                .network
-                .bootstrap_nodes
-                .iter()
-                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
-                .collect(),
-            enable_ipv6: config.network.ipv6_enabled,
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
-            production_config: None,
-            bootstrap_cache_config: None,
-            diversity_config: None,
-            max_message_size: config.transport.max_message_size,
-            node_identity: None,
-            mode: NodeMode::default(),
-            custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
-        })
+        Ok(Self::default())
     }
 
     /// Create a builder for customized NodeConfig construction
@@ -343,34 +323,80 @@ impl NodeConfig {
 // NodeConfig Builder Pattern
 // ============================================================================
 
-/// Builder for constructing NodeConfig with fluent API
-#[derive(Debug, Clone, Default)]
+/// Builder for constructing [`NodeConfig`] with a transport-aware fluent API.
+///
+/// Defaults are chosen for quick local development:
+/// - QUIC on a random free port (`0`)
+/// - IPv6 enabled (dual-stack)
+/// - All interfaces (not local-only)
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Simplest — QUIC on random port, IPv6 on, all interfaces
+/// let config = NodeConfig::builder().build()?;
+///
+/// // Local dev/test mode (loopback, auto-enables allow_loopback)
+/// let config = NodeConfig::builder()
+///     .local(true)
+///     .build()?;
+/// ```
+#[derive(Debug, Clone)]
 pub struct NodeConfigBuilder {
-    listen_port: Option<u16>,
-    enable_ipv6: Option<bool>,
+    port: u16,
+    ipv6: bool,
+    local: bool,
     bootstrap_peers: Vec<crate::MultiAddr>,
     max_connections: Option<usize>,
     connection_timeout: Option<Duration>,
-    keep_alive_interval: Option<Duration>,
     dht_config: Option<DHTConfig>,
-    security_config: Option<SecurityConfig>,
-    production_config: Option<ProductionConfig>,
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
     allow_loopback: Option<bool>,
+    adaptive_dht_config: Option<AdaptiveDhtConfig>,
+}
+
+impl Default for NodeConfigBuilder {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            ipv6: true,
+            local: false,
+            bootstrap_peers: Vec::new(),
+            max_connections: None,
+            connection_timeout: None,
+            dht_config: None,
+            max_message_size: None,
+            mode: NodeMode::default(),
+            custom_user_agent: None,
+            allow_loopback: None,
+            adaptive_dht_config: None,
+        }
+    }
 }
 
 impl NodeConfigBuilder {
-    /// Set the listen port
-    pub fn listen_port(mut self, port: u16) -> Self {
-        self.listen_port = Some(port);
+    /// Set the listen port. Default: `0` (random free port).
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
         self
     }
 
-    /// Enable or disable IPv6
+    /// Enable or disable IPv6 dual-stack. Default: `true`.
     pub fn ipv6(mut self, enabled: bool) -> Self {
-        self.enable_ipv6 = Some(enabled);
+        self.ipv6 = enabled;
+        self
+    }
+
+    /// Bind to loopback only (`true`) or all interfaces (`false`).
+    ///
+    /// When `true`, automatically enables `allow_loopback` unless explicitly
+    /// overridden via [`Self::allow_loopback`].
+    ///
+    /// Default: `false` (all interfaces).
+    pub fn local(mut self, local: bool) -> Self {
+        self.local = local;
         self
     }
 
@@ -380,39 +406,21 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Set maximum connections
+    /// Set maximum connections.
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = Some(max);
         self
     }
 
-    /// Set connection timeout
+    /// Set connection timeout.
     pub fn connection_timeout(mut self, timeout: Duration) -> Self {
         self.connection_timeout = Some(timeout);
         self
     }
 
-    /// Set keep-alive interval
-    pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
-        self.keep_alive_interval = Some(interval);
-        self
-    }
-
-    /// Set DHT configuration
+    /// Set DHT configuration.
     pub fn dht_config(mut self, config: DHTConfig) -> Self {
         self.dht_config = Some(config);
-        self
-    }
-
-    /// Set security configuration
-    pub fn security_config(mut self, config: SecurityConfig) -> Self {
-        self.security_config = Some(config);
-        self
-    }
-
-    /// Set production configuration
-    pub fn production_config(mut self, config: ProductionConfig) -> Self {
-        self.production_config = Some(config);
         self
     }
 
@@ -436,179 +444,101 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Allow loopback addresses in the transport layer.
-    ///
-    /// Enable for devnet/testnet modes where multiple nodes run on the same
-    /// machine. Default: `false`.
+    /// Explicitly control whether loopback addresses are allowed in the
+    /// transport layer. When not called, `local(true)` auto-enables this;
+    /// `local(false)` defaults to `false`.
     pub fn allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = Some(allow);
         self
     }
 
-    /// Build the NodeConfig
+    /// Enable or disable trust-based peer eviction and blocking.
+    ///
+    /// When `false`, peers are never evicted from the routing table or
+    /// blocked from DHT operations based on trust scores. Trust scores
+    /// are still tracked but have no enforcement effect.
+    ///
+    /// When `true` (the default), peers whose trust score falls below the
+    /// block threshold (0.15) are immediately evicted and blocked.
+    ///
+    /// For fine-grained control over the threshold, use
+    /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
+    pub fn trust_enforcement(mut self, enabled: bool) -> Self {
+        let threshold = if enabled {
+            AdaptiveDhtConfig::default().block_threshold
+        } else {
+            0.0
+        };
+        self.adaptive_dht_config = Some(AdaptiveDhtConfig {
+            block_threshold: threshold,
+        });
+        self
+    }
+
+    /// Set the full adaptive DHT configuration.
+    ///
+    /// Overrides any previous call to [`trust_enforcement`](Self::trust_enforcement).
+    pub fn adaptive_dht_config(mut self, config: AdaptiveDhtConfig) -> Self {
+        self.adaptive_dht_config = Some(config);
+        self
+    }
+
+    /// Build the [`NodeConfig`].
     ///
     /// # Errors
     ///
-    /// Returns an error if address construction fails
+    /// Returns an error if address construction fails.
     pub fn build(self) -> Result<NodeConfig> {
-        let base_config = Config::default();
-        let default_port = base_config
-            .listen_socket_addr()
-            .map(|addr| addr.port())
-            .unwrap_or(DEFAULT_LISTEN_PORT);
-        let port = self.listen_port.unwrap_or(default_port);
-        let ipv6_enabled = self.enable_ipv6.unwrap_or(base_config.network.ipv6_enabled);
-
-        let listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+        // local mode auto-enables allow_loopback unless explicitly overridden
+        let allow_loopback = self.allow_loopback.unwrap_or(self.local);
 
         Ok(NodeConfig {
-            listen_addrs: build_listen_addrs(port, ipv6_enabled),
-            listen_addr,
-            bootstrap_peers: self.bootstrap_peers.clone(),
-            enable_ipv6: ipv6_enabled,
+            local: self.local,
+            port: self.port,
+            ipv6: self.ipv6,
+            bootstrap_peers: self.bootstrap_peers,
             connection_timeout: self
                 .connection_timeout
-                .unwrap_or(Duration::from_secs(base_config.network.connection_timeout)),
-            keep_alive_interval: self
-                .keep_alive_interval
-                .unwrap_or(Duration::from_secs(base_config.network.keepalive_interval)),
-            max_connections: self
-                .max_connections
-                .unwrap_or(base_config.network.max_connections),
-            max_incoming_connections: base_config.security.connection_limit as usize,
+                .unwrap_or(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS)),
+            max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             dht_config: self.dht_config.unwrap_or_default(),
-            security_config: self.security_config.unwrap_or_default(),
-            production_config: self.production_config,
             bootstrap_cache_config: None,
             diversity_config: None,
-            max_message_size: self
-                .max_message_size
-                .or(base_config.transport.max_message_size),
+            max_message_size: self.max_message_size,
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
-            allow_loopback: self
-                .allow_loopback
-                .unwrap_or(base_config.network.allow_loopback),
+            allow_loopback,
+            adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
         })
     }
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        let config = Config::default();
-        let listen_addr = config.listen_socket_addr().unwrap_or_else(|_| {
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                DEFAULT_LISTEN_PORT,
-            )
-        });
-
         Self {
-            listen_addrs: build_listen_addrs(listen_addr.port(), config.network.ipv6_enabled),
-            listen_addr,
+            local: false,
+            port: DEFAULT_LISTEN_PORT,
+            ipv6: true,
             bootstrap_peers: Vec::new(),
-            enable_ipv6: config.network.ipv6_enabled,
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
+            connection_timeout: Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
-            production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
-            max_message_size: config.transport.max_message_size,
+            max_message_size: None,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
+            allow_loopback: false,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         }
-    }
-}
-
-impl NodeConfig {
-    /// Create NodeConfig from Config
-    pub fn from_config(config: &Config) -> Result<Self> {
-        let listen_addr = config.listen_socket_addr()?;
-
-        let mut node_config = Self {
-            listen_addrs: vec![listen_addr],
-            listen_addr,
-            bootstrap_peers: config
-                .network
-                .bootstrap_nodes
-                .iter()
-                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
-                .collect(),
-            enable_ipv6: config.network.ipv6_enabled,
-
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig::default(),
-            security_config: SecurityConfig {
-                enable_noise: true,
-                enable_tls: true,
-                trust_level: TrustLevel::Basic,
-            },
-            production_config: Some(ProductionConfig {
-                max_connections: config.network.max_connections,
-                max_memory_bytes: 0,  // unlimited
-                max_bandwidth_bps: 0, // unlimited
-                connection_timeout: Duration::from_secs(config.network.connection_timeout),
-                keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-                health_check_interval: Duration::from_secs(30),
-                metrics_interval: Duration::from_secs(60),
-                enable_performance_tracking: true,
-                enable_auto_cleanup: true,
-                shutdown_timeout: Duration::from_secs(30),
-                rate_limits: crate::production::RateLimitConfig::default(),
-            }),
-            bootstrap_cache_config: None,
-            diversity_config: None,
-            max_message_size: config.transport.max_message_size,
-            node_identity: None,
-            mode: NodeMode::default(),
-            custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
-        };
-
-        // Add IPv6 listen address if enabled
-        if config.network.ipv6_enabled {
-            node_config.listen_addrs.push(std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                listen_addr.port(),
-            ));
-        }
-
-        Ok(node_config)
-    }
-
-    /// Try to build a NodeConfig from a listen address string
-    pub fn with_listen_addr(addr: &str) -> Result<Self> {
-        let listen_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| {
-                NetworkError::InvalidAddress(e.to_string().into())
-            })
-            .map_err(P2PError::Network)?;
-        let cfg = NodeConfig {
-            listen_addr,
-            listen_addrs: vec![listen_addr],
-            diversity_config: None,
-            ..Default::default()
-        };
-        Ok(cfg)
     }
 }
 
 impl DHTConfig {
     const DEFAULT_K_VALUE: usize = 20;
     const DEFAULT_ALPHA_VALUE: usize = 5;
-    const DEFAULT_RECORD_TTL_SECS: u64 = 3600;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
 }
 
@@ -617,18 +547,7 @@ impl Default for DHTConfig {
         Self {
             k_value: Self::DEFAULT_K_VALUE,
             alpha_value: Self::DEFAULT_ALPHA_VALUE,
-            record_ttl: Duration::from_secs(Self::DEFAULT_RECORD_TTL_SECS),
             refresh_interval: Duration::from_secs(Self::DEFAULT_REFRESH_INTERVAL_SECS),
-        }
-    }
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            enable_noise: true,
-            enable_tls: true,
-            trust_level: TrustLevel::Basic,
         }
     }
 }
@@ -641,7 +560,7 @@ pub struct PeerInfo {
     pub(crate) channel_id: String,
 
     /// Peer's addresses
-    pub addresses: Vec<String>,
+    pub addresses: Vec<MultiAddr>,
 
     /// Connection timestamp
     pub connected_at: Instant,
@@ -672,62 +591,6 @@ pub enum ConnectionStatus {
     Disconnected,
     /// Connection failed
     Failed(String),
-}
-
-/// Network events that can occur
-#[derive(Debug, Clone)]
-pub enum NetworkEvent {
-    /// A new peer has connected
-    PeerConnected {
-        /// The identifier of the newly connected peer
-        peer_id: PeerId,
-        /// The network addresses where the peer can be reached
-        addresses: Vec<String>,
-    },
-
-    /// A peer has disconnected
-    PeerDisconnected {
-        /// The identifier of the disconnected peer
-        peer_id: PeerId,
-        /// The reason for the disconnection
-        reason: String,
-    },
-
-    /// A message was received from a peer
-    MessageReceived {
-        /// The identifier of the sending peer
-        peer_id: PeerId,
-        /// The protocol used for the message
-        protocol: String,
-        /// The raw message data
-        data: Vec<u8>,
-    },
-
-    /// A connection attempt failed
-    ConnectionFailed {
-        /// The identifier of the peer (if known)
-        peer_id: Option<PeerId>,
-        /// The address where connection was attempted
-        address: String,
-        /// The error message describing the failure
-        error: String,
-    },
-
-    /// DHT record was stored
-    DHTRecordStored {
-        /// The DHT key where the record was stored
-        key: Vec<u8>,
-        /// The value that was stored
-        value: Vec<u8>,
-    },
-
-    /// DHT record was retrieved
-    DHTRecordRetrieved {
-        /// The DHT key that was queried
-        key: Vec<u8>,
-        /// The retrieved value, if found
-        value: Option<Vec<u8>>,
-    },
 }
 
 /// Network events that can occur in the P2P system
@@ -815,30 +678,18 @@ pub struct P2PNode {
     /// Shutdown token — cancelled when the node should stop
     shutdown: CancellationToken,
 
-    /// DHT manager for distributed hash table operations (peer discovery, routing, storage)
-    dht_manager: Arc<DhtNetworkManager>,
-
-    /// Production resource manager (optional)
-    resource_manager: Option<Arc<ResourceManager>>,
+    /// Adaptive DHT layer — owns both the DHT manager and the trust engine.
+    /// All DHT operations and trust signals go through this component.
+    adaptive_dht: AdaptiveDHT,
 
     /// Bootstrap cache manager for peer discovery
     bootstrap_manager: Option<Arc<RwLock<BootstrapManager>>>,
-
-    /// Security dashboard for monitoring
-    pub security_dashboard: Option<Arc<crate::dht::metrics::SecurityDashboard>>,
 
     /// Bootstrap state tracking - indicates whether peer discovery has completed
     is_bootstrapped: Arc<AtomicBool>,
 
     /// Whether `start()` has been called (and `stop()` has not yet completed)
     is_started: Arc<AtomicBool>,
-
-    /// EigenTrust engine for reputation management
-    ///
-    /// Used to track peer reliability based on data availability outcomes.
-    /// Consumers (like saorsa-node) should report successes and failures
-    /// via `report_peer_success()` and `report_peer_failure()` methods.
-    trust_engine: Option<Arc<EigenTrustEngine>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -884,35 +735,16 @@ impl P2PNode {
         // Derive the canonical peer ID from the cryptographic identity.
         let peer_id = *node_identity.peer_id();
 
-        // Initialize production resource manager if configured
-        let resource_manager = config
-            .production_config
-            .clone()
-            .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
-
         // Initialize bootstrap cache manager
-        let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let bootstrap_manager = match BootstrapManager::with_full_config(
-            cache_config,
-            crate::rate_limit::JoinRateLimiterConfig::default(),
-            &config,
-        )
-        .await
-        {
-            Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-            Err(e) => {
-                warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
-                None
-            }
-        };
-
-        // Initialize EigenTrust engine for reputation management.
-        // The pre-trusted set starts empty — real PeerIds are learned
-        // via identity exchange after connecting to bootstrap peers.
-        let pre_trusted: HashSet<PeerId> = HashSet::new();
-        let trust_engine = Arc::new(EigenTrustEngine::new(pre_trusted));
-        trust_engine.clone().start_background_updates();
-        let trust_engine = Some(trust_engine);
+        let bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
+        let bootstrap_manager =
+            match BootstrapManager::with_node_config(bootstrap_config, &config).await {
+                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
+                Err(e) => {
+                    warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
+                    None
+                }
+            };
 
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig::from_node_config(
@@ -923,14 +755,11 @@ impl P2PNode {
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
 
-        // Initialize DHT manager (owns local DHT core and network DHT behavior)
+        // Initialize AdaptiveDHT — creates the trust engine and DHT manager
         let manager_dht_config = crate::dht::DHTConfig {
-            replication_factor: config.dht_config.k_value,
             bucket_size: config.dht_config.k_value,
             alpha: config.dht_config.alpha_value,
-            record_ttl: config.dht_config.record_ttl,
             bucket_refresh_interval: config.dht_config.refresh_interval,
-            republish_interval: config.dht_config.refresh_interval,
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
@@ -939,21 +768,15 @@ impl P2PNode {
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
-            replication_factor: config.dht_config.k_value,
             enable_security: true,
+            block_threshold: 0.0, // Set by AdaptiveDHT::new() from AdaptiveDhtConfig
         };
-        let dht_manager = Arc::new(
-            DhtNetworkManager::new(transport.clone(), trust_engine.clone(), dht_manager_config)
-                .await?,
-        );
-
-        let security_metrics = dht_manager.security_metrics().await;
-        let security_dashboard = Some(Arc::new(crate::dht::metrics::SecurityDashboard::new(
-            security_metrics,
-            Arc::new(crate::dht::metrics::DhtMetricsCollector::new()),
-            Arc::new(crate::dht::metrics::TrustMetricsCollector::new()),
-            Arc::new(crate::dht::metrics::PlacementMetricsCollector::new()),
-        )));
+        let adaptive_dht = AdaptiveDHT::new(
+            transport.clone(),
+            dht_manager_config,
+            config.adaptive_dht_config.clone(),
+        )
+        .await?;
 
         let node = Self {
             config,
@@ -961,13 +784,10 @@ impl P2PNode {
             transport,
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
-            dht_manager,
-            resource_manager,
+            adaptive_dht,
             bootstrap_manager,
-            security_dashboard,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
-            trust_engine,
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -975,11 +795,6 @@ impl P2PNode {
         );
 
         Ok(node)
-    }
-
-    /// Create a new node builder
-    pub fn builder() -> NodeBuilder {
-        NodeBuilder::new()
     }
 
     /// Get the peer ID of this node.
@@ -992,13 +807,7 @@ impl P2PNode {
         &self.transport
     }
 
-    /// Get the hex-encoded channel ID (QUIC connection identifier).
-    #[allow(dead_code)]
-    pub(crate) fn channel_id(&self) -> Option<String> {
-        self.transport.channel_id()
-    }
-
-    pub fn local_addr(&self) -> Option<String> {
+    pub fn local_addr(&self) -> Option<MultiAddr> {
         self.transport.local_addr()
     }
 
@@ -1020,162 +829,42 @@ impl P2PNode {
     }
 
     // =========================================================================
-    // Trust API - EigenTrust Reputation System
+    // Trust API — delegates to AdaptiveDHT
     // =========================================================================
 
-    /// Get the EigenTrust engine for direct trust operations
-    ///
-    /// This provides access to the underlying trust engine for advanced use cases.
-    /// For simple success/failure reporting, prefer `report_peer_success()` and
-    /// `report_peer_failure()`.
-    ///
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if let Some(engine) = node.trust_engine() {
-    ///     // Update node statistics directly
-    ///     engine.update_node_stats(&peer_id, NodeStatisticsUpdate::StorageContributed(1024)).await;
-    ///
-    ///     // Get global trust scores
-    ///     let scores = engine.compute_global_trust().await;
-    /// }
-    /// ```
-    pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
-        self.trust_engine.clone()
+    /// Get the trust engine for advanced use cases
+    pub fn trust_engine(&self) -> Arc<TrustEngine> {
+        self.adaptive_dht.trust_engine().clone()
     }
 
-    /// Report a successful interaction with a peer
+    /// Report a trust event for a peer.
     ///
-    /// Call this after successful data operations to increase the peer's trust score.
-    /// This is the primary method for saorsa-node to report positive outcomes.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID (as a string) of the node that performed well
+    /// Records a network-observable outcome (connection success/failure)
+    /// that the DHT layer did not record automatically. See [`TrustEvent`]
+    /// for the supported variants.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// // After successfully retrieving a chunk from a peer
-    /// if let Ok(chunk) = fetch_chunk_from(&peer_id).await {
-    ///     node.report_peer_success(&peer_id).await?;
-    /// }
+    /// use saorsa_core::adaptive::TrustEvent;
+    ///
+    /// node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+    /// node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
     /// ```
-    pub async fn report_peer_success(&self, peer_id: &PeerId) -> Result<()> {
-        if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(peer_id, NodeStatisticsUpdate::CorrectResponse)
-                .await;
-            Ok(())
-        } else {
-            // Trust engine not initialized - this is not an error, just a no-op
-            Ok(())
-        }
+    pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
+        self.adaptive_dht.report_trust_event(peer_id, event).await;
     }
 
-    /// Report a failed interaction with a peer
+    /// Get the current trust score for a peer (0.0 to 1.0).
     ///
-    /// Call this after failed data operations to decrease the peer's trust score.
-    /// This includes timeouts, corrupted data, or refused connections.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID (as a string) of the node that failed
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // After a chunk retrieval fails
-    /// match fetch_chunk_from(&peer_id).await {
-    ///     Ok(chunk) => node.report_peer_success(&peer_id).await?,
-    ///     Err(_) => node.report_peer_failure(&peer_id).await?,
-    /// }
-    /// ```
-    pub async fn report_peer_failure(&self, peer_id: &PeerId) -> Result<()> {
-        // Delegate to the enriched version with a generic transport-level reason
-        self.report_peer_failure_with_reason(peer_id, PeerFailureReason::ConnectionFailed)
-            .await
-    }
-
-    /// Report a failed interaction with a peer, providing a specific failure reason.
-    ///
-    /// This is the enriched version of [`P2PNode::report_peer_failure`] that maps the failure
-    /// reason to the appropriate trust penalty. Use this when you know *why* the
-    /// interaction failed to give the trust engine more accurate data.
-    ///
-    /// - Transport-level failures (`Timeout`, `ConnectionFailed`) map to `FailedResponse`
-    /// - `DataUnavailable` maps to `DataUnavailable`
-    /// - `CorruptedData` maps to `CorruptedData` (counts as 2 failures)
-    /// - `ProtocolError` maps to `ProtocolViolation` (counts as 2 failures)
-    /// - `Refused` maps to `FailedResponse`
-    ///
-    /// Requires the `adaptive-ml` feature to be enabled.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID of the node that failed
-    /// * `reason` - Why the interaction failed
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use saorsa_core::error::PeerFailureReason;
-    ///
-    /// // After a chunk retrieval returns corrupted data
-    /// node.report_peer_failure_with_reason(&peer_id, PeerFailureReason::CorruptedData).await?;
-    /// ```
-    pub async fn report_peer_failure_with_reason(
-        &self,
-        peer_id: &PeerId,
-        reason: PeerFailureReason,
-    ) -> Result<()> {
-        if let Some(ref engine) = self.trust_engine {
-            let update = match reason {
-                PeerFailureReason::Timeout | PeerFailureReason::ConnectionFailed => {
-                    NodeStatisticsUpdate::FailedResponse
-                }
-                PeerFailureReason::DataUnavailable => NodeStatisticsUpdate::DataUnavailable,
-                PeerFailureReason::CorruptedData => NodeStatisticsUpdate::CorruptedData,
-                PeerFailureReason::ProtocolError => NodeStatisticsUpdate::ProtocolViolation,
-                PeerFailureReason::Refused => NodeStatisticsUpdate::FailedResponse,
-            };
-
-            engine.update_node_stats(peer_id, update).await;
-            Ok(())
-        } else {
-            // Trust engine not initialized - this is not an error, just a no-op
-            Ok(())
-        }
-    }
-
-    /// Get the current trust score for a peer
-    ///
-    /// Returns a value between 0.0 (untrusted) and 1.0 (fully trusted).
-    /// Unknown peers return 0.0 by default.
-    ///
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_id` - The peer ID to query
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let trust = node.peer_trust(&peer_id);
-    /// if trust < 0.3 {
-    ///     tracing::warn!("Low trust peer: {}", peer_id);
-    /// }
-    /// ```
+    /// Returns 0.5 (neutral) for unknown peers.
     pub fn peer_trust(&self, peer_id: &PeerId) -> f64 {
-        if let Some(ref engine) = self.trust_engine {
-            engine.get_trust(peer_id)
-        } else {
-            // Trust engine not initialized - return neutral trust
-            DEFAULT_NEUTRAL_TRUST
-        }
+        self.adaptive_dht.peer_trust(peer_id)
+    }
+
+    /// Get the AdaptiveDHT component for direct access
+    pub fn adaptive_dht(&self) -> &AdaptiveDHT {
+        &self.adaptive_dht
     }
 
     // =========================================================================
@@ -1196,7 +885,7 @@ impl P2PNode {
     /// # Arguments
     ///
     /// * `peer_id` - Target peer
-    /// * `protocol` - Application protocol name (e.g. `"chunk_fetch"`)
+    /// * `protocol` - Application protocol name (e.g. `"peer_info"`)
     /// * `data` - Request payload bytes
     /// * `timeout` - Maximum time to wait for a response
     ///
@@ -1207,7 +896,7 @@ impl P2PNode {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let response = node.send_request(&peer_id, "chunk_fetch", chunk_id.to_vec(), Duration::from_secs(10)).await?;
+    /// let response = node.send_request(&peer_id, "peer_info", request_data, Duration::from_secs(10)).await?;
     /// println!("Got {} bytes from {}", response.data.len(), response.peer_id);
     /// ```
     pub async fn send_request(
@@ -1217,23 +906,30 @@ impl P2PNode {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<PeerResponse> {
+        // Fail fast for blocked peers
+        if self.adaptive_dht.peer_trust(peer_id) < self.adaptive_dht.config().block_threshold {
+            return Err(P2PError::Network(crate::error::NetworkError::PeerBlocked(
+                *peer_id,
+            )));
+        }
+
         match self
             .transport
             .send_request(peer_id, protocol, data, timeout)
             .await
         {
             Ok(resp) => {
-                let _ = self.report_peer_success(peer_id).await;
+                self.report_trust_event(peer_id, TrustEvent::SuccessfulResponse)
+                    .await;
                 Ok(resp)
             }
             Err(e) => {
-                // Choose the right failure reason based on the error type
-                let reason = if matches!(&e, P2PError::Timeout(_)) {
-                    PeerFailureReason::Timeout
+                let event = if matches!(&e, P2PError::Timeout(_)) {
+                    TrustEvent::ConnectionTimeout
                 } else {
-                    PeerFailureReason::ConnectionFailed
+                    TrustEvent::ConnectionFailed
                 };
-                let _ = self.report_peer_failure_with_reason(peer_id, reason).await;
+                self.report_trust_event(peer_id, event).await;
                 Err(e)
             }
         }
@@ -1272,21 +968,11 @@ impl P2PNode {
     pub async fn start(&self) -> Result<()> {
         info!("Starting P2P node...");
 
-        // Start production resource manager if configured
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager
-                .start()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to start resource manager: {e}")))?;
-            info!("Production resource manager started");
-        }
-
         // Start bootstrap manager background tasks
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let mut manager = bootstrap_manager.write().await;
             manager
-                .start_background_tasks()
-                .await
+                .start_maintenance()
                 .map_err(|e| protocol_error(format!("Failed to start bootstrap manager: {e}")))?;
             info!("Bootstrap cache manager started");
         }
@@ -1294,8 +980,8 @@ impl P2PNode {
         // Start transport listeners and message receiving
         self.transport.start_network_listeners().await?;
 
-        // Start the attached DHT manager.
-        Arc::clone(&self.dht_manager).start().await?;
+        // Start the adaptive DHT layer (DHT manager + trust engine)
+        self.adaptive_dht.start().await?;
 
         // Log current listen addresses
         let listen_addrs = self.transport.listen_addrs().await;
@@ -1340,20 +1026,11 @@ impl P2PNode {
         // Signal the run loop to exit
         self.shutdown.cancel();
 
-        // Stop DHT manager first so leave messages can be sent while transport is still active.
-        self.dht_manager.stop().await?;
+        // Stop DHT layer first so leave messages can be sent while transport is still active.
+        self.adaptive_dht.stop().await?;
 
         // Stop the transport layer (shutdown endpoints, join tasks, disconnect peers)
         self.transport.stop().await?;
-
-        // Shutdown production resource manager if configured
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager
-                .shutdown()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to shutdown resource manager: {e}")))?;
-            info!("Production resource manager stopped");
-        }
 
         self.is_started
             .store(false, std::sync::atomic::Ordering::Release);
@@ -1373,7 +1050,7 @@ impl P2PNode {
     }
 
     /// Get the current listen addresses
-    pub async fn listen_addrs(&self) -> Vec<std::net::SocketAddr> {
+    pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.transport.listen_addrs().await
     }
 
@@ -1392,15 +1069,15 @@ impl P2PNode {
         self.transport.peer_info(peer_id).await
     }
 
-    /// Get the channel ID for a given socket address, if connected (internal only).
+    /// Get the channel ID for a given address, if connected (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &MultiAddr) -> Option<String> {
         self.transport.get_channel_id_by_address(addr).await
     }
 
     /// List all active transport-level connections (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<MultiAddr>)> {
         self.transport.list_active_connections().await
     }
 
@@ -1429,7 +1106,7 @@ impl P2PNode {
     /// the authenticated peer identity, call
     /// [`wait_for_peer_identity`](Self::wait_for_peer_identity) with the
     /// returned channel ID.
-    pub async fn connect_peer(&self, address: &str) -> Result<String> {
+    pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
         self.transport.connect_peer(address).await
     }
 
@@ -1650,48 +1327,24 @@ impl P2PNode {
 
     // /// Get MCP server statistics
 
-    /// Get production resource metrics
-    pub async fn resource_metrics(&self) -> Result<ResourceMetrics> {
-        if let Some(ref resource_manager) = self.resource_manager {
-            Ok(resource_manager.get_metrics().await)
-        } else {
-            Err(protocol_error("Production resource manager not enabled"))
-        }
-    }
-
     // Background tasks (connection_lifecycle_monitor, keepalive, periodic_maintenance)
     // are now implemented in TransportHandle.
 
     /// Check system health
     pub async fn health_check(&self) -> Result<()> {
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.health_check().await
+        let peer_count = self.peer_count().await;
+        if peer_count > self.config.max_connections {
+            Err(protocol_error(format!(
+                "Too many connections: {peer_count}"
+            )))
         } else {
-            // Basic health check without resource manager
-            let peer_count = self.peer_count().await;
-            if peer_count > self.config.max_connections {
-                Err(protocol_error(format!(
-                    "Too many connections: {peer_count}"
-                )))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
-    }
-
-    /// Get production configuration (if enabled)
-    pub fn production_config(&self) -> Option<&ProductionConfig> {
-        self.config.production_config.as_ref()
-    }
-
-    /// Check if production hardening is enabled
-    pub fn is_production_mode(&self) -> bool {
-        self.resource_manager.is_some()
     }
 
     /// Get the attached DHT manager.
     pub fn dht_manager(&self) -> &Arc<DhtNetworkManager> {
-        &self.dht_manager
+        self.adaptive_dht.dht_manager()
     }
 
     /// Backwards-compatible alias for `dht_manager()`.
@@ -1699,34 +1352,26 @@ impl P2PNode {
         self.dht_manager()
     }
 
-    /// Store a value in the local DHT
-    ///
-    /// This method stores data in the local DHT core through the attached manager.
-    /// For network-wide replication across multiple nodes, use `DhtNetworkManager::put`.
-    pub async fn dht_put(&self, key: crate::dht::Key, value: Vec<u8>) -> Result<()> {
-        self.dht_manager.store_local(key, value).await
-    }
-
-    /// Retrieve a value from the local DHT
-    ///
-    /// This method retrieves data from the local DHT core through the attached manager.
-    /// For network-wide lookups across multiple nodes, use `DhtNetworkManager::get`.
-    pub async fn dht_get(&self, key: crate::dht::Key) -> Result<Option<Vec<u8>>> {
-        self.dht_manager.get_local(&key).await
-    }
-
     /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
+    pub async fn add_discovered_peer(
+        &self,
+        _peer_id: PeerId,
+        addresses: Vec<MultiAddr>,
+    ) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.write().await;
+            let manager = bootstrap_manager.read().await;
             let socket_addresses: Vec<std::net::SocketAddr> = addresses
                 .iter()
-                .filter_map(|addr| addr.parse().ok())
+                .filter_map(|addr| addr.socket_addr())
                 .collect();
-            let contact = ContactEntry::new(peer_id, socket_addresses);
-            manager.add_contact(contact).await.map_err(|e| {
-                protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
-            })?;
+            if let Some(&primary) = socket_addresses.first() {
+                manager
+                    .add_peer(&primary, socket_addresses)
+                    .await
+                    .map_err(|e| {
+                        protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -1734,49 +1379,32 @@ impl P2PNode {
     /// Update connection metrics for a peer in the bootstrap cache
     pub async fn update_peer_metrics(
         &self,
-        addr: &std::net::SocketAddr,
+        addr: &MultiAddr,
         success: bool,
         latency_ms: Option<u64>,
         _error: Option<String>,
     ) -> Result<()> {
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.write().await;
-
-            // Create quality metrics based on the connection result
-            let metrics = QualityMetrics {
-                success_rate: if success { 1.0 } else { 0.0 },
-                avg_latency_ms: latency_ms.unwrap_or(0) as f64,
-                quality_score: if success {
-                    BOOTSTRAP_QUALITY_SCORE_SUCCESS
-                } else {
-                    BOOTSTRAP_QUALITY_SCORE_FAILURE
-                },
-                last_connection_attempt: chrono::Utc::now(),
-                last_successful_connection: if success {
-                    chrono::Utc::now()
-                } else {
-                    chrono::Utc::now() - chrono::Duration::hours(BOOTSTRAP_FAILURE_PENALTY_HOURS)
-                },
-                uptime_score: BOOTSTRAP_DEFAULT_UPTIME_SCORE,
-            };
-
-            manager
-                .update_contact_metrics(addr, metrics)
-                .await
-                .map_err(|e| protocol_error(format!("Failed to update peer metrics: {e}")))?;
+        if let Some(ref bootstrap_manager) = self.bootstrap_manager
+            && let Some(sa) = addr.socket_addr()
+        {
+            let manager = bootstrap_manager.read().await;
+            if success {
+                let rtt_ms = latency_ms.unwrap_or(0) as u32;
+                manager.record_success(&sa, rtt_ms).await;
+            } else {
+                manager.record_failure(&sa).await;
+            }
         }
         Ok(())
     }
 
     /// Get bootstrap cache statistics
-    pub async fn get_bootstrap_cache_stats(&self) -> Result<Option<crate::bootstrap::CacheStats>> {
+    pub async fn get_bootstrap_cache_stats(
+        &self,
+    ) -> Result<Option<crate::bootstrap::BootstrapStats>> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
-            let stats = manager
-                .get_stats()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to get bootstrap stats: {e}")))?;
-            Ok(Some(stats))
+            Ok(Some(manager.stats().await))
         } else {
             Ok(None)
         }
@@ -1787,80 +1415,71 @@ impl P2PNode {
         if let Some(ref _bootstrap_manager) = self.bootstrap_manager
             && let Ok(Some(stats)) = self.get_bootstrap_cache_stats().await
         {
-            return stats.total_contacts;
+            return stats.total_peers;
         }
         0
     }
 
     /// Connect to bootstrap peers and perform initial peer discovery
     async fn connect_bootstrap_peers(&self) -> Result<()> {
-        let mut bootstrap_contacts = Vec::new();
+        // Each entry is a list of addresses for a single peer.
+        let mut bootstrap_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
-        // Configured bootstrap peers take priority — always include them first.
+        // Configured bootstrap peers take priority -- always include them first.
         if !self.config.bootstrap_peers.is_empty() {
             info!(
                 "Using {} configured bootstrap peers (priority)",
                 self.config.bootstrap_peers.len()
             );
             for multiaddr in &self.config.bootstrap_peers {
-                let socket_addr = multiaddr.socket_addr;
+                let Some(socket_addr) = multiaddr.dialable_socket_addr() else {
+                    warn!("Skipping non-QUIC bootstrap peer: {}", multiaddr);
+                    continue;
+                };
                 seen_addresses.insert(socket_addr);
-                // Use a zero sentinel PeerId — the real identity comes
-                // from wait_for_peer_identity() after connecting.
-                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![socket_addr]);
-                bootstrap_contacts.push(contact);
+                bootstrap_addr_sets.push(vec![multiaddr.clone()]);
             }
         }
 
         // Supplement with cached bootstrap peers (after CLI peers)
-        // Use QUIC-specific peer selection since we're using saorsa-transport transport
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
-            match manager
-                .get_quic_bootstrap_peers(BOOTSTRAP_PEER_BATCH_SIZE)
-                .await
-            {
-                // Try to get top 20 quality QUIC-enabled peers
-                Ok(contacts) => {
-                    if !contacts.is_empty() {
-                        let mut added_from_cache = 0;
-                        for contact in contacts {
-                            // Only add if we haven't already added this address from CLI
-                            let new_addresses: Vec<_> = contact
-                                .addresses
-                                .iter()
-                                .filter(|addr| !seen_addresses.contains(addr))
-                                .copied()
-                                .collect();
+            let cached_peers = manager.select_peers(BOOTSTRAP_PEER_BATCH_SIZE).await;
+            if !cached_peers.is_empty() {
+                let mut added_from_cache = 0;
+                for cached in cached_peers {
+                    let mut addrs = vec![cached.primary_address];
+                    addrs.extend(cached.addresses);
+                    // Only add addresses we haven't seen from CLI peers
+                    let new_addresses: Vec<MultiAddr> = addrs
+                        .into_iter()
+                        .filter(|a| !seen_addresses.contains(a))
+                        .map(MultiAddr::quic)
+                        .collect();
 
-                            if !new_addresses.is_empty() {
-                                for addr in &new_addresses {
-                                    seen_addresses.insert(*addr);
-                                }
-                                let mut contact = contact.clone();
-                                contact.addresses = new_addresses;
-                                bootstrap_contacts.push(contact);
-                                added_from_cache += 1;
+                    if !new_addresses.is_empty() {
+                        for addr in &new_addresses {
+                            if let Some(sa) = addr.socket_addr() {
+                                seen_addresses.insert(sa);
                             }
                         }
-                        if added_from_cache > 0 {
-                            info!(
-                                "Added {} cached bootstrap peers (supplementing CLI peers)",
-                                added_from_cache
-                            );
-                            used_cache = true;
-                        }
+                        bootstrap_addr_sets.push(new_addresses);
+                        added_from_cache += 1;
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to get cached bootstrap peers: {}", e);
+                if added_from_cache > 0 {
+                    info!(
+                        "Added {} cached bootstrap peers (supplementing CLI peers)",
+                        added_from_cache
+                    );
+                    used_cache = true;
                 }
             }
         }
 
-        if bootstrap_contacts.is_empty() {
+        if bootstrap_addr_sets.is_empty() {
             info!("No bootstrap peers configured and no cached peers available");
             return Ok(());
         }
@@ -1871,9 +1490,9 @@ impl P2PNode {
         let mut successful_connections = 0;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
-        for contact in bootstrap_contacts.iter() {
-            for addr in &contact.addresses {
-                match self.connect_peer(&addr.to_string()).await {
+        for addrs in &bootstrap_addr_sets {
+            for addr in addrs {
+                match self.connect_peer(addr).await {
                     Ok(channel_id) => {
                         // Wait for the remote peer's signed identity announce
                         // so we get a real cryptographic PeerId.
@@ -1888,16 +1507,12 @@ impl P2PNode {
 
                                 // Update bootstrap cache with successful connection
                                 if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                                    let manager = bootstrap_manager.write().await;
-                                    let mut updated_contact = contact.clone();
-                                    updated_contact.peer_id = real_peer_id;
-                                    updated_contact.update_connection_result(true, Some(100), None);
-
-                                    if let Err(e) = manager.add_contact(updated_contact).await {
-                                        warn!("Failed to update bootstrap cache: {}", e);
+                                    let manager = bootstrap_manager.read().await;
+                                    if let Some(sa) = addr.socket_addr() {
+                                        manager.record_success(&sa, 100).await;
                                     }
                                 }
-                                break; // Successfully connected, move to next contact
+                                break; // Successfully connected, move to next peer
                             }
                             Err(e) => {
                                 warn!(
@@ -1914,16 +1529,9 @@ impl P2PNode {
 
                         // Update bootstrap cache with failed connection
                         if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.write().await;
-                            let mut updated_contact = contact.clone();
-                            updated_contact.update_connection_result(
-                                false,
-                                None,
-                                Some(e.to_string()),
-                            );
-
-                            if let Err(e) = manager.add_contact(updated_contact).await {
-                                warn!("Failed to update bootstrap cache: {}", e);
+                            let manager = bootstrap_manager.read().await;
+                            if let Some(sa) = addr.socket_addr() {
+                                manager.record_failure(&sa).await;
                             }
                         }
                     }
@@ -1947,7 +1555,7 @@ impl P2PNode {
 
         // Perform DHT peer discovery from connected bootstrap peers.
         match self
-            .dht_manager
+            .dht_manager()
             .bootstrap_from_peers(&connected_peer_ids)
             .await
         {
@@ -1972,6 +1580,7 @@ impl P2PNode {
 
 /// Network sender trait for sending messages
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait NetworkSender: Send + Sync {
     /// Send a message to an authenticated peer.
     async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()>;
@@ -1981,129 +1590,7 @@ pub trait NetworkSender: Send + Sync {
 }
 
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
-
-/// Builder pattern for creating P2P nodes
-pub struct NodeBuilder {
-    config: NodeConfig,
-}
-
-impl Default for NodeBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NodeBuilder {
-    /// Create a new node builder
-    pub fn new() -> Self {
-        Self {
-            config: NodeConfig::default(),
-        }
-    }
-
-    /// Add a listen address
-    pub fn listen_on(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse() {
-            self.config.listen_addrs.push(multiaddr);
-        }
-        self
-    }
-
-    /// Add a bootstrap peer
-    pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
-        if let Ok(multiaddr) = addr.parse::<crate::MultiAddr>() {
-            self.config.bootstrap_peers.push(multiaddr);
-        }
-        self
-    }
-
-    /// Enable IPv6 support
-    pub fn with_ipv6(mut self, enable: bool) -> Self {
-        self.config.enable_ipv6 = enable;
-        self
-    }
-
-    /// Set the operating mode (Node or Client).
-    ///
-    /// This determines the default user agent and DHT participation.
-    pub fn with_mode(mut self, mode: NodeMode) -> Self {
-        self.config.mode = mode;
-        self
-    }
-
-    /// Set a custom user agent string, overriding the mode-derived default.
-    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
-        self.config.custom_user_agent = Some(user_agent.into());
-        self
-    }
-
-    /// Set connection timeout
-    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
-        self.config.connection_timeout = timeout;
-        self
-    }
-
-    /// Set maximum connections
-    pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.config.max_connections = max;
-        self
-    }
-
-    /// Set maximum application-layer message size in bytes.
-    ///
-    /// If this method is not called, saorsa-transport's built-in default is used.
-    pub fn with_max_message_size(mut self, max_message_size: usize) -> Self {
-        self.config.max_message_size = Some(max_message_size);
-        self
-    }
-
-    /// Enable production mode with default configuration
-    pub fn with_production_mode(mut self) -> Self {
-        self.config.production_config = Some(ProductionConfig::default());
-        self
-    }
-
-    /// Configure production settings
-    pub fn with_production_config(mut self, production_config: ProductionConfig) -> Self {
-        self.config.production_config = Some(production_config);
-        self
-    }
-
-    /// Allow loopback addresses in the transport layer.
-    ///
-    /// Enable for devnet/testnet modes where multiple nodes run on the same
-    /// machine. Default: `false`.
-    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
-        self.config.allow_loopback = allow;
-        self
-    }
-
-    /// Configure IP diversity limits for Sybil protection.
-    pub fn with_diversity_config(
-        mut self,
-        diversity_config: crate::security::IPDiversityConfig,
-    ) -> Self {
-        self.config.diversity_config = Some(diversity_config);
-        self
-    }
-
-    /// Configure DHT settings
-    pub fn with_dht(mut self, dht_config: DHTConfig) -> Self {
-        self.config.dht_config = dht_config;
-        self
-    }
-
-    /// Enable DHT with default configuration
-    pub fn with_default_dht(mut self) -> Self {
-        self.config.dht_config = DHTConfig::default();
-        self
-    }
-
-    /// Build the P2P node
-    pub async fn build(self) -> Result<P2PNode> {
-        P2PNode::new(self.config).await
-    }
-}
+// NodeBuilder removed — use NodeConfigBuilder + P2PNode::new() instead.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2114,16 +1601,12 @@ mod diversity_tests {
     async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
         // Use a temp dir to avoid conflicts with cached files from old format
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let mut cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        cache_config.cache_dir = temp_dir.path().to_path_buf();
+        let mut bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
+        bootstrap_config.cache_dir = temp_dir.path().to_path_buf();
 
-        BootstrapManager::with_full_config(
-            cache_config,
-            crate::rate_limit::JoinRateLimiterConfig::default(),
-            config,
-        )
-        .await
-        .expect("bootstrap manager")
+        BootstrapManager::with_node_config(bootstrap_config, config)
+            .await
+            .expect("bootstrap manager")
     }
 
     #[tokio::test]
@@ -2148,7 +1631,7 @@ pub(crate) async fn register_new_channel(
     let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
         channel_id: channel_id.to_owned(),
-        addresses: vec![remote_addr.to_string()],
+        addresses: vec![remote_addr.clone()],
         connected_at: tokio::time::Instant::now(),
         last_seen: tokio::time::Instant::now(),
         status: ConnectionStatus::Connected,
@@ -2175,24 +1658,13 @@ mod tests {
     /// Helper function to create a test node configuration
     fn create_test_node_config() -> NodeConfig {
         NodeConfig {
-            listen_addrs: vec![
-                std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            ],
-            listen_addr: std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                0,
-            ),
+            local: true,
+            port: 0,
+            ipv6: true,
             bootstrap_peers: vec![],
-            enable_ipv6: true,
-
             connection_timeout: Duration::from_secs(2),
-            keep_alive_interval: Duration::from_secs(30),
             max_connections: 100,
-            max_incoming_connections: 50,
             dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
-            production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
@@ -2200,6 +1672,7 @@ mod tests {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: true,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         }
     }
 
@@ -2210,10 +1683,8 @@ mod tests {
     async fn test_node_config_default() {
         let config = NodeConfig::default();
 
-        assert_eq!(config.listen_addrs.len(), 2);
-        assert!(config.enable_ipv6);
-        assert_eq!(config.max_connections, 10000); // Fixed: matches actual default
-        assert_eq!(config.max_incoming_connections, 100);
+        assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
+        assert_eq!(config.max_connections, 10000);
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
     }
 
@@ -2223,31 +1694,7 @@ mod tests {
 
         assert_eq!(config.k_value, 20);
         assert_eq!(config.alpha_value, 5);
-        assert_eq!(config.record_ttl, Duration::from_secs(3600));
         assert_eq!(config.refresh_interval, Duration::from_secs(600));
-    }
-
-    #[tokio::test]
-    async fn test_security_config_default() {
-        let config = SecurityConfig::default();
-
-        assert!(config.enable_noise);
-        assert!(config.enable_tls);
-        assert_eq!(config.trust_level, TrustLevel::Basic);
-    }
-
-    #[test]
-    fn test_trust_level_variants() {
-        // Test that all trust level variants can be created
-        let _none = TrustLevel::None;
-        let _basic = TrustLevel::Basic;
-        let _full = TrustLevel::Full;
-
-        // Test equality
-        assert_eq!(TrustLevel::None, TrustLevel::None);
-        assert_eq!(TrustLevel::Basic, TrustLevel::Basic);
-        assert_eq!(TrustLevel::Full, TrustLevel::Full);
-        assert_ne!(TrustLevel::None, TrustLevel::Basic);
     }
 
     #[test]
@@ -2326,7 +1773,7 @@ mod tests {
             .listen_addrs()
             .await
             .into_iter()
-            .find(|a| a.ip().is_ipv4())
+            .find(|a| a.is_ipv4())
             .ok_or_else(|| {
                 P2PError::Network(crate::error::NetworkError::InvalidAddress(
                     "Node 2 did not expose an IPv4 listen address".into(),
@@ -2335,7 +1782,7 @@ mod tests {
 
         // Connect to a real peer (unsigned — no node_identity configured).
         // connect_peer returns a transport-level channel ID (String), not a PeerId.
-        let channel_id = node1.connect_peer(&node2_addr.to_string()).await?;
+        let channel_id = node1.connect_peer(&node2_addr).await?;
 
         // Unauthenticated connections don't appear in the app-level peer maps.
         // Verify transport-level tracking via is_connection_active / peers map.
@@ -2359,6 +1806,28 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_connect_peer_rejects_tcp_multiaddr() -> Result<()> {
+        let config = create_test_node_config();
+        let node = P2PNode::new(config).await?;
+
+        let tcp_addr: MultiAddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        let result = node.connect_peer(&tcp_addr).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(P2PError::Network(
+                    crate::error::NetworkError::InvalidAddress(_)
+                ))
+            ),
+            "TCP multiaddrs should be rejected before a QUIC dial is attempted, got: {:?}",
+            result
+        );
+
+        Ok(())
+    }
+
     // TODO(windows): Investigate QUIC connection issues on Windows CI
     // This test consistently fails on Windows GitHub Actions runners with
     // "All connect attempts failed" even with IPv4-only config, long delays,
@@ -2371,25 +1840,18 @@ mod tests {
         // PeerConnected/PeerDisconnected only fire for authenticated peers
         // (nodes with node_identity that send signed messages).
         // Configure both nodes with identities so the event subscription test works.
-        let ipv4_localhost =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-
         let identity1 =
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node1"));
         let identity2 =
             Arc::new(NodeIdentity::generate().expect("should generate identity for test node2"));
 
         let mut config1 = create_test_node_config();
-        config1.listen_addr = ipv4_localhost;
-        config1.listen_addrs = vec![ipv4_localhost];
-        config1.enable_ipv6 = false;
+        config1.ipv6 = false;
         config1.node_identity = Some(identity1);
 
         let node2_peer_id = *identity2.peer_id();
         let mut config2 = create_test_node_config();
-        config2.listen_addr = ipv4_localhost;
-        config2.listen_addrs = vec![ipv4_localhost];
-        config2.enable_ipv6 = false;
+        config2.ipv6 = false;
         config2.node_identity = Some(identity2);
 
         let node1 = P2PNode::new(config1).await?;
@@ -2466,16 +1928,14 @@ mod tests {
     #[cfg_attr(target_os = "windows", ignore)]
     #[tokio::test]
     async fn test_message_sending() -> Result<()> {
-        // Create two nodes
+        // Create two nodes (IPv4-only loopback)
         let mut config1 = create_test_node_config();
-        config1.listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        config1.ipv6 = false;
         let node1 = P2PNode::new(config1).await?;
         node1.start().await?;
 
         let mut config2 = create_test_node_config();
-        config2.listen_addr =
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        config2.ipv6 = false;
         let node2 = P2PNode::new(config2).await?;
         node2.start().await?;
 
@@ -2609,25 +2069,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_node_builder() -> Result<()> {
-        // Create a config using the builder but don't actually build a real node
-        let builder = P2PNode::builder()
-            .listen_on("/ip4/127.0.0.1/tcp/0")
-            .listen_on("/ip6/::1/tcp/0")
-            .with_bootstrap_peer("127.0.0.1:9000")
-            .with_ipv6(true)
-            .with_connection_timeout(Duration::from_secs(15))
-            .with_max_connections(200)
-            .with_max_message_size(TEST_MAX_MESSAGE_SIZE);
+    async fn test_node_config_builder() -> Result<()> {
+        let bootstrap: MultiAddr = "/ip4/127.0.0.1/udp/9000/quic".parse().unwrap();
 
-        // Test the configuration that was built
-        let config = builder.config;
-        assert_eq!(config.listen_addrs.len(), 2); // 2 added by builder (no defaults)
+        let config = NodeConfig::builder()
+            .local(true)
+            .ipv6(true)
+            .bootstrap_peer(bootstrap)
+            .connection_timeout(Duration::from_secs(15))
+            .max_connections(200)
+            .max_message_size(TEST_MAX_MESSAGE_SIZE)
+            .build()?;
+
+        assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
+        assert!(config.local);
+        assert!(config.ipv6);
         assert_eq!(config.bootstrap_peers.len(), 1);
-        assert!(config.enable_ipv6);
         assert_eq!(config.connection_timeout, Duration::from_secs(15));
         assert_eq!(config.max_connections, 200);
         assert_eq!(config.max_message_size, Some(TEST_MAX_MESSAGE_SIZE));
+        assert!(config.allow_loopback); // auto-enabled by local(true)
 
         Ok(())
     }
@@ -2655,65 +2116,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_production_mode_disabled() -> Result<()> {
-        let config = create_test_node_config();
-        let node = P2PNode::new(config).await?;
-
-        assert!(!node.is_production_mode());
-        assert!(node.production_config().is_none());
-
-        // Resource metrics should fail when production mode is disabled
-        let result = node.resource_metrics().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not enabled"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_network_event_variants() {
-        // Test that all network event variants can be created
-        let peer_id = PeerId::from_name("test_peer");
-        let address = "/ip4/127.0.0.1/tcp/9000".to_string();
-
-        let _peer_connected = NetworkEvent::PeerConnected {
-            peer_id,
-            addresses: vec![address.clone()],
-        };
-
-        let _peer_disconnected = NetworkEvent::PeerDisconnected {
-            peer_id,
-            reason: "test disconnect".to_string(),
-        };
-
-        let _message_received = NetworkEvent::MessageReceived {
-            peer_id,
-            protocol: "test-protocol".to_string(),
-            data: vec![1, 2, 3],
-        };
-
-        let _connection_failed = NetworkEvent::ConnectionFailed {
-            peer_id: Some(peer_id),
-            address: address.clone(),
-            error: "connection refused".to_string(),
-        };
-
-        let _dht_stored = NetworkEvent::DHTRecordStored {
-            key: vec![1, 2, 3],
-            value: vec![4, 5, 6],
-        };
-
-        let _dht_retrieved = NetworkEvent::DHTRecordRetrieved {
-            key: vec![1, 2, 3],
-            value: Some(vec![4, 5, 6]),
-        };
-    }
-
-    #[tokio::test]
     async fn test_peer_info_structure() {
         let peer_info = PeerInfo {
             channel_id: "test_peer".to_string(),
-            addresses: vec!["/ip4/127.0.0.1/tcp/9000".to_string()],
+            addresses: vec!["/ip4/127.0.0.1/tcp/9000".parse::<MultiAddr>().unwrap()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2734,8 +2140,10 @@ mod tests {
         let serialized = serde_json::to_string(&config)?;
         let deserialized: NodeConfig = serde_json::from_str(&serialized)?;
 
-        assert_eq!(config.listen_addrs, deserialized.listen_addrs);
-        assert_eq!(config.enable_ipv6, deserialized.enable_ipv6);
+        assert_eq!(config.local, deserialized.local);
+        assert_eq!(config.port, deserialized.port);
+        assert_eq!(config.ipv6, deserialized.ipv6);
+        assert_eq!(config.bootstrap_peers, deserialized.bootstrap_peers);
 
         Ok(())
     }
@@ -2747,11 +2155,12 @@ mod tests {
 
         // Manually insert a peer for testing
         let test_channel_id = "peer_test_123".to_string();
-        let test_address = "192.168.1.100:9000".to_string();
+        let test_address = "192.168.1.100:9000";
+        let test_multiaddr = MultiAddr::quic(test_address.parse().unwrap());
 
         let peer_info = PeerInfo {
             channel_id: test_channel_id.clone(),
-            addresses: vec![test_address.clone()],
+            addresses: vec![test_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2764,7 +2173,8 @@ mod tests {
             .await;
 
         // Test: Find channel by address
-        let found_channel_id = node.get_channel_id_by_address(&test_address).await;
+        let lookup_addr = MultiAddr::quic(test_address.parse().unwrap());
+        let found_channel_id = node.get_channel_id_by_address(&lookup_addr).await;
         assert_eq!(found_channel_id, Some(test_channel_id));
 
         Ok(())
@@ -2776,7 +2186,8 @@ mod tests {
         let node = P2PNode::new(config).await?;
 
         // Test: Try to find a channel that doesn't exist
-        let result = node.get_channel_id_by_address("192.168.1.200:9000").await;
+        let unknown_addr = MultiAddr::quic("192.168.1.200:9000".parse().unwrap());
+        let result = node.get_channel_id_by_address(&unknown_addr).await;
         assert_eq!(result, None);
 
         Ok(())
@@ -2787,8 +2198,12 @@ mod tests {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        // Test: Invalid address format should return None
-        let result = node.get_channel_id_by_address("invalid-address").await;
+        // Test: Non-IP address should return None (no matching socket addr)
+        let ble_addr = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let result = node.get_channel_id_by_address(&ble_addr).await;
         assert_eq!(result, None);
 
         Ok(())
@@ -2801,14 +2216,16 @@ mod tests {
 
         // Add multiple peers with different addresses
         let peer1_id = "peer_1".to_string();
-        let peer1_addr = "192.168.1.101:9001".to_string();
+        let peer1_addr_str = "192.168.1.101:9001";
+        let peer1_multiaddr = MultiAddr::quic(peer1_addr_str.parse().unwrap());
 
         let peer2_id = "peer_2".to_string();
-        let peer2_addr = "192.168.1.102:9002".to_string();
+        let peer2_addr_str = "192.168.1.102:9002";
+        let peer2_multiaddr = MultiAddr::quic(peer2_addr_str.parse().unwrap());
 
         let peer1_info = PeerInfo {
             channel_id: peer1_id.clone(),
-            addresses: vec![peer1_addr.clone()],
+            addresses: vec![peer1_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2818,7 +2235,7 @@ mod tests {
 
         let peer2_info = PeerInfo {
             channel_id: peer2_id.clone(),
-            addresses: vec![peer2_addr.clone()],
+            addresses: vec![peer2_multiaddr],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2834,8 +2251,12 @@ mod tests {
             .await;
 
         // Test: Find each channel by their unique address
-        let found_peer1 = node.get_channel_id_by_address(&peer1_addr).await;
-        let found_peer2 = node.get_channel_id_by_address(&peer2_addr).await;
+        let found_peer1 = node
+            .get_channel_id_by_address(&MultiAddr::quic(peer1_addr_str.parse().unwrap()))
+            .await;
+        let found_peer2 = node
+            .get_channel_id_by_address(&MultiAddr::quic(peer2_addr_str.parse().unwrap()))
+            .await;
 
         assert_eq!(found_peer1, Some(peer1_id));
         assert_eq!(found_peer2, Some(peer2_id));
@@ -2863,12 +2284,12 @@ mod tests {
         // Add multiple peers
         let peer1_id = "peer_1".to_string();
         let peer1_addrs = vec![
-            "192.168.1.101:9001".to_string(),
-            "192.168.1.101:9002".to_string(),
+            MultiAddr::quic("192.168.1.101:9001".parse().unwrap()),
+            MultiAddr::quic("192.168.1.101:9002".parse().unwrap()),
         ];
 
         let peer2_id = "peer_2".to_string();
-        let peer2_addrs = vec!["192.168.1.102:9003".to_string()];
+        let peer2_addrs = vec![MultiAddr::quic("192.168.1.102:9003".parse().unwrap())];
 
         let peer1_info = PeerInfo {
             channel_id: peer1_id.clone(),
@@ -2933,7 +2354,7 @@ mod tests {
         let channel_peer_id = PeerId::from_name(&channel_id);
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
-            addresses: vec!["192.168.1.100:9000".to_string()],
+            addresses: vec![MultiAddr::quic("192.168.1.100:9000".parse().unwrap())],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -2987,7 +2408,7 @@ mod tests {
         // Add peer
         let peer_info = PeerInfo {
             channel_id: channel_id.clone(),
-            addresses: vec!["192.168.1.100:9000".to_string()],
+            addresses: vec![MultiAddr::quic("192.168.1.100:9000".parse().unwrap())],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,

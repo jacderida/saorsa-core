@@ -61,7 +61,7 @@ use crate::PeerId;
 use crate::error::{P2PError, P2pResult};
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +72,7 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 const MAX_PATH_LENGTH: usize = 4096;
 const MAX_KEY_SIZE: usize = 1024 * 1024; // 1MB for DHT keys
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10MB for DHT values
+#[allow(dead_code)]
 const MAX_FILE_NAME_LENGTH: usize = 255;
 
 // Rate limiting constants
@@ -126,6 +127,7 @@ impl From<ValidationError> for P2PError {
 
 /// Context for validation operations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidationContext {
     pub max_message_size: usize,
     pub max_key_size: usize,
@@ -150,6 +152,7 @@ impl Default for ValidationContext {
     }
 }
 
+#[allow(dead_code)]
 impl ValidationContext {
     /// Create a new validation context with custom settings
     pub fn new() -> Self {
@@ -176,52 +179,17 @@ impl ValidationContext {
 }
 
 /// Core validation trait
+#[allow(dead_code)]
 pub trait Validate {
     /// Validate the object with the given context
     fn validate(&self, ctx: &ValidationContext) -> P2pResult<()>;
 }
 
 /// Trait for sanitizing input
+#[allow(dead_code)]
 pub trait Sanitize {
     /// Sanitize the input, returning a cleaned version
     fn sanitize(&self) -> Self;
-}
-
-// ===== Network Address Validation =====
-
-/// Validate a network address
-pub fn validate_network_address(addr: &SocketAddr, ctx: &ValidationContext) -> P2pResult<()> {
-    let ip = addr.ip();
-
-    // Check for localhost
-    if ip.is_loopback() && !ctx.allow_localhost {
-        return Err(
-            ValidationError::InvalidAddress("Localhost addresses not allowed".to_string()).into(),
-        );
-    }
-
-    // Check for private IPs
-    if is_private_ip(&ip) && !ctx.allow_private_ips {
-        return Err(ValidationError::InvalidAddress(
-            "Private IP addresses not allowed".to_string(),
-        )
-        .into());
-    }
-
-    // Validate port
-    if addr.port() == 0 {
-        return Err(ValidationError::InvalidAddress("Port 0 is not allowed".to_string()).into());
-    }
-
-    Ok(())
-}
-
-/// Check if an IP is private
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => ipv4.is_private(),
-        IpAddr::V6(ipv6) => ipv6.is_unique_local() || ipv6.is_unicast_link_local(),
-    }
 }
 
 // ===== Peer ID Validation =====
@@ -230,6 +198,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 ///
 /// PeerId is a strongly-typed 32-byte identifier that is always valid by
 /// construction, so this is a no-op. Kept for API compatibility.
+#[allow(dead_code)]
 pub fn validate_peer_id(_peer_id: &PeerId) -> P2pResult<()> {
     Ok(())
 }
@@ -237,6 +206,7 @@ pub fn validate_peer_id(_peer_id: &PeerId) -> P2pResult<()> {
 // ===== Message Size Validation =====
 
 /// Validate message size
+#[allow(dead_code)]
 pub fn validate_message_size(size: usize, max_size: usize) -> P2pResult<()> {
     if size > max_size {
         return Err(ValidationError::MessageTooLarge {
@@ -251,6 +221,7 @@ pub fn validate_message_size(size: usize, max_size: usize) -> P2pResult<()> {
 // ===== File Path Validation =====
 
 /// Validate a file path for security
+#[allow(dead_code)]
 pub fn validate_file_path(path: &Path) -> P2pResult<()> {
     let path_str = path.to_string_lossy();
 
@@ -319,6 +290,7 @@ pub fn validate_file_path(path: &Path) -> P2pResult<()> {
 // ===== Cryptographic Parameter Validation =====
 
 /// Validate key size for cryptographic operations
+#[allow(dead_code)]
 pub fn validate_key_size(size: usize, expected: usize) -> P2pResult<()> {
     if size != expected {
         return Err(ValidationError::InvalidCryptoParam(format!(
@@ -331,6 +303,7 @@ pub fn validate_key_size(size: usize, expected: usize) -> P2pResult<()> {
 }
 
 /// Validate nonce size
+#[allow(dead_code)]
 pub fn validate_nonce_size(size: usize, expected: usize) -> P2pResult<()> {
     if size != expected {
         return Err(ValidationError::InvalidCryptoParam(format!(
@@ -345,6 +318,7 @@ pub fn validate_nonce_size(size: usize, expected: usize) -> P2pResult<()> {
 // ===== DHT Key/Value Validation =====
 
 /// Validate DHT key
+#[allow(dead_code)]
 pub fn validate_dht_key(key: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
     if key.is_empty() {
         return Err(ValidationError::InvalidFormat("DHT key cannot be empty".to_string()).into());
@@ -362,6 +336,7 @@ pub fn validate_dht_key(key: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
 }
 
 /// Validate DHT value
+#[allow(dead_code)]
 pub fn validate_dht_value(value: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
     if value.len() > ctx.max_value_size {
         return Err(ValidationError::InvalidValueSize {
@@ -388,6 +363,7 @@ pub struct RateLimiter {
 
 /// Rate limit configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RateLimitConfig {
     /// Time window for rate limiting
     pub window: Duration,
@@ -451,6 +427,7 @@ impl RateLimiter {
     }
 
     /// Clean up expired entries
+    #[allow(dead_code)]
     pub fn cleanup(&self) {
         // Not required with the unified engine (buckets age out via window). No-op.
     }
@@ -460,6 +437,7 @@ impl RateLimiter {
 
 /// Network message validation
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct NetworkMessage {
     pub peer_id: PeerId,
     pub payload: Vec<u8>,
@@ -493,6 +471,7 @@ impl Validate for NetworkMessage {
 
 /// API request validation
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
@@ -562,39 +541,8 @@ impl Validate for ApiRequest {
     }
 }
 
-/// Configuration value validation
-pub fn validate_config_value<T>(value: &str, min: Option<T>, max: Option<T>) -> P2pResult<T>
-where
-    T: std::str::FromStr + PartialOrd + std::fmt::Display,
-{
-    let parsed = value
-        .parse::<T>()
-        .map_err(|_| ValidationError::InvalidFormat(format!("Failed to parse value: {}", value)))?;
-
-    if let Some(min_val) = min
-        && parsed < min_val
-    {
-        return Err(ValidationError::InvalidFormat(format!(
-            "Value {} is less than minimum {}",
-            parsed, min_val
-        ))
-        .into());
-    }
-
-    if let Some(max_val) = max
-        && parsed > max_val
-    {
-        return Err(ValidationError::InvalidFormat(format!(
-            "Value {} is greater than maximum {}",
-            parsed, max_val
-        ))
-        .into());
-    }
-
-    Ok(parsed)
-}
-
 /// Sanitize a string for safe usage
+#[allow(dead_code)]
 pub fn sanitize_string(input: &str, max_length: usize) -> String {
     // First remove any HTML tags and dangerous patterns
     let mut cleaned = input
@@ -631,23 +579,6 @@ mod tests {
         // PeerId is always valid by construction
         let peer = PeerId::random();
         assert!(validate_peer_id(&peer).is_ok());
-    }
-
-    #[test]
-    fn test_network_address_validation() {
-        let ctx = ValidationContext::default();
-
-        // Valid addresses
-        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(validate_network_address(&addr, &ctx).is_ok());
-
-        // Invalid addresses
-        let localhost: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(validate_network_address(&localhost, &ctx).is_err());
-
-        // Allow localhost when configured
-        let ctx_localhost = ValidationContext::default().allow_localhost();
-        assert!(validate_network_address(&localhost, &ctx_localhost).is_ok());
     }
 
     #[test]

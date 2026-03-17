@@ -28,7 +28,6 @@ use crate::network::{
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
-use crate::production::{ProductionConfig, ResourceManager};
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
@@ -55,16 +54,13 @@ const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
-    /// Primary listen address.
-    pub listen_addr: SocketAddr,
-    /// Whether IPv6 dual-stack is enabled.
-    pub enable_ipv6: bool,
+    /// Addresses to bind on. The transport partitions these into at most
+    /// one IPv4 and one IPv6 QUIC endpoint.
+    pub listen_addrs: Vec<MultiAddr>,
     /// Connection timeout for outbound dials and sends.
     pub connection_timeout: Duration,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Optional production hardening config.
-    pub production_config: Option<ProductionConfig>,
     /// Broadcast channel capacity for P2P events.
     pub event_channel_capacity: usize,
     /// Optional override for the maximum application-layer message size.
@@ -90,11 +86,9 @@ impl TransportConfig {
         node_identity: Arc<NodeIdentity>,
     ) -> Self {
         Self {
-            listen_addr: config.listen_addr,
-            enable_ipv6: config.enable_ipv6,
+            listen_addrs: config.listen_addrs(),
             connection_timeout: config.connection_timeout,
             max_connections: config.max_connections,
-            production_config: config.production_config.clone(),
             event_channel_capacity,
             max_message_size: config.max_message_size,
             node_identity,
@@ -115,14 +109,13 @@ pub struct TransportHandle {
     peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
     active_connections: Arc<RwLock<HashSet<String>>>,
     event_tx: broadcast::Sender<P2PEvent>,
-    listen_addrs: RwLock<Vec<SocketAddr>>,
+    listen_addrs: RwLock<Vec<MultiAddr>>,
     rate_limiter: Arc<RateLimiter>,
     active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
     // Held to keep the Arc alive for background tasks that captured a clone.
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
-    resource_manager: Option<Arc<ResourceManager>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
@@ -158,33 +151,19 @@ impl TransportHandle {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
 
         // Initialize dual-stack saorsa-transport nodes
-        let (v6_opt, v4_opt) = {
-            let port = config.listen_addr.port();
-            let ip = config.listen_addr.ip();
-
-            let v4_addr = if ip.is_ipv4() {
-                Some(SocketAddr::new(ip, port))
-            } else {
-                Some(SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    port,
-                ))
-            };
-
-            let v6_addr = if config.enable_ipv6 {
-                if ip.is_ipv6() {
-                    Some(SocketAddr::new(ip, port))
-                } else {
-                    Some(SocketAddr::new(
-                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                        port,
-                    ))
+        // Partition listen addresses into first IPv4 and first IPv6 for
+        // dual-stack binding. Non-IP addresses are skipped.
+        let mut v4_opt: Option<SocketAddr> = None;
+        let mut v6_opt: Option<SocketAddr> = None;
+        for addr in &config.listen_addrs {
+            if let Some(sa) = addr.dialable_socket_addr() {
+                match sa.ip() {
+                    std::net::IpAddr::V4(_) if v4_opt.is_none() => v4_opt = Some(sa),
+                    std::net::IpAddr::V6(_) if v6_opt.is_none() => v6_opt = Some(sa),
+                    _ => {} // already have one for this family
                 }
-            } else {
-                None
-            };
-            (v6_addr, v4_addr)
-        };
+            }
+        }
 
         let dual_node = Arc::new(
             DualStackNetworkNode::new_with_options(
@@ -206,11 +185,6 @@ impl TransportHandle {
         let active_connections = Arc::new(RwLock::new(HashSet::new()));
         let geo_provider = Arc::new(BgpGeoProvider::new());
         let peers = Arc::new(RwLock::new(HashMap::new()));
-
-        // Initialize production resource manager if configured
-        let resource_manager = config
-            .production_config
-            .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
 
         let shutdown = CancellationToken::new();
 
@@ -265,7 +239,6 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider,
             shutdown,
-            resource_manager,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -327,7 +300,6 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
-            resource_manager: None,
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -356,35 +328,22 @@ impl TransportHandle {
         &self.node_identity
     }
 
-    /// Get the channel ID (local listen address as a string).
-    ///
-    /// This is the transport-level connection identifier. It differs from
-    /// `peer_id()` which is the app-level cryptographic identity.
-    pub(crate) fn channel_id(&self) -> Option<String> {
-        self.local_addr()
-    }
-
     /// Get the first listen address as a string.
-    pub fn local_addr(&self) -> Option<String> {
+    pub fn local_addr(&self) -> Option<MultiAddr> {
         self.listen_addrs
             .try_read()
             .ok()
-            .and_then(|addrs| addrs.first().map(|a| a.to_string()))
+            .and_then(|addrs| addrs.first().cloned())
     }
 
     /// Get all current listen addresses.
-    pub async fn listen_addrs(&self) -> Vec<SocketAddr> {
+    pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.listen_addrs.read().await.clone()
     }
 
     /// Get the connection timeout duration.
     pub fn connection_timeout(&self) -> Duration {
         self.connection_timeout
-    }
-
-    /// Get a reference to the resource manager, if configured.
-    pub fn resource_manager(&self) -> Option<&Arc<ResourceManager>> {
-        self.resource_manager.as_ref()
     }
 }
 
@@ -436,17 +395,15 @@ impl TransportHandle {
         self.peers.read().await.get(channel_id).cloned()
     }
 
-    /// Get the channel ID for a given socket address, if connected (internal only).
+    /// Get the channel ID for a given address, if connected (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn get_channel_id_by_address(&self, addr: &str) -> Option<String> {
-        let socket_addr: SocketAddr = addr.parse().ok()?;
+    pub(crate) async fn get_channel_id_by_address(&self, addr: &MultiAddr) -> Option<String> {
+        let target = addr.socket_addr()?;
         let peers = self.peers.read().await;
 
         for (channel_id, peer_info) in peers.iter() {
             for peer_addr in &peer_info.addresses {
-                if let Ok(peer_socket) = peer_addr.parse::<SocketAddr>()
-                    && peer_socket == socket_addr
-                {
+                if peer_addr.socket_addr() == Some(target) {
                     return Some(channel_id.clone());
                 }
             }
@@ -456,7 +413,7 @@ impl TransportHandle {
 
     /// List all active connections with peer IDs and addresses (internal only).
     #[allow(dead_code)]
-    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<MultiAddr>)> {
         let active = self.active_connections.read().await;
         let peers = self.peers.read().await;
 
@@ -560,25 +517,20 @@ impl TransportHandle {
 impl TransportHandle {
     /// Connect to a peer at the given address.
     ///
-    /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
-    /// `/ip4/1.2.3.4/udp/9000`).
-    pub async fn connect_peer(&self, address: &str) -> Result<String> {
-        // Check production limits if resource manager is enabled
-        let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
-            Some(resource_manager.acquire_connection().await?)
-        } else {
-            None
-        };
-
-        // Parse via MultiAddr for consistent MultiAddr support
-        let socket_addr: SocketAddr = address
-            .parse::<MultiAddr>()
-            .map(|na| na.socket_addr)
-            .map_err(|e| {
-                P2PError::Network(NetworkError::InvalidAddress(
-                    format!("{}: {}", address, e).into(),
-                ))
-            })?;
+    /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
+    /// return [`NetworkError::InvalidAddress`].
+    pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
+        // Require a dialable (QUIC) transport.
+        let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
+            P2PError::Network(NetworkError::InvalidAddress(
+                format!(
+                    "only QUIC transport is supported for connect, got {}: {}",
+                    address.transport().kind(),
+                    address
+                )
+                .into(),
+            ))
+        })?;
 
         let normalized_addr = normalize_wildcard_to_loopback(socket_addr);
         let addr_list = vec![normalized_addr];
@@ -596,7 +548,7 @@ impl TransportHandle {
                 // addresses (dual-stack nodes may have both IPv4 and IPv6).
                 let is_self = {
                     let addrs = self.listen_addrs.read().await;
-                    addrs.iter().any(|a| a.to_string() == connected_peer_id)
+                    addrs.iter().any(|a| a.socket_addr() == Some(addr))
                 };
                 if is_self {
                     warn!(
@@ -632,7 +584,7 @@ impl TransportHandle {
 
         let peer_info = PeerInfo {
             channel_id: peer_id.clone(),
-            addresses: vec![address.to_string()],
+            addresses: vec![address.clone()],
             connected_at: Instant::now(),
             last_seen: Instant::now(),
             status: ConnectionStatus::Connected,
@@ -645,10 +597,6 @@ impl TransportHandle {
             .write()
             .await
             .insert(peer_id.clone());
-
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.record_bandwidth(0, 0);
-        }
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
@@ -801,17 +749,6 @@ impl TransportHandle {
             channel_id, protocol
         );
 
-        // Check rate limits if resource manager is enabled
-        if let Some(ref resource_manager) = self.resource_manager
-            && !resource_manager
-                .check_rate_limit(channel_id, "message")
-                .await?
-        {
-            return Err(P2PError::ResourceExhausted(
-                format!("Rate limit exceeded for channel {}", channel_id).into(),
-            ));
-        }
-
         if !self.peers.read().await.contains_key(channel_id) {
             return Err(P2PError::Network(NetworkError::PeerNotFound(
                 channel_id.to_string().into(),
@@ -823,10 +760,6 @@ impl TransportHandle {
             return Err(P2PError::Network(NetworkError::ConnectionClosed {
                 peer_id: channel_id.to_string().into(),
             }));
-        }
-
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.record_bandwidth(data.len() as u64, 0);
         }
 
         let raw_data_len = data.len();
@@ -1264,14 +1197,15 @@ impl TransportHandle {
     /// Start network listeners on the dual-stack transport.
     pub async fn start_network_listeners(&self) -> Result<()> {
         info!("Starting dual-stack listeners (saorsa-transport)...");
-        let addrs = self.dual_node.local_addrs().await.map_err(|e| {
+        let socket_addrs = self.dual_node.local_addrs().await.map_err(|e| {
             P2PError::Transport(crate::error::TransportError::SetupFailed(
                 format!("Failed to get local addresses: {}", e).into(),
             ))
         })?;
+        let addrs: Vec<SocketAddr> = socket_addrs.clone();
         {
             let mut la = self.listen_addrs.write().await;
-            *la = addrs.clone();
+            *la = socket_addrs.into_iter().map(MultiAddr::quic).collect();
         }
 
         let peers = self.peers.clone();
@@ -1294,7 +1228,7 @@ impl TransportHandle {
                 }
 
                 let channel_id = remote_sock.to_string();
-                let remote_addr = MultiAddr::from(remote_sock);
+                let remote_addr = MultiAddr::quic(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
                 register_new_channel(&peers, &channel_id, &remote_addr).await;
@@ -1557,7 +1491,7 @@ impl TransportHandle {
                                         channel_id.clone(),
                                         PeerInfo {
                                             channel_id: channel_id.clone(),
-                                            addresses: vec![remote_address.to_string()],
+                                            addresses: vec![MultiAddr::quic(remote_address)],
                                             status: ConnectionStatus::Connected,
                                             last_seen: Instant::now(),
                                             connected_at: Instant::now(),

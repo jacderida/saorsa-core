@@ -17,12 +17,10 @@
 //! It implements IPv6-based node ID generation and IP diversity enforcement to prevent
 //! large-scale Sybil attacks while maintaining network openness.
 
-use crate::PeerId;
 use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, ml_dsa_sign, ml_dsa_verify,
 };
 use anyhow::{Result, anyhow};
-use blake3;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,6 +39,7 @@ const MAX_SUBNET_TRACKING: usize = 50_000;
 // ============================================================================
 
 /// Trait for IP addresses that can be used in node ID generation
+#[allow(dead_code)]
 pub trait NodeIpAddress: Debug + Clone + Send + Sync + 'static {
     /// Get the octets of this IP address for hashing
     fn octets_vec(&self) -> Vec<u8>;
@@ -67,6 +66,7 @@ impl NodeIpAddress for Ipv4Addr {
 /// This struct provides a unified implementation for both IPv4 and IPv6
 /// node identities, reducing code duplication while maintaining type safety.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GenericIpNodeID<A: NodeIpAddress> {
     /// Derived node ID (BLAKE3 of ip_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
@@ -82,6 +82,7 @@ pub struct GenericIpNodeID<A: NodeIpAddress> {
     pub salt: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl<A: NodeIpAddress> GenericIpNodeID<A> {
     /// ML-DSA-65 signature length
     const SIGNATURE_LENGTH: usize = 3309;
@@ -209,6 +210,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
 
 /// IPv6-based node identity that binds node ID to actual network location
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct IPv6NodeID {
     /// Derived node ID (BLAKE3 of ipv6_addr + public_key + salt)
     pub node_id: Vec<u8>,
@@ -229,11 +231,11 @@ pub struct IPv6NodeID {
 pub struct IPDiversityConfig {
     // === IPv6 subnet limits (existing) ===
     /// Maximum nodes per /64 subnet (default: 1)
-    pub max_nodes_per_64: usize,
+    pub max_nodes_per_ipv6_64: usize,
     /// Maximum nodes per /48 allocation (default: 3)
-    pub max_nodes_per_48: usize,
+    pub max_nodes_per_ipv6_48: usize,
     /// Maximum nodes per /32 region (default: 10)
-    pub max_nodes_per_32: usize,
+    pub max_nodes_per_ipv6_32: usize,
 
     // === IPv4 subnet limits ===
     /// Optional guaranteed minimum for nodes per single IPv4 address (/32).
@@ -254,7 +256,24 @@ pub struct IPDiversityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_16: Option<usize>,
 
-    // === Network-relative limits (new) ===
+    // === Per-protocol limit overrides ===
+    /// Optional floor for all IPv4 subnet limits. When set, the effective
+    /// limit at every IPv4 prefix level (/32, /24, /16) will be at least
+    /// this value, overriding the dynamic calculation and existing hard caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_limit_floor: Option<usize>,
+    /// Optional ceiling for all IPv4 subnet limits. When set, the effective
+    /// limit at every IPv4 prefix level will be at most this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_limit_ceiling: Option<usize>,
+    /// Optional floor for all IPv6 subnet limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_limit_floor: Option<usize>,
+    /// Optional ceiling for all IPv6 subnet limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_limit_ceiling: Option<usize>,
+
+    // === Network-relative limits ===
     /// Absolute maximum nodes allowed per single IP (default: 50)
     pub max_per_ip_cap: usize,
     /// Maximum fraction of network any single IP can represent (default: 0.005 = 0.5%)
@@ -296,6 +315,7 @@ pub struct IPAnalysis {
 
 /// Analysis of an IPv4 address for diversity enforcement
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct IPv4Analysis {
     /// The exact IPv4 address
     pub ip_addr: Ipv4Addr,
@@ -319,6 +339,7 @@ pub struct IPv4Analysis {
 
 /// Unified IP analysis that handles both IPv4 and IPv6 addresses
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub enum UnifiedIPAnalysis {
     /// IPv4 address analysis
     IPv4(IPv4Analysis),
@@ -326,38 +347,22 @@ pub enum UnifiedIPAnalysis {
     IPv6(IPAnalysis),
 }
 
-/// Node reputation tracking for security-aware routing
-#[derive(Debug, Clone)]
-pub struct NodeReputation {
-    /// Peer ID
-    pub peer_id: PeerId,
-    /// Fraction of queries answered successfully
-    pub response_rate: f64,
-    /// Average response time
-    pub response_time: Duration,
-    /// Consistency of provided data (0.0-1.0)
-    pub consistency_score: f64,
-    /// Estimated continuous uptime
-    pub uptime_estimate: Duration,
-    /// Accuracy of routing information provided
-    pub routing_accuracy: f64,
-    /// Last time this node was seen
-    pub last_seen: SystemTime,
-    /// Total number of interactions
-    pub interaction_count: u64,
-}
-
 impl Default for IPDiversityConfig {
     fn default() -> Self {
         Self {
             // IPv6 limits
-            max_nodes_per_64: 1,
-            max_nodes_per_48: 3,
-            max_nodes_per_32: 10,
+            max_nodes_per_ipv6_64: 1,
+            max_nodes_per_ipv6_48: 3,
+            max_nodes_per_ipv6_32: 10,
             // IPv4 limits — None = purely dynamic (no static cap)
             max_nodes_per_ipv4_32: None,
             max_nodes_per_ipv4_24: None,
             max_nodes_per_ipv4_16: None,
+            // Per-protocol overrides — None = no override
+            ipv4_limit_floor: None,
+            ipv4_limit_ceiling: None,
+            ipv6_limit_floor: None,
+            ipv6_limit_ceiling: None,
             // Network-relative limits
             max_per_ip_cap: 50,          // Hard cap of 50 nodes per IP
             max_network_fraction: 0.005, // 0.5% of network max
@@ -384,18 +389,22 @@ impl IPDiversityConfig {
     pub fn testnet() -> Self {
         Self {
             // IPv6 relaxed limits
-            max_nodes_per_64: 100,  // Allow many nodes per /64 subnet
-            max_nodes_per_48: 500,  // Allow many nodes per /48 allocation
-            max_nodes_per_32: 1000, // Allow many nodes per /32 region
+            max_nodes_per_ipv6_64: 100,  // Allow many nodes per /64 subnet
+            max_nodes_per_ipv6_48: 500,  // Allow many nodes per /48 allocation
+            max_nodes_per_ipv6_32: 1000, // Allow many nodes per /32 region
             // IPv4 — guaranteed minimums prevent bootstrap deadlock when
             // many nodes share few public IPs (e.g. 10 nodes per VM).
             // Without these, the dynamic per-IP formula starts at 1 for
             // small networks and never grows past the number of unique IPs.
-            // The merge logic uses max(static, dynamic) so these act as
-            // floors, not ceilings.
             max_nodes_per_ipv4_32: Some(100),
             max_nodes_per_ipv4_24: Some(500),
             max_nodes_per_ipv4_16: Some(1000),
+            // Floors ensure small testnets (< 100 nodes) aren't bottlenecked
+            // by the dynamic per-IP formula, which yields 1 for tiny networks.
+            ipv4_limit_floor: Some(5),
+            ipv4_limit_ceiling: None,
+            ipv6_limit_floor: Some(5),
+            ipv6_limit_ceiling: None,
             // Network-relative limits (relaxed for testnet)
             max_per_ip_cap: 100,       // Higher cap for testing
             max_network_fraction: 0.1, // Allow 10% of network from one IP (relaxed from 0.5%)
@@ -414,13 +423,18 @@ impl IPDiversityConfig {
     pub fn permissive() -> Self {
         Self {
             // IPv6 - effectively disabled
-            max_nodes_per_64: usize::MAX,
-            max_nodes_per_48: usize::MAX,
-            max_nodes_per_32: usize::MAX,
+            max_nodes_per_ipv6_64: usize::MAX,
+            max_nodes_per_ipv6_48: usize::MAX,
+            max_nodes_per_ipv6_32: usize::MAX,
             // IPv4 — no static caps
             max_nodes_per_ipv4_32: None,
             max_nodes_per_ipv4_24: None,
             max_nodes_per_ipv4_16: None,
+            // Per-protocol overrides — None = no override
+            ipv4_limit_floor: None,
+            ipv4_limit_ceiling: None,
+            ipv6_limit_floor: None,
+            ipv6_limit_ceiling: None,
             // Network-relative - effectively disabled
             max_per_ip_cap: usize::MAX,
             max_network_fraction: 1.0, // Allow 100% of network
@@ -438,6 +452,7 @@ impl IPDiversityConfig {
     }
 }
 
+#[allow(dead_code)]
 impl IPv6NodeID {
     /// Generate a new IPv6-based node ID
     ///
@@ -508,6 +523,7 @@ impl IPv6NodeID {
 /// IPv4-based node identity that binds node ID to actual network location
 /// Mirrors IPv6NodeID for security parity on IPv4 networks
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct IPv4NodeID {
     /// Derived node ID (BLAKE3 of ipv4_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
@@ -523,6 +539,7 @@ pub struct IPv4NodeID {
     pub salt: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl IPv4NodeID {
     /// Generate a new IPv4-based node ID
     ///
@@ -609,17 +626,22 @@ pub struct IPDiversityEnforcer {
     subnet_48_counts: LruCache<Ipv6Addr, usize>,
     subnet_32_counts: LruCache<Ipv6Addr, usize>,
     // IPv4 tracking (LRU caches with max 50k entries to prevent memory DoS)
+    #[allow(dead_code)]
     ipv4_32_counts: LruCache<Ipv4Addr, usize>, // Per exact IP
+    #[allow(dead_code)]
     ipv4_24_counts: LruCache<Ipv4Addr, usize>, // Per /24 subnet
+    #[allow(dead_code)]
     ipv4_16_counts: LruCache<Ipv4Addr, usize>, // Per /16 subnet
     // Shared tracking (LRU caches with max 50k entries to prevent memory DoS)
     asn_counts: LruCache<u32, usize>,
     country_counts: LruCache<String, usize>,
     geo_provider: Option<Arc<dyn GeoProvider + Send + Sync>>,
     // Network size for dynamic limits
+    #[allow(dead_code)]
     network_size: usize,
 }
 
+#[allow(dead_code)]
 impl IPDiversityEnforcer {
     /// Create a new IP diversity enforcer with loopback disabled.
     pub fn new(config: IPDiversityConfig) -> Self {
@@ -715,17 +737,17 @@ impl IPDiversityEnforcer {
             if ip_analysis.is_hosting_provider || ip_analysis.is_vpn_provider {
                 // Stricter limits for hosting providers (halved)
                 (
-                    std::cmp::max(1, self.config.max_nodes_per_64 / 2),
-                    std::cmp::max(1, self.config.max_nodes_per_48 / 2),
-                    std::cmp::max(1, self.config.max_nodes_per_32 / 2),
+                    std::cmp::max(1, self.config.max_nodes_per_ipv6_64 / 2),
+                    std::cmp::max(1, self.config.max_nodes_per_ipv6_48 / 2),
+                    std::cmp::max(1, self.config.max_nodes_per_ipv6_32 / 2),
                     std::cmp::max(1, self.config.max_nodes_per_asn / 2),
                 )
             } else {
                 // Regular limits for normal nodes
                 (
-                    self.config.max_nodes_per_64,
-                    self.config.max_nodes_per_48,
-                    self.config.max_nodes_per_32,
+                    self.config.max_nodes_per_ipv6_64,
+                    self.config.max_nodes_per_ipv6_48,
+                    self.config.max_nodes_per_ipv6_32,
                     self.config.max_nodes_per_asn,
                 )
             };
@@ -876,19 +898,19 @@ impl IPDiversityEnforcer {
     /// Get diversity statistics
     pub fn get_diversity_stats(&self) -> DiversityStats {
         // LRU cache API: use iter() instead of values()
-        let max_nodes_per_64 = self
+        let max_nodes_per_ipv6_64 = self
             .subnet_64_counts
             .iter()
             .map(|(_, &v)| v)
             .max()
             .unwrap_or(0);
-        let max_nodes_per_48 = self
+        let max_nodes_per_ipv6_48 = self
             .subnet_48_counts
             .iter()
             .map(|(_, &v)| v)
             .max()
             .unwrap_or(0);
-        let max_nodes_per_32 = self
+        let max_nodes_per_ipv6_32 = self
             .subnet_32_counts
             .iter()
             .map(|(_, &v)| v)
@@ -919,9 +941,9 @@ impl IPDiversityEnforcer {
             total_32_subnets: self.subnet_32_counts.len(),
             total_asns: self.asn_counts.len(),
             total_countries: self.country_counts.len(),
-            max_nodes_per_64,
-            max_nodes_per_48,
-            max_nodes_per_32,
+            max_nodes_per_ipv6_64,
+            max_nodes_per_ipv6_48,
+            max_nodes_per_ipv6_32,
             // IPv4 stats
             total_ipv4_32: self.ipv4_32_counts.len(),
             total_ipv4_24_subnets: self.ipv4_24_counts.len(),
@@ -1193,6 +1215,7 @@ impl IPDiversityEnforcer {
 
 #[cfg(test)]
 impl IPDiversityEnforcer {
+    #[allow(dead_code)]
     pub fn config(&self) -> &IPDiversityConfig {
         &self.config
     }
@@ -1214,11 +1237,13 @@ pub struct GeoInfo {
 
 /// A simple in-memory caching wrapper for a GeoProvider
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CachedGeoProvider<P: GeoProvider> {
     inner: P,
     cache: parking_lot::RwLock<HashMap<Ipv6Addr, GeoInfo>>,
 }
 
+#[allow(dead_code)]
 impl<P: GeoProvider> CachedGeoProvider<P> {
     pub fn new(inner: P) -> Self {
         Self {
@@ -1241,6 +1266,7 @@ impl<P: GeoProvider> GeoProvider for CachedGeoProvider<P> {
 
 /// Stub provider returning no ASN/GeoIP info
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StubGeoProvider;
 impl GeoProvider for StubGeoProvider {
     fn lookup(&self, _ip: Ipv6Addr) -> GeoInfo {
@@ -1255,6 +1281,7 @@ impl GeoProvider for StubGeoProvider {
 
 /// Diversity statistics for monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DiversityStats {
     // === IPv6 stats ===
     /// Number of unique /64 subnets represented
@@ -1264,11 +1291,11 @@ pub struct DiversityStats {
     /// Number of unique /32 subnets represented
     pub total_32_subnets: usize,
     /// Maximum nodes in any single /64 subnet
-    pub max_nodes_per_64: usize,
+    pub max_nodes_per_ipv6_64: usize,
     /// Maximum nodes in any single /48 subnet
-    pub max_nodes_per_48: usize,
+    pub max_nodes_per_ipv6_48: usize,
     /// Maximum nodes in any single /32 subnet
-    pub max_nodes_per_32: usize,
+    pub max_nodes_per_ipv6_32: usize,
 
     // === IPv4 stats (new) ===
     /// Number of unique IPv4 addresses (/32)
@@ -1291,85 +1318,6 @@ pub struct DiversityStats {
     pub total_countries: usize,
 }
 
-/// Reputation manager for tracking node behavior
-#[derive(Debug)]
-pub struct ReputationManager {
-    reputations: HashMap<PeerId, NodeReputation>,
-    reputation_decay: f64,
-    min_reputation: f64,
-}
-
-impl ReputationManager {
-    /// Create a new reputation manager
-    pub fn new(reputation_decay: f64, min_reputation: f64) -> Self {
-        Self {
-            reputations: HashMap::new(),
-            reputation_decay,
-            min_reputation,
-        }
-    }
-
-    /// Get reputation for a peer
-    pub fn get_reputation(&self, peer_id: &PeerId) -> Option<&NodeReputation> {
-        self.reputations.get(peer_id)
-    }
-
-    /// Update reputation based on interaction
-    pub fn update_reputation(&mut self, peer_id: &PeerId, success: bool, response_time: Duration) {
-        let reputation = self
-            .reputations
-            .entry(*peer_id)
-            .or_insert_with(|| NodeReputation {
-                peer_id: *peer_id,
-                response_rate: 0.5,
-                response_time: Duration::from_millis(500),
-                consistency_score: 0.5,
-                uptime_estimate: Duration::from_secs(0),
-                routing_accuracy: 0.5,
-                last_seen: SystemTime::now(),
-                interaction_count: 0,
-            });
-
-        // Use higher learning rate for faster convergence in tests
-        let alpha = 0.3; // Increased from 0.1 for better test convergence
-
-        if success {
-            reputation.response_rate = reputation.response_rate * (1.0 - alpha) + alpha;
-        } else {
-            reputation.response_rate *= 1.0 - alpha;
-        }
-
-        // Update response time
-        let response_time_ms = response_time.as_millis() as f64;
-        let current_response_ms = reputation.response_time.as_millis() as f64;
-        let new_response_ms = current_response_ms * (1.0 - alpha) + response_time_ms * alpha;
-        reputation.response_time = Duration::from_millis(new_response_ms as u64);
-
-        reputation.last_seen = SystemTime::now();
-        reputation.interaction_count += 1;
-    }
-
-    /// Apply time-based reputation decay
-    pub fn apply_decay(&mut self) {
-        let now = SystemTime::now();
-
-        self.reputations.retain(|_, reputation| {
-            if let Ok(elapsed) = now.duration_since(reputation.last_seen) {
-                // Decay reputation over time
-                let decay_factor = (-elapsed.as_secs_f64() / 3600.0 * self.reputation_decay).exp();
-                reputation.response_rate *= decay_factor;
-                reputation.consistency_score *= decay_factor;
-                reputation.routing_accuracy *= decay_factor;
-
-                // Remove nodes with very low reputation
-                reputation.response_rate > self.min_reputation / 10.0
-            } else {
-                true
-            }
-        });
-    }
-}
-
 // Ed25519 compatibility removed
 
 #[cfg(test)]
@@ -1390,13 +1338,17 @@ mod tests {
     fn create_test_diversity_config() -> IPDiversityConfig {
         IPDiversityConfig {
             // IPv6 limits
-            max_nodes_per_64: 1,
-            max_nodes_per_48: 3,
-            max_nodes_per_32: 10,
+            max_nodes_per_ipv6_64: 1,
+            max_nodes_per_ipv6_48: 3,
+            max_nodes_per_ipv6_32: 10,
             // IPv4 limits — None = purely dynamic
             max_nodes_per_ipv4_32: None,
             max_nodes_per_ipv4_24: None,
             max_nodes_per_ipv4_16: None,
+            ipv4_limit_floor: None,
+            ipv4_limit_ceiling: None,
+            ipv6_limit_floor: None,
+            ipv6_limit_ceiling: None,
             // Network-relative limits
             max_per_ip_cap: 50,
             max_network_fraction: 0.005,
@@ -1624,9 +1576,9 @@ mod tests {
     fn test_ip_diversity_config_default() {
         let config = IPDiversityConfig::default();
 
-        assert_eq!(config.max_nodes_per_64, 1);
-        assert_eq!(config.max_nodes_per_48, 3);
-        assert_eq!(config.max_nodes_per_32, 10);
+        assert_eq!(config.max_nodes_per_ipv6_64, 1);
+        assert_eq!(config.max_nodes_per_ipv6_48, 3);
+        assert_eq!(config.max_nodes_per_ipv6_32, 10);
         assert_eq!(config.max_nodes_per_asn, 20);
         assert!(config.enable_geolocation_check);
         assert_eq!(config.min_geographic_diversity, 3);
@@ -1637,7 +1589,10 @@ mod tests {
         let config = create_test_diversity_config();
         let enforcer = IPDiversityEnforcer::with_loopback(config.clone(), true);
 
-        assert_eq!(enforcer.config.max_nodes_per_64, config.max_nodes_per_64);
+        assert_eq!(
+            enforcer.config.max_nodes_per_ipv6_64,
+            config.max_nodes_per_ipv6_64
+        );
         assert_eq!(enforcer.subnet_64_counts.len(), 0);
         assert_eq!(enforcer.subnet_48_counts.len(), 0);
         assert_eq!(enforcer.subnet_32_counts.len(), 0);
@@ -1728,7 +1683,7 @@ mod tests {
         assert!(enforcer.can_accept_node(&analysis1));
         enforcer.add_node(&analysis1)?;
 
-        // Second node in same /64 should be rejected (max_nodes_per_64 = 1)
+        // Second node in same /64 should be rejected (max_nodes_per_ipv6_64 = 1)
         assert!(!enforcer.can_accept_node(&analysis2));
 
         // But adding should fail
@@ -1747,8 +1702,8 @@ mod tests {
     #[test]
     fn test_hosting_provider_stricter_limits() -> Result<()> {
         let config = IPDiversityConfig {
-            max_nodes_per_64: 4, // Set higher limit for regular nodes
-            max_nodes_per_48: 8,
+            max_nodes_per_ipv6_64: 4, // Set higher limit for regular nodes
+            max_nodes_per_ipv6_48: 8,
             ..create_test_diversity_config()
         };
         let mut enforcer = IPDiversityEnforcer::new(config);
@@ -1812,9 +1767,9 @@ mod tests {
         assert_eq!(stats.total_64_subnets, 3);
         assert_eq!(stats.total_48_subnets, 3);
         assert_eq!(stats.total_32_subnets, 2); // Two /32 prefixes
-        assert_eq!(stats.max_nodes_per_64, 1);
-        assert_eq!(stats.max_nodes_per_48, 1);
-        assert_eq!(stats.max_nodes_per_32, 2); // 2001:db8 has 2 nodes
+        assert_eq!(stats.max_nodes_per_ipv6_64, 1);
+        assert_eq!(stats.max_nodes_per_ipv6_48, 1);
+        assert_eq!(stats.max_nodes_per_ipv6_32, 2); // 2001:db8 has 2 nodes
 
         Ok(())
     }
@@ -1851,131 +1806,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reputation_manager_creation() {
-        let manager = ReputationManager::new(0.1, 0.1);
-        assert_eq!(manager.reputation_decay, 0.1);
-        assert_eq!(manager.min_reputation, 0.1);
-        assert_eq!(manager.reputations.len(), 0);
-    }
-
-    #[test]
-    fn test_reputation_get_nonexistent() {
-        let manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        let reputation = manager.get_reputation(&peer_id);
-        assert!(reputation.is_none());
-    }
-
-    #[test]
-    fn test_reputation_update_creates_entry() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-
-        let reputation = manager.get_reputation(&peer_id);
-        assert!(reputation.is_some());
-
-        let rep = reputation.unwrap();
-        assert_eq!(rep.peer_id, peer_id);
-        assert!(rep.response_rate > 0.5); // Should increase from initial 0.5
-        assert_eq!(rep.interaction_count, 1);
-    }
-
-    #[test]
-    fn test_reputation_update_success_improves_rate() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Multiple successful interactions
-        for _ in 0..15 {
-            manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        assert!(reputation.response_rate > 0.85); // Should be very high with higher learning rate
-        assert_eq!(reputation.interaction_count, 15);
-    }
-
-    #[test]
-    fn test_reputation_update_failure_decreases_rate() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Multiple failed interactions
-        for _ in 0..15 {
-            manager.update_reputation(&peer_id, false, Duration::from_millis(1000));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        assert!(reputation.response_rate < 0.15); // Should be very low with higher learning rate
-        assert_eq!(reputation.interaction_count, 15);
-    }
-
-    #[test]
-    fn test_reputation_response_time_tracking() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Update with specific response time
-        manager.update_reputation(&peer_id, true, Duration::from_millis(200));
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        // Response time should be between initial 500ms and new 200ms
-        assert!(reputation.response_time.as_millis() > 200);
-        assert!(reputation.response_time.as_millis() < 500);
-    }
-
-    #[test]
-    fn test_reputation_decay() {
-        let mut manager = ReputationManager::new(1.0, 0.01); // High decay rate
-        let peer_id = PeerId::random();
-
-        // Create a reputation entry
-        manager.update_reputation(&peer_id, true, Duration::from_millis(100));
-
-        // Manually set last_seen to past
-        if let Some(reputation) = manager.reputations.get_mut(&peer_id) {
-            reputation.last_seen = SystemTime::now() - Duration::from_secs(7200); // 2 hours ago
-        }
-
-        let original_rate = manager.get_reputation(&peer_id).unwrap().response_rate;
-
-        // Apply decay
-        manager.apply_decay();
-
-        let reputation = manager.get_reputation(&peer_id);
-        if let Some(rep) = reputation {
-            // Should have decayed
-            assert!(rep.response_rate < original_rate);
-        } // else the reputation was removed due to low score
-    }
-
-    #[test]
-    fn test_reputation_decay_removes_low_reputation() {
-        let mut manager = ReputationManager::new(0.1, 0.5); // High min reputation
-        let peer_id = PeerId::random();
-
-        // Create a low reputation entry
-        for _ in 0..10 {
-            manager.update_reputation(&peer_id, false, Duration::from_millis(1000));
-        }
-
-        // Manually set last_seen to past
-        if let Some(reputation) = manager.reputations.get_mut(&peer_id) {
-            reputation.last_seen = SystemTime::now() - Duration::from_secs(3600); // 1 hour ago
-            reputation.response_rate = 0.01; // Very low
-        }
-
-        // Apply decay
-        manager.apply_decay();
-
-        // Should be removed
-        assert!(manager.get_reputation(&peer_id).is_none());
-    }
-
-    #[test]
     fn test_security_types_keypair() {
         let (public_key, secret_key) =
             generate_ml_dsa_keypair().expect("Failed to generate keypair");
@@ -1989,29 +1819,6 @@ mod tests {
 
         // Verify the signature
         assert!(ml_dsa_verify(&public_key, message, &signature).is_ok());
-    }
-
-    #[test]
-    fn test_node_reputation_structure() {
-        let peer_id = PeerId::random();
-        let reputation = NodeReputation {
-            peer_id,
-            response_rate: 0.85,
-            response_time: Duration::from_millis(150),
-            consistency_score: 0.9,
-            uptime_estimate: Duration::from_secs(86400),
-            routing_accuracy: 0.8,
-            last_seen: SystemTime::now(),
-            interaction_count: 42,
-        };
-
-        assert_eq!(reputation.peer_id, peer_id);
-        assert_eq!(reputation.response_rate, 0.85);
-        assert_eq!(reputation.response_time, Duration::from_millis(150));
-        assert_eq!(reputation.consistency_score, 0.9);
-        assert_eq!(reputation.uptime_estimate, Duration::from_secs(86400));
-        assert_eq!(reputation.routing_accuracy, 0.8);
-        assert_eq!(reputation.interaction_count, 42);
     }
 
     #[test]
@@ -2042,9 +1849,9 @@ mod tests {
             total_64_subnets: 100,
             total_48_subnets: 50,
             total_32_subnets: 25,
-            max_nodes_per_64: 1,
-            max_nodes_per_48: 3,
-            max_nodes_per_32: 10,
+            max_nodes_per_ipv6_64: 1,
+            max_nodes_per_ipv6_48: 3,
+            max_nodes_per_ipv6_32: 10,
             // IPv4 stats
             total_ipv4_32: 80,
             total_ipv4_24_subnets: 40,
@@ -2061,9 +1868,9 @@ mod tests {
         assert_eq!(stats.total_64_subnets, 100);
         assert_eq!(stats.total_48_subnets, 50);
         assert_eq!(stats.total_32_subnets, 25);
-        assert_eq!(stats.max_nodes_per_64, 1);
-        assert_eq!(stats.max_nodes_per_48, 3);
-        assert_eq!(stats.max_nodes_per_32, 10);
+        assert_eq!(stats.max_nodes_per_ipv6_64, 1);
+        assert_eq!(stats.max_nodes_per_ipv6_48, 3);
+        assert_eq!(stats.max_nodes_per_ipv6_32, 10);
         // IPv4 assertions
         assert_eq!(stats.total_ipv4_32, 80);
         assert_eq!(stats.total_ipv4_24_subnets, 40);
@@ -2079,9 +1886,9 @@ mod tests {
     #[test]
     fn test_multiple_same_subnet_nodes() -> Result<()> {
         let config = IPDiversityConfig {
-            max_nodes_per_64: 3, // Allow more nodes in same /64
-            max_nodes_per_48: 5,
-            max_nodes_per_32: 10,
+            max_nodes_per_ipv6_64: 3, // Allow more nodes in same /64
+            max_nodes_per_ipv6_48: 5,
+            max_nodes_per_ipv6_32: 10,
             ..create_test_diversity_config()
         };
         let mut enforcer = IPDiversityEnforcer::new(config);
@@ -2105,7 +1912,7 @@ mod tests {
 
         let stats = enforcer.get_diversity_stats();
         assert_eq!(stats.total_64_subnets, 1);
-        assert_eq!(stats.max_nodes_per_64, 3);
+        assert_eq!(stats.max_nodes_per_ipv6_64, 3);
 
         Ok(())
     }
@@ -2132,24 +1939,5 @@ mod tests {
         assert!(!enforcer.country_counts.contains("US"));
 
         Ok(())
-    }
-
-    #[test]
-    fn test_reputation_mixed_interactions() {
-        let mut manager = ReputationManager::new(0.1, 0.1);
-        let peer_id = PeerId::random();
-
-        // Mix of successful and failed interactions
-        for i in 0..15 {
-            let success = i % 3 != 0; // 2/3 success rate
-            manager.update_reputation(&peer_id, success, Duration::from_millis(100 + i * 10));
-        }
-
-        let reputation = manager.get_reputation(&peer_id).unwrap();
-        // Should converge closer to 2/3 with more iterations and higher learning rate
-        // With alpha=0.3 and 2/3 success rate, convergence may be higher
-        assert!(reputation.response_rate > 0.55);
-        assert!(reputation.response_rate < 0.85);
-        assert_eq!(reputation.interaction_count, 15);
     }
 }

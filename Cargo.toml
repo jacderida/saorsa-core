@@ -2,7 +2,6 @@
 name = "saorsa-core"
 # 0.10.3: postcard serialization migration (PR #14)
 # 0.10.4: refocus on phonebook + trust signals, remove user-facing APIs (PR #15)
-# 0.10.5: replica planner helper for storage orchestration
 # 0.11.0: remove feature gates — adaptive/trust/placement always compiled
 # 0.11.1: fix Kademlia protocol violations in iterative lookups
 # 0.12.0: configurable max_message_size, bump saorsa-transport to 0.22.0
@@ -11,7 +10,8 @@ name = "saorsa-core"
 # 0.14.0: user-agent DHT gating — exclude ephemeral clients from DHT routing table
 # 0.14.1: fix deterministic identity generation to use real ML-DSA keypairs
 # 0.15.0: routing table single-source-of-truth fixes
-version = "0.15.0"
+# 0.16.0: delegate transport addressing to saorsa-transport's TransportAddr (PR #39)
+version = "0.16.0"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
@@ -28,20 +28,9 @@ documentation = "https://docs.rs/saorsa-core"
 no-default-features = false
 default-target = "x86_64-unknown-linux-gnu"
 
-[features]
-default = ["metrics"]
-metrics = ["dep:prometheus"]
-# Compile-time gate for test/dummy helpers. Off by default.
-mocks = []
-## Optional: enable hyperbolic greedy routing helpers in API
-h2_greedy = []
-# Test utilities including mock DHT for integration tests
-test-utils = []
-
 [dependencies]
 # Core async and serialization
 tokio = { version = "1.49", features = ["full"] }
-
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -49,132 +38,32 @@ serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
-smallvec = { version = "1.15", features = ["serde"] }
 uuid = { version = "1.14", features = ["v4", "serde"] }
 bytes = "1.10"
 hex = "0.4"
-chrono = { version = "0.4.43", features = ["serde"] }
-base64 = "0.22"
-array-init = "2.1"
-serde_cbor = "0.11"
-statrs = "0.18"
 
 # Cryptography - Primary source of truth: saorsa-pqc
 saorsa-pqc = "0.5"
-# Classical crypto for backward compatibility only
-# Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
-# Password hashing
-argon2 = "0.5"
-# Random number generation
 rand = "0.8"
-rand_core = "0.6"
-# Constant-time operations for cryptographic security
-subtle = "2.6"
-# TODO: Remove once fully migrated to saorsa-pqc - keeping temporarily for compatibility
 blake3 = "1.6"
-hkdf = "0.12"
 
 # Performance optimization
 parking_lot = "0.12"
-flate2 = "1.1"
 once_cell = "1.21"
 
 # Networking
-saorsa-transport = "0.25"
+saorsa-transport = "0.26"
 
 # Core-specific dependencies
 dirs = "6.0"
-fastrand = "2.3"
-
-# Git content addressing
 postcard = { version = "1.1.3", features = ["use-std"] }
 lru = "0.16"
-
-
-# Monitoring (optional to avoid build script issues on docs.rs)
-prometheus = { version = "0.14", optional = true, default-features = false }
-
-# Configuration
-toml = "0.8"
-regex = "1.11"
-log = "0.4"
-
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 
-# Health check dependencies
-axum = "0.8"
-tower = { version = "0.5", features = ["util"] }
-
-# HTTP client for upgrade system
-reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
-num_cpus = "1.16"
-
-rusqlite = { version = "0.37", features = ["chrono", "serde_json", "uuid", "bundled"] }
-
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
-# wyz 0.5.0 has incorrect import path for tap::Pipe, fixed in 0.5.1
-# Exact pin required: >=0.5.1 doesn't override transitive resolution under -Z minimal-versions
 wyz = "=0.5.1"
 
-clap = { version = "4.5", features = ["derive"] }
-
-[build-dependencies]
-# No build dependencies currently required
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.17"
-pretty_assertions = "1.4"
-serial_test = "3.3"
-criterion = { version = "0.5", features = ["html_reports"] }
-clap = { version = "4.5", features = ["derive"] }
-proptest = "1.6"
-quickcheck = "1.0"
-quickcheck_macros = "1.0"
-approx = "0.5"
-tokio-test = "0.4"
-semver = "1.0"
 
-# All features are now enabled by default - no feature flags needed
-
-[[bench]]
-name = "adaptive_benchmarks"
-harness = false
-
-[[bench]]
-name = "validation_bench"
-harness = false
-
-[[test]]
-name = "eigentrust_integration_test"
-path = "tests/eigentrust_integration_test.rs"
-
-[[test]]
-name = "gossipsub_integration_test"
-path = "tests/gossipsub_integration_test.rs"
-
-[[example]]
-name = "security_example"
-
-[[example]]
-name = "adaptive_network_monitor"
-
-# Platform-specific dependencies for secure memory management
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["memoryapi"] }
-
-# [[bench]]
-# name = "comprehensive_performance_test"
-# harness = false
-
-# [[bench]]
-# name = "load_testing_scenarios"
-# harness = false
-
-# [[bench]]
-# name = "performance_monitor"
-# harness = false

@@ -26,16 +26,6 @@
 //! The `accept()` method accepts all incoming connections regardless of protocol.
 //! Applications must validate the protocol on received connections.
 //!
-//! ## Quality-Based Peer Selection
-//!
-//! The adapter tracks peer quality scores from saorsa-transport's `Capabilities.quality_score()`
-//! (range 0.0 to 1.0, where higher is better). Methods available:
-//! - `get_peer_quality(addr)` - Get quality for a specific peer
-//! - `get_peers_by_quality()` - Get all peers sorted by quality (descending)
-//! - `get_top_peers_by_quality(n)` - Get top N peers by quality
-//! - `get_peers_above_quality_threshold(threshold)` - Filter peers by minimum quality
-//! - `get_average_peer_quality()` - Get average quality of all peers
-//!
 //! ## NAT Traversal Configuration
 //!
 //! NAT traversal behavior is configured via `NetworkConfig`:
@@ -48,8 +38,7 @@
 //! When saorsa-core is compiled with the `metrics` feature, this adapter
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
-use crate::error::{GeoEnforcementMode, GeoRejectionError, GeographicConfig};
-use crate::telemetry::StreamClass;
+use crate::error::{GeoRejectionError, GeographicConfig};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -78,6 +67,7 @@ pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht
 
 /// Connection lifecycle events from saorsa-transport
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ConnectionEvent {
     /// Connection successfully established
     Established {
@@ -102,6 +92,7 @@ pub enum ConnectionEvent {
 /// with advanced NAT traversal and post-quantum cryptography.
 ///
 /// Generic over the transport type to allow testing with MockTransport.
+#[allow(dead_code)]
 pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
     /// The underlying transport (generic for testing)
     transport: Arc<T>,
@@ -129,12 +120,7 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
 /// explicitly configured.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
-/// Maximum application-layer message size (1 MiB).
-///
-/// This tunes both the QUIC stream receive window and the per-stream
-/// read buffer inside `saorsa-transport`.
-pub const MAX_MESSAGE_SIZE: usize = P2pConfig::DEFAULT_MAX_MESSAGE_SIZE;
-
+#[allow(dead_code)]
 impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with default P2pLinkTransport
     pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
@@ -205,48 +191,6 @@ impl P2PNetworkNode<P2pLinkTransport> {
         })?;
 
         Self::with_transport(Arc::new(transport), actual_addr).await
-    }
-
-    /// Create a new P2P network node from NetworkConfig with an optional
-    /// message-size override.
-    ///
-    /// When `max_msg_size` is `None` saorsa-transport's built-in default is used.
-    pub async fn from_network_config(
-        bind_addr: SocketAddr,
-        net_config: &crate::transport::NetworkConfig,
-        max_msg_size: Option<usize>,
-        allow_loopback: bool,
-    ) -> Result<Self> {
-        // Build P2pConfig based on NetworkConfig
-        let mut builder = P2pConfig::builder()
-            .bind_addr(bind_addr)
-            .max_connections(DEFAULT_MAX_CONNECTIONS)
-            .conservative_timeouts()
-            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
-        if let Some(max_msg_size) = max_msg_size {
-            builder = builder.max_message_size(max_msg_size);
-        }
-
-        // Apply NAT traversal settings if present, merging allow_loopback.
-        if let Some(mut nat_config) = net_config.to_ant_config() {
-            if allow_loopback {
-                nat_config.allow_loopback = true;
-            }
-            builder = builder.nat(nat_config);
-        } else if allow_loopback {
-            builder = builder.nat(NatConfig {
-                allow_loopback: true,
-                ..NatConfig::default()
-            });
-        }
-
-        let config = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build P2P config: {}", e))?;
-
-        tracing::info!("Creating P2P network node at {}", bind_addr);
-
-        Self::new_with_config(bind_addr, config).await
     }
 
     /// Send data to a peer using P2pEndpoint's send method
@@ -339,6 +283,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Create with any LinkTransport implementation (for testing)
     pub async fn with_transport(transport: Arc<T>, bind_addr: SocketAddr) -> Result<Self> {
@@ -591,20 +536,6 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         Ok(())
     }
 
-    /// Send data with a StreamClass (basic QoS wiring with telemetry)
-    pub async fn send_with_class(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-        class: StreamClass,
-    ) -> Result<()> {
-        self.send_to_peer_raw(addr, data).await?;
-        crate::telemetry::telemetry()
-            .record_stream_bandwidth(class, data.len() as u64)
-            .await;
-        Ok(())
-    }
-
     /// Get our local address
     pub fn local_address(&self) -> SocketAddr {
         self.local_addr
@@ -678,19 +609,10 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         if let Some(ref config) = self.geo_config {
             match self.validate_geographic_diversity(&addr, config).await {
                 Ok(()) => {}
-                Err(err) => match config.enforcement_mode {
-                    GeoEnforcementMode::Strict => {
-                        tracing::warn!("REJECTED peer {} - {}", addr, err);
-                        return;
-                    }
-                    GeoEnforcementMode::LogOnly => {
-                        tracing::info!(
-                            "GEO_AUDIT: Would reject peer {} - {} (log-only mode)",
-                            addr,
-                            err
-                        );
-                    }
-                },
+                Err(err) => {
+                    tracing::warn!("REJECTED peer {} - {}", addr, err);
+                    return;
+                }
             }
         }
 
@@ -774,72 +696,6 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         self.peer_regions.read().await.clone()
     }
 
-    /// Get the quality score for a specific peer (0.0 to 1.0)
-    ///
-    /// Returns None if the peer is not connected or quality score is not available.
-    /// Quality scores come from saorsa-transport's Capabilities.quality_score() method.
-    pub async fn get_peer_quality(&self, addr: &SocketAddr) -> Option<f32> {
-        let quality_map = self.peer_quality.read().await;
-        quality_map.get(addr).copied()
-    }
-
-    /// Get all connected peers sorted by quality score (highest first)
-    ///
-    /// Returns peers with their quality scores, sorted from highest to lowest quality.
-    /// Peers without quality scores are excluded from the results.
-    pub async fn get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)> {
-        let peers = self.peers.read().await;
-        let quality_map = self.peer_quality.read().await;
-
-        let mut peer_qualities: Vec<(SocketAddr, f32)> = peers
-            .iter()
-            .filter_map(|addr| quality_map.get(addr).map(|quality| (*addr, *quality)))
-            .collect();
-
-        // Sort by quality descending (highest first)
-        peer_qualities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        peer_qualities
-    }
-
-    /// Get the top N peers by quality score
-    ///
-    /// Returns at most `n` peers with highest quality scores.
-    /// Useful for selecting the best peers for operations like storage or routing.
-    pub async fn get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)> {
-        let mut peers = self.get_peers_by_quality().await;
-        peers.truncate(n);
-        peers
-    }
-
-    /// Get peers with quality score above a threshold
-    ///
-    /// Returns only peers whose quality score is >= the given threshold.
-    /// Useful for filtering out low-quality peers.
-    pub async fn get_peers_above_quality_threshold(
-        &self,
-        threshold: f32,
-    ) -> Vec<(SocketAddr, f32)> {
-        self.get_peers_by_quality()
-            .await
-            .into_iter()
-            .filter(|(_, quality)| *quality >= threshold)
-            .collect()
-    }
-
-    /// Get the average quality score of all connected peers
-    ///
-    /// Returns None if no peers have quality scores.
-    pub async fn get_average_peer_quality(&self) -> Option<f32> {
-        let quality_map = self.peer_quality.read().await;
-        if quality_map.is_empty() {
-            return None;
-        }
-
-        let sum: f32 = quality_map.values().sum();
-        Some(sum / quality_map.len() as f32)
-    }
-
     /// Send data to a peer.
     pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         self.send_to_peer_raw(addr, data).await
@@ -903,11 +759,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 }
 
 /// Dual-stack wrapper managing IPv4 and IPv6 transports
+#[allow(dead_code)]
 pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     pub v6: Option<P2PNetworkNode<T>>,
     pub v4: Option<P2PNetworkNode<T>>,
 }
 
+#[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
     /// Shut down the underlying QUIC endpoints on both stacks.
     ///
@@ -1029,6 +887,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Create with custom transports (for testing)
     pub fn with_transports(v6: Option<P2PNetworkNode<T>>, v4: Option<P2PNetworkNode<T>>) -> Self {
@@ -1186,22 +1045,6 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         self.send_to_peer_raw(addr, data).await
     }
 
-    /// Send to peer with StreamClass
-    pub async fn send_with_class(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-        class: StreamClass,
-    ) -> Result<()> {
-        let res = self.send_to_peer_raw(addr, data).await;
-        if res.is_ok() {
-            crate::telemetry::telemetry()
-                .record_stream_bandwidth(class, data.len() as u64)
-                .await;
-        }
-        res
-    }
-
     /// Subscribe to connection lifecycle events from both stacks
     pub fn subscribe_connection_events(&self) -> broadcast::Receiver<ConnectionEvent> {
         let (tx, rx) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
@@ -1284,16 +1127,4 @@ mod tests {
         // - test_send_to_peer_string: Exercises connect_to_peer with add_peer call
         // Integration tests verify the ConnectionEvent broadcasts work correctly.
     }
-
-    // TDD Phase 4: Quality-based peer selection implementation notes
-    //
-    // The following methods were added in Phase 4:
-    // - get_peer_quality(&self, addr: &SocketAddr) -> Option<f32>
-    // - get_peers_by_quality(&self) -> Vec<(SocketAddr, f32)>
-    // - get_top_peers_by_quality(&self, n: usize) -> Vec<(SocketAddr, f32)>
-    // - get_peers_above_quality_threshold(&self, threshold: f32) -> Vec<(SocketAddr, f32)>
-    // - get_average_peer_quality(&self) -> Option<f32>
-    //
-    // These methods are tested by integration tests in the test suite that
-    // actually create connections and verify quality-based peer selection.
 }

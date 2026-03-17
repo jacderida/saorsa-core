@@ -70,14 +70,11 @@ cargo doc --open                    # Build and open documentation
 ./scripts/check_no_panic_unwrap.sh  # Check for forbidden patterns
 ```
 
-### Adaptive Network Testing Suite
+### Trust System Tests
 ```bash
-./scripts/test_adaptive_network.sh  # Run adaptive component tests
-
-# Individual adaptive component tests
-cargo test --test adaptive_components_test test_thompson_sampling_basic --release
-cargo test --test adaptive_components_test test_multi_armed_bandit_basic --release
-cargo test --test adaptive_components_test test_q_learning_cache_basic --release
+# Trust engine unit tests (in src/adaptive/)
+cargo test --lib trust
+cargo test --lib adaptive::dht
 ```
 
 ## Critical Code Standards
@@ -113,130 +110,67 @@ all application data and business logic in **saorsa-node**. In practice:
 - **DHT is a peer phonebook only** (peer records, routing, discovery).
 - **Chunk storage/retrieval is done via `send_message`** in saorsa-node.
 - **Trust updates remain in saorsa-core**: saorsa-node reports data availability
-  outcomes so EigenTrust can downscore nodes that fail to serve expected data.
+  outcomes so the TrustEngine can downscore nodes that fail to serve expected data.
+  All trust signals flow through `AdaptiveDHT`.
 
 Example trust signal hook:
 ```rust
-use saorsa_core::adaptive::{EigenTrustEngine, NodeStatisticsUpdate};
+use saorsa_core::TrustEvent;
 
-trust_engine
-    .update_node_stats(&peer_id, NodeStatisticsUpdate::CorrectResponse)
-    .await;
+// Report application-level outcomes via P2PNode
+node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
 ```
 
 ### Multi-Layer P2P Architecture
 
-The system combines distributed hash table (DHT) storage with machine learning for optimal routing:
+The system combines a DHT peer phonebook with machine learning for optimal routing:
 
 #### 1. Transport Layer (`src/transport/`)
 - **Primary**: `saorsa-transport` (0.8+) for QUIC transport with NAT traversal
 - **Security**: Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
 
 #### 2. Adaptive Network Layer (`src/adaptive/`)
-Central to the system's intelligence, using ML for dynamic strategy selection:
-- **Multi-Armed Bandit**: Thompson Sampling for strategy selection
-- **Routing Strategies**: Kademlia DHT, Hyperbolic routing, Trust-based routing
-- **ML Components**: Q-Learning cache optimization, Churn prediction
+Trust boundary and adaptive routing:
+- **AdaptiveDHT**: Sole owner of TrustEngine and DhtNetworkManager — all trust signals flow through here
+- **TrustEngine**: Response-rate scoring with time decay for decentralized reputation
+- **TrustEvent**: Unified enum for all trust-relevant outcomes (reported via `P2PNode::report_trust_event`)
+- **Binary blocking**: Peers below block threshold are evicted and rejected (no trust-weighted routing)
 
 #### 3. DHT Layer (`src/dht/`)
-Distributed storage with geographic awareness:
-- **Core Engine**: Kademlia-based with K=8 replication
+Peer phonebook with geographic awareness (no data storage):
+- **Core Engine**: Kademlia-based routing table and peer discovery
 - **Geographic Routing**: Region-aware peer selection
-- **Witness System**: Byzantine fault tolerance
-- **Optimizations**: RSPS (Root-Scoped Provider Summaries) via `saorsa-rsps`
-
-#### 4. Identity System (`src/identity/`)
-- **Cryptography**: ML-DSA-65 for post-quantum signatures
-- **No PoW**: Pure cryptographic identity without proof-of-work
-
-#### 5. Placement System (`src/placement/`)
-Advanced storage orchestration with EigenTrust integration:
-- **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
-- **Byzantine Tolerance**: Configurable f-out-of-3f+1 fault tolerance
-- **DHT Records**: NODE_AD, GROUP_BEACON, DATA_POINTER (≤512B)
+- **Trust-Weighted Eviction**: Peers below trust threshold are evicted (live TrustEngine queries)
 
 ## External Crate Dependencies
 
 ### Saorsa Ecosystem
-- `saorsa-rsps` (0.2.0): DHT optimization with provider summaries
-- `saorsa-webrtc` (0.1.2): WebRTC with pluggable signaling
-- `saorsa-pqc` (0.3.12): Post-quantum cryptography
-- `saorsa-transport` (0.10+): QUIC transport with NAT traversal and PQC
+- `saorsa-pqc` (0.5): Post-quantum cryptography
+- `saorsa-transport` (0.25+): QUIC transport with NAT traversal and PQC
 
 ### Feature Flags
-```toml
-default = ["metrics"]
-metrics = ["dep:prometheus"]  # Prometheus monitoring
-```
+
+No feature flags — all functionality is always enabled.
 
 ## Testing Infrastructure
 
 ### Test Organization
 - **Unit Tests**: In-module `#[cfg(test)]` blocks
-- **Integration Tests**: `tests/` directory
-- **Property Tests**: Using `proptest` for randomized testing
 
-### Key Integration Tests
+### Key Tests
 ```bash
-# New API Tests (v0.3.16+)
-cargo test --test api_implementation_tests       # Clean API implementation
-cargo test --test storage_tests                  # Storage strategies & replication
-
-# Core functionality  
-cargo test --test saorsa_transport_integration_test      # QUIC transport
-cargo test --test dht_core_operations_test        # DHT operations
-cargo test --test adaptive_components_test        # Adaptive networking
-
-# Security & trust
-cargo test --test eigentrust_integration_test     # Trust system
-cargo test --test security_comprehensive_test     # Security validation
-```
-
-## Common Development Workflows
-
-### Adding New Adaptive Strategy
-1. Implement in `src/adaptive/`
-2. Add to `RoutingStrategy` enum
-3. Update multi-armed bandit
-4. Add performance metrics
-5. Write tests in `tests/adaptive_components_test.rs`
-
-### Adding New Placement Strategy
-1. Implement `PlacementStrategy` trait in `src/placement/algorithms.rs`
-2. Add strategy to placement engine configuration
-3. Ensure geographic diversity compliance
-4. Add EigenTrust integration hooks
-5. Write comprehensive tests with property-based testing
-
-### DHT Operation with Witnesses
-```rust
-// Store with witness validation
-let witnesses = engine.select_witnesses(&key, 3)?;
-let receipt = engine.store_with_witnesses(
-    key,
-    value,
-    &witnesses,
-    Duration::from_secs(3600)
-).await?;
+# All unit tests (includes DHT, trust, transport, security)
+cargo test --lib
 ```
 
 ## Important Implementation Details
 
 ### DHT Configuration
-- **Replication Factor**: K=8 (8 replicas per key)
-- **Consistency Levels**: Eventual, Quorum, All
-- **Geographic Awareness**: Regional peer preference
-- **Witness System**: Byzantine fault tolerance
-
-### Placement System Configuration
-- **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
-  - `τ_i`: EigenTrust reputation score (0.0-1.0)
-  - `p_i`: Performance score (0.0-1.0)
-  - `c_i`: Capacity score (0.0-1.0)
-  - `d_i`: Diversity bonus multiplier (1.0-2.0)
-- **Byzantine Tolerance**: f-out-of-3f+1 nodes (configurable f)
-- **DHT Record Limits**: ≤512 bytes
-- **Audit Frequency**: 5-minute intervals with concurrent limits
+- **Bucket Size**: 20 nodes per k-bucket
+- **Concurrency**: Alpha=3 parallel lookups
+- **Geographic Awareness**: Region-aware peer selection
+- **Trust Integration**: Response-rate scoring with binary blocking
 
 ### Performance Optimizations
 - **Connection Pooling**: Max 100 connections with LRU eviction

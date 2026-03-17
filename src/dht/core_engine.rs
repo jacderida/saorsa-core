@@ -1,33 +1,19 @@
-//! Enhanced DHT Core Engine with Kademlia routing and intelligent data distribution
+//! DHT Core Engine with Kademlia routing
 //!
-//! Provides the main DHT functionality with k=8 replication, load balancing, and fault tolerance.
+//! Provides peer discovery and routing via a Kademlia DHT with k=8 buckets,
+//! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
-use crate::adaptive::EigenTrustEngine;
 use crate::address::MultiAddr;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::metrics::SecurityMetricsCollector;
-use crate::dht::network_integration::{DhtMessage, DhtResponse};
-use crate::dht::routing_maintenance::close_group_validator::{
-    CloseGroupEnforcementMode, CloseGroupFailure, CloseGroupValidator, CloseGroupValidatorConfig,
-};
-use crate::dht::routing_maintenance::{
-    BucketRefreshManager, EvictionManager, EvictionReason, MaintenanceConfig,
-};
-use crate::dht::trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
-use crate::network::NetworkSender;
 use crate::security::IPDiversityConfig;
-use anyhow::{Context, Result, anyhow};
-use lru::LruCache;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::{RwLock, oneshot};
+use std::time::SystemTime;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 /// DHT key type — now a direct alias for [`PeerId`].
 ///
@@ -49,9 +35,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Node information for routing.
 ///
 /// The `address` field stores a typed [`MultiAddr`] that is always valid.
-/// For wire-protocol compatibility it serializes as a plain `"ip:port"` string
-/// and deserializes from both `"ip:port"` and MultiAddr formats like
-/// `/ip4/1.2.3.4/udp/9000`.
+/// Serializes as a canonical `/`-delimited string via `serde_as_string`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
@@ -62,17 +46,15 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    /// Get the socket address. Always succeeds because `MultiAddr`
-    /// guarantees a valid `SocketAddr`.
+    /// Get the socket address. Returns `None` for non-IP transports.
     #[must_use]
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.address.socket_addr
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        self.address.socket_addr()
     }
 
-    /// Get the IP address. Always succeeds because `MultiAddr`
-    /// guarantees a valid IP.
+    /// Get the IP address. Returns `None` for non-IP transports.
     #[must_use]
-    pub fn ip(&self) -> IpAddr {
+    pub fn ip(&self) -> Option<IpAddr> {
         self.address.ip()
     }
 }
@@ -80,7 +62,6 @@ impl NodeInfo {
 /// Node capacity metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapacity {
-    pub storage_available: u64,
     pub bandwidth_available: u64,
     pub reliability_score: f64,
 }
@@ -88,8 +69,7 @@ pub struct NodeCapacity {
 impl Default for NodeCapacity {
     fn default() -> Self {
         Self {
-            storage_available: 1_000_000_000, // 1GB
-            bandwidth_available: 10_000_000,  // 10MB/s
+            bandwidth_available: 10_000_000, // 10MB/s
             reliability_score: 1.0,
         }
     }
@@ -136,18 +116,11 @@ impl KBucket {
 
     /// Update `last_seen` (and optionally the address) for a node, then move
     /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
-    ///
-    /// The `address` parameter accepts a string in either `"ip:port"` or
-    /// MultiAddr format.  Invalid strings are silently ignored — the existing
-    /// address is preserved.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
-            if let Some(addr) = address
-                && !addr.is_empty()
-                && let Ok(parsed) = addr.parse::<MultiAddr>()
-            {
-                self.nodes[pos].address = parsed;
+            if let Some(addr) = address {
+                self.nodes[pos].address = addr.clone();
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
@@ -199,7 +172,7 @@ impl KademliaRoutingTable {
 
     /// Update `last_seen` (and optionally address) for a node and move it to
     /// the tail of its k-bucket. Returns `true` if the node was found.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&str>) -> bool {
+    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].touch_node(node_id, address)
     }
@@ -284,130 +257,6 @@ impl KademliaRoutingTable {
     }
 }
 
-/// Consistency level for operations
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ConsistencyLevel {
-    One,    // At least 1 replica
-    Quorum, // Majority of replicas
-    All,    // All replicas
-}
-
-/// Load metrics for a node
-#[derive(Debug, Clone)]
-pub struct LoadMetric {
-    pub storage_used_percent: f64,
-    pub bandwidth_used_percent: f64,
-    pub request_rate: f64,
-}
-
-/// Store receipt for DHT operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoreReceipt {
-    pub key: DhtKey,
-    pub stored_at: Vec<PeerId>,
-    pub timestamp: SystemTime,
-    pub success: bool,
-}
-
-impl StoreReceipt {
-    pub fn is_successful(&self) -> bool {
-        self.success
-    }
-}
-
-/// Data store for local storage
-struct DataStore {
-    data: HashMap<DhtKey, Vec<u8>>,
-    metadata: HashMap<DhtKey, DataMetadata>,
-}
-
-#[derive(Debug, Clone)]
-struct DataMetadata {
-    _size: usize,
-    _stored_at: SystemTime,
-}
-
-impl DataStore {
-    fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-            metadata: HashMap::new(),
-        }
-    }
-
-    fn put(&mut self, key: DhtKey, value: Vec<u8>) {
-        let metadata = DataMetadata {
-            _size: value.len(),
-            _stored_at: SystemTime::now(),
-        };
-
-        self.data.insert(key, value);
-        self.metadata.insert(key, metadata);
-    }
-
-    /// Look up a value without updating access metadata (read-only).
-    fn get(&self, key: &DhtKey) -> Option<Vec<u8>> {
-        self.data.get(key).cloned()
-    }
-}
-
-/// Replication manager for maintaining data redundancy
-struct ReplicationManager {
-    _replication_factor: usize,
-    _consistency_level: ConsistencyLevel,
-    _pending_repairs: Vec<DhtKey>,
-}
-
-impl ReplicationManager {
-    fn new(replication_factor: usize) -> Self {
-        Self {
-            _replication_factor: replication_factor,
-            _consistency_level: ConsistencyLevel::Quorum,
-            _pending_repairs: Vec::new(),
-        }
-    }
-}
-
-/// Load balancer for intelligent data distribution
-struct LoadBalancer {
-    node_loads: HashMap<PeerId, LoadMetric>,
-    _rebalance_threshold: f64,
-}
-
-impl LoadBalancer {
-    fn new() -> Self {
-        Self {
-            node_loads: HashMap::new(),
-            _rebalance_threshold: 0.8,
-        }
-    }
-
-    fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<PeerId> {
-        // Filter NaN values during collection to avoid intermediate allocations with invalid data
-        let mut sorted: Vec<_> = candidates
-            .iter()
-            .filter_map(|node| {
-                let load = self
-                    .node_loads
-                    .get(&node.id)
-                    .map(|l| l.storage_used_percent)
-                    .unwrap_or(0.0);
-                // Filter NaN during collection rather than after
-                if load.is_nan() {
-                    None
-                } else {
-                    Some((node.id, load))
-                }
-            })
-            .collect();
-
-        // Use total_cmp for safe float comparison
-        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        sorted.into_iter().take(count).map(|(id, _)| id).collect()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Address parsing and subnet masking helpers for diversity checks
 // ---------------------------------------------------------------------------
@@ -450,31 +299,26 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
     Ipv6Addr::from(bits & mask)
 }
 
+/// Apply optional floor/ceiling overrides to a computed subnet limit.
+/// Floor is applied first (raising the value), then ceiling (lowering it).
+/// When both are set, ceiling wins if floor > ceiling.
+fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> usize {
+    let mut result = limit;
+    if let Some(f) = floor {
+        result = result.max(f);
+    }
+    if let Some(c) = ceiling {
+        result = result.min(c);
+    }
+    result
+}
+
 /// Default maximum nodes per geographic region. Matches
 /// `GeographicRoutingConfig::max_nodes_per_region` default.
 const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 
-/// DHT query timeout duration
-const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Alpha parameter from Kademlia - max parallel queries
-const MAX_PARALLEL_QUERIES: usize = 3;
-
-/// K parameter - replication factor
+/// K parameter - number of closest nodes per bucket
 const K: usize = 8;
-
-/// Maximum value size for DHT store operations (512 bytes)
-/// The DHT is designed as a "phonebook" for peer discovery, not general storage.
-/// Record types (NODE_AD, GROUP_BEACON, DATA_POINTER) should fit within 512 bytes.
-/// Larger data should be stored via send_message() in the application layer.
-const MAX_DHT_VALUE_SIZE: usize = 512;
-
-/// Maximum node count for FindNode requests
-/// Prevents amplification attacks by limiting response size
-const MAX_FIND_NODE_COUNT: usize = 20;
-
-/// Maximum pending DHT requests before evicting oldest (prevents memory DoS)
-const MAX_PENDING_DHT_REQUESTS: usize = 10_000;
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -483,41 +327,19 @@ const KADEMLIA_BUCKET_COUNT: usize = 256;
 /// Collect 2x requested count before early exit to ensure good selection
 const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 
-/// DHT routing table maintenance interval in seconds
-/// Periodic refresh of buckets and eviction of stale nodes
-const MAINTENANCE_INTERVAL_SECS: u64 = 60;
+/// Subnet diversity multiplier: /24 (IPv4) or /64 (IPv6) limit = per-IP * this.
+const SUBNET_NARROW_MULTIPLIER: usize = 3;
 
-/// DHT request wrapper with request ID for correlation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtRequestWrapper {
-    /// Unique request ID for response correlation
-    pub id: String,
-    /// The underlying DHT message
-    pub message: DhtMessage,
-}
+/// Subnet diversity multiplier: /16 (IPv4) or /48 (IPv6) limit = per-IP * this.
+const SUBNET_MEDIUM_MULTIPLIER: usize = 10;
 
-/// DHT response wrapper with request ID for correlation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtResponseWrapper {
-    /// Request ID this response corresponds to
-    pub id: String,
-    /// The underlying DHT response
-    pub response: DhtResponse,
-}
+/// Subnet diversity multiplier for IPv6 /32 (widest prefix tier).
+const SUBNET_WIDE_MULTIPLIER: usize = 30;
 
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
     node_id: PeerId,
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
-    data_store: Arc<RwLock<DataStore>>,
-    replication_manager: Arc<RwLock<ReplicationManager>>,
-    load_balancer: Arc<RwLock<LoadBalancer>>,
-
-    // Security Components
-    security_metrics: Arc<SecurityMetricsCollector>,
-    bucket_refresh_manager: Arc<RwLock<BucketRefreshManager>>,
-    close_group_validator: Arc<RwLock<CloseGroupValidator>>,
-    eviction_manager: Arc<RwLock<EvictionManager>>,
 
     /// IP diversity limits — checked against the live routing table on each
     /// `add_node` call rather than maintained as incremental counters.
@@ -531,31 +353,27 @@ pub struct DhtCoreEngine {
     /// Maximum nodes per geographic region.
     geo_max_per_region: usize,
 
-    // Network query components
-    /// Transport handle for sending messages to remote peers
-    transport: Option<Arc<dyn NetworkSender>>,
-    /// Pending requests waiting for responses (request_id -> response sender)
-    /// LRU cache with max 10k entries to prevent memory DoS
-    pending_requests: Arc<RwLock<LruCache<String, oneshot::Sender<DhtResponse>>>>,
-
-    // Trust-weighted peer selection
-    /// Optional trust-aware peer selector for combining distance with trust scores
-    trust_peer_selector: Option<TrustAwarePeerSelector<EigenTrustEngine>>,
-
     /// Shutdown token for background maintenance tasks
     shutdown: CancellationToken,
 }
 
 impl DhtCoreEngine {
-    /// Create new DHT engine with specified node ID
-    pub fn new(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict, false)
-    }
-
-    /// Create new DHT engine for testing (permissive validation)
+    /// Create new DHT engine for testing
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::LogOnly, false)
+        Self::new(node_id, false)
+    }
+
+    /// Create a new DHT core engine.
+    pub(crate) fn new(node_id: PeerId, allow_loopback: bool) -> Result<Self> {
+        Ok(Self {
+            node_id,
+            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
+            ip_diversity_config: IPDiversityConfig::default(),
+            allow_loopback,
+            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
+            shutdown: CancellationToken::new(),
+        })
     }
 
     /// Override the IP diversity configuration.
@@ -564,76 +382,9 @@ impl DhtCoreEngine {
     }
 
     /// Set whether loopback addresses are allowed in the routing table.
-    /// Only available in test builds — production code sets this at construction.
     #[cfg(test)]
     pub fn set_allow_loopback(&mut self, allow: bool) {
         self.allow_loopback = allow;
-    }
-
-    /// Create new DHT engine with specified validation mode
-    pub(crate) fn new_with_validation_mode(
-        node_id: PeerId,
-        enforcement_mode: CloseGroupEnforcementMode,
-        allow_loopback: bool,
-    ) -> Result<Self> {
-        // Initialize security components
-        let security_metrics = Arc::new(SecurityMetricsCollector::new());
-        let validator_config =
-            CloseGroupValidatorConfig::default().with_enforcement_mode(enforcement_mode);
-        let close_group_validator = Arc::new(RwLock::new(CloseGroupValidator::new(
-            validator_config.clone(),
-        )));
-
-        let mut bucket_refresh_manager =
-            BucketRefreshManager::new_with_validation(node_id, validator_config.clone());
-        // Link validator to refresh manager
-        bucket_refresh_manager.set_validator(close_group_validator.clone());
-        let bucket_refresh_manager = Arc::new(RwLock::new(bucket_refresh_manager));
-
-        let eviction_manager = Arc::new(RwLock::new(EvictionManager::new(
-            MaintenanceConfig::default(),
-        )));
-
-        Ok(Self {
-            node_id,
-            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
-            data_store: Arc::new(RwLock::new(DataStore::new())),
-            replication_manager: Arc::new(RwLock::new(ReplicationManager::new(K))),
-            load_balancer: Arc::new(RwLock::new(LoadBalancer::new())),
-            security_metrics,
-            bucket_refresh_manager,
-            close_group_validator,
-            eviction_manager,
-            ip_diversity_config: IPDiversityConfig::default(),
-            allow_loopback,
-            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
-            transport: None,
-            pending_requests: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(MAX_PENDING_DHT_REQUESTS)
-                    .context("MAX_PENDING_DHT_REQUESTS must be non-zero")?,
-            ))),
-            trust_peer_selector: None,
-            shutdown: CancellationToken::new(),
-        })
-    }
-
-    /// Set the transport handle for network operations
-    ///
-    /// Once set, `retrieve()` will query remote peers when a key is not found locally.
-    pub fn set_transport(&mut self, transport: Arc<dyn NetworkSender>) {
-        self.transport = Some(transport);
-    }
-
-    /// Check if network operations are available
-    #[must_use]
-    pub fn has_transport(&self) -> bool {
-        self.transport.is_some()
-    }
-
-    /// Get this node's ID
-    #[must_use]
-    pub fn node_id(&self) -> &PeerId {
-        &self.node_id
     }
 
     /// Number of peers currently in the routing table.
@@ -641,603 +392,20 @@ impl DhtCoreEngine {
         self.routing_table.read().await.node_count()
     }
 
-    // ===== Trust-weighted peer selection methods =====
-
-    /// Enable trust-weighted peer selection
-    ///
-    /// When enabled, peer selection for DHT operations will combine XOR distance
-    /// with EigenTrust scores to prefer higher-trust nodes.
-    ///
-    /// # Arguments
-    /// * `trust_engine` - The EigenTrust engine providing trust scores
-    /// * `config` - Configuration for trust selection behavior
-    pub fn enable_trust_selection(
-        &mut self,
-        trust_engine: Arc<EigenTrustEngine>,
-        config: TrustSelectionConfig,
-    ) {
-        self.trust_peer_selector = Some(TrustAwarePeerSelector::new(trust_engine, config));
-        tracing::info!("DHT trust-weighted peer selection enabled");
+    /// Remove a peer from the routing table by ID.
+    pub async fn remove_node_by_id(&mut self, peer_id: &PeerId) {
+        self.routing_table.write().await.remove_node(peer_id);
     }
 
-    /// Enable trust-weighted peer selection with separate configs for queries and storage
-    ///
-    /// Storage operations use stricter trust requirements since data persistence
-    /// depends on node reliability.
-    pub fn enable_trust_selection_with_storage_config(
-        &mut self,
-        trust_engine: Arc<EigenTrustEngine>,
-        query_config: TrustSelectionConfig,
-        storage_config: TrustSelectionConfig,
-    ) {
-        self.trust_peer_selector = Some(TrustAwarePeerSelector::with_storage_config(
-            trust_engine,
-            query_config,
-            storage_config,
-        ));
-        tracing::info!("DHT trust-weighted peer selection enabled with separate storage config");
-    }
-
-    /// Disable trust-weighted peer selection
-    ///
-    /// Falls back to pure distance-based selection.
-    pub fn disable_trust_selection(&mut self) {
-        self.trust_peer_selector = None;
-        tracing::info!("DHT trust-weighted peer selection disabled");
-    }
-
-    /// Check if trust-weighted peer selection is enabled
-    #[must_use]
-    pub fn has_trust_selection(&self) -> bool {
-        self.trust_peer_selector.is_some()
-    }
-
-    /// Select peers for a query operation, considering trust if enabled
-    ///
-    /// If trust selection is enabled, combines XOR distance with trust scores.
-    /// Otherwise, returns closest nodes by XOR distance only.
-    async fn select_query_peers(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        let routing = self.routing_table.read().await;
-        // Get 2x candidates to allow trust-based filtering
-        let candidates = routing.find_closest_nodes(key, count * 2);
-        drop(routing);
-
-        if let Some(ref selector) = self.trust_peer_selector {
-            selector.select_peers(key, &candidates, count)
-        } else {
-            // Fallback: take closest by distance
-            candidates.into_iter().take(count).collect()
-        }
-    }
-
-    /// Select peers for a storage operation, considering trust if enabled
-    ///
-    /// Storage operations use stricter trust requirements when trust selection
-    /// is enabled, as data persistence depends on node reliability.
-    async fn select_storage_peers(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        let routing = self.routing_table.read().await;
-        // Get 3x candidates for storage to allow stricter trust filtering
-        let candidates = routing.find_closest_nodes(key, count * 3);
-        drop(routing);
-
-        if let Some(ref selector) = self.trust_peer_selector {
-            selector.select_storage_peers(key, &candidates, count)
-        } else {
-            // Fallback: take closest by distance
-            candidates.into_iter().take(count).collect()
-        }
-    }
-
-    /// Signal background maintenance tasks to stop
+    /// Signal background tasks to stop
     pub fn signal_shutdown(&self) {
         self.shutdown.cancel();
-    }
-
-    /// Start background maintenance tasks for security and health
-    pub fn start_maintenance_tasks(&self) {
-        let routing_table = self.routing_table.clone();
-        let refresh_manager = self.bucket_refresh_manager.clone();
-        let eviction_manager = self.eviction_manager.clone();
-        let close_group_validator = self.close_group_validator.clone();
-        let security_metrics = self.security_metrics.clone();
-        let shutdown = self.shutdown.clone();
-
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    () = shutdown.cancelled() => {
-                        tracing::info!("DHT core maintenance task shutting down");
-                        break;
-                    }
-                }
-
-                // 1. Run Bucket Refresh Logic with Validation Integration
-                {
-                    let mut mgr = refresh_manager.write().await;
-
-                    // Check for attack mode escalation based on validation failures
-                    if mgr.should_trigger_attack_mode() {
-                        if let Some(validator) = mgr.validator() {
-                            validator.write().await.escalate_to_bft();
-                            tracing::warn!(
-                                "Escalating to BFT mode due to validation failures (rate: {:.2}%)",
-                                mgr.overall_validation_rate() * 100.0
-                            );
-                        }
-                    } else if let Some(validator) = mgr.validator() {
-                        // De-escalate if validation rate recovers above 85%
-                        if mgr.overall_validation_rate() > 0.85 {
-                            validator.write().await.deescalate_from_bft();
-                        }
-                    }
-
-                    // Get buckets needing refresh
-                    let buckets = mgr.get_buckets_needing_refresh();
-                    if !buckets.is_empty() {
-                        // Get buckets that also need validation
-                        let validation_buckets = mgr.get_buckets_needing_validation();
-                        let mut total_validated = 0usize;
-                        let mut total_evicted = 0usize;
-
-                        for bucket in buckets {
-                            // Record refresh (in a real impl, trigger network lookups first)
-                            mgr.record_refresh_success(bucket, 0);
-
-                            // Perform trust-based validation during refresh
-                            if validation_buckets.contains(&bucket) {
-                                // Get nodes that need validation from the refresh manager
-                                let nodes_to_validate = mgr.get_nodes_in_bucket(bucket);
-
-                                // Validate each node using trust-based validation
-                                let validator = close_group_validator.read().await;
-                                let mut evict_list = Vec::new();
-
-                                for node_id in &nodes_to_validate {
-                                    // Query trust score from eviction manager's trust cache
-                                    // This cache is populated by EigenTrust updates via update_trust_score()
-                                    let trust_score = {
-                                        let evict_mgr = eviction_manager.read().await;
-                                        evict_mgr.get_trust_score(node_id)
-                                    };
-
-                                    let (is_valid, failure_reason) =
-                                        validator.validate_trust_only(node_id, trust_score);
-
-                                    if !is_valid && let Some(reason) = failure_reason {
-                                        tracing::info!(
-                                            node_id = ?node_id,
-                                            bucket = bucket,
-                                            reason = ?reason,
-                                            "Node failed validation during refresh"
-                                        );
-                                        evict_list
-                                            .push((*node_id, EvictionReason::CloseGroupRejection));
-                                    }
-                                }
-                                drop(validator);
-
-                                total_validated += nodes_to_validate.len();
-
-                                // Queue evictions
-                                if !evict_list.is_empty() {
-                                    let mut evict_mgr = eviction_manager.write().await;
-                                    for (node_id, reason) in evict_list {
-                                        evict_mgr.record_eviction(&node_id, reason);
-                                        total_evicted += 1;
-                                    }
-                                }
-
-                                // Record validation metrics
-                                let nodes_count = nodes_to_validate.len();
-                                mgr.record_validation_result(bucket, nodes_count, 0);
-
-                                tracing::debug!(
-                                    bucket = bucket,
-                                    nodes_validated = nodes_count,
-                                    "Bucket validation completed during refresh"
-                                );
-                            }
-                        }
-
-                        // Update security metrics
-                        if total_validated > 0 || total_evicted > 0 {
-                            security_metrics
-                                .record_validation_during_refresh(total_validated, total_evicted);
-                            tracing::info!(
-                                total_validated = total_validated,
-                                total_evicted = total_evicted,
-                                "Refresh validation cycle completed"
-                            );
-                        }
-                    }
-                }
-
-                // 2. Active Eviction Enforcement — remove candidates from both
-                //    the eviction tracker and the routing table.
-                {
-                    let mut eviction_mgr = eviction_manager.write().await;
-                    let candidates = eviction_mgr.get_eviction_candidates();
-                    if !candidates.is_empty() {
-                        let mut routing = routing_table.write().await;
-                        for (node_id, reason) in candidates {
-                            tracing::warn!("Evicting node {} for reason: {:?}", node_id, reason);
-                            routing.remove_node(&node_id);
-                            eviction_mgr.remove_node(&node_id);
-                        }
-                    }
-                }
-
-                // 4. Update Metrics
-                // (Example: update churn rate)
-                // metrics.update_churn(...)
-            }
-        });
-    }
-
-    /// Get the security metrics collector
-    pub fn security_metrics(&self) -> Arc<SecurityMetricsCollector> {
-        self.security_metrics.clone()
-    }
-
-    /// Store data in the DHT
-    ///
-    /// When trust-weighted selection is enabled, storage targets are selected
-    /// by combining XOR distance with trust scores, using stricter requirements
-    /// than query operations since data persistence depends on node reliability.
-    ///
-    /// # Errors
-    /// Returns an error if the value exceeds `MAX_DHT_VALUE_SIZE` (512 bytes).
-    ///
-    /// **Note:** When the local node is not among the selected storage targets,
-    /// the receipt will have `success: false` and an empty `stored_at` list
-    /// because network store-forwarding is not yet implemented.  Callers
-    /// should check [`StoreReceipt::is_successful`] and handle this case.
-    pub async fn store(&mut self, key: &DhtKey, value: Vec<u8>) -> Result<StoreReceipt> {
-        // Security: Reject oversized values to prevent memory exhaustion
-        if value.len() > MAX_DHT_VALUE_SIZE {
-            return Err(anyhow::anyhow!(
-                "Value too large: {} bytes (max: {} bytes)",
-                value.len(),
-                MAX_DHT_VALUE_SIZE
-            ));
-        }
-
-        // Find nodes to store at using trust-aware selection if enabled
-        let target_nodes = self.select_storage_peers(key, K).await;
-
-        // Select nodes based on load (secondary filter)
-        let load_balancer = self.load_balancer.read().await;
-        let selected_nodes = load_balancer.select_least_loaded(&target_nodes, K);
-
-        tracing::debug!(
-            key = ?hex::encode(key.as_bytes()),
-            num_targets = selected_nodes.len(),
-            trust_selection = self.has_trust_selection(),
-            "Selected storage targets"
-        );
-
-        // Store locally if we're one of the selected nodes or if no nodes are available (test/single-node mode)
-        if selected_nodes.contains(&self.node_id) || selected_nodes.is_empty() {
-            let mut store = self.data_store.write().await;
-            // Avoid unnecessary clone of value: key is cloned for ownership, value is consumed by this branch
-            store.put(*key, value);
-            // Return early since we've consumed value
-            return Ok(StoreReceipt {
-                key: *key,
-                stored_at: selected_nodes,
-                timestamp: SystemTime::now(),
-                success: true,
-            });
-        }
-
-        // TODO: send data to selected_nodes via transport when network
-        //       store-forwarding is implemented.  Until then, the receipt
-        //       must not claim success for a remote store that never happened.
-        Ok(StoreReceipt {
-            key: *key,
-            stored_at: Vec::new(),
-            timestamp: SystemTime::now(),
-            success: false,
-        })
-    }
-
-    /// Retrieve data from the DHT
-    ///
-    /// First checks local storage. If not found locally and a transport is configured,
-    /// queries the K closest nodes in parallel and returns the first successful response.
-    pub async fn retrieve(&self, key: &DhtKey) -> Result<Option<Vec<u8>>> {
-        // Step 1: Check local store first (read-only lock)
-        {
-            let store = self.data_store.read().await;
-            if let Some(value) = store.get(key) {
-                tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found in local store");
-                return Ok(Some(value));
-            }
-        }
-
-        // Step 2: Get transport or return None if not available
-        let transport = match &self.transport {
-            Some(t) => Arc::clone(t),
-            None => {
-                tracing::debug!("No transport available for network query");
-                return Ok(None);
-            }
-        };
-
-        // Step 3: Select peers using trust-aware selection if enabled
-        let closest_nodes = self.select_query_peers(key, K).await;
-
-        if closest_nodes.is_empty() {
-            tracing::debug!("No nodes in routing table to query");
-            return Ok(None);
-        }
-
-        tracing::debug!(
-            key = ?hex::encode(key.as_bytes()),
-            num_nodes = closest_nodes.len().min(MAX_PARALLEL_QUERIES),
-            trust_selection = self.has_trust_selection(),
-            "Querying nodes for key"
-        );
-
-        // Step 4: Query nodes in parallel (up to alpha at a time)
-        let nodes_to_query: Vec<_> = closest_nodes
-            .into_iter()
-            .take(MAX_PARALLEL_QUERIES)
-            .collect();
-
-        let query_futures: Vec<_> = nodes_to_query
-            .iter()
-            .map(|node| self.query_node_for_key(Arc::clone(&transport), node, key))
-            .collect();
-
-        // Step 5: Wait for responses (each query has its own DHT_QUERY_TIMEOUT)
-        let responses = futures::future::join_all(query_futures).await;
-
-        // Return first successful response
-        for response in responses {
-            if let Ok(Some(value)) = response {
-                tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found on remote node");
-                return Ok(Some(value));
-            }
-        }
-        tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key not found on any queried node");
-        Ok(None)
-    }
-
-    /// Query a single node for a key value
-    async fn query_node_for_key(
-        &self,
-        transport: Arc<dyn NetworkSender>,
-        node: &NodeInfo,
-        key: &DhtKey,
-    ) -> Result<Option<Vec<u8>>> {
-        // Generate unique request ID
-        let request_id = Uuid::new_v4().to_string();
-
-        // Create response channel
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending request - reject if at capacity to avoid evicting in-flight requests
-        {
-            let mut pending = self.pending_requests.write().await;
-            if pending.len() >= MAX_PENDING_DHT_REQUESTS {
-                return Err(anyhow!(
-                    "DHT request capacity exceeded ({} pending requests). Too many concurrent requests.",
-                    MAX_PENDING_DHT_REQUESTS
-                ));
-            }
-            pending.put(request_id.clone(), tx);
-        }
-
-        // Create the DHT message
-        let message = DhtMessage::Retrieve {
-            key: *key,
-            consistency: ConsistencyLevel::One,
-        };
-
-        // Wrap with request ID
-        let wrapped_request = DhtRequestWrapper {
-            id: request_id.clone(),
-            message,
-        };
-
-        // Serialize the request using postcard
-        let request_bytes = match postcard::to_stdvec(&wrapped_request) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Clean up pending request
-                let mut pending = self.pending_requests.write().await;
-                pending.pop(&request_id);
-                return Err(anyhow!(
-                    "Failed to serialize DHT request for key {}: {e}",
-                    hex::encode(key.as_bytes())
-                ));
-            }
-        };
-
-        // Send request via transport
-        if let Err(e) = transport
-            .send_message(&node.id, "/dht/1.0.0", request_bytes)
-            .await
-        {
-            // Clean up pending request
-            let mut pending = self.pending_requests.write().await;
-            pending.pop(&request_id);
-            tracing::debug!(peer_id = %node.id, error = %e, "Failed to send DHT request");
-            return Err(anyhow!(
-                "Failed to send DHT request to peer {}: {e}",
-                node.id
-            ));
-        }
-
-        // Wait for response with timeout
-        match tokio::time::timeout(DHT_QUERY_TIMEOUT, rx).await {
-            Ok(Ok(response)) => {
-                // Clean up happens automatically when channel completes
-                match response {
-                    DhtResponse::RetrieveReply { value } => Ok(value),
-                    DhtResponse::Error { message, .. } => {
-                        tracing::debug!(peer_id = %node.id, error = %message, "DHT error response");
-                        Ok(None)
-                    }
-                    _ => {
-                        tracing::debug!(peer_id = %node.id, "Unexpected DHT response type");
-                        Ok(None)
-                    }
-                }
-            }
-            Ok(Err(_recv_error)) => {
-                // Channel closed without response
-                tracing::debug!(peer_id = %node.id, "Response channel closed");
-                Ok(None)
-            }
-            Err(_timeout) => {
-                // Timeout - clean up pending request
-                let mut pending = self.pending_requests.write().await;
-                pending.pop(&request_id);
-                tracing::debug!(peer_id = %node.id, "DHT request timed out");
-                Ok(None)
-            }
-        }
-    }
-
-    /// Handle an incoming DHT response from the network
-    ///
-    /// This method should be called by the transport layer when a DHT response
-    /// message is received. It routes the response to the waiting caller.
-    pub async fn handle_response(&self, response_wrapper: DhtResponseWrapper) {
-        let mut pending = self.pending_requests.write().await;
-        if let Some(tx) = pending.pop(&response_wrapper.id) {
-            // Send response - log if receiver dropped (timeout or cancelled request)
-            if tx.send(response_wrapper.response).is_err() {
-                tracing::debug!(
-                    request_id = %response_wrapper.id,
-                    "Response receiver dropped (request likely timed out)"
-                );
-            }
-        } else {
-            tracing::trace!(
-                request_id = %response_wrapper.id,
-                "Received response for unknown or timed-out request"
-            );
-        }
-    }
-
-    /// Handle an incoming DHT request from the network
-    ///
-    /// Processes the request and returns a response wrapper ready to be sent back.
-    pub async fn handle_request(&self, request_wrapper: DhtRequestWrapper) -> DhtResponseWrapper {
-        let response = match request_wrapper.message {
-            DhtMessage::Retrieve { ref key, .. } => match self.data_store.read().await.get(key) {
-                Some(value) => DhtResponse::RetrieveReply { value: Some(value) },
-                None => DhtResponse::RetrieveReply { value: None },
-            },
-            DhtMessage::Store {
-                ref key, ref value, ..
-            } => {
-                // Security: Reject oversized values to prevent memory exhaustion
-                if value.len() > MAX_DHT_VALUE_SIZE {
-                    return DhtResponseWrapper {
-                        id: request_wrapper.id,
-                        response: DhtResponse::Error {
-                            code: crate::dht::network_integration::ErrorCode::InvalidMessage,
-                            message: format!(
-                                "Value too large: {} bytes (max: {} bytes)",
-                                value.len(),
-                                MAX_DHT_VALUE_SIZE
-                            ),
-                            retry_after: None,
-                        },
-                    };
-                }
-                self.data_store.write().await.put(*key, value.clone());
-                DhtResponse::StoreAck {
-                    replicas: vec![self.node_id],
-                }
-            }
-            DhtMessage::FindNode { ref target, count } => {
-                // Security: Cap count to prevent amplification attacks
-                let capped_count = count.min(MAX_FIND_NODE_COUNT);
-                let routing = self.routing_table.read().await;
-                let nodes = routing.find_closest_nodes(target, capped_count);
-                DhtResponse::FindNodeReply {
-                    nodes,
-                    distances: Vec::new(),
-                }
-            }
-            DhtMessage::FindValue { ref key } => {
-                let value = self.data_store.read().await.get(key);
-                if value.is_some() {
-                    DhtResponse::FindValueReply {
-                        value,
-                        nodes: Vec::new(),
-                    }
-                } else {
-                    let routing = self.routing_table.read().await;
-                    let nodes = routing.find_closest_nodes(key, K);
-                    DhtResponse::FindValueReply { value: None, nodes }
-                }
-            }
-            DhtMessage::Ping { timestamp } => DhtResponse::Pong { timestamp },
-            _ => DhtResponse::Error {
-                code: crate::dht::network_integration::ErrorCode::InvalidMessage,
-                message: "Unsupported message type".to_string(),
-                retry_after: None,
-            },
-        };
-
-        DhtResponseWrapper {
-            id: request_wrapper.id,
-            response,
-        }
     }
 
     /// Find nodes closest to a key
     pub async fn find_nodes(&self, key: &DhtKey, count: usize) -> Result<Vec<NodeInfo>> {
         let routing = self.routing_table.read().await;
         Ok(routing.find_closest_nodes(key, count))
-    }
-
-    /// Join the DHT network.
-    ///
-    /// Bootstrap nodes go through the same close-group validation and
-    /// IP/geographic diversity checks as every other `add_node` call, so a
-    /// compromised bootstrap list cannot bypass security invariants.
-    ///
-    /// Returns an error if the list is non-empty but *every* node fails
-    /// validation (the caller would be left with an empty routing table).
-    pub async fn join_network(&mut self, bootstrap_nodes: Vec<NodeInfo>) -> Result<()> {
-        let total = bootstrap_nodes.len();
-        let mut added: usize = 0;
-        for node in bootstrap_nodes {
-            match self.add_node(node).await {
-                Ok(()) => added += 1,
-                Err(e) => tracing::warn!("Skipping bootstrap node that failed validation: {e}"),
-            }
-        }
-
-        if total > 0 && added == 0 {
-            return Err(anyhow!(
-                "All {total} bootstrap nodes failed validation — cannot join network"
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Leave the DHT network gracefully
-    pub async fn leave_network(&mut self) -> Result<()> {
-        // Transfer data to other nodes before leaving
-        // In a real implementation, would redistribute stored data
-
-        let mut store = self.data_store.write().await;
-        store.data.clear();
-        store.metadata.clear();
-
-        Ok(())
     }
 
     /// Look up a node's address from the routing table by peer ID.
@@ -1257,115 +425,9 @@ impl DhtCoreEngine {
     /// routing table should reflect this without requiring dedicated pings.
     /// Passing the current address ensures stale addresses are replaced when a
     /// peer reconnects from a different endpoint.
-    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&str>) -> bool {
+    pub async fn touch_node(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address)
-    }
-
-    /// Handle node failure
-    pub async fn handle_node_failure(&mut self, failed_node: PeerId) -> Result<()> {
-        // Remove from routing table
-        let mut routing = self.routing_table.write().await;
-        routing.remove_node(&failed_node);
-
-        // Schedule repairs for affected data
-        let _replication = self.replication_manager.write().await;
-        // In real implementation, would identify affected keys and schedule repairs
-
-        Ok(())
-    }
-
-    /// Evict a node from the routing table with a specific reason.
-    ///
-    /// This is called when a node fails security validation or is detected
-    /// as malicious through Sybil/collusion detection.
-    pub async fn evict_node(&self, node_id: &PeerId, reason: EvictionReason) -> Result<()> {
-        // 1. Remove from routing table
-        {
-            let mut routing = self.routing_table.write().await;
-            routing.remove_node(node_id);
-        }
-
-        // 2. Update security metrics based on eviction reason
-        let reason_str = match &reason {
-            EvictionReason::ConsecutiveFailures(_) => "consecutive_failures",
-            EvictionReason::LowTrust(_) => "low_trust",
-            EvictionReason::CloseGroupRejection => "close_group_rejection",
-            EvictionReason::Stale => "stale",
-        };
-        self.security_metrics.record_eviction(reason_str).await;
-
-        // 3. Log eviction for data integrity tracking
-        // Note: Data health tracking handled elsewhere
-        // Evicted nodes will be removed from routing table, which affects future lookups
-
-        tracing::info!(
-            node_id = %node_id,
-            reason = ?reason,
-            "Node evicted from DHT"
-        );
-
-        Ok(())
-    }
-
-    /// Evict a node due to close group validation failure.
-    ///
-    /// This is a specialized eviction for security-related failures.
-    pub async fn evict_node_for_security(
-        &self,
-        node_id: &PeerId,
-        failure_reason: CloseGroupFailure,
-    ) -> Result<()> {
-        let eviction_reason = match failure_reason {
-            CloseGroupFailure::NotInCloseGroup => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::EvictedFromCloseGroup => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::InsufficientConfirmation => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::LowTrustScore => {
-                EvictionReason::LowTrust("Security validation failed".to_string())
-            }
-            CloseGroupFailure::InsufficientGeographicDiversity => {
-                EvictionReason::LowTrust("Geographic diversity violation".to_string())
-            }
-            CloseGroupFailure::SuspectedCollusion => {
-                EvictionReason::LowTrust("Suspected collusion".to_string())
-            }
-            CloseGroupFailure::AttackModeTriggered => {
-                EvictionReason::LowTrust("Attack mode triggered".to_string())
-            }
-        };
-
-        self.evict_node(node_id, eviction_reason).await
-    }
-
-    /// Get eviction candidates from the refresh manager.
-    ///
-    /// Returns nodes that should be evicted based on validation failures.
-    pub async fn get_eviction_candidates(&self) -> Vec<(PeerId, CloseGroupFailure)> {
-        self.bucket_refresh_manager
-            .read()
-            .await
-            .get_nodes_for_eviction()
-            .await
-    }
-
-    /// Check if the system is currently in attack mode.
-    #[must_use]
-    pub async fn is_attack_mode(&self) -> bool {
-        self.bucket_refresh_manager
-            .read()
-            .await
-            .is_attack_mode()
-            .await
-    }
-
-    /// Get the bucket refresh manager for external access
-    pub fn bucket_refresh_manager(&self) -> Arc<RwLock<BucketRefreshManager>> {
-        self.bucket_refresh_manager.clone()
-    }
-
-    /// Get the close group validator for external access
-    pub fn close_group_validator(&self) -> Arc<RwLock<CloseGroupValidator>> {
-        self.close_group_validator.clone()
     }
 
     /// Add a node to the DHT with security checks.
@@ -1374,17 +436,16 @@ impl DhtCoreEngine {
     /// live routing table contents on every call, so counts are always accurate
     /// regardless of evictions, reconnections, or address changes.
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
-        // 1. Security Check: Close Group Validator
-        {
-            let validator = self.close_group_validator.read().await;
-            if !validator.validate(&node.id) {
-                tracing::warn!("Node failed close group validation: {:?}", node.id);
-                return Err(anyhow::anyhow!("Node failed close group validation"));
+        // IP-based transports always have an IP; non-IP transports skip diversity.
+        let candidate_ip = match node.ip() {
+            Some(ip) => ip,
+            None => {
+                // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
+                let mut routing = self.routing_table.write().await;
+                routing.add_node(node)?;
+                return Ok(());
             }
-        }
-
-        // MultiAddr guarantees a valid IP — no parsing can fail.
-        let candidate_ip = node.ip();
+        };
 
         // 2. Security Check: IP + Geographic Diversity
         //
@@ -1454,7 +515,10 @@ impl DhtCoreEngine {
             if node.id == *candidate_id {
                 continue;
             }
-            let existing_ip = node.ip();
+            let Some(existing_ip) = node.ip() else {
+                // Non-IP transports don't participate in IP diversity counting.
+                continue;
+            };
             // Loopback nodes don't contribute to network_size or any counts
             if existing_ip.is_loopback() {
                 continue;
@@ -1496,15 +560,28 @@ impl DhtCoreEngine {
         match candidate_ip {
             IpAddr::V4(v4) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_32 = cfg
-                    .max_nodes_per_ipv4_32
-                    .map_or(per_ip, |floor| floor.max(per_ip));
-                let limit_24 = cfg
-                    .max_nodes_per_ipv4_24
-                    .map_or(per_ip * 3, |floor| floor.max(per_ip * 3));
-                let limit_16 = cfg
-                    .max_nodes_per_ipv4_16
-                    .map_or(per_ip * 10, |floor| floor.max(per_ip * 10));
+                let limit_32 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_32
+                        .map_or(per_ip, |cap| cap.min(per_ip)),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
+                let limit_24 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_24
+                        .map_or(per_ip * SUBNET_NARROW_MULTIPLIER, |cap| {
+                            cap.min(per_ip * SUBNET_NARROW_MULTIPLIER)
+                        }),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
+                let limit_16 = clamp_limit(
+                    cfg.max_nodes_per_ipv4_16
+                        .map_or(per_ip * SUBNET_MEDIUM_MULTIPLIER, |cap| {
+                            cap.min(per_ip * SUBNET_MEDIUM_MULTIPLIER)
+                        }),
+                    cfg.ipv4_limit_floor,
+                    cfg.ipv4_limit_ceiling,
+                );
 
                 if v4_counts.exact >= limit_32 {
                     return Err(anyhow!(
@@ -1526,9 +603,21 @@ impl DhtCoreEngine {
             }
             IpAddr::V6(_) => {
                 let cfg = &self.ip_diversity_config;
-                let limit_64 = std::cmp::min(cfg.max_nodes_per_64, per_ip * 3);
-                let limit_48 = std::cmp::min(cfg.max_nodes_per_48, per_ip * 10);
-                let limit_32 = std::cmp::min(cfg.max_nodes_per_32, per_ip * 30);
+                let limit_64 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_64, per_ip * SUBNET_NARROW_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
+                let limit_48 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_48, per_ip * SUBNET_MEDIUM_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
+                let limit_32 = clamp_limit(
+                    std::cmp::min(cfg.max_nodes_per_ipv6_32, per_ip * SUBNET_WIDE_MULTIPLIER),
+                    cfg.ipv6_limit_floor,
+                    cfg.ipv6_limit_ceiling,
+                );
 
                 if v6_counts.slash_64 >= limit_64 {
                     return Err(anyhow!("IP diversity: /64 limit ({limit_64}) exceeded"));
@@ -1571,10 +660,6 @@ impl std::fmt::Debug for DhtCoreEngine {
         f.debug_struct("DhtCoreEngine")
             .field("node_id", &self.node_id)
             .field("routing_table", &"Arc<RwLock<KademliaRoutingTable>>")
-            .field("data_store", &"Arc<RwLock<DataStore>>")
-            .field("replication_manager", &"Arc<RwLock<ReplicationManager>>")
-            .field("load_balancer", &"Arc<RwLock<LoadBalancer>>")
-            .field("security_metrics", &"Arc<SecurityMetricsCollector>")
             .field(
                 "bucket_refresh_manager",
                 &"Arc<RwLock<BucketRefreshManager>>",
@@ -1591,21 +676,6 @@ impl std::fmt::Debug for DhtCoreEngine {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[tokio::test]
-    async fn test_basic_store_retrieve() -> Result<()> {
-        let mut dht = DhtCoreEngine::new(PeerId::from_bytes([42u8; 32]))?;
-        let key = DhtKey::new(b"test_key");
-        let value = b"test_value".to_vec();
-
-        let receipt = dht.store(&key, value.clone()).await?;
-        assert!(receipt.is_successful());
-
-        let retrieved = dht.retrieve(&key).await?;
-        assert_eq!(retrieved, Some(value));
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_xor_distance() {
@@ -1635,26 +705,26 @@ mod tests {
     fn test_touch_node_updates_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
+        let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
         // Touch with a new address
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some("5.6.7.8:9000"));
+        let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
+        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(&new_addr));
         assert!(found);
-        let expected: MultiAddr = "5.6.7.8:9000".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, new_addr);
     }
 
     #[test]
     fn test_touch_node_none_preserves_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
+        let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
-        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
+        let expected: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
@@ -1662,9 +732,15 @@ mod tests {
     fn test_touch_node_moves_to_tail() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
-        bucket.add_node(make_node(2, "2.2.2.2:9000")).unwrap();
-        bucket.add_node(make_node(3, "3.3.3.3:9000")).unwrap();
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+        bucket
+            .add_node(make_node(2, "/ip4/2.2.2.2/udp/9000/quic"))
+            .unwrap();
+        bucket
+            .add_node(make_node(3, "/ip4/3.3.3.3/udp/9000/quic"))
+            .unwrap();
 
         // Touch the first node — it should move to the tail
         bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
@@ -1677,26 +753,15 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_node_empty_string_preserves_address() {
-        let k = 8;
-        let mut bucket = KBucket::new(k);
-        let node = make_node(1, "1.2.3.4:9000");
-        bucket.add_node(node).unwrap();
-
-        // Touch with an empty string should NOT overwrite the valid address
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(""));
-        assert!(found);
-        let expected: MultiAddr = "1.2.3.4:9000".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
-    }
-
-    #[test]
     fn test_touch_node_missing_returns_false() {
         let k = 8;
         let mut bucket = KBucket::new(k);
-        bucket.add_node(make_node(1, "1.1.1.1:9000")).unwrap();
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
 
-        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some("9.9.9.9:9000"));
+        let new_addr: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some(&new_addr));
         assert!(!found);
     }
 
@@ -1717,7 +782,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1728,7 +793,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1761,7 +826,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.1:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1772,7 +837,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "10.0.0.2:9000".parse().unwrap(),
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -1802,7 +867,9 @@ mod tests {
             table
                 .add_node(NodeInfo {
                     id: PeerId::from_bytes(id_bytes),
-                    address: format!("10.0.0.{}:9000", i + 1).parse().unwrap(),
+                    address: format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
+                        .parse()
+                        .unwrap(),
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 })
@@ -1841,7 +908,7 @@ mod tests {
         // Default has allow_loopback = false
         assert!(!dht.allow_loopback);
 
-        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1856,7 +923,7 @@ mod tests {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         assert!(!dht.allow_loopback);
 
-        let loopback_node = make_node(2, "[::1]:9000");
+        let loopback_node = make_node(2, "/ip6/::1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1871,7 +938,7 @@ mod tests {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         dht.set_allow_loopback(true);
 
-        let loopback_node = make_node(1, "127.0.0.1:9000");
+        let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
         let result = dht.add_node(loopback_node).await;
         assert!(result.is_ok(), "loopback should be accepted: {:?}", result);
     }
@@ -1882,7 +949,7 @@ mod tests {
         // allow_loopback = false should not affect normal addresses
         assert!(!dht.allow_loopback);
 
-        let normal_node = make_node(1, "10.0.0.1:9000");
+        let normal_node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
         let result = dht.add_node(normal_node).await;
         assert!(
             result.is_ok(),
@@ -1896,26 +963,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// When the network is small the dynamic per-IP formula yields 1, which
-    /// would block additional same-IP nodes.  A configured static floor
-    /// (e.g. `max_nodes_per_ipv4_32 = Some(100)`) must override the dynamic
-    /// value so that bootstrap can proceed.
+    /// would block additional same-IP nodes.  A configured `ipv4_limit_floor`
+    /// must override the dynamic value so that bootstrap can proceed.
     #[tokio::test]
     async fn test_ipv4_static_floor_overrides_dynamic_limit() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
 
-        // Testnet-like config: static floor of 100 per /32
+        // Testnet-like config: floor of 100 guarantees at least that many
+        // nodes per subnet regardless of how small the network is.
         let mut config = IPDiversityConfig::testnet();
-        config.max_nodes_per_ipv4_32 = Some(100);
+        config.ipv4_limit_floor = Some(100);
         dht.set_ip_diversity_config(config);
 
         // Add multiple nodes from the same IP — the dynamic formula alone
-        // would cap at 1, but the static floor of 100 must allow these.
+        // would cap at 1, but the floor of 100 must allow these.
         for i in 1..=10u8 {
-            let node = make_node(i, "203.0.113.1:9000");
+            let node = make_node(i, "/ip4/203.0.113.1/udp/9000/quic");
             let result = dht.add_node(node).await;
             assert!(
                 result.is_ok(),
-                "node {i} from same IP should be accepted with static floor: {:?}",
+                "node {i} from same IP should be accepted with floor override: {:?}",
                 result
             );
         }

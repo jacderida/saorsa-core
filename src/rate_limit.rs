@@ -111,6 +111,7 @@ use thiserror::Error;
 
 /// Error types for join rate limiting
 #[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum JoinRateLimitError {
     /// Global join limit exceeded (network is under high load)
     #[error("global join rate limit exceeded: max {max_per_minute} joins per minute")]
@@ -130,7 +131,7 @@ pub enum JoinRateLimitError {
 }
 
 /// Configuration for join rate limiting
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JoinRateLimiterConfig {
     /// Maximum joins per /64 subnet per hour (default: 1)
     /// This is the strictest limit to prevent Sybil attacks
@@ -290,11 +291,6 @@ impl JoinRateLimiter {
 
         Ok(())
     }
-
-    /// Get the current configuration
-    pub fn config(&self) -> &JoinRateLimiterConfig {
-        &self.config
-    }
 }
 
 /// Extract /64 subnet prefix from an IPv6 address
@@ -320,17 +316,6 @@ pub fn extract_ipv6_subnet_48(addr: &Ipv6Addr) -> Ipv6Addr {
     Ipv6Addr::from(subnet)
 }
 
-/// Extract /32 subnet prefix from an IPv6 address
-///
-/// Returns an IPv6 address with only the first 32 bits preserved.
-#[inline]
-pub fn extract_ipv6_subnet_32(addr: &Ipv6Addr) -> Ipv6Addr {
-    let octets = addr.octets();
-    let mut subnet = [0u8; 16];
-    subnet[..4].copy_from_slice(&octets[..4]); // Keep first 32 bits
-    Ipv6Addr::from(subnet)
-}
-
 /// Extract /24 subnet prefix from an IPv4 address
 ///
 /// Returns an IPv4 address with only the first 24 bits preserved.
@@ -338,20 +323,6 @@ pub fn extract_ipv6_subnet_32(addr: &Ipv6Addr) -> Ipv6Addr {
 pub fn extract_ipv4_subnet_24(addr: &Ipv4Addr) -> Ipv4Addr {
     let octets = addr.octets();
     Ipv4Addr::new(octets[0], octets[1], octets[2], 0)
-}
-
-/// Extract /16 subnet prefix from an IPv4 address
-#[inline]
-pub fn extract_ipv4_subnet_16(addr: &Ipv4Addr) -> Ipv4Addr {
-    let octets = addr.octets();
-    Ipv4Addr::new(octets[0], octets[1], 0, 0)
-}
-
-/// Extract /8 subnet prefix from an IPv4 address
-#[inline]
-pub fn extract_ipv4_subnet_8(addr: &Ipv4Addr) -> Ipv4Addr {
-    let octets = addr.octets();
-    Ipv4Addr::new(octets[0], 0, 0, 0)
 }
 
 #[cfg(test)]
