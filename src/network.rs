@@ -985,24 +985,22 @@ impl P2PNode {
         self.adaptive_dht.trust_engine().clone()
     }
 
-    /// Report an application-level trust event for a peer.
+    /// Report a trust event for a peer.
     ///
-    /// Use this for outcomes the DHT layer cannot observe directly,
-    /// such as data verification results.
+    /// Records a network-observable outcome (connection success/failure)
+    /// that the DHT layer did not record automatically. See [`TrustEvent`]
+    /// for the supported variants.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// use saorsa_core::adaptive::TrustEvent;
     ///
-    /// // After verifying data from a peer
     /// node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
-    ///
-    /// // After detecting corrupted data
-    /// node.report_trust_event(&peer_id, TrustEvent::CorruptedData).await;
+    /// node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
     /// ```
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
-        self.adaptive_dht.report_app_event(peer_id, event).await;
+        self.adaptive_dht.report_trust_event(peer_id, event).await;
     }
 
     /// Get the current trust score for a peer (0.0 to 1.0).

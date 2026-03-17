@@ -5,8 +5,8 @@
 saorsa-core provides a response-rate trust system for tracking node reliability.
 The trust system is owned by `AdaptiveDHT`, which is the sole authority on peer trust scores.
 
-Consumers (like saorsa-node) report application-level outcomes via `TrustEvent`. DHT-internal
-events (iterative lookup success/failure) are recorded automatically.
+DHT-internal events (iterative lookup success/failure) are recorded automatically.
+External callers can report additional network-observable outcomes via `TrustEvent`.
 
 The trust system enables:
 - **Sybil resistance**: Malicious nodes are downscored automatically
@@ -36,8 +36,9 @@ if trust < 0.3 {
 
 ### `report_trust_event(peer_id, event)`
 
-Report an application-level trust event for a peer. This is the primary method
-for saorsa-node to report outcomes the DHT layer cannot observe directly.
+Report a network-observable trust event for a peer. Use this for connection
+outcomes that the DHT layer did not record automatically (e.g. failures
+observed by the application's own request paths).
 
 ```rust
 pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent)
@@ -61,9 +62,9 @@ pub fn trust_engine(&self) -> &Arc<TrustEngine>
 
 ## TrustEvent Enum
 
-Only events observable by the saorsa-core network layer are included.
-Application-level events (data verification, storage checks) should be added
-when the consuming application layer exists.
+Only network-observable events are included. Application-level events
+(data verification, storage checks) will be added as `TrustEvent` variants
+when saorsa-node's data layer is built.
 
 | Event | Severity | Description | Where it fires |
 |-------|----------|-------------|----------------|
@@ -108,4 +109,4 @@ P2PNode
 - **TrustEngine** is the sole authority on peer trust scores
 - **AdaptiveDHT** owns TrustEngine and DhtNetworkManager
 - **DhtNetworkManager** records trust for DHT operations (iterative lookups)
-- **P2PNode** exposes `report_trust_event()` for application-level signals
+- **P2PNode** exposes `report_trust_event()` for additional network-observable signals

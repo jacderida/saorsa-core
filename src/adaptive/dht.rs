@@ -17,8 +17,8 @@
 //! All DHT operations flow through it, and all trust signals originate from it.
 //!
 //! Internal DHT operations (iterative lookups) record trust via the `TrustEngine`
-//! reference passed to `DhtNetworkManager`. Application-level trust signals
-//! (data verification outcomes) are reported through [`AdaptiveDHT::report_app_event`].
+//! reference passed to `DhtNetworkManager`. External callers report additional
+//! trust signals through [`AdaptiveDHT::report_trust_event`].
 
 use crate::PeerId;
 use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
@@ -107,7 +107,7 @@ impl TrustEvent {
 ///
 /// Owns the `TrustEngine` and `DhtNetworkManager`. All DHT operations
 /// should go through this component. Application-level trust signals
-/// are reported via [`report_app_event`](Self::report_app_event).
+/// are reported via [`report_trust_event`](Self::report_trust_event).
 pub struct AdaptiveDHT {
     /// The underlying DHT network manager (handles raw DHT operations)
     dht_manager: Arc<DhtNetworkManager>,
@@ -157,11 +157,12 @@ impl AdaptiveDHT {
     // Trust API — the only place where external callers record trust events
     // =========================================================================
 
-    /// Report an application-level trust event for a peer.
+    /// Report a trust event for a peer.
     ///
-    /// Use this for outcomes that the DHT layer cannot observe directly,
-    /// such as data verification results from saorsa-node.
-    pub async fn report_app_event(&self, peer_id: &PeerId, event: TrustEvent) {
+    /// Records a network-observable outcome (connection success/failure)
+    /// that the DHT layer did not record automatically. See [`TrustEvent`]
+    /// for the supported variants.
+    pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         self.trust_engine
             .update_node_stats(peer_id, event.to_stats_update())
             .await;
