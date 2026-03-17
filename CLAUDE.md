@@ -70,14 +70,11 @@ cargo doc --open                    # Build and open documentation
 ./scripts/check_no_panic_unwrap.sh  # Check for forbidden patterns
 ```
 
-### Adaptive Network Testing Suite
+### Trust System Tests
 ```bash
-./scripts/test_adaptive_network.sh  # Run adaptive component tests
-
-# Individual adaptive component tests
-cargo test --test adaptive_components_test test_thompson_sampling_basic --release
-cargo test --test adaptive_components_test test_multi_armed_bandit_basic --release
-cargo test --test adaptive_components_test test_q_learning_cache_basic --release
+# Trust engine unit tests (in src/adaptive/)
+cargo test --lib trust
+cargo test --lib adaptive::dht
 ```
 
 ## Critical Code Standards
@@ -122,7 +119,7 @@ use saorsa_core::TrustEvent;
 
 // Report application-level outcomes via P2PNode
 node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
-node.report_trust_event(&peer_id, TrustEvent::CorruptedData).await;
+node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
 ```
 
 ### Multi-Layer P2P Architecture
@@ -136,19 +133,15 @@ The system combines a DHT peer phonebook with machine learning for optimal routi
 #### 2. Adaptive Network Layer (`src/adaptive/`)
 Trust boundary and adaptive routing:
 - **AdaptiveDHT**: Sole owner of TrustEngine and DhtNetworkManager — all trust signals flow through here
-- **TrustEngine**: EigenTrust++ for decentralized reputation (response rate + time decay)
+- **TrustEngine**: Response-rate scoring with time decay for decentralized reputation
 - **TrustEvent**: Unified enum for all trust-relevant outcomes (reported via `P2PNode::report_trust_event`)
-- **Trust-weighted routing**: Optional blending of XOR distance with trust scores (behind config flag)
+- **Binary blocking**: Peers below block threshold are evicted and rejected (no trust-weighted routing)
 
 #### 3. DHT Layer (`src/dht/`)
 Peer phonebook with geographic awareness (no data storage):
 - **Core Engine**: Kademlia-based routing table and peer discovery
 - **Geographic Routing**: Region-aware peer selection
 - **Trust-Weighted Eviction**: Peers below trust threshold are evicted (live TrustEngine queries)
-
-#### 4. Identity System (`src/identity/`)
-- **Cryptography**: ML-DSA-65 for post-quantum signatures
-- **No PoW**: Pure cryptographic identity without proof-of-work
 
 ## External Crate Dependencies
 
@@ -157,52 +150,19 @@ Peer phonebook with geographic awareness (no data storage):
 - `saorsa-transport` (0.25+): QUIC transport with NAT traversal and PQC
 
 ### Feature Flags
-```toml
-default = ["metrics"]
-metrics = ["dep:prometheus"]  # Prometheus monitoring
-```
+
+No feature flags — all functionality is always enabled.
 
 ## Testing Infrastructure
 
 ### Test Organization
 - **Unit Tests**: In-module `#[cfg(test)]` blocks
-- **Integration Tests**: `tests/` directory
-- **Property Tests**: Using `proptest` for randomized testing
 
-### Key Integration Tests
+### Key Tests
 ```bash
-# DHT & peer discovery
-cargo test --test dht_connectivity_diagnostic_test       # DHT connectivity diagnostics
-cargo test --test dht_node_mode_gating_test              # Node mode gating
-cargo test --test dht_peer_address_population_test       # Peer address population
-cargo test --test config_test                            # Configuration tests
-
-# Adaptive networking
-cargo test --test adaptive_components_test               # Adaptive component tests
-cargo test --test adaptive_integration_tests             # Adaptive integration
-cargo test --test multi_armed_bandit_integration_test    # Multi-armed bandit
-cargo test --test q_learning_cache_integration_test      # Q-Learning cache
-cargo test --test hyperbolic_routing_test                # Hyperbolic routing
-
-# Transport
-cargo test --test saorsa_transport_integration_test      # QUIC transport
-
-# Security & trust
-cargo test --test eigentrust_integration_test            # Trust system
-cargo test --test security_comprehensive_test            # Security validation
-cargo test --test trust_weighted_dht_test                # Trust-weighted DHT
-cargo test --test trust_weighted_selection_test           # Trust-weighted selection
-
+# All unit tests (includes DHT, trust, transport, security)
+cargo test --lib
 ```
-
-## Common Development Workflows
-
-### Adding New Adaptive Strategy
-1. Implement in `src/adaptive/`
-2. Add to `RoutingStrategy` enum
-3. Update multi-armed bandit
-4. Add performance metrics
-5. Write tests in `tests/adaptive_components_test.rs`
 
 ## Important Implementation Details
 
@@ -210,7 +170,7 @@ cargo test --test trust_weighted_selection_test           # Trust-weighted selec
 - **Bucket Size**: 20 nodes per k-bucket
 - **Concurrency**: Alpha=3 parallel lookups
 - **Geographic Awareness**: Region-aware peer selection
-- **Trust Integration**: EigenTrust-weighted peer scoring
+- **Trust Integration**: Response-rate scoring with binary blocking
 
 ### Performance Optimizations
 - **Connection Pooling**: Max 100 connections with LRU eviction

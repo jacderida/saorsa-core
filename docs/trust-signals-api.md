@@ -2,7 +2,7 @@
 
 ## Overview
 
-saorsa-core provides an EigenTrust-based reputation system for tracking node reliability.
+saorsa-core provides a response-rate trust system for tracking node reliability.
 The trust system is owned by `AdaptiveDHT`, which is the sole authority on peer trust scores.
 
 Consumers (like saorsa-node) report application-level outcomes via `TrustEvent`. DHT-internal
@@ -10,9 +10,9 @@ events (iterative lookup success/failure) are recorded automatically.
 
 The trust system enables:
 - **Sybil resistance**: Malicious nodes are downscored automatically
-- **Quality routing**: Optional trust-weighted peer selection (behind config flag)
-- **Self-healing**: The network learns from failures and adapts
-- **Live eviction**: Peers below trust threshold are evicted from the routing table
+- **Binary blocking**: Peers below the block threshold are evicted and rejected
+- **Self-healing**: Time decay moves blocked peers back toward neutral over days
+- **Live eviction**: Peers below trust threshold are evicted from the routing table immediately
 
 ## Quick Start
 
@@ -22,8 +22,8 @@ use saorsa_core::{P2PNode, TrustEvent};
 // After successful data retrieval from a peer:
 node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
 
-// After failed data retrieval:
-node.report_trust_event(&peer_id, TrustEvent::CorruptedData).await;
+// After a connection failure:
+node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
 
 // Check peer trust before operations:
 let trust = node.peer_trust(&peer_id);

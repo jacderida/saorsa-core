@@ -11,7 +11,6 @@ Core P2P networking library for Saorsa platform with DHT, QUIC transport, dual-s
 - **API Reference**: see [docs/API.md](docs/API.md) - Comprehensive API documentation with examples
 - **Architecture Decision Records**: see [docs/adr/](docs/adr/) - Design decisions and rationale
 - **Security Model**: see [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) - Network security and anti-Sybil protections
-- **Auto-Upgrade System**: see [docs/AUTO_UPGRADE.md](docs/AUTO_UPGRADE.md) - Cross-platform binary updates
 - Architecture overview: see [ARCHITECTURE.md](ARCHITECTURE.md)
 - Contributor guide: see [AGENTS.md](AGENTS.md)
 
@@ -24,8 +23,7 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | [ADR-001](docs/adr/ADR-001-multi-layer-architecture.md) | Multi-Layer P2P Architecture | Layered design separating transport, DHT, identity, and application concerns |
 | [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
 | [ADR-003](docs/adr/ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
-| [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | EigenTrust Reputation | Iterative trust computation for Sybil resistance |
-| [ADR-007](docs/adr/ADR-007-adaptive-networking.md) | Adaptive Networking | Machine learning for dynamic routing optimization |
+| [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | Trust System | Response-rate scoring for Sybil resistance |
 | [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Delegating bootstrap to saorsa-transport with Sybil protection |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
@@ -33,13 +31,10 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 ## Features
 
 - **P2P NAT Traversal**: True peer-to-peer connectivity with automatic NAT traversal (saorsa-transport 0.21.x)
-- **DHT (Distributed Hash Table)**: Peer phonebook and routing with adaptive scoring and geographic awareness
+- **DHT (Distributed Hash Table)**: Peer phonebook and routing with geographic awareness
 - **QUIC Transport**: High-performance networking with saorsa-transport
-- **Post-Quantum Cryptography**: Future-ready cryptographic algorithms
-- **Geographic Routing**: Location-aware networking
-- **Identity Management**: Post-quantum ML-DSA-65 signatures (NIST Level 3). No PoW; identities hold only required keys.
-- **Auto-Upgrade System**: Cross-platform binary updates with ML-DSA-65 signatures, rollback support, and configurable policies
-- **Monitoring**: Prometheus metrics integration
+- **Post-Quantum Cryptography**: Future-ready cryptographic algorithms (ML-DSA-65, ML-KEM-768)
+- **Trust System**: Response-rate scoring with time decay and binary peer blocking
 
 ## Quick Start
 
@@ -47,7 +42,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-core = "0.15.0"
+saorsa-core = "0.16.0"
 ```
 
 ### Basic P2P Node
@@ -76,19 +71,16 @@ saorsa-core includes full NAT traversal support in the transport and network lay
 saorsa-core does **not** replicate application data. saorsa-node:
 - Stores chunks locally and tracks replica sets.
 - Selects target peers using saorsa-core's adaptive routing outputs.
-- Replicates via `send_message` and reports success/failure back to EigenTrust.
+- Replicates via `send_message` and reports success/failure back to the TrustEngine.
 - Reacts to churn events from `DhtNetworkManager::subscribe_events()` and re-replicates.
 
 ## Architecture
 
 ### Core Components
 
-1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.21.x)
-2. **DHT**: S/Kademlia-based peer phonebook with adaptive routing and geographic awareness
-3. **Identity**: Post-quantum cryptographic identities with ML-DSA-65 signatures (no PoW)
-4. **Trust System**: EigenTrust reputation engine for peer trust scoring
-5. **Adaptive Routing**: ML-based strategy selection (Thompson Sampling, Q-Learning, hyperbolic routing)
-6. **Geographic Routing**: Location-aware message routing
+1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.26)
+2. **DHT**: Kademlia-based peer phonebook with geographic awareness
+3. **Trust System**: Response-rate scoring with time decay and binary peer blocking
 
 ### Cryptographic Architecture
 
@@ -138,13 +130,8 @@ let config = NetworkConfig {
 
 ## Feature Flags
 
-- `default` - Metrics and Prometheus integration
-- `metrics` - Prometheus metrics and monitoring
-- `mocks` - Test/dummy helpers for development (off by default)
-- `h2_greedy` - Hyperbolic greedy routing helpers in API
-- `test-utils` - Test utilities including mock DHT for integration tests
-
-Note: DHT, saorsa-transport QUIC transport, and post-quantum cryptography are always enabled.
+No feature flags — all functionality is always enabled. DHT, QUIC transport (saorsa-transport),
+and post-quantum cryptography are included unconditionally.
 
 ## Performance
 
@@ -153,20 +140,6 @@ Saorsa Core is designed for high performance:
 - **Concurrent Operations**: Tokio-based async runtime
 - **Memory Efficiency**: Zero-copy operations where possible
 - **Network Optimization**: QUIC with congestion control
-- **Caching**: Multi-level caching with Q-learning optimization
-
-### Benchmarks
-
-Run benchmarks with:
-
-```bash
-cargo bench
-```
-
-Key benchmarks:
-- DHT operations: ~10,000 ops/sec
-- Geographic routing: <10ms latency
-- Cryptographic operations: Hardware-accelerated
 
 ## Security
 
@@ -187,10 +160,10 @@ Saorsa Core implements defense-in-depth security designed for adversarial decent
 | Protection | Implementation |
 |------------|----------------|
 | **Node Monitoring** | Automatic eviction after 3 consecutive failures |
-| **Reputation System** | EigenTrust++ with multi-factor trust scoring |
+| **Reputation System** | Response-rate scoring with time decay |
 | **Sybil Resistance** | IP diversity limits (/64: 1, /48: 3, /32: 10, ASN: 20) |
 | **Geographic Diversity** | Regional diversity in routing |
-| **Routing Validation** | Close-group validation and security coordinator checks |
+| **Routing Validation** | Trust-based peer blocking and eviction |
 
 ### Anti-Centralization
 
@@ -213,14 +186,6 @@ The network enforces geographic and infrastructure diversity to prevent centrali
 - **ASN Diversity**: Max 20 nodes per autonomous system
 - **Hosting Provider Limits**: Stricter limits (halved) for known VPS/cloud providers
 - **Eclipse Detection**: Continuous routing table diversity monitoring
-
-## Geographic Features
-
-Location-aware networking:
-
-- Geographic distance calculations
-- Location-based routing
-- Privacy-preserving location services
 
 ## Development
 
@@ -247,7 +212,7 @@ cargo test --test '*'
 ### Linting
 
 ```bash
-cargo clippy --all-features -- -D warnings
+cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 cargo fmt --all
 ```
 
@@ -287,7 +252,7 @@ For commercial licensing, contact: david@saorsalabs.com
 - `tracing` - Logging
 
 ### Networking
-- `saorsa-transport` (0.21.x) - QUIC transport with P2P NAT traversal
+- `saorsa-transport` (0.26) - QUIC transport with P2P NAT traversal
 
 ### Cryptography
 - `saorsa-pqc` - Post-quantum cryptography (ML-DSA, ML-KEM)

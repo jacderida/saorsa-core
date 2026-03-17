@@ -8,8 +8,9 @@ Superseded
 > as part of the DHT phonebook cleanup. The DHT is now a **peer phonebook only**
 > (routing, discovery, liveness). Data storage and replication are handled by the
 > application layer (saorsa-node). S/Kademlia routing extensions (disjoint paths,
-> Sybil detection, authenticated sibling broadcast) remain in the codebase, but the
-> witness attestation and quorum-based store/get operations have been removed.
+> Sybil detection, authenticated sibling broadcast) have also been removed. The
+> codebase now uses standard Kademlia routing with a response-rate trust system
+> for peer blocking.
 
 ## Context
 

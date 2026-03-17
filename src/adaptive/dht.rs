@@ -106,12 +106,30 @@ impl AdaptiveDHT {
     ///
     /// This creates the `TrustEngine` and the `DhtNetworkManager` with the
     /// trust engine injected. Call [`start`](Self::start) to begin DHT
-    /// operations and the periodic blocked-peer sweep.
+    /// operations. Trust scores are computed live — peers are evicted
+    /// immediately when their score crosses the block threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `block_threshold` is not in `[0.0, 1.0]` or if
+    /// the underlying `DhtNetworkManager` fails to initialise.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
         mut dht_config: DhtNetworkConfig,
         adaptive_config: AdaptiveDhtConfig,
     ) -> Result<Self> {
+        if !(0.0..=1.0).contains(&adaptive_config.block_threshold)
+            || adaptive_config.block_threshold.is_nan()
+        {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "block_threshold must be in [0.0, 1.0], got {}",
+                    adaptive_config.block_threshold
+                )
+                .into(),
+            ));
+        }
+
         dht_config.block_threshold = adaptive_config.block_threshold;
 
         let trust_engine = Arc::new(TrustEngine::new());
@@ -218,6 +236,31 @@ mod tests {
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
         assert!((config.block_threshold - DEFAULT_BLOCK_THRESHOLD).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_block_threshold_validation_rejects_invalid() {
+        // Values outside [0.0, 1.0] must be rejected
+        for &bad in &[-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let config = AdaptiveDhtConfig {
+                block_threshold: bad,
+            };
+            assert!(
+                !(0.0..=1.0).contains(&config.block_threshold) || config.block_threshold.is_nan(),
+                "block_threshold {bad} should fail validation"
+            );
+        }
+
+        // Values inside [0.0, 1.0] must be accepted
+        for &good in &[0.0, 0.15, 0.5, 1.0] {
+            let config = AdaptiveDhtConfig {
+                block_threshold: good,
+            };
+            assert!(
+                (0.0..=1.0).contains(&config.block_threshold),
+                "block_threshold {good} should pass validation"
+            );
+        }
     }
 
     // =========================================================================
