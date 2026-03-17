@@ -11,7 +11,8 @@ name = "saorsa-core"
 # 0.14.1: fix deterministic identity generation to use real ML-DSA keypairs
 # 0.15.0: routing table single-source-of-truth fixes
 # 0.16.0: delegate transport addressing to saorsa-transport's TransportAddr (PR #39)
-version = "0.16.0"
+# 0.17.0: remove configuration system, streamline network setup
+version = "0.17.0"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
