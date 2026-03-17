@@ -220,6 +220,16 @@ pub struct NodeConfig {
     /// Default: `false`
     #[serde(default)]
     pub allow_loopback: bool,
+
+    /// Adaptive DHT configuration (trust-based blocking and eviction).
+    ///
+    /// Controls whether peers with low trust scores are evicted from the
+    /// routing table and blocked from DHT operations. Use
+    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
+    ///
+    /// Default: enabled with a block threshold of 0.15.
+    #[serde(default)]
+    pub adaptive_dht_config: AdaptiveDhtConfig,
 }
 
 /// DHT-specific configuration
@@ -357,6 +367,7 @@ impl NodeConfig {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: config.network.allow_loopback,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         })
     }
 
@@ -403,6 +414,7 @@ pub struct NodeConfigBuilder {
     mode: NodeMode,
     custom_user_agent: Option<String>,
     allow_loopback: Option<bool>,
+    adaptive_dht_config: Option<AdaptiveDhtConfig>,
 }
 
 impl Default for NodeConfigBuilder {
@@ -421,6 +433,7 @@ impl Default for NodeConfigBuilder {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: None,
+            adaptive_dht_config: None,
         }
     }
 }
@@ -513,6 +526,37 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Enable or disable trust-based peer eviction and blocking.
+    ///
+    /// When `false`, peers are never evicted from the routing table or
+    /// blocked from DHT operations based on trust scores. Trust scores
+    /// are still tracked but have no enforcement effect.
+    ///
+    /// When `true` (the default), peers whose trust score falls below the
+    /// block threshold (0.15) are immediately evicted and blocked.
+    ///
+    /// For fine-grained control over the threshold, use
+    /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
+    pub fn trust_enforcement(mut self, enabled: bool) -> Self {
+        let threshold = if enabled {
+            AdaptiveDhtConfig::default().block_threshold
+        } else {
+            0.0
+        };
+        self.adaptive_dht_config = Some(AdaptiveDhtConfig {
+            block_threshold: threshold,
+        });
+        self
+    }
+
+    /// Set the full adaptive DHT configuration.
+    ///
+    /// Overrides any previous call to [`trust_enforcement`](Self::trust_enforcement).
+    pub fn adaptive_dht_config(mut self, config: AdaptiveDhtConfig) -> Self {
+        self.adaptive_dht_config = Some(config);
+        self
+    }
+
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -550,6 +594,7 @@ impl NodeConfigBuilder {
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
             allow_loopback,
+            adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
         })
     }
 }
@@ -582,6 +627,7 @@ impl Default for NodeConfig {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: config.network.allow_loopback,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         }
     }
 }
@@ -619,6 +665,7 @@ impl NodeConfig {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: config.network.allow_loopback,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         };
 
         Ok(node_config)
@@ -875,7 +922,7 @@ impl P2PNode {
         let adaptive_dht = AdaptiveDHT::new(
             transport.clone(),
             dht_manager_config,
-            AdaptiveDhtConfig::default(),
+            config.adaptive_dht_config.clone(),
         )
         .await?;
 
@@ -1778,6 +1825,7 @@ mod tests {
             mode: NodeMode::default(),
             custom_user_agent: None,
             allow_loopback: true,
+            adaptive_dht_config: AdaptiveDhtConfig::default(),
         }
     }
 
