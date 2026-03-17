@@ -19,7 +19,6 @@
 use crate::PeerId;
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
-use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 
@@ -113,8 +112,20 @@ pub(crate) const MAX_ACTIVE_REQUESTS: usize = 256;
 /// Maximum allowed timeout for a single request (5 minutes).
 pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default port when config parsing fails.
+/// Default listen port for the P2P node.
 const DEFAULT_LISTEN_PORT: u16 = 9000;
+
+/// Default maximum number of concurrent connections.
+const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// Default connection timeout in seconds.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
+
+/// Default keep-alive interval in seconds.
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+
+/// Default maximum incoming connections per IP.
+const DEFAULT_MAX_INCOMING_CONNECTIONS: usize = 100;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
@@ -341,34 +352,7 @@ impl NodeConfig {
     ///
     /// Returns an error if default addresses cannot be parsed
     pub fn new() -> Result<Self> {
-        let config = Config::default();
-        let listen_sa = config.listen_socket_addr()?;
-
-        Ok(Self {
-            local: false,
-            port: listen_sa.port(),
-            ipv6: config.network.ipv6_enabled,
-            bootstrap_peers: config
-                .network
-                .bootstrap_nodes
-                .iter()
-                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
-                .collect(),
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig::default(),
-            security_config: SecurityConfig::default(),
-            bootstrap_cache_config: None,
-            diversity_config: None,
-            max_message_size: config.transport.max_message_size,
-            node_identity: None,
-            mode: NodeMode::default(),
-            custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
-            adaptive_dht_config: AdaptiveDhtConfig::default(),
-        })
+        Ok(Self::default())
     }
 
     /// Create a builder for customized NodeConfig construction
@@ -563,8 +547,6 @@ impl NodeConfigBuilder {
     ///
     /// Returns an error if address construction fails.
     pub fn build(self) -> Result<NodeConfig> {
-        let base_config = Config::default();
-
         // local mode auto-enables allow_loopback unless explicitly overridden
         let allow_loopback = self.allow_loopback.unwrap_or(self.local);
 
@@ -575,21 +557,17 @@ impl NodeConfigBuilder {
             bootstrap_peers: self.bootstrap_peers,
             connection_timeout: self
                 .connection_timeout
-                .unwrap_or(Duration::from_secs(base_config.network.connection_timeout)),
+                .unwrap_or(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS)),
             keep_alive_interval: self
                 .keep_alive_interval
-                .unwrap_or(Duration::from_secs(base_config.network.keepalive_interval)),
-            max_connections: self
-                .max_connections
-                .unwrap_or(base_config.network.max_connections),
-            max_incoming_connections: base_config.security.connection_limit as usize,
+                .unwrap_or(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS)),
+            max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_incoming_connections: DEFAULT_MAX_INCOMING_CONNECTIONS,
             dht_config: self.dht_config.unwrap_or_default(),
             security_config: self.security_config.unwrap_or_default(),
             bootstrap_cache_config: None,
             diversity_config: None,
-            max_message_size: self
-                .max_message_size
-                .or(base_config.transport.max_message_size),
+            max_message_size: self.max_message_size,
             node_identity: None,
             mode: self.mode,
             custom_user_agent: self.custom_user_agent,
@@ -601,74 +579,26 @@ impl NodeConfigBuilder {
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        let config = Config::default();
-        let listen_sa = config.listen_socket_addr().unwrap_or_else(|_| {
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                DEFAULT_LISTEN_PORT,
-            )
-        });
-
         Self {
             local: false,
-            port: listen_sa.port(),
-            ipv6: config.network.ipv6_enabled,
+            port: DEFAULT_LISTEN_PORT,
+            ipv6: true,
             bootstrap_peers: Vec::new(),
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
+            connection_timeout: Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS),
+            keep_alive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_incoming_connections: DEFAULT_MAX_INCOMING_CONNECTIONS,
             dht_config: DHTConfig::default(),
             security_config: SecurityConfig::default(),
             bootstrap_cache_config: None,
             diversity_config: None,
-            max_message_size: config.transport.max_message_size,
+            max_message_size: None,
             node_identity: None,
             mode: NodeMode::default(),
             custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
+            allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
         }
-    }
-}
-
-impl NodeConfig {
-    /// Create NodeConfig from Config
-    pub fn from_config(config: &Config) -> Result<Self> {
-        let listen_sa = config.listen_socket_addr()?;
-
-        let node_config = Self {
-            local: false,
-            port: listen_sa.port(),
-            ipv6: config.network.ipv6_enabled,
-            bootstrap_peers: config
-                .network
-                .bootstrap_nodes
-                .iter()
-                .filter_map(|s| s.parse::<crate::MultiAddr>().ok())
-                .collect(),
-
-            connection_timeout: Duration::from_secs(config.network.connection_timeout),
-            keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-            max_connections: config.network.max_connections,
-            max_incoming_connections: config.security.connection_limit as usize,
-            dht_config: DHTConfig::default(),
-            security_config: SecurityConfig {
-                enable_noise: true,
-                enable_tls: true,
-                trust_level: TrustLevel::Basic,
-            },
-            bootstrap_cache_config: None,
-            diversity_config: None,
-            max_message_size: config.transport.max_message_size,
-            node_identity: None,
-            mode: NodeMode::default(),
-            custom_user_agent: None,
-            allow_loopback: config.network.allow_loopback,
-            adaptive_dht_config: AdaptiveDhtConfig::default(),
-        };
-
-        Ok(node_config)
     }
 }
 

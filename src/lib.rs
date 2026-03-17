@@ -38,7 +38,6 @@ pub(crate) mod adaptive;
 pub(crate) mod address;
 pub(crate) mod bgp_geo_provider;
 pub(crate) mod bootstrap;
-pub(crate) mod config;
 pub(crate) mod dht;
 pub(crate) mod dht_network_manager;
 pub(crate) mod error;

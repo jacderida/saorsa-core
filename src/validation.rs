@@ -61,7 +61,7 @@ use crate::PeerId;
 use crate::error::{P2PError, P2pResult};
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,43 +190,6 @@ pub trait Validate {
 pub trait Sanitize {
     /// Sanitize the input, returning a cleaned version
     fn sanitize(&self) -> Self;
-}
-
-// ===== Network Address Validation =====
-
-/// Validate a network address
-pub fn validate_network_address(addr: &SocketAddr, ctx: &ValidationContext) -> P2pResult<()> {
-    let ip = addr.ip();
-
-    // Check for localhost
-    if ip.is_loopback() && !ctx.allow_localhost {
-        return Err(
-            ValidationError::InvalidAddress("Localhost addresses not allowed".to_string()).into(),
-        );
-    }
-
-    // Check for private IPs
-    if is_private_ip(&ip) && !ctx.allow_private_ips {
-        return Err(ValidationError::InvalidAddress(
-            "Private IP addresses not allowed".to_string(),
-        )
-        .into());
-    }
-
-    // Validate port
-    if addr.port() == 0 {
-        return Err(ValidationError::InvalidAddress("Port 0 is not allowed".to_string()).into());
-    }
-
-    Ok(())
-}
-
-/// Check if an IP is private
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => ipv4.is_private(),
-        IpAddr::V6(ipv6) => ipv6.is_unique_local() || ipv6.is_unicast_link_local(),
-    }
 }
 
 // ===== Peer ID Validation =====
@@ -578,38 +541,6 @@ impl Validate for ApiRequest {
     }
 }
 
-/// Configuration value validation
-pub fn validate_config_value<T>(value: &str, min: Option<T>, max: Option<T>) -> P2pResult<T>
-where
-    T: std::str::FromStr + PartialOrd + std::fmt::Display,
-{
-    let parsed = value
-        .parse::<T>()
-        .map_err(|_| ValidationError::InvalidFormat(format!("Failed to parse value: {}", value)))?;
-
-    if let Some(min_val) = min
-        && parsed < min_val
-    {
-        return Err(ValidationError::InvalidFormat(format!(
-            "Value {} is less than minimum {}",
-            parsed, min_val
-        ))
-        .into());
-    }
-
-    if let Some(max_val) = max
-        && parsed > max_val
-    {
-        return Err(ValidationError::InvalidFormat(format!(
-            "Value {} is greater than maximum {}",
-            parsed, max_val
-        ))
-        .into());
-    }
-
-    Ok(parsed)
-}
-
 /// Sanitize a string for safe usage
 #[allow(dead_code)]
 pub fn sanitize_string(input: &str, max_length: usize) -> String {
@@ -648,23 +579,6 @@ mod tests {
         // PeerId is always valid by construction
         let peer = PeerId::random();
         assert!(validate_peer_id(&peer).is_ok());
-    }
-
-    #[test]
-    fn test_network_address_validation() {
-        let ctx = ValidationContext::default();
-
-        // Valid addresses
-        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        assert!(validate_network_address(&addr, &ctx).is_ok());
-
-        // Invalid addresses
-        let localhost: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(validate_network_address(&localhost, &ctx).is_err());
-
-        // Allow localhost when configured
-        let ctx_localhost = ValidationContext::default().allow_localhost();
-        assert!(validate_network_address(&localhost, &ctx_localhost).is_ok());
     }
 
     #[test]

@@ -123,10 +123,6 @@ pub enum P2PError {
     #[error("Transport error: {0}")]
     Transport(#[from] TransportError),
 
-    // Configuration errors
-    #[error("Configuration error: {0}")]
-    Config(#[from] ConfigError),
-
     // Security errors
     #[error("Security error: {0}")]
     Security(#[from] SecurityError),
@@ -421,35 +417,6 @@ pub enum TransportError {
     NotInitialized,
 }
 
-/// Configuration-related errors
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("Missing required field: {0}")]
-    MissingField(Cow<'static, str>),
-
-    #[error("Invalid value for {field}: {reason}")]
-    InvalidValue {
-        field: Cow<'static, str>,
-        reason: Cow<'static, str>,
-    },
-
-    #[error("Configuration file not found: {0}")]
-    FileNotFound(Cow<'static, str>),
-
-    #[error("Parse error: {0}")]
-    ParseError(Cow<'static, str>),
-
-    #[error("Validation failed: {0}")]
-    ValidationFailed(Cow<'static, str>),
-
-    #[error("IO error for {path}: {source}")]
-    IoError {
-        path: Cow<'static, str>,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
 /// Security-related errors
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -586,7 +553,7 @@ impl P2PError {
         match self {
             P2PError::Network(NetworkError::Timeout) | P2PError::Timeout(_) => warn!("{}", self),
 
-            P2PError::Validation(_) | P2PError::Config(_) => warn!("{}", self),
+            P2PError::Validation(_) => warn!("{}", self),
 
             _ => error!("{}", self),
         }
