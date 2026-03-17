@@ -27,13 +27,13 @@ use crate::{
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
+use crate::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 /// Minimum concurrent operations for semaphore backpressure
@@ -420,8 +420,8 @@ impl DhtNetworkManager {
                     }
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    warn!("Bootstrap FIND_NODE to {} failed: {}", peer_id.to_hex(), e);
+                Err(_e) => {
+                    warn!("Bootstrap FIND_NODE to {} failed: {}", peer_id.to_hex(), _e);
                 }
             }
         }
@@ -448,8 +448,8 @@ impl DhtNetworkManager {
         if let Some(handle) = self.event_handler_handle.write().await.take() {
             match handle.await {
                 Ok(()) => debug!("Event handler task stopped cleanly"),
-                Err(e) if e.is_cancelled() => debug!("Event handler task was cancelled"),
-                Err(e) => warn!("Event handler task panicked: {}", e),
+                Err(_e) if _e.is_cancelled() => debug!("Event handler task was cancelled"),
+                Err(_e) => warn!("Event handler task panicked: {}", _e),
             }
         }
 
@@ -495,8 +495,8 @@ impl DhtNetworkManager {
                 info!("Received pong from {} in {:?}", responder, latency);
                 Ok(DhtNetworkResult::PongReceived { responder, latency })
             }
-            Ok(result) => {
-                warn!("Unexpected ping result: {:?}", result);
+            Ok(_result) => {
+                warn!("Unexpected ping result: {:?}", _result);
                 Err(P2PError::Dht(crate::error::DhtError::RoutingError(
                     "Unexpected ping response".to_string().into(),
                 )))
@@ -559,8 +559,8 @@ impl DhtNetworkManager {
                     reliability: node.capacity.reliability_score,
                 })
                 .collect(),
-            Err(e) => {
-                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+            Err(_e) => {
+                warn!("find_nodes failed for key {}: {_e}", hex::encode(key));
                 Vec::new()
             }
         }
@@ -610,11 +610,11 @@ impl DhtNetworkManager {
         }
         let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
 
-        for iteration in 0..MAX_ITERATIONS {
+        for _iteration in 0..MAX_ITERATIONS {
             if candidates.is_empty() {
                 debug!(
                     "[NETWORK] No more candidates after {} iterations",
-                    iteration
+                    _iteration
                 );
                 break;
             }
@@ -633,14 +633,14 @@ impl DhtNetworkManager {
             if batch.is_empty() {
                 debug!(
                     "[NETWORK] All candidates queried after {} iterations",
-                    iteration
+                    _iteration
                 );
                 break;
             }
 
             info!(
                 "[NETWORK] Iteration {}: querying {} nodes",
-                iteration,
+                _iteration,
                 batch.len()
             );
 
@@ -728,8 +728,8 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
                     }
-                    Err(e) => {
-                        trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
+                    Err(_e) => {
+                        trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), _e);
                         self.record_peer_failure(&peer_id).await;
                         // Don't add failed nodes to best_nodes - they are unresponsive
                     }
@@ -742,7 +742,7 @@ impl DhtNetworkManager {
             best_nodes.truncate(count);
 
             if !found_new_closer {
-                info!("[NETWORK] Converged after {} iterations", iteration + 1);
+                info!("[NETWORK] Converged after {} iterations", _iteration + 1);
                 break;
             }
 
@@ -754,7 +754,7 @@ impl DhtNetworkManager {
                 info!(
                     "[NETWORK] {}: Candidate set stagnated after {} iterations, stopping",
                     self.config.peer_id.to_hex(),
-                    iteration + 1
+                    _iteration + 1
                 );
                 break;
             }
@@ -885,7 +885,7 @@ impl DhtNetworkManager {
                 dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
                 let _ = self.transport.disconnect_peer(peer_id).await;
-                tracing::info!(
+                crate::info!(
                     peer = peer_id.to_hex(),
                     score = engine.score(peer_id),
                     threshold = self.config.block_threshold,
@@ -917,11 +917,11 @@ impl DhtNetworkManager {
     fn sweep_expired_operations(&self) {
         if let Ok(mut ops) = self.active_operations.lock() {
             let now = Instant::now();
-            ops.retain(|id, ctx| {
+            ops.retain(|_id, ctx| {
                 let expired = now.duration_since(ctx.started_at) > ctx.timeout * 2;
                 if expired {
                     warn!(
-                        "Sweeping expired DHT operation {id} (age {:?}, timeout {:?})",
+                        "Sweeping expired DHT operation {_id} (age {:?}, timeout {:?})",
                         now.duration_since(ctx.started_at),
                         ctx.timeout
                     );
@@ -998,10 +998,10 @@ impl DhtNetworkManager {
 
         // Send message via network layer, reconnecting on demand if needed.
         let peer_hex = peer_id.to_hex();
-        let local_hex = self.config.peer_id.to_hex();
+        let _local_hex = self.config.peer_id.to_hex();
         info!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
-            local_hex, peer_hex, message.payload, message_id
+            _local_hex, peer_hex, message.payload, message_id
         );
 
         // Ensure we have an open channel to the peer before sending.
@@ -1020,7 +1020,7 @@ impl DhtNetworkManager {
         if let Some(ref address) = resolved_address {
             info!(
                 "[STEP 1b] {} -> {}: No open channel, dialling {}",
-                local_hex, peer_hex, address
+                _local_hex, peer_hex, address
             );
             if let Some(channel_id) = self.dial_candidate(peer_id, address).await {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
@@ -1034,7 +1034,7 @@ impl DhtNetworkManager {
                             warn!(
                                 "[STEP 1b] {} -> {}: identity MISMATCH — dialled {} but authenticated as {}. \
                                  Routing table entry may be stale.",
-                                local_hex,
+                                _local_hex,
                                 peer_hex,
                                 address,
                                 authenticated.to_hex()
@@ -1049,7 +1049,7 @@ impl DhtNetworkManager {
                         }
                         debug!(
                             "[STEP 1b] {} -> {}: identity confirmed ({})",
-                            local_hex,
+                            _local_hex,
                             peer_hex,
                             authenticated.to_hex()
                         );
@@ -1057,7 +1057,7 @@ impl DhtNetworkManager {
                     Err(e) => {
                         warn!(
                             "[STEP 1b] {} -> {}: identity exchange failed, disconnecting channel: {}",
-                            local_hex, peer_hex, e
+                            _local_hex, peer_hex, e
                         );
                         self.transport.disconnect_channel(&channel_id).await;
                         if let Ok(mut ops) = self.active_operations.lock() {
@@ -1071,7 +1071,7 @@ impl DhtNetworkManager {
             } else {
                 warn!(
                     "[STEP 1b] {} -> {}: dial failed to {}",
-                    local_hex, peer_hex, address
+                    _local_hex, peer_hex, address
                 );
                 if let Ok(mut ops) = self.active_operations.lock() {
                     ops.remove(&message_id);
@@ -1090,21 +1090,21 @@ impl DhtNetworkManager {
             Ok(_) => {
                 info!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
-                    local_hex, peer_hex
+                    _local_hex, peer_hex
                 );
 
                 // Wait for response via oneshot channel with timeout
                 let result = self.wait_for_response(&message_id, response_rx).await;
                 match &result {
-                    Ok(r) => info!(
+                    Ok(_r) => info!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
-                        local_hex,
+                        _local_hex,
                         peer_hex,
-                        std::mem::discriminant(r)
+                        std::mem::discriminant(_r)
                     ),
-                    Err(e) => warn!(
+                    Err(_e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
-                        local_hex, peer_hex, e
+                        _local_hex, peer_hex, _e
                     ),
                 }
                 result
@@ -1166,10 +1166,10 @@ impl DhtNetworkManager {
             return None;
         }
 
-        let peer_hex = peer_id.to_hex();
+        let _peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
-            debug!("dial_candidate: peer {} already connected", peer_hex);
+            debug!("dial_candidate: peer {} already connected", _peer_hex);
             return None;
         }
 
@@ -1177,7 +1177,7 @@ impl DhtNetworkManager {
         if address.ip().is_some_and(|ip| ip.is_unspecified()) {
             debug!(
                 "dial_candidate: rejecting unspecified address for {}: {}",
-                peer_hex, address
+                _peer_hex, address
             );
             return None;
         }
@@ -1189,14 +1189,14 @@ impl DhtNetworkManager {
             Ok(Ok(channel_id)) => {
                 debug!(
                     "dial_candidate: connected to {} at {} (channel {})",
-                    peer_hex, address, channel_id
+                    _peer_hex, address, channel_id
                 );
                 Some(channel_id)
             }
-            Ok(Err(e)) => {
+            Ok(Err(_e)) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {}: {}",
-                    peer_hex, address, e
+                    _peer_hex, address, _e
                 );
                 self.record_peer_failure(peer_id).await;
                 None
@@ -1204,7 +1204,7 @@ impl DhtNetworkManager {
             Err(_) => {
                 debug!(
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
-                    peer_hex, address, dial_timeout
+                    _peer_hex, address, dial_timeout
                 );
                 self.record_peer_failure(peer_id).await;
                 None
@@ -1627,20 +1627,20 @@ impl DhtNetworkManager {
     /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
     /// only fires after identity verification.
     async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
-        let app_peer_id_hex = node_id.to_hex();
+        let _app_peer_id_hex = node_id.to_hex();
 
         // Block peers whose trust score has fallen below threshold
         if self.is_peer_blocked(&node_id) {
             info!(
                 "Rejecting blocked peer {} from DHT (trust below threshold)",
-                app_peer_id_hex
+                _app_peer_id_hex
             );
             return;
         }
 
         info!(
             "DHT peer connected: app_id={}, user_agent={}",
-            app_peer_id_hex, user_agent
+            _app_peer_id_hex, user_agent
         );
         let dht_key = *node_id.as_bytes();
 
@@ -1650,7 +1650,7 @@ impl DhtNetworkManager {
         let address = if let Some(info) = self.transport.peer_info(&node_id).await {
             Self::first_dialable_address(&info.addresses)
         } else {
-            warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
+            warn!("peer_info unavailable for app_peer_id {}", _app_peer_id_hex);
             None
         };
 
@@ -1658,7 +1658,7 @@ impl DhtNetworkManager {
         let Some(address) = address else {
             warn!(
                 "Peer {} has no valid addresses, skipping DHT routing table addition",
-                app_peer_id_hex
+                _app_peer_id_hex
             );
             return;
         };
@@ -1669,7 +1669,7 @@ impl DhtNetworkManager {
         if !crate::network::is_dht_participant(user_agent) {
             info!(
                 "Skipping DHT routing table for ephemeral peer {} (user_agent={})",
-                app_peer_id_hex, user_agent
+                _app_peer_id_hex, user_agent
             );
         } else {
             let node_info = NodeInfo {
@@ -1679,13 +1679,13 @@ impl DhtNetworkManager {
                 capacity: NodeCapacity::default(),
             };
 
-            if let Err(e) = self.dht.write().await.add_node(node_info).await {
+            if let Err(_e) = self.dht.write().await.add_node(node_info).await {
                 warn!(
                     "Failed to add peer {} to DHT routing table: {}",
-                    app_peer_id_hex, e
+                    _app_peer_id_hex, _e
                 );
             } else {
-                info!("Added peer {} to DHT routing table", app_peer_id_hex);
+                info!("Added peer {} to DHT routing table", _app_peer_id_hex);
             }
         }
 
@@ -1740,7 +1740,7 @@ impl DhtNetworkManager {
                                     );
 
                                     if self_arc.event_tx.receiver_count() > 0
-                                        && let Err(e) = self_arc
+                                        && let Err(_e) = self_arc
                                             .event_tx
                                             .send(DhtNetworkEvent::PeerDisconnected {
                                                 peer_id,
@@ -1748,7 +1748,7 @@ impl DhtNetworkManager {
                                     {
                                         warn!(
                                             "Failed to send PeerDisconnected event: {}",
-                                            e
+                                            _e
                                         );
                                     }
                                 }
@@ -1793,24 +1793,24 @@ impl DhtNetworkManager {
                                             {
                                                 Ok(Ok(Some(response))) => {
                                                     // Send response back to the source peer
-                                                    if let Err(e) = manager_clone
+                                                    if let Err(_e) = manager_clone
                                                         .transport
                                                         .send_message(&source_peer, "/dht/1.0.0", response)
                                                         .await
                                                     {
                                                         warn!(
                                                             "Failed to send DHT response to {}: {}",
-                                                            source_peer, e
+                                                            source_peer, _e
                                                         );
                                                     }
                                                 }
                                                 Ok(Ok(None)) => {
                                                     // No response needed (e.g., for response messages)
                                                 }
-                                                Ok(Err(e)) => {
+                                                Ok(Err(_e)) => {
                                                     warn!(
                                                         "Failed to handle DHT message from {}: {}",
-                                                        source_peer, e
+                                                        source_peer, _e
                                                     );
                                                 }
                                                 Err(_) => {
@@ -1826,8 +1826,8 @@ impl DhtNetworkManager {
                                     }
                                 }
                             },
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!("Network event handler lagged, skipped {} events", skipped);
+                            Err(broadcast::error::RecvError::Lagged(_skipped)) => {
+                                warn!("Network event handler lagged, skipped {} events", _skipped);
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 info!("Network event channel closed, stopping event handler");

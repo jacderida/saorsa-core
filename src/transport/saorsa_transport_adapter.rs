@@ -39,6 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::{debug, info, trace};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -47,7 +48,6 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
@@ -205,8 +205,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
             data.len()
         );
         let result = self.transport.endpoint().send(addr, data).await;
-        if let Err(ref e) = result {
-            debug!("[QUIC SEND] send failed to {}: {}", addr, e);
+        if let Err(ref _e) = result {
+            debug!("[QUIC SEND] send failed to {}: {}", addr, _e);
         }
         result.map_err(|e| anyhow::anyhow!("Send failed: {e}"))
     }
@@ -217,8 +217,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// and abort the per-connection reader task, then removes the peer from
     /// the local registry.
     pub async fn disconnect_peer_quic(&self, addr: &SocketAddr) {
-        if let Err(e) = self.transport.endpoint().disconnect(addr).await {
-            tracing::warn!("QUIC disconnect for peer {}: {}", addr, e);
+        if let Err(_e) = self.transport.endpoint().disconnect(addr).await {
+            crate::warn!("QUIC disconnect for peer {}: {}", addr, _e);
         }
         // Also clean up from generic adapter state
         P2PNetworkNode::<P2pLinkTransport>::disconnect_peer_inner(
@@ -260,7 +260,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
                         match result {
                             Ok((addr, data)) => {
                                 if data.len() > MAX_RECV_MESSAGE_SIZE {
-                                    tracing::warn!(
+                                    crate::warn!(
                                         "Dropping oversized message ({} bytes) from {}",
                                         data.len(),
                                         addr
@@ -271,8 +271,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
                                     break; // channel closed
                                 }
                             }
-                            Err(e) => {
-                                tracing::debug!("Recv task exiting: {e}");
+                            Err(_e) => {
+                                crate::debug!("Recv task exiting: {_e}");
                                 break;
                             }
                         }
@@ -393,7 +393,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to register DHT handler: {}", e))?;
 
-        tracing::info!("DHT handler registered with SharedTransport");
+        crate::info!("DHT handler registered with SharedTransport");
         Ok(())
     }
 
@@ -477,11 +477,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
                 Ok(conn) => {
                     let addr = conn.remote_addr();
                     self.add_peer(addr).await;
-                    tracing::info!("Accepted connection from peer at {}", addr);
+                    crate::info!("Accepted connection from peer at {}", addr);
                     return Some(addr);
                 }
-                Err(e) => {
-                    tracing::warn!("Accept stream error: {}", e);
+                Err(_e) => {
+                    crate::warn!("Accept stream error: {}", _e);
                 }
             }
         }
@@ -588,10 +588,10 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             match self.connect_to_peer(addr).await {
                 Ok(peer_addr) => {
                     connected_peers.push(peer_addr);
-                    tracing::info!("Successfully bootstrapped from {}", addr);
+                    crate::info!("Successfully bootstrapped from {}", addr);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to bootstrap from {}: {}", addr, e);
+                Err(_e) => {
+                    crate::warn!("Failed to bootstrap from {}: {}", addr, _e);
                 }
             }
         }
@@ -609,8 +609,8 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         if let Some(ref config) = self.geo_config {
             match self.validate_geographic_diversity(&addr, config).await {
                 Ok(()) => {}
-                Err(err) => {
-                    tracing::warn!("REJECTED peer {} - {}", addr, err);
+                Err(_err) => {
+                    crate::warn!("REJECTED peer {} - {}", addr, _err);
                     return;
                 }
             }
@@ -625,7 +625,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             let mut regions = self.peer_regions.write().await;
             *regions.entry(region).or_insert(0) += 1;
 
-            tracing::debug!("Added peer from {}", addr);
+            crate::debug!("Added peer from {}", addr);
         }
     }
 
@@ -677,7 +677,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Set geographic configuration for diversity enforcement
     pub fn set_geographic_config(&mut self, config: GeographicConfig) {
-        tracing::info!(
+        crate::info!(
             "Geographic validation enabled: mode={:?}, max_ratio={}%, blocked_regions={:?}",
             config.enforcement_mode,
             config.max_single_region_ratio * 100.0,
@@ -739,12 +739,12 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             let mut quality_map = peer_quality.write().await;
             quality_map.remove(addr);
         }
-        tracing::debug!("Disconnected peer {} from adapter", addr);
+        crate::debug!("Disconnected peer {} from adapter", addr);
     }
 
     /// Shutdown the node gracefully
     pub async fn shutdown(&mut self) {
-        tracing::info!("Shutting down P2PNetworkNode");
+        crate::info!("Shutting down P2PNetworkNode");
 
         self.shutdown.cancel();
 
@@ -848,10 +848,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         if let Some(v6) = &self.v6 {
             match v6.send_to_peer_optimized(addr, data).await {
                 Ok(()) => return Ok(()),
-                Err(e) => {
+                Err(_e) => {
                     trace!(
                         "[DUAL SEND] IPv6 failed to {}, falling back to IPv4: {}",
-                        addr, e
+                        addr, _e
                     );
                 }
             }
@@ -859,8 +859,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         if let Some(v4) = &self.v4 {
             match v4.send_to_peer_optimized(addr, data).await {
                 Ok(()) => return Ok(()),
-                Err(e) => {
-                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, e);
+                Err(_e) => {
+                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, _e);
                 }
             }
         }
@@ -1058,15 +1058,15 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
                         Ok(event) => {
                             let _ = tx_clone.send(event);
                         }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                "IPv6 connection event forwarder lagged, skipped {n} events"
+                        Err(broadcast::error::RecvError::Lagged(_n)) => {
+                            crate::warn!(
+                                "IPv6 connection event forwarder lagged, skipped {_n} events"
                             );
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                tracing::debug!("IPv6 connection event forwarder exited");
+                crate::debug!("IPv6 connection event forwarder exited");
             });
         }
 
@@ -1079,15 +1079,15 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
                         Ok(event) => {
                             let _ = tx_clone.send(event);
                         }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                "IPv4 connection event forwarder lagged, skipped {n} events"
+                        Err(broadcast::error::RecvError::Lagged(_n)) => {
+                            crate::warn!(
+                                "IPv4 connection event forwarder lagged, skipped {_n} events"
                             );
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                tracing::debug!("IPv4 connection event forwarder exited");
+                crate::debug!("IPv4 connection event forwarder exited");
             });
         }
 

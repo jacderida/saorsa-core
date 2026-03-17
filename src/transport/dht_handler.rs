@@ -18,6 +18,7 @@
 //! |------|------|---------|
 //! | DhtQuery | 0x10 | FIND_NODE, Ping requests |
 
+use crate::{debug, error, trace, warn};
 use async_trait::async_trait;
 use bytes::Bytes;
 use saorsa_transport::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};
@@ -25,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, trace, warn};
 
 use crate::dht::core_engine::DhtCoreEngine;
 use crate::dht::network_integration::{DhtMessage, DhtResponse, ErrorCode};
@@ -74,10 +74,10 @@ impl DhtStreamHandler {
     /// Handle a DHT query request.
     async fn handle_query(
         &self,
-        remote_addr: SocketAddr,
+        _remote_addr: SocketAddr,
         data: Bytes,
     ) -> LinkResult<Option<Bytes>> {
-        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT query");
+        trace!(remote_addr = %_remote_addr, size = data.len(), "Processing DHT query");
 
         let message: DhtMessage = postcard::from_bytes(&data)
             .map_err(|e| LinkError::Internal(format!("Failed to deserialize query: {e}")))?;
@@ -120,8 +120,11 @@ impl DhtStreamHandler {
                 Ok(DhtResponse::Pong { timestamp })
             }
 
-            DhtMessage::Join { node_info, .. } => {
-                debug!(node = ?node_info.id, "DHT join request");
+            DhtMessage::Join {
+                node_info: _node_info,
+                ..
+            } => {
+                debug!(node = ?_node_info.id, "DHT join request");
                 Ok(DhtResponse::JoinAck {
                     routing_info: crate::dht::network_integration::RoutingInfo {
                         bootstrap_nodes: vec![],
@@ -132,8 +135,10 @@ impl DhtStreamHandler {
                 })
             }
 
-            DhtMessage::Leave { node_id, .. } => {
-                debug!(node = ?node_id, "DHT leave notification");
+            DhtMessage::Leave {
+                node_id: _node_id, ..
+            } => {
+                debug!(node = ?_node_id, "DHT leave notification");
                 Ok(DhtResponse::LeaveAck { confirmed: true })
             }
         }
@@ -167,15 +172,15 @@ impl ProtocolHandler for DhtStreamHandler {
 
     async fn handle_datagram(
         &self,
-        remote_addr: SocketAddr,
+        _remote_addr: SocketAddr,
         _public_key: Option<&[u8]>,
-        stream_type: StreamType,
-        data: Bytes,
+        _stream_type: StreamType,
+        _data: Bytes,
     ) -> LinkResult<()> {
         trace!(
-            remote_addr = %remote_addr,
-            stream_type = %stream_type,
-            size = data.len(),
+            remote_addr = %_remote_addr,
+            stream_type = %_stream_type,
+            size = _data.len(),
             "DHT datagram received (ignored)"
         );
         Ok(())
