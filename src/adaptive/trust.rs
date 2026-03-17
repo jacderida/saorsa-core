@@ -68,6 +68,14 @@ impl PeerTrust {
     /// This smoothly pulls the score back toward 0.5 over time.
     fn apply_decay(&mut self) {
         let elapsed_secs = self.last_updated.elapsed().as_secs_f64();
+        self.apply_decay_secs(elapsed_secs);
+    }
+
+    /// Apply decay for an explicit number of elapsed seconds.
+    ///
+    /// Factored out so tests can call this directly without manipulating
+    /// `Instant` (which can overflow on Windows if uptime < the duration).
+    fn apply_decay_secs(&mut self, elapsed_secs: f64) {
         if elapsed_secs > 0.0 {
             let decay_factor = (-DECAY_LAMBDA * elapsed_secs).exp();
             self.score =
@@ -87,13 +95,17 @@ impl PeerTrust {
 
     /// Get the current score with decay applied (does not mutate).
     fn decayed_score(&self) -> f64 {
-        let elapsed_secs = self.last_updated.elapsed().as_secs_f64();
+        Self::decay_score(self.score, self.last_updated.elapsed().as_secs_f64())
+    }
+
+    /// Pure function: compute what a score would be after `elapsed_secs` of decay.
+    fn decay_score(score: f64, elapsed_secs: f64) -> f64 {
         if elapsed_secs > 0.0 {
             let decay_factor = (-DECAY_LAMBDA * elapsed_secs).exp();
-            let score = DEFAULT_NEUTRAL_TRUST + (self.score - DEFAULT_NEUTRAL_TRUST) * decay_factor;
-            score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE)
+            let decayed = DEFAULT_NEUTRAL_TRUST + (score - DEFAULT_NEUTRAL_TRUST) * decay_factor;
+            decayed.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE)
         } else {
-            self.score
+            score
         }
     }
 }
@@ -170,15 +182,14 @@ impl TrustEngine {
 
     /// Simulate time passing for a peer (test only).
     ///
-    /// Shifts the peer's `last_updated` timestamp backward by the given duration,
-    /// so the next `score()` call applies the corresponding decay.
+    /// Applies decay as if `elapsed` time had passed since the last update.
+    /// Uses `apply_decay_secs` directly to avoid `Instant` subtraction,
+    /// which panics on Windows when system uptime < `elapsed`.
     #[cfg(test)]
     pub async fn simulate_elapsed(&self, node_id: &PeerId, elapsed: std::time::Duration) {
         let mut peers = self.peers.write().await;
-        if let Some(trust) = peers.get_mut(node_id)
-            && let Some(past) = Instant::now().checked_sub(elapsed)
-        {
-            trust.last_updated = past;
+        if let Some(trust) = peers.get_mut(node_id) {
+            trust.apply_decay_secs(elapsed.as_secs_f64());
         }
     }
 }
@@ -298,72 +309,50 @@ mod tests {
         assert!(after_success > after_fail, "Success should increase score");
     }
 
-    /// 3 days of idle time from worst score (0.0) should cross the block threshold (0.15)
+    /// 3 days of idle time from worst score (0.0) should cross the block threshold (0.15).
+    ///
+    /// Uses the pure `decay_score` function to avoid `Instant` subtraction,
+    /// which panics on Windows if system uptime < the simulated duration.
     #[test]
     fn test_worst_score_unblocks_after_3_days() {
-        let three_days_secs: u64 = 3 * 24 * 3600;
-        let mut trust = PeerTrust {
-            score: MIN_TRUST_SCORE,
-            last_updated: Instant::now() - std::time::Duration::from_secs(three_days_secs),
-        };
-
-        trust.apply_decay();
+        let three_days_secs = (3 * 24 * 3600) as f64;
+        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, three_days_secs);
 
         assert!(
-            trust.score >= 0.15,
-            "After 3 days, score {} should be >= block threshold 0.15",
-            trust.score
+            score >= 0.15,
+            "After 3 days, score {score} should be >= block threshold 0.15",
         );
     }
 
     /// Just under 3 days should NOT be enough to unblock
     #[test]
     fn test_worst_score_still_blocked_before_3_days() {
-        let just_under_3_days: u64 = 3 * 24 * 3600 - 3600; // 3 days minus 1 hour
-        let mut trust = PeerTrust {
-            score: MIN_TRUST_SCORE,
-            last_updated: Instant::now() - std::time::Duration::from_secs(just_under_3_days),
-        };
-
-        trust.apply_decay();
+        let just_under_3_days = (3 * 24 * 3600 - 3600) as f64; // 3 days minus 1 hour
+        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, just_under_3_days);
 
         assert!(
-            trust.score < 0.15,
-            "Before 3 days, score {} should still be < block threshold 0.15",
-            trust.score
+            score < 0.15,
+            "Before 3 days, score {score} should still be < block threshold 0.15",
         );
     }
 
     #[test]
     fn test_decay_from_high_score_moves_down() {
-        let one_week_secs: u64 = 7 * 24 * 3600;
-        let mut trust = PeerTrust {
-            score: 0.95,
-            last_updated: Instant::now() - std::time::Duration::from_secs(one_week_secs),
-        };
+        let one_week_secs = (7 * 24 * 3600) as f64;
+        let score = PeerTrust::decay_score(0.95, one_week_secs);
 
-        trust.apply_decay();
-
-        assert!(trust.score < 0.95, "Score should have decayed from 0.95");
+        assert!(score < 0.95, "Score should have decayed from 0.95");
         assert!(
-            trust.score > DEFAULT_NEUTRAL_TRUST,
+            score > DEFAULT_NEUTRAL_TRUST,
             "Score should still be above neutral after 1 week"
         );
     }
 
     #[test]
     fn test_decay_from_low_score_moves_up() {
-        let one_week_secs: u64 = 7 * 24 * 3600;
-        let mut trust = PeerTrust {
-            score: 0.1,
-            last_updated: Instant::now() - std::time::Duration::from_secs(one_week_secs),
-        };
+        let one_week_secs = (7 * 24 * 3600) as f64;
+        let score = PeerTrust::decay_score(0.1, one_week_secs);
 
-        trust.apply_decay();
-
-        assert!(
-            trust.score > 0.1,
-            "Low score should decay upward toward neutral"
-        );
+        assert!(score > 0.1, "Low score should decay upward toward neutral");
     }
 }
