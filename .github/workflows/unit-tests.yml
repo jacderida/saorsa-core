@@ -59,7 +59,7 @@ jobs:
         run: cargo nextest run --lib --profile default
 
       - name: Run doctests
-        run: cargo test --doc || echo "Doctests completed"
+        run: cargo test --doc
 
   unit-tests-macos:
     name: Unit Tests (macOS)

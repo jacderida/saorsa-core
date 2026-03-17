@@ -56,7 +56,7 @@ pub fn peer_trust(&self, peer_id: &PeerId) -> f64
 Get the underlying TrustEngine for advanced operations.
 
 ```rust
-pub fn trust_engine(&self) -> Arc<TrustEngine>
+pub fn trust_engine(&self) -> &Arc<TrustEngine>
 ```
 
 ## TrustEvent Enum

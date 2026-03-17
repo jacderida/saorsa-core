@@ -50,6 +50,24 @@ impl Default for AdaptiveDhtConfig {
     }
 }
 
+impl AdaptiveDhtConfig {
+    /// Validate that all config values are within acceptable ranges.
+    ///
+    /// Returns `Err` if `block_threshold` is outside `[0.0, 1.0]` or is NaN.
+    pub fn validate(&self) -> crate::error::P2pResult<()> {
+        if !(0.0..=1.0).contains(&self.block_threshold) || self.block_threshold.is_nan() {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "block_threshold must be in [0.0, 1.0], got {}",
+                    self.block_threshold
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Trust-relevant events observable by the saorsa-core network layer.
 ///
 /// Each variant maps to an internal [`NodeStatisticsUpdate`] with appropriate severity.
@@ -118,17 +136,7 @@ impl AdaptiveDHT {
         mut dht_config: DhtNetworkConfig,
         adaptive_config: AdaptiveDhtConfig,
     ) -> Result<Self> {
-        if !(0.0..=1.0).contains(&adaptive_config.block_threshold)
-            || adaptive_config.block_threshold.is_nan()
-        {
-            return Err(crate::error::P2PError::Validation(
-                format!(
-                    "block_threshold must be in [0.0, 1.0], got {}",
-                    adaptive_config.block_threshold
-                )
-                .into(),
-            ));
-        }
+        adaptive_config.validate()?;
 
         dht_config.block_threshold = adaptive_config.block_threshold;
 
@@ -240,24 +248,25 @@ mod tests {
 
     #[test]
     fn test_block_threshold_validation_rejects_invalid() {
-        // Values outside [0.0, 1.0] must be rejected
         for &bad in &[-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let config = AdaptiveDhtConfig {
                 block_threshold: bad,
             };
             assert!(
-                !(0.0..=1.0).contains(&config.block_threshold) || config.block_threshold.is_nan(),
+                config.validate().is_err(),
                 "block_threshold {bad} should fail validation"
             );
         }
+    }
 
-        // Values inside [0.0, 1.0] must be accepted
+    #[test]
+    fn test_block_threshold_validation_accepts_valid() {
         for &good in &[0.0, 0.15, 0.5, 1.0] {
             let config = AdaptiveDhtConfig {
                 block_threshold: good,
             };
             assert!(
-                (0.0..=1.0).contains(&config.block_threshold),
+                config.validate().is_ok(),
                 "block_threshold {good} should pass validation"
             );
         }

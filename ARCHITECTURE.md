@@ -10,14 +10,13 @@ This repository is a Rust library crate that provides a modular, post‑quantum 
 ## Layered Architecture
 - Transport & Networking: `transport/`, `network/` (QUIC, NAT traversal, events, dual‑stack listeners, Happy Eyeballs dialing).
 - Routing & Discovery: `dht/`, `dht_network_manager/`, `peer_record/`.
-- Security: `quantum_crypto/`, `security.rs`, `secure_memory.rs`, `key_derivation.rs`, `encrypted_key_storage.rs`.
-- Adaptive Intelligence: `adaptive/` (ML routing strategies, EigenTrust, churn prediction, SOM).
+- Security: `quantum_crypto/`, `security.rs`.
+- Trust: `adaptive/` (response-rate scoring with time decay, binary peer blocking).
 - Application Modules: provided by upper layers (not in this crate).
-- Cross‑cutting: `validation.rs`, `production.rs`, `health/`, `utils/`, `config.rs`, `error.rs`.
+- Cross‑cutting: `validation.rs`, `config.rs`, `error.rs`.
 
 ## Module Map (selected)
 - Core exports live in `src/lib.rs`; add new modules there and keep names `snake_case`.
-- Health endpoints: `health/` (Axum); metrics behind `metrics` default feature.
 - PQC: `quantum_crypto/` exports saorsa‑pqc types and compatibility shims.
 
 ## Data Flow
@@ -28,13 +27,13 @@ This repository is a Rust library crate that provides a modular, post‑quantum 
      [network]  <->  [dht_network_manager]  <->  [dht]
           |                                        ^
       [transport (QUIC)]                     [adaptive]
-          ^                               (ML routing, trust,
-     [validation|security|secure_memory]   churn prediction)
+          ^                               (trust scoring,
+     [validation|security]                 peer blocking)
 ```
 
-saorsa-core is a peer phonebook with adaptive intelligence: it handles peer discovery,
-trust scoring (EigenTrust), and ML-driven routing. Application data storage and
-replication are handled by saorsa-node via `send_message`-style APIs.
+saorsa-core is a peer phonebook with trust enforcement: it handles peer discovery,
+response-rate trust scoring with time decay, and binary peer blocking. Application
+data storage and replication are handled by saorsa-node via `send_message`-style APIs.
 
 ## Concurrency & Errors
 - Async with `tokio`; prefer `Send + Sync` types and bounded channels where applicable.
@@ -42,11 +41,8 @@ replication are handled by saorsa-node via `send_message`-style APIs.
 - Logging with `tracing`; avoid `unwrap/expect/panic` in lib paths (CI enforces).
 
 ## Observability & Testing
-- Health: `health::HealthServer` (enable metrics with `--features metrics` or default).
-- Tests: unit tests in modules, integration tests under `tests/`; property tests via `proptest`/`quickcheck`.
-- Fuzz parsers/validators in `fuzz/` using `cargo-fuzz`.
-- Mutation testing configured by `mutation-testing.toml` (use `cargo mutants`).
+- Tests: unit tests in modules (`#[cfg(test)]` blocks).
 
 ## Build Targets
-- Library only; examples under `examples/`, benches under `benches/`.
+- Library only.
 - Use `./scripts/local_ci.sh` to run a safe, end‑to‑end local CI.
