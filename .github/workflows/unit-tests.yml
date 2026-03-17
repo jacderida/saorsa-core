@@ -1,4 +1,4 @@
-name: Unit Tests
+name: Tests
 
 on:
   push:
@@ -58,6 +58,9 @@ jobs:
       - name: Run unit tests
         run: cargo nextest run --lib --profile default
 
+      - name: Run integration tests
+        run: cargo nextest run --test '*' --profile default
+
       - name: Run doctests
         run: cargo test --doc
 
@@ -93,6 +96,9 @@ jobs:
       - name: Run unit tests
         run: cargo nextest run --lib --profile default
 
+      - name: Run integration tests
+        run: cargo nextest run --test '*' --profile default
+
   unit-tests-windows:
     name: Unit Tests (Windows)
     runs-on: windows-latest
@@ -124,3 +130,6 @@ jobs:
       # build issues. The zkvm-prover feature requires C++20 on Windows.
       - name: Run unit tests
         run: cargo nextest run --lib --profile default
+
+      - name: Run integration tests
+        run: cargo nextest run --test '*' --profile default

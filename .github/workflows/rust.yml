@@ -11,7 +11,7 @@ env:
 
 # Note: Main test suites are in separate workflows:
 # - lint.yml: Format and clippy checks
-# - unit-tests.yml: Library unit tests (all platforms)
+# - unit-tests.yml: Unit and integration tests (all platforms)
 
 jobs:
   # Build verification on all platforms
