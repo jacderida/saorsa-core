@@ -957,4 +957,34 @@ mod tests {
             result
         );
     }
+
+    // -----------------------------------------------------------------------
+    // IPv4 diversity: static floor overrides low dynamic limit
+    // -----------------------------------------------------------------------
+
+    /// When the network is small the dynamic per-IP formula yields 1, which
+    /// would block additional same-IP nodes.  A configured `ipv4_limit_floor`
+    /// must override the dynamic value so that bootstrap can proceed.
+    #[tokio::test]
+    async fn test_ipv4_static_floor_overrides_dynamic_limit() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Testnet-like config: floor of 100 guarantees at least that many
+        // nodes per subnet regardless of how small the network is.
+        let mut config = IPDiversityConfig::testnet();
+        config.ipv4_limit_floor = Some(100);
+        dht.set_ip_diversity_config(config);
+
+        // Add multiple nodes from the same IP — the dynamic formula alone
+        // would cap at 1, but the floor of 100 must allow these.
+        for i in 1..=10u8 {
+            let node = make_node(i, "/ip4/203.0.113.1/udp/9000/quic");
+            let result = dht.add_node(node).await;
+            assert!(
+                result.is_ok(),
+                "node {i} from same IP should be accepted with floor override: {:?}",
+                result
+            );
+        }
+    }
 }

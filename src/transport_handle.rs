@@ -28,7 +28,6 @@ use crate::network::{
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
-use crate::security::GeoProvider;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
@@ -1452,7 +1451,7 @@ impl TransportHandle {
         active_connections: Arc<RwLock<HashSet<String>>>,
         peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         event_tx: broadcast::Sender<P2PEvent>,
-        geo_provider: Arc<BgpGeoProvider>,
+        _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
         channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
@@ -1479,30 +1478,6 @@ impl TransportHandle {
                                     "Connection established: channel={}, addr={}",
                                     channel_id, remote_address
                                 );
-
-                                let ip = remote_address.ip();
-                                let is_rejected = match ip {
-                                    std::net::IpAddr::V4(v4) => {
-                                        if let Some(asn) = geo_provider.lookup_ipv4_asn(v4) {
-                                            geo_provider.is_hosting_asn(asn) || geo_provider.is_vpn_asn(asn)
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                    std::net::IpAddr::V6(v6) => {
-                                        let info = geo_provider.lookup(v6);
-                                        info.is_hosting_provider || info.is_vpn_provider
-                                    }
-                                };
-
-                                if is_rejected {
-                                    info!(
-                                        "Rejecting connection from {} ({}) due to GeoIP policy",
-                                        channel_id, remote_address
-                                    );
-                                    dual_node.disconnect_peer_by_addr(&remote_address).await;
-                                    continue;
-                                }
 
                                 active_connections.write().await.insert(channel_id.clone());
 
