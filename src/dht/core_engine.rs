@@ -641,15 +641,26 @@ impl DhtCoreEngine {
         Ok(())
     }
 
-    /// Dynamic per-IP limit: `min(cap, floor(network_size * fraction))`,
-    /// clamped to at least 1.  `network_size` excludes loopback nodes so
-    /// devnet environments don't inflate the limit for non-loopback IPs.
+    /// Dynamic per-IP limit: `min(cap, max(floor, fraction))` where
+    /// `fraction = floor(network_size * max_network_fraction)`.
+    ///
+    /// The floor is 5, not 1, because home users commonly run multiple
+    /// nodes behind a single public IP (residential NAT). A floor of 1
+    /// would prevent this entirely, blocking legitimate operators during
+    /// the early growth phase when the network needs them most. At 1000+
+    /// nodes the dynamic formula (`network_size * 0.005`) naturally
+    /// produces 5+, so the floor only matters for smaller networks where
+    /// Sybil resistance from IP diversity alone is weak anyway.
+    ///
+    /// `network_size` excludes loopback nodes so devnet environments
+    /// don't inflate the limit for non-loopback IPs.
     fn dynamic_per_ip_limit(&self, network_size: usize) -> usize {
+        const MIN_PER_IP_FLOOR: usize = 5;
         let fraction =
             (network_size as f64 * self.ip_diversity_config.max_network_fraction).floor() as usize;
         std::cmp::min(
             self.ip_diversity_config.max_per_ip_cap,
-            std::cmp::max(1, fraction),
+            std::cmp::max(MIN_PER_IP_FLOOR, fraction),
         )
     }
 }
