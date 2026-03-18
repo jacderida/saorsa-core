@@ -1584,6 +1584,93 @@ impl NetworkSender for TransportHandle {
     }
 }
 
+// Test-only helpers — available to integration tests via `P2PNode`.
+impl TransportHandle {
+    /// Kill the QUIC connections for a peer while preserving all channel
+    /// bookkeeping, simulating a stale session.
+    ///
+    /// Internally: saves channel state → QUIC disconnect (triggers lifecycle
+    /// monitor cleanup) → waits for event propagation → re-injects saved state.
+    /// The result is a `TransportHandle` that believes the peer is connected
+    /// but has no underlying QUIC session.
+    #[doc(hidden)]
+    pub async fn poison_quic_for_peer(&self, peer_id: &PeerId) {
+        /// Time to wait for the lifecycle monitor to process disconnect events.
+        const EVENT_PROPAGATION_DELAY_MS: u64 = 200;
+
+        let channels = self.channels_for_peer(peer_id).await;
+        if channels.is_empty() {
+            return;
+        }
+
+        // ---- save state that the lifecycle monitor will destroy ----
+        let saved_peers: Vec<(String, PeerInfo)> = {
+            let peers = self.peers.read().await;
+            channels
+                .iter()
+                .filter_map(|ch| peers.get(ch).map(|info| (ch.clone(), info.clone())))
+                .collect()
+        };
+        let saved_active: Vec<String> = {
+            let ac = self.active_connections.read().await;
+            channels
+                .iter()
+                .filter(|ch| ac.contains(ch.as_str()))
+                .cloned()
+                .collect()
+        };
+        let saved_p2c: Option<HashSet<String>> =
+            self.peer_to_channel.read().await.get(peer_id).cloned();
+        let saved_c2p: Vec<(String, HashSet<PeerId>)> = {
+            let c2p = self.channel_to_peers.read().await;
+            channels
+                .iter()
+                .filter_map(|ch| c2p.get(ch).map(|pids| (ch.clone(), pids.clone())))
+                .collect()
+        };
+        let saved_ua: Option<String> = self.peer_user_agents.read().await.get(peer_id).cloned();
+
+        // ---- kill QUIC connections (triggers async cleanup via events) ----
+        for ch in &channels {
+            if let Ok(addr) = ch.parse::<std::net::SocketAddr>() {
+                self.dual_node.disconnect_peer_by_addr(&addr).await;
+            }
+        }
+
+        // ---- wait for lifecycle monitor to finish cleanup ----
+        tokio::time::sleep(std::time::Duration::from_millis(EVENT_PROPAGATION_DELAY_MS)).await;
+
+        // ---- re-inject saved state so the peer appears connected ----
+        {
+            let mut peers = self.peers.write().await;
+            for (ch, info) in saved_peers {
+                peers.insert(ch, info);
+            }
+        }
+        {
+            let mut ac = self.active_connections.write().await;
+            for ch in saved_active {
+                ac.insert(ch);
+            }
+        }
+        if let Some(channel_set) = saved_p2c {
+            self.peer_to_channel
+                .write()
+                .await
+                .insert(*peer_id, channel_set);
+        }
+        {
+            let mut c2p = self.channel_to_peers.write().await;
+            for (ch, pids) in saved_c2p {
+                c2p.insert(ch, pids);
+            }
+        }
+        if let Some(ua) = saved_ua {
+            self.peer_user_agents.write().await.insert(*peer_id, ua);
+        }
+    }
+}
+
 // Test-only helpers for injecting state
 #[cfg(test)]
 impl TransportHandle {

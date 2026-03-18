@@ -1145,6 +1145,16 @@ impl P2PNode {
     ) -> Result<()> {
         self.transport.send_message(peer_id, protocol, data).await
     }
+
+    /// Simulate a stale QUIC session for a peer: kills the underlying QUIC
+    /// connections while preserving all channel bookkeeping so the node
+    /// believes the peer is still connected.
+    ///
+    /// Used by integration tests to verify reconnect-on-send behaviour.
+    #[doc(hidden)]
+    pub async fn poison_quic_for_peer(&self, peer_id: &PeerId) {
+        self.transport.poison_quic_for_peer(peer_id).await;
+    }
 }
 
 /// Parse a postcard-encoded protocol message into a `P2PEvent::Message`.
