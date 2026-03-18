@@ -31,7 +31,6 @@ use crate::network::{
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
-use crate::{debug, info, trace, warn};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,6 +39,7 @@ use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn};
 
 // Test configuration defaults (used by `new_for_tests()` which is available in all builds)
 const TEST_EVENT_CHANNEL_CAPACITY: usize = 16;
@@ -444,10 +444,10 @@ impl TransportHandle {
     pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
         match channel_id.parse::<SocketAddr>() {
             Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
-            Err(_e) => {
+            Err(e) => {
                 warn!(
                     channel = %channel_id,
-                    error = %_e,
+                    error = %e,
                     "Failed to parse channel ID as SocketAddr — QUIC connection will not be closed",
                 );
             }
@@ -650,11 +650,11 @@ impl TransportHandle {
         for channel_id in &orphaned_channels {
             match channel_id.parse::<SocketAddr>() {
                 Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
-                Err(_e) => {
+                Err(e) => {
                     warn!(
                         peer = %peer_id,
                         channel = %channel_id,
-                        error = %_e,
+                        error = %e,
                         "Failed to parse channel ID as SocketAddr — QUIC connection will not be closed",
                     );
                 }
@@ -762,14 +762,14 @@ impl TransportHandle {
             }));
         }
 
-        let _raw_data_len = data.len();
+        let raw_data_len = data.len();
         let message_data = self.create_protocol_message(protocol, data)?;
         info!(
             "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
             message_data.len(),
             channel_id,
             protocol,
-            _raw_data_len
+            raw_data_len
         );
 
         let addr: SocketAddr = channel_id.parse().map_err(|e: std::net::AddrParseError| {
@@ -1083,8 +1083,8 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Subscribe to a topic (currently a no-op stub).
-    pub async fn subscribe(&self, _topic: &str) -> Result<()> {
-        info!("Subscribed to topic: {}", _topic);
+    pub async fn subscribe(&self, topic: &str) -> Result<()> {
+        info!("Subscribed to topic: {}", topic);
         Ok(())
     }
 
@@ -1130,7 +1130,7 @@ impl TransportHandle {
             debug!("No peers connected, message will only be sent to local subscribers");
         } else {
             let mut send_count = 0;
-            let _total = peer_channel_groups.len();
+            let total = peer_channel_groups.len();
             for channels in &peer_channel_groups {
                 let mut sent = false;
                 for channel_id in channels {
@@ -1141,10 +1141,10 @@ impl TransportHandle {
                             sent = true;
                             break;
                         }
-                        Err(_e) => {
+                        Err(e) => {
                             warn!(
                                 channel = %channel_id,
-                                error = %_e,
+                                error = %e,
                                 "Publish channel failed, removing and trying next",
                             );
                             self.remove_channel(channel_id).await;
@@ -1157,7 +1157,7 @@ impl TransportHandle {
             }
             info!(
                 "Published message to {}/{} connected peers",
-                send_count, _total
+                send_count, total
             );
         }
 
@@ -1183,8 +1183,8 @@ impl TransportHandle {
 
     /// Send an event to all subscribers.
     pub(crate) fn send_event(&self, event: P2PEvent) {
-        if let Err(_e) = self.event_tx.send(event) {
-            crate::trace!("Event broadcast has no receivers: {_e}");
+        if let Err(e) = self.event_tx.send(event) {
+            tracing::trace!("Event broadcast has no receivers: {e}");
         }
     }
 }
@@ -1202,7 +1202,7 @@ impl TransportHandle {
                 format!("Failed to get local addresses: {}", e).into(),
             ))
         })?;
-        let _addrs: Vec<SocketAddr> = socket_addrs.clone();
+        let addrs: Vec<SocketAddr> = socket_addrs.clone();
         {
             let mut la = self.listen_addrs.write().await;
             *la = socket_addrs.into_iter().map(MultiAddr::quic).collect();
@@ -1219,10 +1219,10 @@ impl TransportHandle {
                     break;
                 };
 
-                if let Err(_e) = rate_limiter.check_ip(&remote_sock.ip()) {
+                if let Err(e) = rate_limiter.check_ip(&remote_sock.ip()) {
                     warn!(
                         "Rate-limited incoming connection from {}: {}",
-                        remote_sock, _e
+                        remote_sock, e
                     );
                     continue;
                 }
@@ -1239,7 +1239,7 @@ impl TransportHandle {
 
         self.start_message_receiving_system().await?;
 
-        info!("Dual-stack listeners active on: {:?}", _addrs);
+        info!("Dual-stack listeners active on: {:?}", addrs);
         Ok(())
     }
 
@@ -1420,17 +1420,17 @@ impl TransportHandle {
         }
     }
 
-    async fn join_task_handle(handle: JoinHandle<()>, _task_name: &str) {
+    async fn join_task_handle(handle: JoinHandle<()>, task_name: &str) {
         match handle.await {
             Ok(()) => {}
-            Err(_e) if _e.is_cancelled() => {
-                crate::debug!("{_task_name} task was cancelled during shutdown");
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!("{task_name} task was cancelled during shutdown");
             }
-            Err(_e) if _e.is_panic() => {
-                crate::error!("{_task_name} task panicked during shutdown: {:?}", _e);
+            Err(e) if e.is_panic() => {
+                tracing::error!("{task_name} task panicked during shutdown: {:?}", e);
             }
-            Err(_e) => {
-                crate::warn!("{_task_name} task join error during shutdown: {:?}", _e);
+            Err(e) => {
+                tracing::warn!("{task_name} task join error during shutdown: {:?}", e);
             }
         }
     }
@@ -1504,25 +1504,25 @@ impl TransportHandle {
                                 // Send identity announce so the remote peer can authenticate us.
                                 match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
                                     Ok(announce_bytes) => {
-                                        if let Err(_e) = dual_node
+                                        if let Err(e) = dual_node
                                             .send_to_peer_optimized(&remote_address, &announce_bytes)
                                             .await
                                         {
-                                            warn!("Failed to send identity announce to {channel_id}: {_e}");
+                                            warn!("Failed to send identity announce to {channel_id}: {e}");
                                         }
                                     }
-                                    Err(_e) => {
-                                        warn!("Failed to create identity announce: {_e}");
+                                    Err(e) => {
+                                        warn!("Failed to create identity announce: {e}");
                                     }
                                 }
 
                                 // PeerConnected is emitted when the remote receives and
                                 // verifies our identity announce — not at transport level.
                             }
-                            ConnectionEvent::Lost { remote_address, reason: _reason }
-                            | ConnectionEvent::Failed { remote_address, reason: _reason } => {
+                            ConnectionEvent::Lost { remote_address, reason }
+                            | ConnectionEvent::Failed { remote_address, reason } => {
                                 let channel_id = remote_address.to_string();
-                                debug!("Connection lost/failed: channel={channel_id}, reason={_reason}");
+                                debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
 
                                 active_connections.write().await.remove(&channel_id);
                                 peers.write().await.remove(&channel_id);
@@ -1537,10 +1537,10 @@ impl TransportHandle {
                                 ).await;
                             }
                         },
-                        Err(broadcast::error::RecvError::Lagged(_skipped)) => {
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(
                                 "Connection event receiver lagged, skipped {} events",
-                                _skipped
+                                skipped
                             );
                         }
                         Err(broadcast::error::RecvError::Closed) => {

@@ -25,7 +25,6 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
-use crate::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 /// Wire protocol message format for P2P communication.
 ///
@@ -740,8 +740,8 @@ impl P2PNode {
         let bootstrap_manager =
             match BootstrapManager::with_node_config(bootstrap_config, &config).await {
                 Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(_e) => {
-                    warn!("Failed to initialize bootstrap manager: {_e}, continuing without cache");
+                Err(e) => {
+                    warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
                     None
                 }
             };
@@ -984,8 +984,8 @@ impl P2PNode {
         self.adaptive_dht.start().await?;
 
         // Log current listen addresses
-        let _listen_addrs = self.transport.listen_addrs().await;
-        info!("P2P node started on addresses: {:?}", _listen_addrs);
+        let listen_addrs = self.transport.listen_addrs().await;
+        info!("P2P node started on addresses: {:?}", listen_addrs);
 
         // NOTE: Message receiving is now integrated into the accept loop in start_network_listeners()
         // The old start_message_receiving_system() is no longer needed as it competed with the accept
@@ -1173,8 +1173,8 @@ fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
 
 /// Helper to send an event via a broadcast sender, logging at trace level if no receivers.
 pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent) {
-    if let Err(_e) = tx.send(event) {
-        crate::trace!("Event broadcast has no receivers: {_e}");
+    if let Err(e) = tx.send(event) {
+        tracing::trace!("Event broadcast has no receivers: {e}");
     }
 }
 
@@ -1188,7 +1188,7 @@ pub(crate) struct ParsedMessage {
     pub(crate) user_agent: String,
 }
 
-pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<ParsedMessage> {
+pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
 
     // Validate timestamp to prevent replay attacks
@@ -1199,9 +1199,9 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
 
     // Reject messages that are too old (potential replay)
     if message.timestamp < now.saturating_sub(MAX_MESSAGE_AGE_SECS) {
-        crate::warn!(
+        tracing::warn!(
             "Rejecting stale message from {} (timestamp {} is {} seconds old)",
-            _source,
+            source,
             message.timestamp,
             now.saturating_sub(message.timestamp)
         );
@@ -1210,9 +1210,9 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
 
     // Reject messages too far in the future (clock manipulation)
     if message.timestamp > now + MAX_FUTURE_SECS {
-        crate::warn!(
+        tracing::warn!(
             "Rejecting future-dated message from {} (timestamp {} is {} seconds ahead)",
-            _source,
+            source,
             message.timestamp,
             message.timestamp.saturating_sub(now)
         );
@@ -1225,14 +1225,14 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
             Ok(peer_id) => {
                 debug!(
                     "Message from {} authenticated as app-level NodeId {}",
-                    _source, peer_id
+                    source, peer_id
                 );
                 Some(peer_id)
             }
-            Err(_e) => {
+            Err(e) => {
                 warn!(
                     "Rejecting message from {}: signature verification failed: {}",
-                    _source, _e
+                    source, e
                 );
                 return None;
             }
@@ -1245,7 +1245,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
         "Parsed P2PEvent::Message - topic: {}, source: {:?} (transport: {}, logical: {}), payload_len: {}",
         message.protocol,
         authenticated_node_id,
-        _source,
+        source,
         message.from,
         message.data.len()
     );
@@ -1514,18 +1514,18 @@ impl P2PNode {
                                 }
                                 break; // Successfully connected, move to next peer
                             }
-                            Err(_e) => {
+                            Err(e) => {
                                 warn!(
                                     "Timeout waiting for identity from bootstrap peer {}: {}, \
                                      closing channel {}",
-                                    addr, _e, channel_id
+                                    addr, e, channel_id
                                 );
                                 self.disconnect_channel(&channel_id).await;
                             }
                         }
                     }
-                    Err(_e) => {
-                        warn!("Failed to connect to bootstrap peer {}: {}", addr, _e);
+                    Err(e) => {
+                        warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
 
                         // Update bootstrap cache with failed connection
                         if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
@@ -1559,8 +1559,8 @@ impl P2PNode {
             .bootstrap_from_peers(&connected_peer_ids)
             .await
         {
-            Ok(_count) => info!("DHT peer discovery found {} peers", _count),
-            Err(_e) => warn!("DHT peer discovery failed: {}", _e),
+            Ok(count) => info!("DHT peer discovery found {} peers", count),
+            Err(e) => warn!("DHT peer discovery failed: {}", e),
         }
 
         // Mark node as bootstrapped - we have connected to bootstrap peers
