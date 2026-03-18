@@ -27,6 +27,7 @@ use crate::{
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
+use crate::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -884,7 +885,7 @@ impl DhtNetworkManager {
                 dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
                 let _ = self.transport.disconnect_peer(peer_id).await;
-                info!(
+                crate::info!(
                     peer = peer_id.to_hex(),
                     score = engine.score(peer_id),
                     threshold = self.config.block_threshold,

@@ -31,6 +31,7 @@ use crate::network::{
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use crate::{debug, info, trace, warn};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1183,7 +1184,7 @@ impl TransportHandle {
     /// Send an event to all subscribers.
     pub(crate) fn send_event(&self, event: P2PEvent) {
         if let Err(_e) = self.event_tx.send(event) {
-            trace!("Event broadcast has no receivers: {_e}");
+            crate::trace!("Event broadcast has no receivers: {_e}");
         }
     }
 }
@@ -1423,13 +1424,13 @@ impl TransportHandle {
         match handle.await {
             Ok(()) => {}
             Err(_e) if _e.is_cancelled() => {
-                debug!("{_task_name} task was cancelled during shutdown");
+                crate::debug!("{_task_name} task was cancelled during shutdown");
             }
             Err(_e) if _e.is_panic() => {
-                error!("{_task_name} task panicked during shutdown: {:?}", _e);
+                crate::error!("{_task_name} task panicked during shutdown: {:?}", _e);
             }
             Err(_e) => {
-                warn!("{_task_name} task join error during shutdown: {:?}", _e);
+                crate::warn!("{_task_name} task join error during shutdown: {:?}", _e);
             }
         }
     }

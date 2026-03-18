@@ -25,6 +25,7 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
+use crate::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1173,7 +1174,7 @@ fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
 /// Helper to send an event via a broadcast sender, logging at trace level if no receivers.
 pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent) {
     if let Err(_e) = tx.send(event) {
-        trace!("Event broadcast has no receivers: {_e}");
+        crate::trace!("Event broadcast has no receivers: {_e}");
     }
 }
 
@@ -1198,7 +1199,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
 
     // Reject messages that are too old (potential replay)
     if message.timestamp < now.saturating_sub(MAX_MESSAGE_AGE_SECS) {
-        warn!(
+        crate::warn!(
             "Rejecting stale message from {} (timestamp {} is {} seconds old)",
             _source,
             message.timestamp,
@@ -1209,7 +1210,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], _source: &str) -> Option<Pars
 
     // Reject messages too far in the future (clock manipulation)
     if message.timestamp > now + MAX_FUTURE_SECS {
-        warn!(
+        crate::warn!(
             "Rejecting future-dated message from {} (timestamp {} is {} seconds ahead)",
             _source,
             message.timestamp,

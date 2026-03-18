@@ -34,10 +34,7 @@
 #![warn(rust_2018_idioms)]
 
 // Conditional logging macros (compile to nothing in release builds).
-// `#[macro_use]` makes these macros available throughout the crate without imports.
-// Not `#[macro_export]` — these are internal-only, not part of the public API.
-#[macro_use]
-mod logging;
+pub(crate) mod logging;
 
 // Internal modules — used by the crate but not exposed publicly.
 pub(crate) mod adaptive;

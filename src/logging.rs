@@ -5,6 +5,7 @@
 //! field names) is present in release binaries.
 
 /// Emit a TRACE-level event (debug builds only).
+#[macro_export]
 macro_rules! trace {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
@@ -13,6 +14,7 @@ macro_rules! trace {
 }
 
 /// Emit a DEBUG-level event (debug builds only).
+#[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
@@ -21,6 +23,7 @@ macro_rules! debug {
 }
 
 /// Emit an INFO-level event (debug builds only).
+#[macro_export]
 macro_rules! info {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
@@ -29,6 +32,7 @@ macro_rules! info {
 }
 
 /// Emit a WARN-level event (debug builds only).
+#[macro_export]
 macro_rules! warn {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
@@ -37,6 +41,7 @@ macro_rules! warn {
 }
 
 /// Emit an ERROR-level event (debug builds only).
+#[macro_export]
 macro_rules! error {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
