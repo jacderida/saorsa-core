@@ -548,8 +548,6 @@ impl P2PError {
 impl P2PError {
     /// Log error with appropriate level
     pub fn log(&self) {
-        use tracing::{error, warn};
-
         match self {
             P2PError::Network(NetworkError::Timeout) | P2PError::Timeout(_) => warn!("{}", self),
 
@@ -560,9 +558,8 @@ impl P2PError {
     }
 
     /// Log error with context
-    pub fn log_with_context(&self, context: &str) {
-        use tracing::error;
-        error!("{}: {}", context, self);
+    pub fn log_with_context(&self, _context: &str) {
+        error!("{}: {}", _context, self);
     }
 }
 
