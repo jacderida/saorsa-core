@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
 /// Configuration for the bootstrap manager
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -177,8 +178,8 @@ impl BootstrapManager {
             }
 
             // Track in diversity enforcer
-            if let Err(_e) = diversity.add_node(&analysis) {
-                warn!("Failed to track IP diversity for {}: {}", ip, _e);
+            if let Err(e) = diversity.add_node(&analysis) {
+                warn!("Failed to track IP diversity for {}: {}", ip, e);
             }
         } // Lock released here before await
 
