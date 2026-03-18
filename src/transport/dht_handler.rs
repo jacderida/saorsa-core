@@ -18,7 +18,6 @@
 //! |------|------|---------|
 //! | DhtQuery | 0x10 | FIND_NODE, Ping requests |
 
-use crate::{debug, error, trace, warn};
 use async_trait::async_trait;
 use bytes::Bytes;
 use saorsa_transport::link_transport::{LinkError, LinkResult, ProtocolHandler, StreamType};

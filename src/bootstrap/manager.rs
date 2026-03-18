@@ -24,7 +24,6 @@ use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
 use crate::{P2PError, Result};
-use crate::{info, warn};
 use parking_lot::Mutex;
 use saorsa_transport::bootstrap_cache::{
     BootstrapCache as AntBootstrapCache, BootstrapCacheConfig, CachedPeer, PeerCapabilities,
