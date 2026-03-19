@@ -1228,10 +1228,12 @@ impl DhtNetworkManager {
     /// addresses), then falls back to the transport layer for connected peers.
     /// Returns an empty vec when the peer is unknown or has no addresses.
     pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
-        // 1. Routing table — contains validated MultiAddr entries
+        // 1. Routing table — filter to dialable QUIC addresses (the table
+        //    can hold unspecified or non-QUIC entries from peer announcements).
         let addrs = self.dht.read().await.get_node_addresses(peer_id).await;
-        if !addrs.is_empty() {
-            return addrs;
+        let filtered = Self::dialable_addresses(&addrs);
+        if !filtered.is_empty() {
+            return filtered;
         }
 
         // 2. Transport layer — for connected peers not yet in the routing table
