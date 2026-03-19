@@ -1308,7 +1308,11 @@ impl P2PNode {
         }
 
         // 3. DHT routing table.
-        self.adaptive_dht.peer_address_for_dial(peer_id).await
+        self.adaptive_dht
+            .peer_addresses_for_dial(peer_id)
+            .await
+            .into_iter()
+            .next()
     }
 
     /// Return the first dialable QUIC address from a slice, skipping

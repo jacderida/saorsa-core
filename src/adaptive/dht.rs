@@ -212,13 +212,13 @@ impl AdaptiveDHT {
         self.dht_manager.stop().await
     }
 
-    /// Look up a connectable address for a peer.
+    /// Look up connectable addresses for a peer.
     ///
     /// Checks the DHT routing table first, then falls back to the transport
-    /// layer. Returns `None` when the peer is unknown or has no dialable
+    /// layer. Returns an empty vec when the peer is unknown or has no dialable
     /// addresses.
-    pub(crate) async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
-        self.dht_manager.peer_address_for_dial(peer_id).await
+    pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+        self.dht_manager.peer_addresses_for_dial(peer_id).await
     }
 }
 

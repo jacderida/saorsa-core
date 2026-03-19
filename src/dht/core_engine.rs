@@ -32,30 +32,48 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// Maximum addresses stored per node to prevent memory exhaustion.
+/// A peer can legitimately have several addresses (multi-homed, NAT traversal),
+/// but unbounded lists would be an abuse vector.
+const MAX_ADDRESSES_PER_NODE: usize = 8;
+
 /// Node information for routing.
 ///
-/// The `address` field stores a typed [`MultiAddr`] that is always valid.
-/// Serializes as a canonical `/`-delimited string via `serde_as_string`.
+/// The `addresses` field stores one or more typed [`MultiAddr`] values that are
+/// always valid. Serializes each as a canonical `/`-delimited string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
-    #[serde(with = "crate::address::serde_as_string")]
-    pub address: MultiAddr,
+    pub addresses: Vec<MultiAddr>,
     pub last_seen: SystemTime,
     pub capacity: NodeCapacity,
 }
 
 impl NodeInfo {
-    /// Get the socket address. Returns `None` for non-IP transports.
+    /// Get the socket address from the first address. Returns `None` for
+    /// non-IP transports or when no addresses are stored.
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.address.socket_addr()
+        self.addresses.first().and_then(MultiAddr::socket_addr)
     }
 
-    /// Get the IP address. Returns `None` for non-IP transports.
+    /// Get the IP address from the first address. Returns `None` for
+    /// non-IP transports or when no addresses are stored.
     #[must_use]
     pub fn ip(&self) -> Option<IpAddr> {
-        self.address.ip()
+        self.addresses.first().and_then(MultiAddr::ip)
+    }
+
+    /// Merge a new address into this node's address list.
+    ///
+    /// If the address is already present it is moved to the front (most
+    /// recently seen). New addresses are prepended. The list is capped at
+    /// [`MAX_ADDRESSES_PER_NODE`].
+    pub fn merge_address(&mut self, addr: MultiAddr) {
+        // Remove existing duplicate so the re-insert moves it to the front.
+        self.addresses.retain(|a| a != &addr);
+        self.addresses.insert(0, addr);
+        self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
     }
 }
 
@@ -114,13 +132,14 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
-    /// Update `last_seen` (and optionally the address) for a node, then move
-    /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
+    /// Update `last_seen` (and optionally merge an address) for a node, then
+    /// move it to the tail of the bucket (most recently seen) per Kademlia
+    /// protocol.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
             if let Some(addr) = address {
-                self.nodes[pos].address = addr.clone();
+                self.nodes[pos].merge_address(addr.clone());
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
@@ -170,8 +189,8 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].remove_node(node_id);
     }
 
-    /// Update `last_seen` (and optionally address) for a node and move it to
-    /// the tail of its k-bucket. Returns `true` if the node was found.
+    /// Update `last_seen` (and optionally merge an address) for a node and
+    /// move it to the tail of its k-bucket. Returns `true` if the node was found.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].touch_node(node_id, address)
@@ -408,13 +427,22 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Look up a node's address from the routing table by peer ID.
+    /// Look up a node's addresses from the routing table by peer ID.
     ///
-    /// Returns the stored address if the peer is in the routing table,
-    /// `None` otherwise. O(K) scan of the target k-bucket.
-    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+    /// Returns the stored addresses if the peer is in the routing table,
+    /// an empty vec otherwise. O(K) scan of the target k-bucket.
+    pub async fn get_node_addresses(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
         let routing = self.routing_table.read().await;
-        routing.find_node_by_id(peer_id).map(|n| n.address.clone())
+        routing
+            .find_node_by_id(peer_id)
+            .map(|n| n.addresses.clone())
+            .unwrap_or_default()
+    }
+
+    /// Check whether a peer is present in the routing table.
+    pub async fn has_node(&self, peer_id: &PeerId) -> bool {
+        let routing = self.routing_table.read().await;
+        routing.find_node_by_id(peer_id).is_some()
     }
 
     /// Record a successful interaction with a peer by updating its `last_seen`
@@ -691,7 +719,7 @@ mod tests {
     fn make_node(byte: u8, address: &str) -> NodeInfo {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
-            address: address.parse::<MultiAddr>().unwrap(),
+            addresses: vec![address.parse::<MultiAddr>().unwrap()],
             last_seen: SystemTime::now(),
             capacity: NodeCapacity::default(),
         }
@@ -702,21 +730,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_touch_node_updates_address() {
+    fn test_touch_node_merges_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
-        // Touch with a new address
+        // Touch with a new address — should be prepended, old kept
         let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
+        let old_addr: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(&new_addr));
         assert!(found);
-        assert_eq!(bucket.get_nodes().last().unwrap().address, new_addr);
+        let addrs = &bucket.get_nodes().last().unwrap().addresses;
+        assert_eq!(addrs[0], new_addr);
+        assert_eq!(addrs[1], old_addr);
     }
 
     #[test]
-    fn test_touch_node_none_preserves_address() {
+    fn test_touch_node_none_preserves_addresses() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
@@ -725,7 +756,7 @@ mod tests {
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
         let expected: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
+        assert_eq!(bucket.get_nodes().last().unwrap().addresses, vec![expected]);
     }
 
     #[test]
@@ -782,7 +813,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
+                addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -793,7 +824,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+                addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -826,7 +857,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
+                addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -837,7 +868,7 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+                addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
                 capacity: NodeCapacity::default(),
             })
@@ -867,9 +898,11 @@ mod tests {
             table
                 .add_node(NodeInfo {
                     id: PeerId::from_bytes(id_bytes),
-                    address: format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
-                        .parse()
-                        .unwrap(),
+                    addresses: vec![
+                        format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
+                            .parse()
+                            .unwrap(),
+                    ],
                     last_seen: SystemTime::now(),
                     capacity: NodeCapacity::default(),
                 })
