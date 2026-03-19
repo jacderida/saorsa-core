@@ -415,9 +415,9 @@ impl DhtNetworkManager {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
                         if seen.insert(node.peer_id)
-                            && let Some(addr) = node.addresses.first()
+                            && let Some(addr) = Self::first_dialable_address(&node.addresses)
                         {
-                            self.dial_candidate(&node.peer_id, addr).await;
+                            self.dial_candidate(&node.peer_id, &addr).await;
                         }
                     }
                 }
@@ -653,7 +653,7 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = node.addresses.first().cloned();
+                    let address = Self::first_dialable_address(&node.addresses);
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         if let Some(ref addr) = address {
