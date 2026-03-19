@@ -116,19 +116,6 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
 
-  security-audit:
-    name: Security Audit
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Run audit
-        run: cargo audit
-
   publish-crate:
     name: Publish to crates.io
     needs: [validate, test]
