@@ -27,6 +27,9 @@ use tokio::time::timeout;
 /// Maximum time to wait for node_b to recognise node_a after initial dial.
 const BILATERAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default QUIC idle timeout configured in saorsa-transport (RFC 9308 § 3.2).
+const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Polling interval when waiting for bilateral connection.
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -149,6 +152,51 @@ async fn send_recovers_when_target_drops_connection() {
     assert!(
         post_result.is_ok(),
         "send_message should recover after target drops connection: {:?}",
+        post_result.unwrap_err()
+    );
+
+    node_a.stop().await.unwrap();
+    node_b.stop().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Natural idle timeout expiry
+// ---------------------------------------------------------------------------
+
+/// Both peers sit idle past the QUIC idle timeout.  The connection dies
+/// naturally on both sides.  The next `send_message` should reconnect
+/// transparently.
+#[tokio::test]
+async fn send_recovers_after_idle_timeout_expiry() {
+    let (node_a, _peer_a, node_b, peer_b) = connected_pair().await;
+
+    // Sanity: a normal send works before going idle.
+    let pre_result = timeout(
+        Duration::from_millis(500),
+        node_a.send_message(&peer_b, "test/echo", b"before idle".to_vec(), &[]),
+    )
+    .await
+    .expect("pre-idle send should not timeout");
+    assert!(
+        pre_result.is_ok(),
+        "pre-idle send should succeed: {:?}",
+        pre_result.unwrap_err()
+    );
+
+    // Wait for the QUIC idle timeout to expire on both sides.
+    tokio::time::sleep(QUIC_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+
+    // Both peers should have independently detected the idle timeout and
+    // cleaned up.  The next send should trigger a reconnect.
+    let post_result = timeout(
+        Duration::from_secs(10),
+        node_a.send_message(&peer_b, "test/echo", b"after idle".to_vec(), &[]),
+    )
+    .await
+    .expect("post-idle send should not timeout");
+    assert!(
+        post_result.is_ok(),
+        "send_message should recover after idle timeout: {:?}",
         post_result.unwrap_err()
     );
 
