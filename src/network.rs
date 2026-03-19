@@ -1178,11 +1178,11 @@ impl P2PNode {
         // prunes dead channels from bookkeeping but does NOT close the
         // underlying QUIC connection.  We need the original IDs for
         // disconnect_channel later.
-        let stale_channels = self.transport.channels_for_peer(peer_id).await;
+        let existing_channels = self.transport.channels_for_peer(peer_id).await;
 
         // No existing connection — serialise so concurrent sends to the same
         // unconnected peer don't each open their own QUIC connection.
-        if stale_channels.is_empty() {
+        if existing_channels.is_empty() {
             let lock = self.reconnect_lock_for(peer_id);
             let _guard = lock.lock().await;
 
@@ -1240,7 +1240,7 @@ impl P2PNode {
             retry_data,
             addrs,
             &saved_addrs,
-            &stale_channels,
+            &existing_channels,
         )
         .await
     }
