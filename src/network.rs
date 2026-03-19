@@ -1180,9 +1180,17 @@ impl P2PNode {
         // disconnect_channel later.
         let stale_channels = self.transport.channels_for_peer(peer_id).await;
 
-        // No existing connection — skip the fast path (and its data clone)
-        // and go straight to dial-and-send.
+        // No existing connection — serialise so concurrent sends to the same
+        // unconnected peer don't each open their own QUIC connection.
         if stale_channels.is_empty() {
+            let lock = self.reconnect_lock_for(peer_id);
+            let _guard = lock.lock().await;
+
+            // Another sender may have connected while we waited for the lock.
+            if self.transport.is_peer_connected(peer_id).await {
+                return self.transport.send_message(peer_id, protocol, data).await;
+            }
+
             return self
                 .reconnect_and_send(peer_id, protocol, data, addrs, &[], &[])
                 .await;
