@@ -90,7 +90,17 @@ impl KBucket {
         }
     }
 
-    fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+    fn add_node(&mut self, mut node: NodeInfo) -> Result<()> {
+        // Reject nodes with no addresses — a node without reachable
+        // addresses is useless in the routing table and would waste a slot.
+        if node.addresses.is_empty() {
+            return Err(anyhow!("NodeInfo has no addresses"));
+        }
+
+        // Cap addresses to prevent memory exhaustion from oversized lists
+        // arriving via deserialization or direct construction.
+        node.addresses.truncate(MAX_ADDRESSES_PER_NODE);
+
         // If the node is already in this bucket, replace it fully and move to
         // tail (most-recently-seen) per standard Kademlia protocol.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
@@ -996,5 +1006,66 @@ mod tests {
                 result
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // KBucket::add_node address validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_node_rejects_empty_addresses() {
+        let mut bucket = KBucket::new(8);
+        let node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![],
+            last_seen: SystemTime::now(),
+        };
+        assert!(bucket.add_node(node).is_err());
+    }
+
+    #[test]
+    fn test_add_node_truncates_excess_addresses() {
+        let mut bucket = KBucket::new(8);
+
+        // Build a NodeInfo with more addresses than the cap.
+        let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
+            .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
+            .collect();
+        assert!(addresses.len() > MAX_ADDRESSES_PER_NODE);
+
+        let node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses,
+            last_seen: SystemTime::now(),
+        };
+        bucket.add_node(node).unwrap();
+
+        let stored = &bucket.get_nodes()[0].addresses;
+        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+    }
+
+    #[test]
+    fn test_add_node_replace_also_truncates() {
+        let mut bucket = KBucket::new(8);
+
+        // Insert once with a single address.
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+        assert_eq!(bucket.get_nodes()[0].addresses.len(), 1);
+
+        // Replace with an oversized address list.
+        let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
+            .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
+            .collect();
+        let replacement = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses,
+            last_seen: SystemTime::now(),
+        };
+        bucket.add_node(replacement).unwrap();
+
+        let stored = &bucket.get_nodes().last().unwrap().addresses;
+        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
     }
 }
