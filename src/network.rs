@@ -1228,6 +1228,12 @@ impl P2PNode {
 
         // Another sender may have reconnected while we waited for the lock.
         if self.transport.is_peer_connected(peer_id).await {
+            // Close stale QUIC connections that remove_channel (called inside
+            // transport.send_message on failure) didn't tear down — it only
+            // removes bookkeeping, not the underlying QUIC session.
+            for channel_id in &existing_channels {
+                self.transport.disconnect_channel(channel_id).await;
+            }
             return self
                 .transport
                 .send_message(peer_id, protocol, retry_data)
@@ -1277,10 +1283,19 @@ impl P2PNode {
 
         // Dial and wait for identity exchange.
         let channel_id = self.transport.connect_peer(&address).await?;
-        let authenticated = self
+        let authenticated = match self
             .transport
             .wait_for_peer_identity(&channel_id, RECONNECT_IDENTITY_TIMEOUT)
-            .await?;
+            .await
+        {
+            Ok(peer) => peer,
+            Err(e) => {
+                // Close the freshly-dialed QUIC connection so it doesn't
+                // linger as a zombie until idle timeout.
+                self.transport.disconnect_channel(&channel_id).await;
+                return Err(e);
+            }
+        };
 
         if &authenticated != peer_id {
             self.transport.disconnect_channel(&channel_id).await;
