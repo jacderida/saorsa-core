@@ -20,7 +20,7 @@ use crate::PeerId;
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
-use crate::error::{NetworkError, P2PError, P2pResult as Result};
+use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
@@ -651,6 +651,14 @@ pub(crate) struct PendingRequest {
     pub(crate) expected_peer: PeerId,
 }
 
+/// Maximum time to wait for identity exchange during a reconnect-on-send dial.
+const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Delay after tearing down a stale QUIC connection before re-dialing the
+/// same address.  Gives the transport endpoint time to fully release the
+/// old connection so the fresh one isn't shadowed by residual state.
+const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
+
 /// Main P2P network node that manages connections, routing, and communication
 ///
 /// This struct represents a complete P2P network participant that can:
@@ -1136,14 +1144,123 @@ impl P2PNode {
         self.transport.is_connection_active(channel_id).await
     }
 
-    /// Send a message to an authenticated peer.
+    /// Send a message to an authenticated peer, reconnecting on demand.
+    ///
+    /// Tries the existing connection first. If the send fails (stale QUIC
+    /// session, peer not found, etc.), resolves a dial address from:
+    ///
+    /// 1. Caller-provided `addrs` (highest priority)
+    /// 2. Addresses cached in the transport layer (snapshotted before the
+    ///    send attempt, since stale-channel cleanup removes them)
+    /// 3. DHT routing table
+    ///
+    /// Then dials, waits for identity exchange, and retries the send exactly
+    /// once on the fresh connection.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
         protocol: &str,
         data: Vec<u8>,
+        addrs: &[MultiAddr],
     ) -> Result<()> {
+        // Snapshot addresses before the send attempt — transport.send_message
+        // prunes stale channels, which removes peer_info.
+        let saved_addrs: Vec<MultiAddr> = self
+            .transport
+            .peer_info(peer_id)
+            .await
+            .map(|info| info.addresses)
+            .unwrap_or_default();
+
+        // Fast path: try existing connection.
+        match self
+            .transport
+            .send_message(peer_id, protocol, data.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                debug!(
+                    peer = %peer_id.to_hex(),
+                    error = %e,
+                    "send failed, attempting reconnect",
+                );
+            }
+        }
+
+        // Resolve a dial address: caller-provided > saved > DHT.
+        let address = self
+            .resolve_dial_address(peer_id, addrs, &saved_addrs)
+            .await
+            .ok_or_else(|| {
+                P2PError::Network(NetworkError::PeerNotFound(peer_id.to_hex().into()))
+            })?;
+
+        // Tear down any lingering QUIC state for the address we are about
+        // to redial.  `transport.send_message` only removes bookkeeping
+        // (peer_to_channel, peers, active_connections) — it does NOT close
+        // the underlying QUIC connection.  Without this, the transport
+        // layer reuses the dead connection handle on reconnect.
+        if let Some(sa) = address.dialable_socket_addr() {
+            self.transport.disconnect_channel(&sa.to_string()).await;
+            tokio::time::sleep(QUIC_TEARDOWN_GRACE).await;
+        }
+
+        // Dial and wait for identity exchange.
+        let channel_id = self.transport.connect_peer(&address).await?;
+        let authenticated = self
+            .transport
+            .wait_for_peer_identity(&channel_id, RECONNECT_IDENTITY_TIMEOUT)
+            .await?;
+
+        if &authenticated != peer_id {
+            self.transport.disconnect_channel(&channel_id).await;
+            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
+                expected: peer_id.to_hex().into(),
+                actual: authenticated.to_hex().into(),
+            }));
+        }
+
+        // Retry on the fresh connection.
         self.transport.send_message(peer_id, protocol, data).await
+    }
+
+    /// Resolve a dial address for `peer_id`, preferring caller-provided
+    /// addresses over cached/DHT sources.
+    ///
+    /// Returns the first dialable (QUIC, non-unspecified) address found, or
+    /// `None` when no address is available.
+    async fn resolve_dial_address(
+        &self,
+        peer_id: &PeerId,
+        caller_addrs: &[MultiAddr],
+        saved_addrs: &[MultiAddr],
+    ) -> Option<MultiAddr> {
+        // 1. Caller-provided addresses (highest priority).
+        if let Some(addr) = Self::first_dialable(caller_addrs) {
+            return Some(addr);
+        }
+
+        // 2. Addresses snapshotted from the transport layer before the send
+        //    attempt cleaned them up.
+        if let Some(addr) = Self::first_dialable(saved_addrs) {
+            return Some(addr);
+        }
+
+        // 3. DHT routing table.
+        self.adaptive_dht.peer_address_for_dial(peer_id).await
+    }
+
+    /// Return the first dialable QUIC address from a slice, skipping
+    /// non-QUIC and unspecified (`0.0.0.0` / `::`) addresses.
+    fn first_dialable(addrs: &[MultiAddr]) -> Option<MultiAddr> {
+        addrs
+            .iter()
+            .find(|a| {
+                a.dialable_socket_addr()
+                    .is_some_and(|sa| !sa.ip().is_unspecified())
+            })
+            .cloned()
     }
 
     /// Simulate a stale QUIC session for a peer: kills the underlying QUIC
@@ -1904,7 +2021,7 @@ mod tests {
 
         // node1 sends a signed message → node2 authenticates → PeerConnected fires on node2
         node1
-            .send_message(&target_peer_id, "test-topic", b"hello".to_vec())
+            .send_message(&target_peer_id, "test-topic", b"hello".to_vec(), &[])
             .await?;
 
         // Check for PeerConnected event on node2
@@ -1975,7 +2092,7 @@ mod tests {
         let message_data = b"Hello, peer!".to_vec();
         let result = match timeout(
             Duration::from_millis(500),
-            node1.send_message(&target_peer_id, "test-protocol", message_data),
+            node1.send_message(&target_peer_id, "test-protocol", message_data, &[]),
         )
         .await
         {
@@ -1991,7 +2108,7 @@ mod tests {
         // Try to send to non-existent peer
         let non_existent_peer = PeerId::from_bytes([0xFFu8; 32]);
         let result = node1
-            .send_message(&non_existent_peer, "test-protocol", vec![])
+            .send_message(&non_existent_peer, "test-protocol", vec![], &[])
             .await;
         assert!(result.is_err(), "Sending to non-existent peer should fail");
 

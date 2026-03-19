@@ -1216,7 +1216,7 @@ impl DhtNetworkManager {
     /// Checks the DHT routing table first (source of truth for DHT peer
     /// addresses), then falls back to the transport layer for connected peers.
     /// Returns `None` when the peer is unknown or has no addresses.
-    async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+    pub(crate) async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
         // 1. Routing table — contains validated MultiAddr entries
         if let Some(address) = self.dht.read().await.get_node_address(peer_id).await {
             return Some(address);

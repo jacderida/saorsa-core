@@ -20,9 +20,9 @@
 //! reference passed to `DhtNetworkManager`. External callers report additional
 //! trust signals through [`AdaptiveDHT::report_trust_event`].
 
-use crate::PeerId;
 use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
+use crate::{MultiAddr, PeerId};
 
 use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,15 @@ impl AdaptiveDHT {
     /// Stop the DHT manager gracefully.
     pub async fn stop(&self) -> Result<()> {
         self.dht_manager.stop().await
+    }
+
+    /// Look up a connectable address for a peer.
+    ///
+    /// Checks the DHT routing table first, then falls back to the transport
+    /// layer. Returns `None` when the peer is unknown or has no dialable
+    /// addresses.
+    pub(crate) async fn peer_address_for_dial(&self, peer_id: &PeerId) -> Option<MultiAddr> {
+        self.dht_manager.peer_address_for_dial(peer_id).await
     }
 }
 
