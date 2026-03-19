@@ -1,5 +1,5 @@
 use crate::PeerId;
-use crate::dht::core_engine::{DhtCoreEngine, NodeCapacity, NodeInfo};
+use crate::dht::core_engine::{DhtCoreEngine, NodeInfo};
 use crate::security::IPDiversityConfig;
 use std::time::SystemTime;
 
@@ -13,7 +13,6 @@ async fn test_ip_diversity_enforcement_ipv6() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::1/udp/9000/quic".parse().unwrap()], // /64 subnet 2001:db8::
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
 
     // 3. Create Node 2 (Same /64 subnet)
@@ -21,7 +20,6 @@ async fn test_ip_diversity_enforcement_ipv6() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::2/udp/9000/quic".parse().unwrap()], // Same /64
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
 
     // 4. Add Node 1 - Should Succeed
@@ -48,7 +46,6 @@ async fn test_ip_diversity_enforcement_ipv4() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -57,7 +54,6 @@ async fn test_ip_diversity_enforcement_ipv4() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()], // Same IP
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node2).await;
     assert!(result.is_err());
@@ -79,7 +75,6 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -87,7 +82,6 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.2/udp/9000/quic".parse().unwrap()], // Different IP, same /24
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node2).await?;
 
@@ -95,7 +89,6 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.3/udp/9000/quic".parse().unwrap()], // Different IP, same /24
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node3).await?;
 
@@ -104,7 +97,6 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.4/udp/9000/quic".parse().unwrap()], // Different IP, same /24
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node4).await;
     assert!(result.is_err());
@@ -126,7 +118,6 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_v4).await?;
 
@@ -135,7 +126,6 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_v6).await?;
 
@@ -144,7 +134,6 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result_v4 = engine.add_node(node_v4_2).await;
     assert!(result_v4.is_err());
@@ -154,7 +143,6 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::2/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result_v6 = engine.add_node(node_v6_2).await;
     assert!(result_v6.is_err());
@@ -173,7 +161,6 @@ async fn test_geographic_diversity_allows_different_regions() -> anyhow::Result<
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()], // NorthAmerica
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_na).await?;
 
@@ -182,7 +169,6 @@ async fn test_geographic_diversity_allows_different_regions() -> anyhow::Result<
         id: PeerId::random(),
         addresses: vec!["/ip4/130.45.10.1/udp/9000/quic".parse().unwrap()], // Europe
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_eu).await?;
 
@@ -191,7 +177,6 @@ async fn test_geographic_diversity_allows_different_regions() -> anyhow::Result<
         id: PeerId::random(),
         addresses: vec!["/ip4/170.20.30.1/udp/9000/quic".parse().unwrap()], // AsiaPacific
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_ap).await?;
 
@@ -200,7 +185,6 @@ async fn test_geographic_diversity_allows_different_regions() -> anyhow::Result<
         id: PeerId::random(),
         addresses: vec!["/ip4/225.1.1.1/udp/9000/quic".parse().unwrap()], // SouthAmerica
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node_sa).await?;
 
@@ -219,7 +203,6 @@ async fn test_geographic_diversity_counts_region_nodes() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/130.10.1.1/udp/9000/quic".parse().unwrap()], // Europe
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -227,7 +210,6 @@ async fn test_geographic_diversity_counts_region_nodes() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/130.20.1.1/udp/9000/quic".parse().unwrap()], // Europe, different /24
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node2).await?;
 
@@ -235,7 +217,6 @@ async fn test_geographic_diversity_counts_region_nodes() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/131.30.1.1/udp/9000/quic".parse().unwrap()], // Europe, different /16
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node3).await?;
 
@@ -262,7 +243,6 @@ async fn test_ipv4_floor_override_raises_limit() -> anyhow::Result<()> {
                     .unwrap(),
             ],
             last_seen: SystemTime::now(),
-            capacity: NodeCapacity::default(),
         };
         engine.add_node(node).await?;
     }
@@ -272,7 +252,6 @@ async fn test_ipv4_floor_override_raises_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9003/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node4).await;
     assert!(result.is_err());
@@ -299,7 +278,6 @@ async fn test_ipv4_ceiling_override_lowers_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/10.0.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -308,7 +286,6 @@ async fn test_ipv4_ceiling_override_lowers_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/10.0.1.2/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node2).await;
     assert!(result.is_err());
@@ -332,7 +309,6 @@ async fn test_ipv6_floor_override_raises_limit() -> anyhow::Result<()> {
             id: PeerId::random(),
             addresses: vec![format!("/ip6/2001:db8::{i}/udp/9000/quic").parse().unwrap()],
             last_seen: SystemTime::now(),
-            capacity: NodeCapacity::default(),
         };
         engine.add_node(node).await?;
     }
@@ -342,7 +318,6 @@ async fn test_ipv6_floor_override_raises_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::6/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node6).await;
     assert!(result.is_err());
@@ -370,7 +345,6 @@ async fn test_ipv6_ceiling_override_lowers_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -378,7 +352,6 @@ async fn test_ipv6_ceiling_override_lowers_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::2/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node2).await?;
 
@@ -387,7 +360,6 @@ async fn test_ipv6_ceiling_override_lowers_limit() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip6/2001:db8::3/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node3).await;
     assert!(result.is_err());
@@ -406,7 +378,6 @@ async fn test_no_override_preserves_dynamic_behavior() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9000/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     engine.add_node(node1).await?;
 
@@ -415,7 +386,6 @@ async fn test_no_override_preserves_dynamic_behavior() -> anyhow::Result<()> {
         id: PeerId::random(),
         addresses: vec!["/ip4/192.168.1.1/udp/9001/quic".parse().unwrap()],
         last_seen: SystemTime::now(),
-        capacity: NodeCapacity::default(),
     };
     let result = engine.add_node(node2).await;
     assert!(result.is_err());

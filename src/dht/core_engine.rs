@@ -46,7 +46,6 @@ pub struct NodeInfo {
     pub id: PeerId,
     pub addresses: Vec<MultiAddr>,
     pub last_seen: SystemTime,
-    pub capacity: NodeCapacity,
 }
 
 impl NodeInfo {
@@ -74,22 +73,6 @@ impl NodeInfo {
         self.addresses.retain(|a| a != &addr);
         self.addresses.insert(0, addr);
         self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
-    }
-}
-
-/// Node capacity metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeCapacity {
-    pub bandwidth_available: u64,
-    pub reliability_score: f64,
-}
-
-impl Default for NodeCapacity {
-    fn default() -> Self {
-        Self {
-            bandwidth_available: 10_000_000, // 10MB/s
-            reliability_score: 1.0,
-        }
     }
 }
 
@@ -721,7 +704,6 @@ mod tests {
             id: PeerId::from_bytes([byte; 32]),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
             last_seen: SystemTime::now(),
-            capacity: NodeCapacity::default(),
         }
     }
 
@@ -815,7 +797,6 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -826,7 +807,6 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -859,7 +839,6 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -870,7 +849,6 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -904,7 +882,6 @@ mod tests {
                             .unwrap(),
                     ],
                     last_seen: SystemTime::now(),
-                    capacity: NodeCapacity::default(),
                 })
                 .unwrap();
         }

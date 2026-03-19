@@ -22,7 +22,7 @@ use crate::{
     P2PError, PeerId, Result,
     adaptive::TrustEngine,
     address::MultiAddr,
-    dht::core_engine::{NodeCapacity, NodeInfo},
+    dht::core_engine::NodeInfo,
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -557,7 +557,7 @@ impl DhtNetworkManager {
                     peer_id: node.id,
                     addresses: node.addresses,
                     distance: None,
-                    reliability: node.capacity.reliability_score,
+                    reliability: SELF_RELIABILITY_SCORE,
                 })
                 .collect(),
             Err(_e) => {
@@ -1686,7 +1686,6 @@ impl DhtNetworkManager {
                 id: node_id,
                 addresses,
                 last_seen: SystemTime::now(),
-                capacity: NodeCapacity::default(),
             };
 
             if let Err(_e) = self.dht.write().await.add_node(node_info).await {
