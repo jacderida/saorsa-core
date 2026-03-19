@@ -15,14 +15,20 @@
 //!
 //! Verifies that `send_message` transparently reconnects when the underlying
 //! QUIC connection is dead but the channel bookkeeping still considers it
-//! alive.  This exercises the reconnect-and-retry path added in
-//! `TransportHandle::send_on_channel`.
+//! alive.  This exercises the reconnect-and-retry path in
+//! `P2PNode::send_message`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use saorsa_core::{NodeConfig, P2PNode, PeerId};
 use std::time::Duration;
 use tokio::time::timeout;
+
+/// Maximum time to wait for node_b to recognise node_a after initial dial.
+const BILATERAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Polling interval when waiting for bilateral connection.
+const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Helper: local loopback, ephemeral port, IPv4-only config.
 fn test_config() -> NodeConfig {
@@ -34,11 +40,16 @@ fn test_config() -> NodeConfig {
         .expect("test config should be valid")
 }
 
-/// Helper: start two nodes and connect node_a → node_b.
-/// Returns (node_a, node_b, peer_id_of_b).
-async fn connected_pair() -> (P2PNode, P2PNode, PeerId) {
+/// Helper: start two nodes with a bilateral connection.
+///
+/// Connects node_a → node_b, waits for identity exchange on both sides,
+/// and returns (node_a, peer_a, node_b, peer_b).
+async fn connected_pair() -> (P2PNode, PeerId, P2PNode, PeerId) {
     let node_a = P2PNode::new(test_config()).await.unwrap();
     let node_b = P2PNode::new(test_config()).await.unwrap();
+
+    let peer_a = *node_a.peer_id();
+    let peer_b_expected = *node_b.peer_id();
 
     node_a.start().await.unwrap();
     node_b.start().await.unwrap();
@@ -60,7 +71,7 @@ async fn connected_pair() -> (P2PNode, P2PNode, PeerId) {
         .expect("connect should not timeout")
         .expect("connect should succeed");
 
-    // Wait for identity exchange to complete
+    // Wait for identity exchange on node_a's side
     let peer_b = timeout(
         Duration::from_secs(2),
         node_a.wait_for_peer_identity(&channel_id, Duration::from_secs(2)),
@@ -70,62 +81,74 @@ async fn connected_pair() -> (P2PNode, P2PNode, PeerId) {
     .expect("identity exchange should succeed");
 
     assert_eq!(
-        &peer_b,
-        node_b.peer_id(),
+        peer_b, peer_b_expected,
         "Identity exchange should reveal node_b's peer ID"
     );
 
-    (node_a, node_b, peer_b)
+    // Wait for node_b to also recognise node_a (bilateral connection).
+    // The incoming identity exchange on node_b is async, so poll until ready.
+    let bilateral = timeout(BILATERAL_CONNECT_TIMEOUT, async {
+        loop {
+            if node_b.is_peer_connected(&peer_a).await {
+                break;
+            }
+            tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+        }
+    })
+    .await;
+    assert!(
+        bilateral.is_ok(),
+        "node_b should recognise node_a within {:?}",
+        BILATERAL_CONNECT_TIMEOUT,
+    );
+
+    (node_a, peer_a, node_b, peer_b)
 }
 
 // ---------------------------------------------------------------------------
-// Stale session recovery
+// Target-side disconnect (the common real-world scenario)
 // ---------------------------------------------------------------------------
 
-/// After the QUIC session is poisoned, `send_message` should still succeed
-/// because `P2PNode::send_message` reconnects transparently.
-///
-/// Currently ignored: `poison_quic_for_peer` kills the QUIC connection on
-/// one side only.  When we redial, saorsa-transport does not fully register
-/// the new incoming connection on the server side, so the identity exchange
-/// never completes.  Real-world stale sessions (30 s idle timeout) are
-/// cleaned up on **both** sides via `ConnectionEvent::Lost`, which avoids
-/// this issue.  A saorsa-transport fix for same-address reconnection will
-/// un-ignore this test.
-#[ignore = "blocked on saorsa-transport same-address reconnect bug"]
+/// The target peer drops the connection (e.g. idle timeout), while the sender
+/// still believes it is connected.  `send_message` should detect the dead
+/// connection, reconnect transparently, and deliver the message.
 #[tokio::test]
-async fn send_message_recovers_from_stale_quic_session() {
-    let (node_a, node_b, peer_b) = connected_pair().await;
+async fn send_recovers_when_target_drops_connection() {
+    let (node_a, peer_a, node_b, peer_b) = connected_pair().await;
 
-    // Sanity: a normal send works before poisoning.
+    // Sanity: a normal send works before the disconnect.
     let pre_result = timeout(
         Duration::from_millis(500),
-        node_a.send_message(&peer_b, "test/echo", b"before poison".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"before disconnect".to_vec(), &[]),
     )
     .await
-    .expect("pre-poison send should not timeout");
+    .expect("pre-disconnect send should not timeout");
     assert!(
         pre_result.is_ok(),
-        "pre-poison send should succeed: {:?}",
+        "pre-disconnect send should succeed: {:?}",
         pre_result.unwrap_err()
     );
 
-    // Poison: kill the QUIC connection without touching channel bookkeeping.
-    node_a.poison_quic_for_peer(&peer_b).await;
+    // Target peer drops the connection — simulates an idle timeout where the
+    // remote side cleans up first.  node_a's bookkeeping is untouched, but
+    // the underlying QUIC session is dead from node_b's side.
+    node_b.disconnect_peer(&peer_a).await.unwrap();
 
-    // Brief pause so the QUIC teardown completes on both sides.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Brief pause so the QUIC close propagates at the transport level.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The next send should trigger reconnect-and-retry inside send_on_channel.
+    // node_a still thinks it's connected, but the next send should fail on
+    // the dead QUIC session, trigger reconnect, and succeed on a fresh
+    // connection.
     let post_result = timeout(
         Duration::from_secs(10),
-        node_a.send_message(&peer_b, "test/echo", b"after poison".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"after disconnect".to_vec(), &[]),
     )
     .await
-    .expect("post-poison send should not timeout");
+    .expect("post-disconnect send should not timeout");
     assert!(
         post_result.is_ok(),
-        "send_message should recover from stale QUIC session: {:?}",
+        "send_message should recover after target drops connection: {:?}",
         post_result.unwrap_err()
     );
 

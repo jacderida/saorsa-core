@@ -25,12 +25,13 @@ use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -654,10 +655,12 @@ pub(crate) struct PendingRequest {
 /// Maximum time to wait for identity exchange during a reconnect-on-send dial.
 const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Delay after tearing down a stale QUIC connection before re-dialing the
-/// same address.  Gives the transport endpoint time to fully release the
-/// old connection so the fresh one isn't shadowed by residual state.
-const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
+/// Short grace period after closing stale QUIC connections before re-dialing.
+///
+/// `disconnect_channel` is async and waits for the QUIC close, but the
+/// transport endpoint may need a moment to fully release internal state.
+/// Only applied when stale channels were actually disconnected.
+const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Main P2P network node that manages connections, routing, and communication
 ///
@@ -697,6 +700,11 @@ pub struct P2PNode {
 
     /// Whether `start()` has been called (and `stop()` has not yet completed)
     is_started: Arc<AtomicBool>,
+
+    /// Per-peer locks that serialise reconnect attempts so concurrent sends
+    /// to the same stale peer don't race to dial.  Entries accumulate over
+    /// the node's lifetime; each is a lightweight `Arc<TokioMutex<()>>`.
+    reconnect_locks: ParkingMutex<HashMap<PeerId, Arc<TokioMutex<()>>>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -795,6 +803,7 @@ impl P2PNode {
             bootstrap_manager,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
+            reconnect_locks: ParkingMutex::new(HashMap::new()),
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -1155,7 +1164,8 @@ impl P2PNode {
     /// 3. DHT routing table
     ///
     /// Then dials, waits for identity exchange, and retries the send exactly
-    /// once on the fresh connection.
+    /// once on the fresh connection.  Concurrent reconnects to the same peer
+    /// are serialised so only one dial is attempted at a time.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
@@ -1163,6 +1173,20 @@ impl P2PNode {
         data: Vec<u8>,
         addrs: &[MultiAddr],
     ) -> Result<()> {
+        // Snapshot channel IDs before the send attempt — transport.send_message
+        // prunes dead channels from bookkeeping but does NOT close the
+        // underlying QUIC connection.  We need the original IDs for
+        // disconnect_channel later.
+        let stale_channels = self.transport.channels_for_peer(peer_id).await;
+
+        // No existing connection — skip the fast path (and its data clone)
+        // and go straight to dial-and-send.
+        if stale_channels.is_empty() {
+            return self
+                .reconnect_and_send(peer_id, protocol, data, addrs, &[], &[])
+                .await;
+        }
+
         // Snapshot addresses before the send attempt — transport.send_message
         // prunes stale channels, which removes peer_info.
         let saved_addrs: Vec<MultiAddr> = self
@@ -1172,12 +1196,12 @@ impl P2PNode {
             .map(|info| info.addresses)
             .unwrap_or_default();
 
+        // Clone data for retry — transport.send_message consumes the Vec,
+        // so we need a copy if the first attempt fails.
+        let retry_data = data.clone();
+
         // Fast path: try existing connection.
-        match self
-            .transport
-            .send_message(peer_id, protocol, data.clone())
-            .await
-        {
+        match self.transport.send_message(peer_id, protocol, data).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 debug!(
@@ -1188,21 +1212,57 @@ impl P2PNode {
             }
         }
 
+        // Serialise reconnect attempts so concurrent sends to the same
+        // stale peer don't race to dial.
+        let lock = self.reconnect_lock_for(peer_id);
+        let _guard = lock.lock().await;
+
+        // Another sender may have reconnected while we waited for the lock.
+        if self.transport.is_peer_connected(peer_id).await {
+            return self
+                .transport
+                .send_message(peer_id, protocol, retry_data)
+                .await;
+        }
+
+        self.reconnect_and_send(
+            peer_id,
+            protocol,
+            retry_data,
+            addrs,
+            &saved_addrs,
+            &stale_channels,
+        )
+        .await
+    }
+
+    /// Tear down stale channels, reconnect to a peer, and send a message.
+    async fn reconnect_and_send(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+        addrs: &[MultiAddr],
+        saved_addrs: &[MultiAddr],
+        stale_channels: &[String],
+    ) -> Result<()> {
         // Resolve a dial address: caller-provided > saved > DHT.
         let address = self
-            .resolve_dial_address(peer_id, addrs, &saved_addrs)
+            .resolve_dial_address(peer_id, addrs, saved_addrs)
             .await
             .ok_or_else(|| {
                 P2PError::Network(NetworkError::PeerNotFound(peer_id.to_hex().into()))
             })?;
 
-        // Tear down any lingering QUIC state for the address we are about
-        // to redial.  `transport.send_message` only removes bookkeeping
-        // (peer_to_channel, peers, active_connections) — it does NOT close
-        // the underlying QUIC connection.  Without this, the transport
-        // layer reuses the dead connection handle on reconnect.
-        if let Some(sa) = address.dialable_socket_addr() {
-            self.transport.disconnect_channel(&sa.to_string()).await;
+        // Tear down stale QUIC connections using their actual channel IDs.
+        // transport.send_message only removes bookkeeping (peer_to_channel,
+        // peers, active_connections) — it does NOT close the underlying QUIC
+        // connection.  We must use the real channel IDs, not the resolved
+        // dial address, because NAT / port migration can make them differ.
+        if !stale_channels.is_empty() {
+            for channel_id in stale_channels {
+                self.transport.disconnect_channel(channel_id).await;
+            }
             tokio::time::sleep(QUIC_TEARDOWN_GRACE).await;
         }
 
@@ -1221,7 +1281,7 @@ impl P2PNode {
             }));
         }
 
-        // Retry on the fresh connection.
+        // Send on the fresh connection.
         self.transport.send_message(peer_id, protocol, data).await
     }
 
@@ -1257,20 +1317,24 @@ impl P2PNode {
         addrs
             .iter()
             .find(|a| {
-                a.dialable_socket_addr()
-                    .is_some_and(|sa| !sa.ip().is_unspecified())
+                let dialable = a
+                    .dialable_socket_addr()
+                    .is_some_and(|sa| !sa.ip().is_unspecified());
+                if !dialable {
+                    trace!(address = %a, "skipping non-dialable address");
+                }
+                dialable
             })
             .cloned()
     }
 
-    /// Simulate a stale QUIC session for a peer: kills the underlying QUIC
-    /// connections while preserving all channel bookkeeping so the node
-    /// believes the peer is still connected.
-    ///
-    /// Used by integration tests to verify reconnect-on-send behaviour.
-    #[doc(hidden)]
-    pub async fn poison_quic_for_peer(&self, peer_id: &PeerId) {
-        self.transport.poison_quic_for_peer(peer_id).await;
+    /// Get or create a per-peer reconnect lock.
+    fn reconnect_lock_for(&self, peer_id: &PeerId) -> Arc<TokioMutex<()>> {
+        self.reconnect_locks
+            .lock()
+            .entry(*peer_id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
     }
 }
 
