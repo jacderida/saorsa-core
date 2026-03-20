@@ -39,7 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -167,7 +167,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
 
         let transport = P2pLinkTransport::new(config)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
+            .context("Failed to create transport")?;
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
         let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
@@ -825,15 +825,54 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             None
         };
         let v4 = if let Some(addr) = v4_addr {
-            Some(
-                P2PNetworkNode::new_with_options(
-                    addr,
-                    max_connections,
-                    max_msg_size,
-                    allow_loopback,
-                )
-                .await?,
+            match P2PNetworkNode::new_with_options(
+                addr,
+                max_connections,
+                max_msg_size,
+                allow_loopback,
             )
+            .await
+            {
+                Ok(node) => Some(node),
+                Err(e) => {
+                    // On Linux with net.ipv6.bindv6only=0 (the default), an IPv6
+                    // socket bound to [::]:port already accepts IPv4 traffic via
+                    // dual-stack.  Binding a separate IPv4 socket to the same port
+                    // then fails with "Address in use".  When we already hold an
+                    // IPv6 socket on that port we can safely skip the IPv4 bind.
+                    //
+                    // Only applies when the IPv6 address is unspecified ([::]); a
+                    // specific IPv6 address won't accept IPv4 traffic.
+                    let same_port = match (v6_addr, v4_addr) {
+                        (Some(v6_sock), Some(v4_sock)) => v6_sock.port() == v4_sock.port(),
+                        _ => false,
+                    };
+                    let v6_is_unspecified = matches!(
+                        v6_addr,
+                        Some(SocketAddr::V6(ref a)) if a.ip().is_unspecified()
+                    );
+                    // Prefer downcasting through the error chain to find the
+                    // original io::Error (works when .context() preserves the
+                    // source).  Fall back to string matching because the current
+                    // transport layer stringifies the io::Error before wrapping.
+                    let is_addr_in_use = e
+                        .chain()
+                        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                        .any(|io_err| io_err.kind() == std::io::ErrorKind::AddrInUse)
+                        || format!("{e:#}").contains("in use");
+
+                    if v6.is_some() && v6_is_unspecified && same_port && is_addr_in_use {
+                        info!(
+                            port = addr.port(),
+                            "IPv6 socket is dual-stack — skipping separate IPv4 bind"
+                        );
+                        debug!("IPv4 bind error (suppressed): {e}");
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         } else {
             None
         };
