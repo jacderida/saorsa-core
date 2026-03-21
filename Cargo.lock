@@ -2422,8 +2422,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9647e1797e760d73568fb6f7035f40945e70b789579bffccd6a5305e9d5d0136"
+source = "git+https://github.com/jacderida/saorsa-transport.git?branch=feat-nat_traversal_attempts#ee6cf6f70a7af5f9eb7bfe54972ded9f5528dfce"
 dependencies = [
  "anyhow",
  "async-trait",

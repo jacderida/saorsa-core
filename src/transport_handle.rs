@@ -749,10 +749,38 @@ impl TransportHandle {
             channel_id, protocol
         );
 
-        if !self.peers.read().await.contains_key(channel_id) {
-            return Err(P2PError::Network(NetworkError::PeerNotFound(
-                channel_id.to_string().into(),
-            )));
+        // If the peer isn't in `self.peers`, register it on the fly.
+        // Hole-punched connections are accepted at the transport layer and
+        // registered in P2pEndpoint::connected_peers, but the event chain
+        // to populate TransportHandle::peers may not have completed yet.
+        //
+        // Uses a single write lock with entry() to avoid a TOCTOU race
+        // where a concurrent event handler could insert a fully-populated
+        // PeerInfo between a read-check and our write.
+        {
+            let mut peers = self.peers.write().await;
+            peers.entry(channel_id.to_string()).or_insert_with(|| {
+                info!(
+                    "send_on_channel: registering new channel {} on the fly",
+                    channel_id
+                );
+                // Parse the channel_id as a SocketAddr to populate the
+                // address field, so lookups like get_channel_id_by_address
+                // can find this peer.
+                let addresses = channel_id
+                    .parse::<std::net::SocketAddr>()
+                    .map(|addr| vec![MultiAddr::quic(addr)])
+                    .unwrap_or_default();
+                PeerInfo {
+                    channel_id: channel_id.to_string(),
+                    addresses,
+                    status: ConnectionStatus::Connected,
+                    last_seen: Instant::now(),
+                    connected_at: Instant::now(),
+                    protocols: Vec::new(),
+                    heartbeat_count: 0,
+                }
+            });
         }
 
         if !self.is_connection_active(channel_id).await {
