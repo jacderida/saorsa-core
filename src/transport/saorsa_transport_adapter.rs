@@ -41,7 +41,7 @@
 use crate::error::{GeoRejectionError, GeographicConfig};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
@@ -758,11 +758,20 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     }
 }
 
-/// Dual-stack wrapper managing IPv4 and IPv6 transports
+/// Dual-stack wrapper managing IPv4 and IPv6 transports.
+///
+/// When `is_dual_stack` is true (`v6` is Some, `v4` is None), the v6 socket
+/// handles both IPv4 and IPv6 via the kernel's dual-stack mechanism
+/// (`bindv6only=0`).  The kernel represents IPv4 peers as `[::ffff:x.x.x.x]`
+/// internally.  This struct normalises all addresses at its boundary so that
+/// code above (saorsa-core) always sees plain IPv4 addresses, while code below
+/// (P2PNetworkNode / Quinn) uses the native socket format.
 #[allow(dead_code)]
 pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     pub v6: Option<P2PNetworkNode<T>>,
     pub v4: Option<P2PNetworkNode<T>>,
+    /// True when v6 handles IPv4 too (bindv6only=0, v4 bind skipped).
+    is_dual_stack: bool,
 }
 
 #[allow(dead_code)]
@@ -876,16 +885,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         } else {
             None
         };
-        Ok(Self { v6, v4 })
+        let is_dual_stack = v6.is_some() && v4.is_none();
+        Ok(Self { v6, v4, is_dual_stack })
     }
 
     /// Send to peer using P2pEndpoint's optimized send method.
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
     /// bidirectional communication. Tries IPv6 first, then IPv4.
+    ///
+    /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
+    /// expected by the v6 transport before sending.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         if let Some(v6) = &self.v6 {
-            match v6.send_to_peer_optimized(addr, data).await {
+            let wire_addr = self.to_mapped_if_needed(addr);
+            match v6.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     trace!(
@@ -910,10 +924,12 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Disconnect a peer, closing the underlying QUIC connection.
     ///
-    /// Tries both IPv6 and IPv4 stacks.
+    /// Tries both IPv6 and IPv4 stacks. In dual-stack mode, converts
+    /// plain IPv4 to mapped form for the v6 transport.
     pub async fn disconnect_peer_by_addr(&self, addr: &SocketAddr) {
         if let Some(ref v6) = self.v6 {
-            v6.disconnect_peer_quic(addr).await;
+            let wire_addr = self.to_mapped_if_needed(addr);
+            v6.disconnect_peer_quic(&wire_addr).await;
         }
         if let Some(ref v4) = self.v4 {
             v4.disconnect_peer_quic(addr).await;
@@ -924,16 +940,86 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     pub async fn disconnect_peer(&self, addr: &SocketAddr) {
         self.disconnect_peer_by_addr(addr).await;
     }
+
+    /// Spawn recv tasks for all active stacks.
+    ///
+    /// In dual-stack mode, addresses from the v6 transport are normalised
+    /// (IPv4-mapped → plain IPv4) before being sent to the channel so that
+    /// saorsa-core always sees a consistent address format.
+    pub fn spawn_recv_tasks(
+        &self,
+        tx: tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = Vec::new();
+
+        if let Some(v6) = self.v6.as_ref() {
+            if self.is_dual_stack {
+                let (inner_tx, mut inner_rx) =
+                    tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(1024);
+                handles.push(v6.spawn_recv_task(inner_tx, shutdown.clone()));
+                let outer_tx = tx.clone();
+                handles.push(tokio::spawn(async move {
+                    while let Some((addr, data)) = inner_rx.recv().await {
+                        let norm = saorsa_transport::shared::normalize_socket_addr(addr);
+                        if outer_tx.send((norm, data)).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            } else {
+                handles.push(v6.spawn_recv_task(tx.clone(), shutdown.clone()));
+            }
+        }
+
+        if let Some(v4) = self.v4.as_ref() {
+            handles.push(v4.spawn_recv_task(tx.clone(), shutdown.clone()));
+        }
+
+        handles
+    }
 }
 
 #[allow(dead_code)]
 impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Create with custom transports (for testing)
     pub fn with_transports(v6: Option<P2PNetworkNode<T>>, v4: Option<P2PNetworkNode<T>>) -> Self {
-        Self { v6, v4 }
+        let is_dual_stack = v6.is_some() && v4.is_none();
+        Self { v6, v4, is_dual_stack }
     }
 
-    /// Happy Eyeballs connect: race IPv6 and IPv4 attempts
+    /// If dual-stack, normalise IPv4-mapped IPv6 → plain IPv4.
+    /// Otherwise return unchanged.  Used on all addresses leaving the
+    /// transport boundary towards saorsa-core.
+    fn normalize(&self, addr: SocketAddr) -> SocketAddr {
+        if self.is_dual_stack {
+            saorsa_transport::shared::normalize_socket_addr(addr)
+        } else {
+            addr
+        }
+    }
+
+    /// If dual-stack and `addr` is plain IPv4, convert to the mapped
+    /// form `[::ffff:x.x.x.x]` that the v6 transport expects.
+    /// Used on all addresses entering the transport from saorsa-core.
+    fn to_mapped_if_needed(&self, addr: &SocketAddr) -> SocketAddr {
+        if self.is_dual_stack {
+            if let SocketAddr::V4(v4) = addr {
+                return SocketAddr::V6(SocketAddrV6::new(
+                    v4.ip().to_ipv6_mapped(),
+                    v4.port(),
+                    0,
+                    0,
+                ));
+            }
+        }
+        *addr
+    }
+
+    /// Happy Eyeballs connect: race IPv6 and IPv4 attempts.
+    ///
+    /// In dual-stack mode, IPv4 targets are converted to mapped form for the
+    /// v6 transport.  The returned address is always normalised (plain IPv4).
     pub async fn connect_happy_eyeballs(&self, targets: &[SocketAddr]) -> Result<SocketAddr> {
         let mut v6_targets: Vec<SocketAddr> = Vec::new();
         let mut v4_targets: Vec<SocketAddr> = Vec::new();
@@ -949,10 +1035,19 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         let (v6_node, v4_node) = match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) if !v6_targets.is_empty() && !v4_targets.is_empty() => (v6, v4),
             (Some(_), _) if !v6_targets.is_empty() => {
-                return self.connect_sequential(&self.v6, &v6_targets).await;
+                let addr = self.connect_sequential(&self.v6, &v6_targets).await?;
+                return Ok(self.normalize(addr));
             }
             (_, Some(_)) if !v4_targets.is_empty() => {
-                return self.connect_sequential(&self.v4, &v4_targets).await;
+                let addr = self.connect_sequential(&self.v4, &v4_targets).await?;
+                return Ok(self.normalize(addr));
+            }
+            // Dual-stack: v6 socket can reach IPv4 peers via mapped addresses
+            (Some(_), None) if !v4_targets.is_empty() => {
+                let mapped: Vec<SocketAddr> =
+                    v4_targets.iter().map(|a| self.to_mapped_if_needed(a)).collect();
+                let addr = self.connect_sequential(&self.v6, &mapped).await?;
+                return Ok(self.normalize(addr));
             }
             _ => return Err(anyhow::anyhow!("No suitable transport available")),
         };
@@ -1038,8 +1133,9 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Accept the next incoming connection from either stack.
     ///
     /// Returns `None` when shutdown is signalled or no stacks are available.
+    /// Addresses are normalised so callers always see plain IPv4.
     pub async fn accept_any(&self) -> Option<SocketAddr> {
-        match (&self.v6, &self.v4) {
+        let raw = match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) => {
                 tokio::select! {
                     res = v6.accept_connection() => res,
@@ -1049,10 +1145,12 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
             (Some(v6), None) => v6.accept_connection().await,
             (None, Some(v4)) => v4.accept_connection().await,
             (None, None) => None,
-        }
+        };
+        raw.map(|a| self.normalize(a))
     }
 
-    /// Get all connected peer addresses (merged from both stacks)
+    /// Get all connected peer addresses (merged from both stacks).
+    /// Addresses are normalised so callers always see plain IPv4.
     pub async fn get_connected_peers(&self) -> Vec<SocketAddr> {
         let mut out = Vec::new();
         if let Some(v6) = &self.v6 {
@@ -1061,15 +1159,22 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         if let Some(v4) = &self.v4 {
             out.extend(v4.get_connected_peers().await);
         }
+        if self.is_dual_stack {
+            for addr in &mut out {
+                *addr = saorsa_transport::shared::normalize_socket_addr(*addr);
+            }
+        }
         out
     }
 
     /// Send to peer by address; tries IPv6 first, then IPv4.
+    /// In dual-stack mode, converts plain IPv4 to mapped form for v6.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        if let Some(v6) = &self.v6
-            && v6.send_to_peer_raw(addr, data).await.is_ok()
-        {
-            return Ok(());
+        if let Some(v6) = &self.v6 {
+            let wire_addr = self.to_mapped_if_needed(addr);
+            if v6.send_to_peer_raw(&wire_addr, data).await.is_ok() {
+                return Ok(());
+            }
         }
         if let Some(v4) = &self.v4
             && v4.send_to_peer_raw(addr, data).await.is_ok()
@@ -1084,9 +1189,11 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         self.send_to_peer_raw(addr, data).await
     }
 
-    /// Subscribe to connection lifecycle events from both stacks
+    /// Subscribe to connection lifecycle events from both stacks.
+    /// Addresses in events are normalised so callers always see plain IPv4.
     pub fn subscribe_connection_events(&self) -> broadcast::Receiver<ConnectionEvent> {
         let (tx, rx) = broadcast::channel(crate::DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let dual = self.is_dual_stack;
 
         if let Some(v6) = &self.v6 {
             let mut v6_rx = v6.subscribe_connection_events();
@@ -1095,6 +1202,11 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
                 loop {
                     match v6_rx.recv().await {
                         Ok(event) => {
+                            let event = if dual {
+                                normalize_connection_event(event)
+                            } else {
+                                event
+                            };
                             let _ = tx_clone.send(event);
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1137,14 +1249,44 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
     /// Get observed external address
     pub fn get_observed_external_address(&self) -> Option<SocketAddr> {
-        self.v4
+        let raw = self
+            .v4
             .as_ref()
             .and_then(|v4| v4.get_observed_external_address())
             .or_else(|| {
                 self.v6
                     .as_ref()
                     .and_then(|v6| v6.get_observed_external_address())
-            })
+            });
+        raw.map(|a| self.normalize(a))
+    }
+}
+
+/// Normalise addresses in a `ConnectionEvent` (IPv4-mapped → plain IPv4).
+fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
+    use saorsa_transport::shared::normalize_socket_addr;
+    match event {
+        ConnectionEvent::Established {
+            remote_address,
+            public_key,
+        } => ConnectionEvent::Established {
+            remote_address: normalize_socket_addr(remote_address),
+            public_key,
+        },
+        ConnectionEvent::Lost {
+            remote_address,
+            reason,
+        } => ConnectionEvent::Lost {
+            remote_address: normalize_socket_addr(remote_address),
+            reason,
+        },
+        ConnectionEvent::Failed {
+            remote_address,
+            reason,
+        } => ConnectionEvent::Failed {
+            remote_address: normalize_socket_addr(remote_address),
+            reason,
+        },
     }
 }
 
