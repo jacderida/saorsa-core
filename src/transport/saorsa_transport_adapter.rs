@@ -511,29 +511,44 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        let conn = self
-            .transport
-            .dial_addr(*addr, SAORSA_DHT_PROTOCOL)
-            .await
-            .map_err(|e| anyhow::anyhow!("Dial by address failed: {}", e))?;
+        // Wrap the entire send path in a 60-second timeout.
+        //
+        // dial_addr() may trigger connect_with_fallback() which includes
+        // hole-punching (15s per round) and relay attempts. Without this
+        // outer timeout, the send path can block indefinitely if the
+        // transport layer deadlocks or the NAT traversal enters a
+        // pathological retry loop. The caller (chunk_protocol) has its own
+        // per-request deadline, but that deadline only starts AFTER this
+        // send completes — so an unbounded send blocks everything.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
-        // Open a typed unidirectional stream for DHT messages
-        // Using DhtStore stream type for DHT protocol messages
-        let mut stream = conn
-            .open_uni_typed(StreamType::DhtStore)
-            .await
-            .map_err(|e| anyhow::anyhow!("Stream open failed: {}", e))?;
+        tokio::time::timeout(SEND_TIMEOUT, async {
+            let conn = self
+                .transport
+                .dial_addr(*addr, SAORSA_DHT_PROTOCOL)
+                .await
+                .map_err(|e| anyhow::anyhow!("Dial by address failed: {}", e))?;
 
-        // Use LinkSendStream trait methods directly
-        stream
-            .write_all(data)
-            .await
-            .map_err(|e| anyhow::anyhow!("Write failed: {}", e))?;
-        stream
-            .finish()
-            .map_err(|e| anyhow::anyhow!("Stream finish failed: {}", e))?;
+            // Open a typed unidirectional stream for DHT messages
+            // Using DhtStore stream type for DHT protocol messages
+            let mut stream = conn
+                .open_uni_typed(StreamType::DhtStore)
+                .await
+                .map_err(|e| anyhow::anyhow!("Stream open failed: {}", e))?;
 
-        Ok(())
+            // Use LinkSendStream trait methods directly
+            stream
+                .write_all(data)
+                .await
+                .map_err(|e| anyhow::anyhow!("Write failed: {}", e))?;
+            stream
+                .finish()
+                .map_err(|e| anyhow::anyhow!("Stream finish failed: {}", e))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("send_to_peer_raw timed out after {SEND_TIMEOUT:?} to {addr}"))?
     }
 
     /// Get our local address
