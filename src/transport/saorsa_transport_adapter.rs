@@ -432,8 +432,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // Add timeout to prevent indefinite hanging during NAT traversal/QUIC handshake
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+        // The full NAT traversal flow is: direct (5s) → hole-punch (15s) →
+        // relay (30s). The outer timeout must accommodate the entire flow,
+        // otherwise the connection attempt is killed mid-hole-punch and the
+        // NAT'd peer is never reached.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(90);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,

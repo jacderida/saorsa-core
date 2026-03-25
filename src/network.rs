@@ -120,7 +120,11 @@ const DEFAULT_LISTEN_PORT: u16 = 9000;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Default connection timeout in seconds.
-const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
+///
+/// Must accommodate the full NAT traversal flow: direct (5s) → hole-punch
+/// (15s) → relay (30s) = ~50s. With 90s we have headroom for retries and
+/// slow handshakes.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 90;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
