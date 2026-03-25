@@ -1,5 +1,0 @@
-[alias]
-# Alias for running tests without metrics to avoid Prometheus conflicts
-test-no-metrics = "test --no-default-features"
-# Alias for running tests with all features
-test-all = "test"
