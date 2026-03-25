@@ -2422,7 +2422,6 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.28.0"
-source = "git+https://github.com/jacderida/saorsa-transport.git?branch=feat-nat_traversal_attempts#ee6cf6f70a7af5f9eb7bfe54972ded9f5528dfce"
 dependencies = [
  "anyhow",
  "async-trait",

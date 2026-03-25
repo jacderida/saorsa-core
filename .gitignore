@@ -3,6 +3,7 @@
 **/*.rs.bk
 *.pdb
 .cargo/config.toml
+Cargo.lock
 
 # IDE
 .vscode/
