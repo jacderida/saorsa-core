@@ -794,20 +794,28 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
 
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
-    /// Check if a peer is connected via either stack.
+    /// Check if a peer has a live QUIC connection via either stack.
     ///
+    /// Checks the underlying P2pEndpoint's NatTraversalEndpoint connections
+    /// DashMap directly, which is authoritative for QUIC connection state.
     /// Tries both the plain and IPv4-mapped address forms to handle
     /// dual-stack normalization.
     pub async fn is_peer_connected_by_addr(&self, addr: &std::net::SocketAddr) -> bool {
         let mapped = saorsa_transport::shared::dual_stack_alternate(addr);
         for node in [&self.v6, &self.v4].into_iter().flatten() {
-            if node.is_connected(addr).await {
+            // Check NatTraversalEndpoint's connections (authoritative for QUIC state)
+            let endpoint = node.transport.endpoint();
+            if endpoint.inner_is_connected(addr) {
                 return true;
             }
             if let Some(ref alt) = mapped {
-                if node.is_connected(alt).await {
+                if endpoint.inner_is_connected(alt) {
                     return true;
                 }
+            }
+            // Also check the link transport capabilities cache
+            if node.is_connected(addr).await {
+                return true;
             }
         }
         false
