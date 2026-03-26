@@ -780,38 +780,23 @@ impl TransportHandle {
             });
         }
 
-        // Ensure the channel is in active_connections.  Hole-punch
-        // connections may not yet be registered here because the
-        // ConnectionEvent::Established event chain (NAT → P2p → Link →
-        // transport_handle lifecycle monitor) has a ~500ms delay.  Without
-        // this, the is_connection_active() check below rejects the channel
-        // and the response is dropped.
+        // NOTE: We intentionally do NOT check is_connection_active() here.
+        //
+        // Hole-punch and NAT-traversed connections have a registration delay
+        // (the ConnectionEvent chain takes ~500ms). During this window, the
+        // connection IS live at the QUIC level but not yet in
+        // active_connections. Checking here would reject valid sends.
+        //
+        // Instead, we let the actual QUIC send attempt proceed. If the
+        // connection doesn't exist, P2pEndpoint::send() returns PeerNotFound
+        // naturally — no premature rejection needed.
         if !self.is_connection_active(channel_id).await {
-            // Check if the underlying transport actually has a live
-            // connection to this address. If so, register it now rather
-            // than rejecting the send.
-            let addr = channel_id.parse::<std::net::SocketAddr>().ok();
-            let transport_connected = if let Some(a) = addr {
-                self.dual_node.is_peer_connected_by_addr(&a).await
-            } else {
-                false
-            };
-
-            if transport_connected {
-                info!(
-                    "send_on_channel: registering {} in active_connections (transport has live connection)",
-                    channel_id
-                );
-                self.active_connections
-                    .write()
-                    .await
-                    .insert(channel_id.to_string());
-            } else {
-                self.remove_channel(channel_id).await;
-                return Err(P2PError::Network(NetworkError::ConnectionClosed {
-                    peer_id: channel_id.to_string().into(),
-                }));
-            }
+            // Register it as active now — the actual send below will
+            // validate if the connection is truly live.
+            self.active_connections
+                .write()
+                .await
+                .insert(channel_id.to_string());
         }
 
         let raw_data_len = data.len();
