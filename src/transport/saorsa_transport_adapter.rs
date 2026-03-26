@@ -794,6 +794,25 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
 
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
+    /// Check if a peer is connected via either stack.
+    ///
+    /// Tries both the plain and IPv4-mapped address forms to handle
+    /// dual-stack normalization.
+    pub async fn is_peer_connected_by_addr(&self, addr: &std::net::SocketAddr) -> bool {
+        let mapped = saorsa_transport::shared::dual_stack_alternate(addr);
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            if node.is_connected(addr).await {
+                return true;
+            }
+            if let Some(ref alt) = mapped {
+                if node.is_connected(alt).await {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Shut down the underlying QUIC endpoints on both stacks.
     ///
     /// This cancels each endpoint's internal `CancellationToken`, which

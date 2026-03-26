@@ -764,9 +764,6 @@ impl TransportHandle {
                     "send_on_channel: registering new channel {} on the fly",
                     channel_id
                 );
-                // Parse the channel_id as a SocketAddr to populate the
-                // address field, so lookups like get_channel_id_by_address
-                // can find this peer.
                 let addresses = channel_id
                     .parse::<std::net::SocketAddr>()
                     .map(|addr| vec![MultiAddr::quic(addr)])
@@ -783,11 +780,38 @@ impl TransportHandle {
             });
         }
 
+        // Ensure the channel is in active_connections.  Hole-punch
+        // connections may not yet be registered here because the
+        // ConnectionEvent::Established event chain (NAT → P2p → Link →
+        // transport_handle lifecycle monitor) has a ~500ms delay.  Without
+        // this, the is_connection_active() check below rejects the channel
+        // and the response is dropped.
         if !self.is_connection_active(channel_id).await {
-            self.remove_channel(channel_id).await;
-            return Err(P2PError::Network(NetworkError::ConnectionClosed {
-                peer_id: channel_id.to_string().into(),
-            }));
+            // Check if the underlying transport actually has a live
+            // connection to this address. If so, register it now rather
+            // than rejecting the send.
+            let addr = channel_id.parse::<std::net::SocketAddr>().ok();
+            let transport_connected = if let Some(a) = addr {
+                self.dual_node.is_peer_connected_by_addr(&a).await
+            } else {
+                false
+            };
+
+            if transport_connected {
+                info!(
+                    "send_on_channel: registering {} in active_connections (transport has live connection)",
+                    channel_id
+                );
+                self.active_connections
+                    .write()
+                    .await
+                    .insert(channel_id.to_string());
+            } else {
+                self.remove_channel(channel_id).await;
+                return Err(P2PError::Network(NetworkError::ConnectionClosed {
+                    peer_id: channel_id.to_string().into(),
+                }));
+            }
         }
 
         let raw_data_len = data.len();
