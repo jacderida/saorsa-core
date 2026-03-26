@@ -551,7 +551,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             Ok(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("send_to_peer_raw timed out after {SEND_TIMEOUT:?} to {addr}"))?
+        .map_err(|_| {
+            anyhow::anyhow!("send_to_peer_raw timed out after {SEND_TIMEOUT:?} to {addr}")
+        })?
     }
 
     /// Get our local address
@@ -931,7 +933,11 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             None
         };
         let is_dual_stack = v6.is_some() && v4.is_none();
-        Ok(Self { v6, v4, is_dual_stack })
+        Ok(Self {
+            v6,
+            v4,
+            is_dual_stack,
+        })
     }
 
     /// Send to peer using P2pEndpoint's optimized send method.
@@ -1030,7 +1036,11 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Create with custom transports (for testing)
     pub fn with_transports(v6: Option<P2PNetworkNode<T>>, v4: Option<P2PNetworkNode<T>>) -> Self {
         let is_dual_stack = v6.is_some() && v4.is_none();
-        Self { v6, v4, is_dual_stack }
+        Self {
+            v6,
+            v4,
+            is_dual_stack,
+        }
     }
 
     /// If dual-stack, normalise IPv4-mapped IPv6 → plain IPv4.
@@ -1089,8 +1099,10 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
             }
             // Dual-stack: v6 socket can reach IPv4 peers via mapped addresses
             (Some(_), None) if !v4_targets.is_empty() => {
-                let mapped: Vec<SocketAddr> =
-                    v4_targets.iter().map(|a| self.to_mapped_if_needed(a)).collect();
+                let mapped: Vec<SocketAddr> = v4_targets
+                    .iter()
+                    .map(|a| self.to_mapped_if_needed(a))
+                    .collect();
                 let addr = self.connect_sequential(&self.v6, &mapped).await?;
                 return Ok(self.normalize(addr));
             }

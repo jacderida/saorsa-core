@@ -1286,7 +1286,9 @@ impl TransportHandle {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(MESSAGE_RECV_CHANNEL_CAPACITY);
 
-        let mut handles = self.dual_node.spawn_recv_tasks(tx.clone(), self.shutdown.clone());
+        let mut handles = self
+            .dual_node
+            .spawn_recv_tasks(tx.clone(), self.shutdown.clone());
         drop(tx);
 
         let event_tx = self.event_tx.clone();

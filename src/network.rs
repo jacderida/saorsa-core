@@ -1904,7 +1904,7 @@ mod tests {
 
         assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
         assert_eq!(config.max_connections, 10000);
-        assert_eq!(config.connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.connection_timeout, Duration::from_secs(90));
     }
 
     #[tokio::test]
