@@ -72,3 +72,6 @@ wyz = "=0.5.1"
 [dev-dependencies]
 tempfile = "3.17"
 
+
+[patch.crates-io]
+saorsa-transport = { git = "https://github.com/jacderida/saorsa-transport.git", branch = "feat-continuous_uploads" }
