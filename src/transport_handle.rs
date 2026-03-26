@@ -757,42 +757,52 @@ impl TransportHandle {
         // Uses a single write lock with entry() to avoid a TOCTOU race
         // where a concurrent event handler could insert a fully-populated
         // PeerInfo between a read-check and our write.
+        // Double-checked locking: only take a write lock when the channel
+        // is not yet registered, avoiding write-lock contention on every send.
         {
-            let mut peers = self.peers.write().await;
-            peers.entry(channel_id.to_string()).or_insert_with(|| {
-                info!(
-                    "send_on_channel: registering new channel {} on the fly",
-                    channel_id
-                );
-                let addresses = channel_id
-                    .parse::<std::net::SocketAddr>()
-                    .map(|addr| vec![MultiAddr::quic(addr)])
-                    .unwrap_or_default();
-                PeerInfo {
-                    channel_id: channel_id.to_string(),
-                    addresses,
-                    status: ConnectionStatus::Connected,
-                    last_seen: Instant::now(),
-                    connected_at: Instant::now(),
-                    protocols: Vec::new(),
-                    heartbeat_count: 0,
-                }
-            });
+            let needs_insert = {
+                let peers = self.peers.read().await;
+                !peers.contains_key(channel_id)
+            };
+
+            if needs_insert {
+                let mut peers = self.peers.write().await;
+                peers.entry(channel_id.to_string()).or_insert_with(|| {
+                    info!(
+                        "send_on_channel: registering new channel {} on the fly",
+                        channel_id
+                    );
+                    let addresses = channel_id
+                        .parse::<std::net::SocketAddr>()
+                        .map(|addr| vec![MultiAddr::quic(addr)])
+                        .unwrap_or_default();
+                    PeerInfo {
+                        channel_id: channel_id.to_string(),
+                        addresses,
+                        status: ConnectionStatus::Connected,
+                        last_seen: Instant::now(),
+                        connected_at: Instant::now(),
+                        protocols: Vec::new(),
+                        heartbeat_count: 0,
+                    }
+                });
+            }
         }
 
-        // NOTE: We intentionally do NOT check is_connection_active() here.
+        // NOTE: We no longer *reject* sends based on is_connection_active().
         //
         // Hole-punch and NAT-traversed connections have a registration delay
         // (the ConnectionEvent chain takes ~500ms). During this window, the
         // connection IS live at the QUIC level but not yet in
-        // active_connections. Checking here would reject valid sends.
+        // active_connections. Using is_connection_active() as a hard gate
+        // here would reject valid sends.
         //
-        // Instead, we let the actual QUIC send attempt proceed. If the
-        // connection doesn't exist, P2pEndpoint::send() returns PeerNotFound
-        // naturally — no premature rejection needed.
+        // Instead, we always attempt the actual QUIC send and let
+        // P2pEndpoint::send() return PeerNotFound naturally if the
+        // connection doesn't exist. The is_connection_active() check below
+        // is used only to opportunistically populate active_connections,
+        // not to decide whether we send.
         if !self.is_connection_active(channel_id).await {
-            // Register it as active now — the actual send below will
-            // validate if the connection is truly live.
             self.active_connections
                 .write()
                 .await
@@ -836,6 +846,9 @@ impl TransportHandle {
             );
         } else {
             warn!("Failed to send message to channel {}", channel_id);
+            // Clean up the optimistic active_connections entry so stale
+            // entries don't accumulate for unknown channels.
+            self.active_connections.write().await.remove(channel_id);
         }
 
         result

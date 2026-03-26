@@ -819,6 +819,11 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             if node.is_connected(addr).await {
                 return true;
             }
+            if let Some(ref alt) = mapped {
+                if node.is_connected(alt).await {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -1006,8 +1011,9 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
         if let Some(v6) = self.v6.as_ref() {
             if self.is_dual_stack {
-                let (inner_tx, mut inner_rx) =
-                    tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(1024);
+                let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(
+                    crate::network::MESSAGE_RECV_CHANNEL_CAPACITY,
+                );
                 handles.push(v6.spawn_recv_task(inner_tx, shutdown.clone()));
                 let outer_tx = tx.clone();
                 handles.push(tokio::spawn(async move {
