@@ -525,7 +525,7 @@ impl TransportHandle {
             P2PError::Network(NetworkError::InvalidAddress(
                 format!(
                     "only QUIC transport is supported for connect, got {}: {}",
-                    address.transport().kind(),
+                    address.transport().transport_type(),
                     address
                 )
                 .into(),

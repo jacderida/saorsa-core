@@ -2026,12 +2026,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_connect_peer_rejects_tcp_multiaddr() -> Result<()> {
+    async fn test_connect_peer_rejects_non_udp_multiaddr() -> Result<()> {
         let config = create_test_node_config();
         let node = P2PNode::new(config).await?;
 
-        let tcp_addr: MultiAddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
-        let result = node.connect_peer(&tcp_addr).await;
+        let ble_addr = MultiAddr::new(crate::address::TransportAddr::Ble {
+            device_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            service_uuid: None,
+        });
+        let result = node.connect_peer(&ble_addr).await;
 
         assert!(
             matches!(
@@ -2040,7 +2043,7 @@ mod tests {
                     crate::error::NetworkError::InvalidAddress(_)
                 ))
             ),
-            "TCP multiaddrs should be rejected before a QUIC dial is attempted, got: {:?}",
+            "Non-UDP multiaddrs should be rejected before a dial is attempted, got: {:?}",
             result
         );
 
@@ -2419,8 +2422,8 @@ mod tests {
 
         // Test: Non-IP address should return None (no matching socket addr)
         let ble_addr = MultiAddr::new(crate::address::TransportAddr::Ble {
-            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
-            psm: 0x0025,
+            device_id: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            service_uuid: None,
         });
         let result = node.get_channel_id_by_address(&ble_addr).await;
         assert_eq!(result, None);

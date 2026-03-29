@@ -156,10 +156,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
             builder = builder.max_message_size(max_msg_size);
         }
         if allow_loopback {
-            builder = builder.nat(NatConfig {
-                allow_loopback: true,
-                ..NatConfig::default()
-            });
+            builder = builder.nat(NatConfig::default());
         }
         let config = builder
             .build()
@@ -794,35 +791,51 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     is_dual_stack: bool,
 }
 
+/// Return the dual-stack alternate of a socket address.
+///
+/// For IPv4 addresses, returns the IPv4-mapped IPv6 form (`::ffff:a.b.c.d`).
+/// For IPv4-mapped IPv6 addresses, returns the IPv4 form.
+/// For native IPv6 addresses, returns `None`.
+fn dual_stack_alternate(addr: &SocketAddr) -> Option<SocketAddr> {
+    match addr.ip() {
+        IpAddr::V4(v4) => Some(SocketAddr::new(
+            IpAddr::V6(v4.to_ipv6_mapped()),
+            addr.port(),
+        )),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
+    }
+}
+
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
     /// Check if a peer has a live QUIC connection via either stack.
     ///
-    /// Checks the underlying P2pEndpoint's NatTraversalEndpoint connections
-    /// DashMap directly, which is authoritative for QUIC connection state.
-    /// Tries both the plain and IPv4-mapped address forms to handle
-    /// dual-stack normalization.
+    /// Checks the underlying P2pEndpoint's connection state, which is
+    /// authoritative for QUIC connection state.  Tries both the plain and
+    /// IPv4-mapped address forms to handle dual-stack normalization.
     pub async fn is_peer_connected_by_addr(&self, addr: &std::net::SocketAddr) -> bool {
-        let mapped = saorsa_transport::shared::dual_stack_alternate(addr);
+        let mapped = dual_stack_alternate(addr);
         for node in [&self.v6, &self.v4].into_iter().flatten() {
-            // Check NatTraversalEndpoint's connections (authoritative for QUIC state)
+            // Check the endpoint's connection state (authoritative for QUIC)
             let endpoint = node.transport.endpoint();
-            if endpoint.inner_is_connected(addr) {
+            if endpoint.is_connected(addr).await {
                 return true;
             }
-            if let Some(ref alt) = mapped {
-                if endpoint.inner_is_connected(alt) {
-                    return true;
-                }
+            if let Some(ref alt) = mapped
+                && endpoint.is_connected(alt).await
+            {
+                return true;
             }
             // Also check the link transport capabilities cache
             if node.is_connected(addr).await {
                 return true;
             }
-            if let Some(ref alt) = mapped {
-                if node.is_connected(alt).await {
-                    return true;
-                }
+            if let Some(ref alt) = mapped
+                && node.is_connected(alt).await
+            {
+                return true;
             }
         }
         false
@@ -1064,15 +1077,10 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// form `[::ffff:x.x.x.x]` that the v6 transport expects.
     /// Used on all addresses entering the transport from saorsa-core.
     fn to_mapped_if_needed(&self, addr: &SocketAddr) -> SocketAddr {
-        if self.is_dual_stack {
-            if let SocketAddr::V4(v4) = addr {
-                return SocketAddr::V6(SocketAddrV6::new(
-                    v4.ip().to_ipv6_mapped(),
-                    v4.port(),
-                    0,
-                    0,
-                ));
-            }
+        if self.is_dual_stack
+            && let SocketAddr::V4(v4) = addr
+        {
+            return SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0));
         }
         *addr
     }
