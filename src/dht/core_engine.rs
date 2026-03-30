@@ -449,6 +449,12 @@ pub struct DhtCoreEngine {
     /// Trust score below which a peer is evicted and blocked from re-admission.
     block_threshold: f64,
 
+    /// Duration of no contact after which a peer is considered stale.
+    /// Defaults to [`LIVE_THRESHOLD`]; overridden in tests to avoid
+    /// `Instant` subtraction overflow on Windows (where `Instant` starts
+    /// at process creation and cannot represent times before it).
+    live_threshold: Duration,
+
     /// Shutdown token for background maintenance tasks
     shutdown: CancellationToken,
 }
@@ -488,6 +494,7 @@ impl DhtCoreEngine {
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             block_threshold,
+            live_threshold: LIVE_THRESHOLD,
             shutdown: CancellationToken::new(),
         })
     }
@@ -501,6 +508,16 @@ impl DhtCoreEngine {
     #[cfg(test)]
     pub fn set_allow_loopback(&mut self, allow: bool) {
         self.allow_loopback = allow;
+    }
+
+    /// Override the live threshold for testing.
+    ///
+    /// On Windows, `Instant` starts at process creation, so tests cannot
+    /// subtract large durations without overflow. Setting a small threshold
+    /// (e.g. 1 second) lets tests use a correspondingly small subtraction.
+    #[cfg(test)]
+    pub fn set_live_threshold(&mut self, threshold: Duration) {
+        self.live_threshold = threshold;
     }
 
     /// Get this node's peer ID.
@@ -664,7 +681,7 @@ impl DhtCoreEngine {
             .buckets
             .iter()
             .flat_map(|b| b.get_nodes())
-            .filter(|n| n.last_seen.elapsed() > LIVE_THRESHOLD)
+            .filter(|n| n.last_seen.elapsed() > self.live_threshold)
             .count();
         RoutingTableStats {
             total_peers,
@@ -871,7 +888,7 @@ impl DhtCoreEngine {
                         if let Some((far_id, far_dist, far_last_seen)) = farthest
                             && candidate_distance < far_dist
                             && (trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
-                                || far_last_seen.elapsed() > LIVE_THRESHOLD)
+                                || far_last_seen.elapsed() > self.live_threshold)
                         {
                             return Ok(Some(*far_id));
                         }
@@ -947,7 +964,7 @@ impl DhtCoreEngine {
                         if let Some((far_id, far_dist, far_last_seen)) = farthest
                             && candidate_distance < far_dist
                             && (trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
-                                || far_last_seen.elapsed() > LIVE_THRESHOLD)
+                                || far_last_seen.elapsed() > self.live_threshold)
                         {
                             return Ok(Some(*far_id));
                         }
@@ -965,15 +982,16 @@ impl DhtCoreEngine {
     /// Collect stale peers from a bucket.
     ///
     /// Returns `(peer_id, bucket_index)` pairs for all peers in the target
-    /// bucket whose `last_seen` exceeds [`LIVE_THRESHOLD`].
+    /// bucket whose `last_seen` exceeds the given `threshold`.
     fn collect_stale_peers_in_bucket(
         routing: &KademliaRoutingTable,
         bucket_idx: usize,
+        threshold: Duration,
     ) -> Vec<(PeerId, usize)> {
         routing.buckets[bucket_idx]
             .nodes
             .iter()
-            .filter(|n| n.last_seen.elapsed() > LIVE_THRESHOLD)
+            .filter(|n| n.last_seen.elapsed() > threshold)
             .map(|n| (n.id, bucket_idx))
             .collect()
     }
@@ -1210,7 +1228,11 @@ impl DhtCoreEngine {
                     .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
             if !already_exists && !has_room && !swap_frees_slot {
                 if allow_stale_revalidation {
-                    let mut stale_peers = Self::collect_stale_peers_in_bucket(routing, bucket_idx);
+                    let mut stale_peers = Self::collect_stale_peers_in_bucket(
+                        routing,
+                        bucket_idx,
+                        self.live_threshold,
+                    );
 
                     // Merge stale routing-neighborhood violators (Design Section 7.5):
                     // close-group swap targets that are stale and not already in the
@@ -1223,7 +1245,7 @@ impl DhtCoreEngine {
                         }
                         if let Some(swap_bucket_idx) = routing.get_bucket_index(close_swap_id)
                             && let Some(swap_node) = routing.find_node_by_id(close_swap_id)
-                            && swap_node.last_seen.elapsed() > LIVE_THRESHOLD
+                            && swap_node.last_seen.elapsed() > self.live_threshold
                         {
                             stale_peers.push((*close_swap_id, swap_bucket_idx));
                         }
@@ -1715,6 +1737,17 @@ mod tests {
         }
     }
 
+    /// Live threshold used by tests: 1 second.
+    ///
+    /// Production uses 900 s, but on Windows `Instant` starts at process
+    /// creation time, so subtracting large durations panics.  Tests call
+    /// `set_live_threshold(TEST_LIVE_THRESHOLD)` and then set `last_seen`
+    /// to `Instant::now() - TEST_STALE_AGE` which is safe on every platform.
+    const TEST_LIVE_THRESHOLD: Duration = Duration::from_secs(1);
+
+    /// How far back to set `last_seen` so peers exceed `TEST_LIVE_THRESHOLD`.
+    const TEST_STALE_AGE: Duration = Duration::from_secs(2);
+
     // -----------------------------------------------------------------------
     // Test 4: blocked peer rejection
     // -----------------------------------------------------------------------
@@ -1795,6 +1828,7 @@ mod tests {
     #[tokio::test]
     async fn test_stale_trusted_peer_can_be_swapped() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         // Two peers in bucket 0, same IP (exact-IP limit = 2)
         let mut id_far = [0u8; 32];
@@ -1819,8 +1853,8 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
-            // Set last_seen to 20 minutes ago (> LIVE_THRESHOLD of 15 min)
-            node.last_seen = Instant::now() - Duration::from_secs(1200);
+            // Set last_seen to exceed the test live threshold
+            node.last_seen = Instant::now() - TEST_STALE_AGE;
         }
 
         // A closer candidate with the same IP
@@ -1964,6 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn test_swap_eviction_produces_both_events() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         // Two peers in bucket 0, same IP (exact-IP limit = 2)
         let mut id_far = [0u8; 32];
@@ -1989,7 +2024,7 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
-            node.last_seen = Instant::now() - Duration::from_secs(1200);
+            node.last_seen = Instant::now() - TEST_STALE_AGE;
         }
 
         // A closer candidate with the same IP triggers swap
@@ -2057,6 +2092,7 @@ mod tests {
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         // Fill bucket 0 with 4 peers (k=4).
         for i in 1..=4u8 {
@@ -2079,7 +2115,7 @@ mod tests {
             id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
-                node.last_seen = Instant::now() - Duration::from_secs(1200);
+                node.last_seen = Instant::now() - TEST_STALE_AGE;
             }
         }
 
@@ -2241,6 +2277,7 @@ mod tests {
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         // Fill bucket 0 with 4 stale peers.
         for i in 1..=4u8 {
@@ -2263,7 +2300,7 @@ mod tests {
             id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
-                node.last_seen = Instant::now() - Duration::from_secs(1200);
+                node.last_seen = Instant::now() - TEST_STALE_AGE;
             }
         }
 
@@ -2296,6 +2333,7 @@ mod tests {
             DEFAULT_BLOCK_THRESHOLD,
         )
         .unwrap();
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         // Add a fresh peer.
         let mut id_fresh = [0u8; 32];
@@ -2325,9 +2363,13 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_stale))
                 .unwrap();
-            node.last_seen = Instant::now() - Duration::from_secs(1200);
+            node.last_seen = Instant::now() - TEST_STALE_AGE;
 
-            let stale = DhtCoreEngine::collect_stale_peers_in_bucket(&routing, bucket_idx);
+            let stale = DhtCoreEngine::collect_stale_peers_in_bucket(
+                &routing,
+                bucket_idx,
+                TEST_LIVE_THRESHOLD,
+            );
             assert_eq!(stale.len(), 1);
             assert_eq!(stale[0].0, PeerId::from_bytes(id_stale));
         }
@@ -2635,6 +2677,7 @@ mod tests {
     #[tokio::test]
     async fn test_stale_trusted_peer_displaced_by_closer_candidate() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_live_threshold(TEST_LIVE_THRESHOLD);
 
         let mut id_far = [0u8; 32];
         id_far[0] = 0xFF;
@@ -2659,7 +2702,7 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
-            node.last_seen = Instant::now() - Duration::from_secs(1200);
+            node.last_seen = Instant::now() - TEST_STALE_AGE;
         }
 
         let far_peer = PeerId::from_bytes(id_far);
