@@ -48,9 +48,6 @@ const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
 #[allow(dead_code)]
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
 
-/// Maximum peers accepted from a single FIND_NODE response.
-pub(crate) const MAX_PEERS_PER_RESPONSE: usize = 20;
-
 /// Node information for routing.
 ///
 /// The `addresses` field stores one or more typed [`MultiAddr`] values that are

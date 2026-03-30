@@ -86,16 +86,18 @@ impl IPDiversityConfig {
     /// share the same ASN (AS14061). The relaxed limits allow many nodes from the
     /// same provider while still maintaining some diversity tracking.
     ///
+    /// Currently identical to [`permissive`](Self::permissive) but kept as a
+    /// separate constructor so testnet limits can diverge independently (e.g.
+    /// allowing same-subnet but limiting per-IP) without changing local-dev
+    /// callers.
+    ///
     /// # Warning
     ///
     /// This configuration should NEVER be used in production as it significantly
     /// weakens Sybil attack protection.
     #[must_use]
     pub fn testnet() -> Self {
-        Self {
-            max_per_ip: Some(usize::MAX),
-            max_per_subnet: Some(usize::MAX),
-        }
+        Self::permissive()
     }
 
     /// Create a permissive configuration that effectively disables diversity checks.

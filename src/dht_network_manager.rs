@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::{MAX_PEERS_PER_RESPONSE, NodeInfo},
+    dht::core_engine::NodeInfo,
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -1032,11 +1032,11 @@ impl DhtNetworkManager {
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
-                        // Truncate response to MAX_PEERS_PER_RESPONSE closest
-                        // to the lookup key to limit amplification from a single
-                        // response and bound per-iteration memory growth.
+                        // Truncate response to K closest to the lookup key to
+                        // limit amplification from a single response and bound
+                        // per-iteration memory growth.
                         nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-                        nodes.truncate(MAX_PEERS_PER_RESPONSE);
+                        nodes.truncate(self.k_value());
                         for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
                                 || queued_peer_ids.contains(&node.peer_id)

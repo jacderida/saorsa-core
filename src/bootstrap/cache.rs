@@ -21,6 +21,7 @@ use crate::PeerId;
 use crate::adaptive::trust::TrustRecord;
 use crate::address::MultiAddr;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::Path;
 
 /// Filename used for the close group cache inside the configured directory.
@@ -53,8 +54,9 @@ pub struct CloseGroupCache {
 impl CloseGroupCache {
     /// Save the cache to `{dir}/close_group_cache.json`.
     ///
-    /// Uses write-then-rename for atomicity: a crash mid-write leaves the
-    /// previous file intact instead of producing truncated JSON.
+    /// Uses [`tempfile::NamedTempFile::persist`] for atomicity: the temp file
+    /// has a unique name (safe under concurrent saves) and `persist` is an
+    /// atomic rename on Unix and a replace-then-rename on Windows.
     pub async fn save_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
         // Ensure the directory exists (first run or after cache dir deletion).
         tokio::fs::create_dir_all(dir).await.map_err(|e| {
@@ -65,24 +67,27 @@ impl CloseGroupCache {
         })?;
 
         let path = dir.join(CACHE_FILENAME);
-        let tmp_path = dir.join("close_group_cache.json.tmp");
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize close group cache: {e}"))?;
 
-        tokio::fs::write(&tmp_path, json).await.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to write close group cache to {}: {e}",
-                tmp_path.display()
-            )
-        })?;
-        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to rename close group cache {} -> {}: {e}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
+        // Spawn blocking because NamedTempFile I/O is synchronous.
+        let dir_owned = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut tmp = tempfile::NamedTempFile::new_in(&dir_owned).map_err(|e| {
+                anyhow::anyhow!("failed to create temp file in {}: {e}", dir_owned.display())
+            })?;
+            tmp.write_all(json.as_bytes())
+                .map_err(|e| anyhow::anyhow!("failed to write close group cache: {e}"))?;
+            tmp.persist(&path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to persist close group cache to {}: {e}",
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("close group cache save task panicked: {e}"))?
     }
 
     /// Load the cache from `{dir}/close_group_cache.json`.
