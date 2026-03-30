@@ -81,6 +81,16 @@ impl NodeInfo {
         self.addresses.first().and_then(MultiAddr::ip)
     }
 
+    /// Return all distinct, canonicalized IP addresses across every address in
+    /// this node's address list. Useful for IP diversity checks that must
+    /// consider all addresses, not just the primary one.
+    fn all_ips(&self) -> HashSet<IpAddr> {
+        self.addresses
+            .iter()
+            .filter_map(|a| a.ip().map(canonicalize_ip))
+            .collect()
+    }
+
     /// Merge a new address into this node's address list.
     ///
     /// If the address is already present it is moved to the front (most
@@ -803,7 +813,11 @@ impl DhtCoreEngine {
 
                 let cand_24 = mask_ipv4(v4, 24);
 
-                // Single pass: count exact-IP and /24 matches, track farthest at each
+                // Single pass: count exact-IP and /24 matches, track farthest at each.
+                // Check ALL addresses of each existing node to prevent diversity
+                // bypass via address rotation (e.g. touch_node prepending a new address).
+                // Each node is counted at most once per tier to avoid double-counting
+                // multi-homed peers.
                 let mut count_ip: usize = 0;
                 let mut count_subnet: usize = 0;
                 let mut farthest_ip: Option<(PeerId, [u8; 32], Instant)> = None;
@@ -813,25 +827,39 @@ impl DhtCoreEngine {
                     if n.id == *candidate_id {
                         continue;
                     }
-                    let Some(existing_ip) = n.ip().map(canonicalize_ip) else {
-                        continue;
-                    };
-                    if existing_ip.is_loopback() {
+                    let existing_ips = n.all_ips();
+                    if existing_ips.is_empty() {
                         continue;
                     }
-                    let IpAddr::V4(existing_v4) = existing_ip else {
-                        continue;
-                    };
 
                     let dist = xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes());
 
-                    if existing_v4 == v4 {
+                    // Check if any of this node's addresses match the candidate's
+                    // exact IP or /24 subnet. Count each node at most once per tier.
+                    let mut matched_ip = false;
+                    let mut matched_subnet = false;
+                    for existing_ip in &existing_ips {
+                        if existing_ip.is_loopback() {
+                            continue;
+                        }
+                        let IpAddr::V4(existing_v4) = existing_ip else {
+                            continue;
+                        };
+                        if !matched_ip && *existing_v4 == v4 {
+                            matched_ip = true;
+                        }
+                        if !matched_subnet && mask_ipv4(*existing_v4, 24) == cand_24 {
+                            matched_subnet = true;
+                        }
+                    }
+
+                    if matched_ip {
                         count_ip += 1;
                         if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
                             farthest_ip = Some((n.id, dist, n.last_seen));
                         }
                     }
-                    if mask_ipv4(existing_v4, 24) == cand_24 {
+                    if matched_subnet {
                         count_subnet += 1;
                         if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
                             farthest_subnet = Some((n.id, dist, n.last_seen));
@@ -867,7 +895,8 @@ impl DhtCoreEngine {
 
                 let cand_48 = mask_ipv6(v6, 48);
 
-                // Single pass: count exact-IPv6 and /48 matches
+                // Single pass: count exact-IPv6 and /48 matches.
+                // Check ALL addresses per node (see IPv4 branch comment).
                 let mut count_ip: usize = 0;
                 let mut count_subnet: usize = 0;
                 let mut farthest_ip: Option<(PeerId, [u8; 32], Instant)> = None;
@@ -877,25 +906,37 @@ impl DhtCoreEngine {
                     if n.id == *candidate_id {
                         continue;
                     }
-                    let Some(existing_ip) = n.ip().map(canonicalize_ip) else {
-                        continue;
-                    };
-                    if existing_ip.is_loopback() {
+                    let existing_ips = n.all_ips();
+                    if existing_ips.is_empty() {
                         continue;
                     }
-                    let IpAddr::V6(existing_v6) = existing_ip else {
-                        continue;
-                    };
 
                     let dist = xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes());
 
-                    if existing_v6 == v6 {
+                    let mut matched_ip = false;
+                    let mut matched_subnet = false;
+                    for existing_ip in &existing_ips {
+                        if existing_ip.is_loopback() {
+                            continue;
+                        }
+                        let IpAddr::V6(existing_v6) = existing_ip else {
+                            continue;
+                        };
+                        if !matched_ip && *existing_v6 == v6 {
+                            matched_ip = true;
+                        }
+                        if !matched_subnet && mask_ipv6(*existing_v6, 48) == cand_48 {
+                            matched_subnet = true;
+                        }
+                    }
+
+                    if matched_ip {
                         count_ip += 1;
                         if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
                             farthest_ip = Some((n.id, dist, n.last_seen));
                         }
                     }
-                    if mask_ipv6(existing_v6, 48) == cand_48 {
+                    if matched_subnet {
                         count_subnet += 1;
                         if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
                             farthest_subnet = Some((n.id, dist, n.last_seen));
@@ -1036,13 +1077,22 @@ impl DhtCoreEngine {
 
         // === Per-bucket IP diversity ===
         // Run diversity checks for each non-loopback candidate IP independently.
+        // After identifying a swap for one IP, exclude that peer from subsequent
+        // checks so that each IP sees the state after prior swaps — preventing
+        // over-eviction when a candidate has multiple IPs.
         let mut all_bucket_swaps: Vec<PeerId> = Vec::new();
         for &candidate_ip in candidate_ips {
             if candidate_ip.is_loopback() {
                 continue;
             }
+            let bucket_view: Vec<NodeInfo> = routing.buckets[bucket_idx]
+                .nodes
+                .iter()
+                .filter(|n| !all_bucket_swaps.contains(&n.id))
+                .cloned()
+                .collect();
             let swap = self.find_ip_swap_in_scope(
-                &routing.buckets[bucket_idx].nodes,
+                &bucket_view,
                 &node.id,
                 candidate_ip,
                 &candidate_distance,
@@ -1092,12 +1142,19 @@ impl DhtCoreEngine {
             hyp_close.truncate(self.k_value);
 
             // === Close-group IP diversity ===
+            // Exclude prior close-group swaps from each subsequent check to
+            // prevent over-eviction (same rationale as the bucket loop above).
             for &candidate_ip in candidate_ips {
                 if candidate_ip.is_loopback() {
                     continue;
                 }
+                let close_view: Vec<NodeInfo> = hyp_close
+                    .iter()
+                    .filter(|n| !all_close_swaps.contains(&n.id))
+                    .cloned()
+                    .collect();
                 let swap = self.find_ip_swap_in_scope(
-                    &hyp_close,
+                    &close_view,
                     &node.id,
                     candidate_ip,
                     &candidate_distance,

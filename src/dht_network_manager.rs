@@ -1275,6 +1275,7 @@ impl DhtNetworkManager {
         let rt_events = dht.remove_node_by_id(peer_id).await;
         drop(dht);
         self.broadcast_routing_events(&rt_events);
+        self.check_and_emit_k_closest_changed().await;
         self.cancel_operations_for_peer(peer_id);
         let _ = self.transport.disconnect_peer(peer_id).await;
         tracing::info!(
