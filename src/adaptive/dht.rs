@@ -179,19 +179,22 @@ impl AdaptiveDHT {
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
-                // Weight validation: reject <= 0, clamp > MAX_CONSUMER_WEIGHT
-                if weight <= 0.0 {
-                    return; // no-op for zero/negative weights
+                // Weight validation: reject <= 0, clamp > MAX_CONSUMER_WEIGHT.
+                // Only skip the trust update — the block check below still runs
+                // so that peers already below threshold get evicted even when
+                // called with an invalid weight.
+                if weight > 0.0 {
+                    let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
+                    let is_success = matches!(event, TrustEvent::ApplicationSuccess(_));
+                    let update = if is_success {
+                        NodeStatisticsUpdate::CorrectResponse
+                    } else {
+                        NodeStatisticsUpdate::FailedResponse
+                    };
+                    self.trust_engine
+                        .update_node_stats_weighted(peer_id, update, clamped_weight)
+                        .await;
                 }
-                let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
-                let update = match event {
-                    TrustEvent::ApplicationSuccess(_) => NodeStatisticsUpdate::CorrectResponse,
-                    TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
-                    _ => return, // unreachable but satisfies the compiler
-                };
-                self.trust_engine
-                    .update_node_stats_weighted(peer_id, update, clamped_weight)
-                    .await;
             }
             _ => {
                 // Internal events: unit weight
@@ -204,6 +207,8 @@ impl AdaptiveDHT {
         // Block check (Design Section 13.1 step 5): if the score crossed
         // below BLOCK_THRESHOLD, evict the peer from the routing table,
         // cancel in-flight RPCs, and disconnect at the transport layer.
+        // Runs unconditionally — even if the trust update was skipped above,
+        // the peer may have crossed the threshold from a previous event.
         if self.config.block_threshold > 0.0
             && self.trust_engine.score(peer_id) < self.config.block_threshold
         {

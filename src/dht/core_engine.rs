@@ -416,6 +416,9 @@ pub enum RoutingTableEvent {
     /// A peer was removed from the routing table (eviction, blocking, or departure).
     PeerRemoved(PeerId),
     /// The set of K-closest peers to self changed.
+    /// Fields retained for the design API; the network manager uses snapshot
+    /// diffing instead of consuming these directly.
+    #[allow(dead_code)]
     KClosestPeersChanged { old: Vec<PeerId>, new: Vec<PeerId> },
 }
 
@@ -438,7 +441,11 @@ pub enum AdmissionResult {
         candidate: NodeInfo,
         /// All candidate IPs (for re-evaluation after revalidation).
         candidate_ips: Vec<IpAddr>,
+        /// The candidate's target bucket index (for per-bucket revalidation guard).
+        candidate_bucket_idx: usize,
         /// Stale peers that should be pinged. Each entry is `(peer_id, bucket_index)`.
+        /// May include peers from multiple buckets when routing-neighborhood
+        /// violators are merged (Design Section 7.5).
         stale_peers: Vec<(PeerId, usize)>,
     },
 }
@@ -719,10 +726,10 @@ impl DhtCoreEngine {
         }
 
         // Reject blocked peers — trust score below block threshold.
-        if trust_score(&node.id) < self.block_threshold {
+        let score = trust_score(&node.id);
+        if score < self.block_threshold {
             return Err(anyhow!(
-                "peer blocked: trust score {:.3} below threshold {:.3}",
-                trust_score(&node.id),
+                "peer blocked: trust score {score:.3} below threshold {:.3}",
                 self.block_threshold
             ));
         }
@@ -742,6 +749,15 @@ impl DhtCoreEngine {
         if candidate_ips.is_empty() {
             // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
             let mut routing = self.routing_table.write().await;
+            // Update short-circuit: if peer already exists, merge addresses and
+            // refresh last_seen without emitting PeerAdded (matches the main
+            // diversity path's update logic at the "Design step 5" block).
+            if routing.find_node_by_id(&peer_id).is_some() {
+                for addr in &node.addresses {
+                    routing.touch_node(&peer_id, Some(addr));
+                }
+                return Ok(AdmissionResult::Admitted(vec![]));
+            }
             let k_before = routing.k_closest_ids(self.k_value);
             routing.add_node(node)?;
             let k_after = routing.k_closest_ids(self.k_value);
@@ -1022,6 +1038,14 @@ impl DhtCoreEngine {
                 ));
             }
             // Loopback with allow_loopback=true bypasses all diversity checks.
+            // Update short-circuit: if peer already exists, merge addresses and
+            // refresh last_seen without emitting PeerAdded.
+            if routing.find_node_by_id(&peer_id).is_some() {
+                for addr in &node.addresses {
+                    routing.touch_node(&peer_id, Some(addr));
+                }
+                return Ok(AdmissionResult::Admitted(vec![]));
+            }
             let k_before = routing.k_closest_ids(self.k_value);
             routing.add_node(node)?;
             let k_after = routing.k_closest_ids(self.k_value);
@@ -1182,11 +1206,30 @@ impl DhtCoreEngine {
                     .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
             if !already_exists && !has_room && !swap_frees_slot {
                 if allow_stale_revalidation {
-                    let stale_peers = Self::collect_stale_peers_in_bucket(routing, bucket_idx);
+                    let mut stale_peers = Self::collect_stale_peers_in_bucket(routing, bucket_idx);
+
+                    // Merge stale routing-neighborhood violators (Design Section 7.5):
+                    // close-group swap targets that are stale and not already in the
+                    // bucket-level set. Evicting these may resolve the close-group
+                    // diversity violation and (if they happen to reside in the same
+                    // bucket) free capacity for the candidate.
+                    for close_swap_id in &all_close_swaps {
+                        if stale_peers.iter().any(|(id, _)| id == close_swap_id) {
+                            continue;
+                        }
+                        if let Some(swap_bucket_idx) = routing.get_bucket_index(close_swap_id)
+                            && let Some(swap_node) = routing.find_node_by_id(close_swap_id)
+                            && swap_node.last_seen.elapsed() > LIVE_THRESHOLD
+                        {
+                            stale_peers.push((*close_swap_id, swap_bucket_idx));
+                        }
+                    }
+
                     if !stale_peers.is_empty() {
                         return Ok(AdmissionResult::StaleRevalidationNeeded {
                             candidate: node,
                             candidate_ips: candidate_ips.to_vec(),
+                            candidate_bucket_idx: bucket_idx,
                             stale_peers,
                         });
                     }
@@ -2054,6 +2097,7 @@ mod tests {
             AdmissionResult::StaleRevalidationNeeded {
                 candidate,
                 candidate_ips,
+                candidate_bucket_idx: _,
                 stale_peers,
             } => {
                 assert_eq!(candidate.id, PeerId::from_bytes(id_c));

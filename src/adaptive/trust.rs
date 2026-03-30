@@ -93,6 +93,9 @@ impl PeerTrust {
     /// formula and is equivalent to applying `W` consecutive unit-weight updates
     /// for integer W.
     fn record_weighted(&mut self, observation: f64, weight: f64) {
+        if !weight.is_finite() || weight <= 0.0 {
+            return;
+        }
         self.apply_decay();
         let alpha_w = 1.0 - (1.0 - EMA_WEIGHT).powf(weight);
         self.score = (1.0 - alpha_w) * self.score + alpha_w * observation;

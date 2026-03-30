@@ -70,6 +70,9 @@ const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
 /// Maximum concurrent stale revalidation passes across all buckets.
 const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 
+/// Maximum concurrent pings within a single stale revalidation pass.
+const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
+
 /// Consecutive non-improving iterations before a network lookup terminates.
 const LOOKUP_STAGNATION_LIMIT: usize = 3;
 
@@ -236,7 +239,7 @@ pub struct DhtNetworkManager {
     revalidation_semaphore: Arc<Semaphore>,
     /// Per-bucket revalidation state: tracks active revalidation to prevent
     /// concurrent revalidation passes on the same bucket.
-    bucket_revalidation_active: Arc<tokio::sync::Mutex<HashSet<usize>>>,
+    bucket_revalidation_active: Arc<std::sync::Mutex<HashSet<usize>>>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -345,16 +348,13 @@ pub struct DhtNetworkStats {
 /// on drop, ensuring the slot is released even if the revalidation panics or
 /// returns early.
 struct BucketRevalidationGuard {
-    active: Arc<tokio::sync::Mutex<HashSet<usize>>>,
+    active: Arc<std::sync::Mutex<HashSet<usize>>>,
     bucket_idx: usize,
 }
 
 impl Drop for BucketRevalidationGuard {
     fn drop(&mut self) {
-        // Cannot use .await in Drop, so use blocking_lock which is safe
-        // because the tokio::sync::Mutex is not held across .await at
-        // this point (the guard is dropped at the end of the async fn).
-        let mut guard = self.active.blocking_lock();
+        let mut guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
         guard.remove(&self.bucket_idx);
     }
 }
@@ -400,7 +400,7 @@ impl DhtNetworkManager {
             message_handler_semaphore,
             k_closest_peers: Mutex::new(HashSet::new()),
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
-            bucket_revalidation_active: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            bucket_revalidation_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
@@ -1306,22 +1306,29 @@ impl DhtNetworkManager {
     /// operations MUST NOT record trust events — the blocking decision
     /// has already been made (Section 7.4 step 2a).
     fn cancel_operations_for_peer(&self, peer_id: &PeerId) {
-        if let Ok(mut ops) = self.active_operations.lock() {
-            ops.retain(|_id, ctx| {
-                if ctx.peer_id == *peer_id {
-                    // Drop the oneshot sender — the waiter will get RecvError
-                    // and should NOT record a trust event for this cancellation.
-                    tracing::debug!(
-                        peer = peer_id.to_hex(),
-                        op = ?ctx.operation,
-                        "Cancelling in-flight operation for blocked peer"
-                    );
-                    false // remove from map
-                } else {
-                    true // keep
-                }
-            });
-        }
+        let mut ops = match self.active_operations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "active_operations mutex poisoned in cancel_operations_for_peer, recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        ops.retain(|_id, ctx| {
+            if ctx.peer_id == *peer_id {
+                // Drop the oneshot sender — the waiter will get RecvError
+                // and should NOT record a trust event for this cancellation.
+                tracing::debug!(
+                    peer = peer_id.to_hex(),
+                    op = ?ctx.operation,
+                    "Cancelling in-flight operation for blocked peer"
+                );
+                false // remove from map
+            } else {
+                true // keep
+            }
+        });
     }
 
     /// Remove expired operations from `active_operations`.
@@ -1329,20 +1336,27 @@ impl DhtNetworkManager {
     /// Uses a 2x timeout multiplier as safety margin. Called at the start of
     /// `send_dht_request` to clean up orphaned entries from dropped futures.
     fn sweep_expired_operations(&self) {
-        if let Ok(mut ops) = self.active_operations.lock() {
-            let now = Instant::now();
-            ops.retain(|id, ctx| {
-                let expired = now.duration_since(ctx.started_at) > ctx.timeout * 2;
-                if expired {
-                    warn!(
-                        "Sweeping expired DHT operation {id} (age {:?}, timeout {:?})",
-                        now.duration_since(ctx.started_at),
-                        ctx.timeout
-                    );
-                }
-                !expired
-            });
-        }
+        let mut ops = match self.active_operations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "active_operations mutex poisoned in sweep_expired_operations, recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let now = Instant::now();
+        ops.retain(|id, ctx| {
+            let expired = now.duration_since(ctx.started_at) > ctx.timeout * 2;
+            if expired {
+                warn!(
+                    "Sweeping expired DHT operation {id} (age {:?}, timeout {:?})",
+                    now.duration_since(ctx.started_at),
+                    ctx.timeout
+                );
+            }
+            !expired
+        });
     }
 
     /// Send a DHT request to a specific peer.
@@ -2131,6 +2145,7 @@ impl DhtNetworkManager {
                 Ok(AdmissionResult::StaleRevalidationNeeded {
                     candidate,
                     candidate_ips,
+                    candidate_bucket_idx,
                     stale_peers,
                 }) => {
                     debug!(
@@ -2142,6 +2157,7 @@ impl DhtNetworkManager {
                         .revalidate_and_retry_admission(
                             candidate,
                             candidate_ips,
+                            candidate_bucket_idx,
                             stale_peers,
                             &trust_fn,
                         )
@@ -2339,13 +2355,13 @@ impl DhtNetworkManager {
         &self,
         candidate: NodeInfo,
         candidate_ips: Vec<IpAddr>,
+        bucket_idx: usize,
         stale_peers: Vec<(PeerId, usize)>,
         trust_fn: &impl Fn(&PeerId) -> f64,
     ) -> anyhow::Result<Vec<RoutingTableEvent>> {
-        let bucket_idx = stale_peers
-            .first()
-            .map(|(_, idx)| *idx)
-            .ok_or_else(|| anyhow::anyhow!("no stale peers to revalidate"))?;
+        if stale_peers.is_empty() {
+            return Err(anyhow::anyhow!("no stale peers to revalidate"));
+        }
 
         // Try acquire global semaphore (non-blocking to avoid stalling the caller).
         let _permit = self
@@ -2355,8 +2371,15 @@ impl DhtNetworkManager {
             .map_err(|_| anyhow::anyhow!("global revalidation limit reached"))?;
 
         // Try acquire per-bucket slot to prevent concurrent revalidation.
+        // Note: guards only the candidate's target bucket, not all buckets in
+        // stale_peers (which may span multiple buckets after routing-neighborhood
+        // merge). The DHT write lock provides correctness; this guard only
+        // prevents redundant ping work on the same bucket.
         {
-            let mut active = self.bucket_revalidation_active.lock().await;
+            let mut active = self
+                .bucket_revalidation_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if active.contains(&bucket_idx) {
                 return Err(anyhow::anyhow!(
                     "revalidation already in progress for bucket {bucket_idx}"
@@ -2371,20 +2394,29 @@ impl DhtNetworkManager {
             bucket_idx,
         };
 
-        // --- Ping stale peers with DHT write lock released ---
+        // --- Ping stale peers concurrently with DHT write lock released ---
+        // Process in chunks to bound concurrent pings while still parallelising
+        // within each chunk (total wall time: chunks * STALE_REVALIDATION_TIMEOUT
+        // instead of stale_peers.len() * STALE_REVALIDATION_TIMEOUT).
         let mut evicted_peers = Vec::new();
         let mut retained_peers = Vec::new();
 
-        for (peer_id, _) in &stale_peers {
-            let responded =
-                tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
+        for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
+            let results = futures::future::join_all(chunk.iter().map(|(peer_id, _)| async {
+                let responded =
+                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                (*peer_id, responded)
+            }))
+            .await;
 
-            if responded {
-                retained_peers.push(*peer_id);
-            } else {
-                evicted_peers.push(*peer_id);
+            for (peer_id, responded) in results {
+                if responded {
+                    retained_peers.push(peer_id);
+                } else {
+                    evicted_peers.push(peer_id);
+                }
             }
         }
 
@@ -2461,16 +2493,10 @@ impl DhtNetworkManager {
                         .event_tx
                         .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
                 }
-                RoutingTableEvent::KClosestPeersChanged { old, new } => {
-                    let added: Vec<PeerId> =
-                        new.iter().filter(|id| !old.contains(id)).copied().collect();
-                    let removed: Vec<PeerId> =
-                        old.iter().filter(|id| !new.contains(id)).copied().collect();
-                    if !added.is_empty() || !removed.is_empty() {
-                        let _ = self
-                            .event_tx
-                            .send(DhtNetworkEvent::KClosestPeersChanged { added, removed });
-                    }
+                RoutingTableEvent::KClosestPeersChanged { .. } => {
+                    // Handled by check_and_emit_k_closest_changed after each
+                    // mutation — that path does snapshot diffing which is more
+                    // robust than forwarding core engine events directly.
                 }
             }
         }

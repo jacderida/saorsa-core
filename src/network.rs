@@ -1073,6 +1073,24 @@ impl P2PNode {
         let close_group_cache = if let Some(ref dir) = self.config.close_group_cache_dir {
             match CloseGroupCache::load_from_dir(dir).await {
                 Ok(Some(cache)) => {
+                    // Filter out peers with non-finite trust scores (NaN/Inf)
+                    // that could corrupt trust engine state or sort ordering.
+                    let original_count = cache.peers.len();
+                    let cache = CloseGroupCache {
+                        peers: cache
+                            .peers
+                            .into_iter()
+                            .filter(|p| p.trust.score.is_finite())
+                            .collect(),
+                        ..cache
+                    };
+                    let filtered_count = original_count - cache.peers.len();
+                    if filtered_count > 0 {
+                        warn!(
+                            "Filtered {filtered_count} peers with non-finite trust scores from close group cache"
+                        );
+                    }
+
                     let trust_snapshot = TrustSnapshot {
                         peers: cache
                             .peers
@@ -1767,15 +1785,24 @@ impl P2PNode {
         if let Some(cache) = close_group_cache {
             let mut sorted_peers: Vec<&CachedCloseGroupPeer> = cache.peers.iter().collect();
             sorted_peers.sort_by(|a, b| {
-                b.trust
-                    .score
-                    .partial_cmp(&a.trust.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        let da = self.peer_id.xor_distance(&a.peer_id);
-                        let db = self.peer_id.xor_distance(&b.peer_id);
-                        da.cmp(&db)
-                    })
+                // NaN-safe comparison: push NaN scores to the back instead
+                // of treating them as equal (which would silently promote
+                // corrupted entries to the front of the reconnection queue).
+                let score_ord = match b.trust.score.partial_cmp(&a.trust.score) {
+                    Some(ord) => ord,
+                    None => {
+                        if a.trust.score.is_nan() {
+                            std::cmp::Ordering::Greater // a is NaN, push to back
+                        } else {
+                            std::cmp::Ordering::Less // b is NaN, push b to back
+                        }
+                    }
+                };
+                score_ord.then_with(|| {
+                    let da = self.peer_id.xor_distance(&a.peer_id);
+                    let db = self.peer_id.xor_distance(&b.peer_id);
+                    da.cmp(&db)
+                })
             });
 
             let mut added_from_close_group = 0usize;
