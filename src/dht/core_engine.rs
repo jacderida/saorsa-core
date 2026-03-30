@@ -5,7 +5,7 @@
 
 use crate::PeerId;
 use crate::address::MultiAddr;
-use crate::security::{IPDiversityConfig, canonicalize_ip};
+use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -364,14 +364,8 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 #[cfg(test)]
 const DEFAULT_K: usize = 20;
 
-/// Max nodes sharing an exact IP address per bucket/close-group.
-const IP_EXACT_LIMIT: usize = 2;
-
-/// Compute the subnet diversity limit from the active K value.
-/// At least 1 node per subnet is always permitted.
-const fn ip_subnet_limit(k: usize) -> usize {
-    if k / 4 > 0 { k / 4 } else { 1 }
-}
+// IP_EXACT_LIMIT and ip_subnet_limit are imported from crate::security
+// to keep a single source of truth for diversity constants.
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -482,6 +476,14 @@ impl DhtCoreEngine {
         allow_loopback: bool,
         block_threshold: f64,
     ) -> Result<Self> {
+        if k_value < 4 {
+            return Err(anyhow!("k_value must be >= 4 (got {k_value})"));
+        }
+        if !(0.0..1.0).contains(&block_threshold) || block_threshold.is_nan() {
+            return Err(anyhow!(
+                "block_threshold must be in [0.0, 1.0), got {block_threshold}"
+            ));
+        }
         Ok(Self {
             node_id,
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, k_value))),
@@ -710,15 +712,6 @@ impl DhtCoreEngine {
         // Reject self-insertion — a node must never appear in its own routing table.
         if node.id == self.node_id {
             return Err(anyhow!("cannot add self to routing table"));
-        }
-
-        // Reject blocked peers — trust score below block threshold.
-        let score = trust_score(&node.id);
-        if score < self.block_threshold {
-            return Err(anyhow!(
-                "peer blocked: trust score {score:.3} below threshold {:.3}",
-                self.block_threshold
-            ));
         }
 
         let peer_id = node.id;
@@ -1016,6 +1009,15 @@ impl DhtCoreEngine {
     ) -> Result<AdmissionResult> {
         let peer_id = node.id;
 
+        // --- Block check under write lock (Invariant 10) ---
+        let score = trust_score(&peer_id);
+        if score < self.block_threshold {
+            return Err(anyhow!(
+                "peer blocked: trust score {score:.3} below threshold {:.3}",
+                self.block_threshold
+            ));
+        }
+
         // --- Reject invalid addresses ---
         // Multicast and unspecified addresses are never valid peer endpoints.
         if candidate_ips
@@ -1024,6 +1026,13 @@ impl DhtCoreEngine {
         {
             return Err(anyhow!(
                 "IP diversity: multicast or unspecified addresses rejected"
+            ));
+        }
+
+        // --- Reject any loopback addresses when loopback is disallowed (M2) ---
+        if !self.allow_loopback && candidate_ips.iter().any(|ip| ip.is_loopback()) {
+            return Err(anyhow!(
+                "IP diversity: loopback addresses rejected (allow_loopback=false)"
             ));
         }
 
@@ -1289,10 +1298,7 @@ impl DhtCoreEngine {
         candidate_ips: &[IpAddr],
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<Vec<RoutingTableEvent>> {
-        if trust_score(&candidate.id) < self.block_threshold {
-            return Err(anyhow!("peer blocked after revalidation"));
-        }
-
+        // Block check moved into add_with_diversity (Invariant 10: under write lock).
         let mut routing = self.routing_table.write().await;
         match self.add_with_diversity(&mut routing, candidate, candidate_ips, trust_score, false)? {
             AdmissionResult::Admitted(events) => Ok(events),
@@ -2045,34 +2051,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_revalidation_needed_when_bucket_full_with_stale_peers() {
-        // Use k=2 so the bucket fills quickly.
+        // Use k=4 (minimum valid K) so the bucket fills quickly.
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
-            2,
+            4,
             false,
             DEFAULT_BLOCK_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
 
-        // Fill bucket 0 with 2 peers (k=2).
-        let mut id_a = [0u8; 32];
-        id_a[0] = 0x80;
-        id_a[31] = 1;
-        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+        // Fill bucket 0 with 4 peers (k=4).
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80;
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.0.0.{i}/udp/9000/quic"),
+            ))
             .await
             .unwrap();
+        }
 
-        let mut id_b = [0u8; 32];
-        id_b[0] = 0x80;
-        id_b[31] = 2;
-        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
-            .await
-            .unwrap();
-
-        // Make both peers stale.
+        // Make all peers stale.
         {
             let mut routing = dht.routing_table_for_test().write().await;
+            let mut id_a = [0u8; 32];
+            id_a[0] = 0x80;
+            id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
                 node.last_seen = Instant::now() - Duration::from_secs(1200);
@@ -2080,12 +2087,12 @@ mod tests {
         }
 
         // New candidate for bucket 0 — bucket is full, but stale peers exist.
-        let mut id_c = [0u8; 32];
-        id_c[0] = 0x80;
-        id_c[31] = 3;
+        let mut id_new = [0u8; 32];
+        id_new[0] = 0x80;
+        id_new[31] = 5;
         let result = dht
             .add_node(
-                make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic"),
+                make_node_with_addr(id_new, "/ip4/10.0.0.5/udp/9000/quic"),
                 &|_| DEFAULT_NEUTRAL_TRUST,
             )
             .await
@@ -2098,9 +2105,9 @@ mod tests {
                 candidate_bucket_idx: _,
                 stale_peers,
             } => {
-                assert_eq!(candidate.id, PeerId::from_bytes(id_c));
+                assert_eq!(candidate.id, PeerId::from_bytes(id_new));
                 assert!(!candidate_ips.is_empty());
-                assert_eq!(stale_peers.len(), 2, "both peers should be stale");
+                assert_eq!(stale_peers.len(), 4, "all peers should be stale");
             }
             AdmissionResult::Admitted(_) => panic!("expected StaleRevalidationNeeded"),
         }
@@ -2108,38 +2115,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_stale_revalidation_when_bucket_full_no_stale() {
-        // Use k=2 so the bucket fills quickly.
+        // Use k=4 (minimum valid K) so the bucket fills quickly.
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
-            2,
+            4,
             false,
             DEFAULT_BLOCK_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
 
-        // Fill bucket 0 with 2 fresh (live) peers.
-        let mut id_a = [0u8; 32];
-        id_a[0] = 0x80;
-        id_a[31] = 1;
-        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+        // Fill bucket 0 with 4 fresh (live) peers.
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80;
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.0.0.{i}/udp/9000/quic"),
+            ))
             .await
             .unwrap();
-
-        let mut id_b = [0u8; 32];
-        id_b[0] = 0x80;
-        id_b[31] = 2;
-        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
-            .await
-            .unwrap();
+        }
 
         // New candidate — bucket full, no stale peers → hard rejection.
-        let mut id_c = [0u8; 32];
-        id_c[0] = 0x80;
-        id_c[31] = 3;
+        let mut id_new = [0u8; 32];
+        id_new[0] = 0x80;
+        id_new[31] = 5;
         let result = dht
             .add_node(
-                make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic"),
+                make_node_with_addr(id_new, "/ip4/10.0.0.5/udp/9000/quic"),
                 &|_| DEFAULT_NEUTRAL_TRUST,
             )
             .await;
@@ -2154,40 +2159,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_re_evaluate_admission_after_eviction() {
-        // Use k=2 so the bucket fills quickly.
+        // Use k=4 (minimum valid K) so the bucket fills quickly.
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
-            2,
+            4,
             false,
             DEFAULT_BLOCK_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
 
-        // Fill bucket 0 with 2 peers.
+        // Fill bucket 0 with 4 peers.
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80;
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.0.0.{i}/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Evict one peer (simulating revalidation outcome).
         let mut id_a = [0u8; 32];
         id_a[0] = 0x80;
         id_a[31] = 1;
-        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
-            .await
-            .unwrap();
-
-        let mut id_b = [0u8; 32];
-        id_b[0] = 0x80;
-        id_b[31] = 2;
-        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
-            .await
-            .unwrap();
-
-        // Evict one peer (simulating revalidation outcome).
         dht.remove_node_by_id(&PeerId::from_bytes(id_a)).await;
 
         // Re-evaluate admission — should succeed now that there's room.
-        let mut id_c = [0u8; 32];
-        id_c[0] = 0x80;
-        id_c[31] = 3;
-        let candidate = make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic");
-        let candidate_ips = vec!["10.0.0.3".parse().unwrap()];
+        let mut id_new = [0u8; 32];
+        id_new[0] = 0x80;
+        id_new[31] = 5;
+        let candidate = make_node_with_addr(id_new, "/ip4/10.0.0.5/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.5".parse().unwrap()];
 
         let events = dht
             .re_evaluate_admission(candidate, &candidate_ips, &|_| DEFAULT_NEUTRAL_TRUST)
@@ -2196,11 +2202,11 @@ mod tests {
 
         assert!(
             events.iter().any(
-                |e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == PeerId::from_bytes(id_c))
+                |e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == PeerId::from_bytes(id_new))
             ),
             "re-evaluation should produce PeerAdded"
         );
-        assert!(dht.has_node(&PeerId::from_bytes(id_c)).await);
+        assert!(dht.has_node(&PeerId::from_bytes(id_new)).await);
     }
 
     #[tokio::test]
@@ -2229,34 +2235,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_re_evaluate_does_not_trigger_second_revalidation() {
-        // Use k=2 so the bucket fills quickly.
+        // Use k=4 (minimum valid K) so the bucket fills quickly.
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
-            2,
+            4,
             false,
             DEFAULT_BLOCK_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
 
-        // Fill bucket 0 with 2 stale peers.
-        let mut id_a = [0u8; 32];
-        id_a[0] = 0x80;
-        id_a[31] = 1;
-        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+        // Fill bucket 0 with 4 stale peers.
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80;
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.0.0.{i}/udp/9000/quic"),
+            ))
             .await
             .unwrap();
+        }
 
-        let mut id_b = [0u8; 32];
-        id_b[0] = 0x80;
-        id_b[31] = 2;
-        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
-            .await
-            .unwrap();
-
-        // Make both stale.
+        // Make all stale.
         {
             let mut routing = dht.routing_table_for_test().write().await;
+            let mut id_a = [0u8; 32];
+            id_a[0] = 0x80;
+            id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
                 node.last_seen = Instant::now() - Duration::from_secs(1200);
@@ -2265,11 +2272,11 @@ mod tests {
 
         // re_evaluate_admission with full bucket and stale peers should reject,
         // NOT return StaleRevalidationNeeded (no second round).
-        let mut id_c = [0u8; 32];
-        id_c[0] = 0x80;
-        id_c[31] = 3;
-        let candidate = make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic");
-        let candidate_ips = vec!["10.0.0.3".parse().unwrap()];
+        let mut id_new = [0u8; 32];
+        id_new[0] = 0x80;
+        id_new[31] = 5;
+        let candidate = make_node_with_addr(id_new, "/ip4/10.0.0.5/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.5".parse().unwrap()];
 
         let result = dht
             .re_evaluate_admission(candidate, &candidate_ips, &|_| DEFAULT_NEUTRAL_TRUST)

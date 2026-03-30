@@ -1101,8 +1101,7 @@ impl P2PNode {
                     };
                     self.adaptive_dht
                         .trust_engine()
-                        .import_snapshot(&trust_snapshot)
-                        .await;
+                        .import_snapshot(&trust_snapshot);
                     info!(
                         "Loaded {} peers from close group cache (trust scores imported)",
                         cache.peers.len()
@@ -2026,16 +2025,21 @@ impl P2PNode {
 
         let peers: Vec<CachedCloseGroupPeer> = close_group
             .into_iter()
-            .map(|dht_node| {
+            .filter_map(|dht_node| {
                 let score = trust_engine.score(&dht_node.peer_id);
-                CachedCloseGroupPeer {
+                // Guard against NaN/Infinity — serde_json cannot round-trip
+                // non-finite f64 values, which would corrupt the cache file.
+                if !score.is_finite() {
+                    return None;
+                }
+                Some(CachedCloseGroupPeer {
                     peer_id: dht_node.peer_id,
                     addresses: dht_node.addresses,
                     trust: TrustRecord {
                         score,
                         last_updated_epoch_secs: now_epoch,
                     },
-                }
+                })
             })
             .collect();
 

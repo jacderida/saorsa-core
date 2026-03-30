@@ -242,6 +242,10 @@ pub struct DhtNetworkManager {
     shutdown: CancellationToken,
     /// Handle for the network event handler task
     event_handler_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the periodic self-lookup background task
+    self_lookup_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the periodic bucket refresh background task
+    bucket_refresh_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
@@ -399,6 +403,8 @@ impl DhtNetworkManager {
             bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
+            self_lookup_handle: Arc::new(RwLock::new(None)),
+            bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
         })
     }
@@ -491,8 +497,9 @@ impl DhtNetworkManager {
     fn spawn_self_lookup_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
+        let handle_slot = Arc::clone(&self.self_lookup_handle);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 let interval =
                     Self::randomised_interval(SELF_LOOKUP_INTERVAL_MIN, SELF_LOOKUP_INTERVAL_MAX);
@@ -510,6 +517,12 @@ impl DhtNetworkManager {
                 this.maybe_rebootstrap().await;
             }
         });
+        // Store handle synchronously — this runs once during start().
+        // Use try_write to avoid blocking; if contended, the handle is lost
+        // (acceptable: shutdown still signals via cancellation token).
+        if let Ok(mut guard) = handle_slot.try_write() {
+            *guard = Some(handle);
+        }
     }
 
     /// Spawn the periodic bucket refresh background task.
@@ -521,8 +534,9 @@ impl DhtNetworkManager {
     fn spawn_bucket_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
+        let handle_slot = Arc::clone(&self.bucket_refresh_handle);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(BUCKET_REFRESH_INTERVAL) => {}
@@ -581,6 +595,9 @@ impl DhtNetworkManager {
                 this.maybe_rebootstrap().await;
             }
         });
+        if let Ok(mut guard) = handle_slot.try_write() {
+            *guard = Some(handle);
+        }
     }
 
     /// Trigger an immediate self-lookup to refresh the close neighborhood.
@@ -735,14 +752,19 @@ impl DhtNetworkManager {
         // Signal background tasks to stop
         self.dht.read().await.signal_shutdown();
 
-        // Join the event handler task
-        if let Some(handle) = self.event_handler_handle.write().await.take() {
-            match handle.await {
-                Ok(()) => debug!("Event handler task stopped cleanly"),
-                Err(e) if e.is_cancelled() => debug!("Event handler task was cancelled"),
-                Err(e) => warn!("Event handler task panicked: {}", e),
+        // Join all background tasks
+        async fn join_task(name: &str, slot: &RwLock<Option<tokio::task::JoinHandle<()>>>) {
+            if let Some(handle) = slot.write().await.take() {
+                match handle.await {
+                    Ok(()) => debug!("{name} task stopped cleanly"),
+                    Err(e) if e.is_cancelled() => debug!("{name} task was cancelled"),
+                    Err(e) => warn!("{name} task panicked: {e}"),
+                }
             }
         }
+        join_task("event handler", &self.event_handler_handle).await;
+        join_task("self-lookup", &self.self_lookup_handle).await;
+        join_task("bucket refresh", &self.bucket_refresh_handle).await;
 
         info!("DHT Network Manager stopped");
         Ok(())
@@ -1060,6 +1082,7 @@ impl DhtNetworkManager {
                         let rt_events = dht.remove_node_by_id(&peer_id).await;
                         drop(dht);
                         self.broadcast_routing_events(&rt_events);
+                        let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
                         self.record_peer_success(&peer_id).await;
@@ -1218,23 +1241,19 @@ impl DhtNetworkManager {
 
     async fn record_peer_success(&self, peer_id: &PeerId) {
         if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-                )
-                .await;
+            engine.update_node_stats(
+                peer_id,
+                crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
+            );
         }
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
         if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::FailedResponse,
-                )
-                .await;
+            engine.update_node_stats(
+                peer_id,
+                crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+            );
 
             // Immediately evict and disconnect if trust has crossed the block threshold
             if self.config.block_threshold > 0.0
@@ -2409,20 +2428,16 @@ impl DhtNetworkManager {
         // Record trust events for revalidation outcomes.
         if let Some(ref engine) = self.trust_engine {
             for peer_id in &retained_peers {
-                engine
-                    .update_node_stats(
-                        peer_id,
-                        crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-                    )
-                    .await;
+                engine.update_node_stats(
+                    peer_id,
+                    crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
+                );
             }
             for peer_id in &evicted_peers {
-                engine
-                    .update_node_stats(
-                        peer_id,
-                        crate::adaptive::NodeStatisticsUpdate::FailedResponse,
-                    )
-                    .await;
+                engine.update_node_stats(
+                    peer_id,
+                    crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+                );
             }
         }
 

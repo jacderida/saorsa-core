@@ -231,7 +231,7 @@ async fn removing_peer_resets_to_neutral() {
     assert!(node.peer_trust(&peer) < NEUTRAL_TRUST);
 
     // Remove via engine
-    node.trust_engine().remove_node(&peer).await;
+    node.trust_engine().remove_node(&peer);
 
     let score = node.peer_trust(&peer);
     assert!(

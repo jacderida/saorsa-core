@@ -180,8 +180,8 @@ impl TrustEngine {
     }
 
     /// Record a peer interaction outcome
-    pub async fn update_node_stats(&self, node_id: &PeerId, update: NodeStatisticsUpdate) {
-        self.update_node_stats_weighted(node_id, update, 1.0).await;
+    pub fn update_node_stats(&self, node_id: &PeerId, update: NodeStatisticsUpdate) {
+        self.update_node_stats_weighted(node_id, update, 1.0);
     }
 
     /// Record a peer interaction outcome with an explicit weight.
@@ -189,7 +189,7 @@ impl TrustEngine {
     /// Weight `1.0` is equivalent to a single internal event. Higher weights
     /// amplify the observation's influence on the EMA. The caller is responsible
     /// for validating/clamping the weight before calling this method.
-    pub async fn update_node_stats_weighted(
+    pub fn update_node_stats_weighted(
         &self,
         node_id: &PeerId,
         update: NodeStatisticsUpdate,
@@ -223,7 +223,7 @@ impl TrustEngine {
     }
 
     /// Remove a peer from the trust system entirely
-    pub async fn remove_node(&self, node_id: &PeerId) {
+    pub fn remove_node(&self, node_id: &PeerId) {
         let mut peers = self.peers.write();
         peers.remove(node_id);
     }
@@ -232,7 +232,7 @@ impl TrustEngine {
     ///
     /// Applies decay to all scores before exporting so the snapshot
     /// reflects the current effective scores.
-    pub async fn export_snapshot(&self) -> TrustSnapshot {
+    pub fn export_snapshot(&self) -> TrustSnapshot {
         let peers_guard = self.peers.read();
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -259,7 +259,7 @@ impl TrustEngine {
     /// not run while our node is offline — we can't observe peer behavior
     /// during downtime, so penalising peers for our absence would be wrong.
     /// Decay resumes naturally from the moment the node restarts.
-    pub async fn import_snapshot(&self, snapshot: &TrustSnapshot) {
+    pub fn import_snapshot(&self, snapshot: &TrustSnapshot) {
         let mut peers_guard = self.peers.write();
 
         for (peer_id, record) in &snapshot.peers {
@@ -315,9 +315,7 @@ mod tests {
         let peer = PeerId::random();
 
         for _ in 0..50 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         }
 
         let score = engine.score(&peer);
@@ -334,9 +332,7 @@ mod tests {
         let peer = PeerId::random();
 
         for _ in 0..50 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
 
         let score = engine.score(&peer);
@@ -354,9 +350,7 @@ mod tests {
 
         // Many successes — should not exceed MAX
         for _ in 0..1000 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         }
         let score = engine.score(&peer);
         assert!(score >= MIN_TRUST_SCORE, "Score {score} below min");
@@ -364,9 +358,7 @@ mod tests {
 
         // Many failures — should not go below MIN
         for _ in 0..2000 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let score = engine.score(&peer);
         assert!(score >= MIN_TRUST_SCORE, "Score {score} below min");
@@ -378,12 +370,10 @@ mod tests {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         assert!(engine.score(&peer) < DEFAULT_NEUTRAL_TRUST);
 
-        engine.remove_node(&peer).await;
+        engine.remove_node(&peer);
         assert!((engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON);
     }
 
@@ -393,16 +383,12 @@ mod tests {
         let peer = PeerId::random();
 
         // First failure moves score below neutral
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         let after_fail = engine.score(&peer);
         assert!(after_fail < DEFAULT_NEUTRAL_TRUST);
 
         // A success moves it back up (but not all the way to neutral)
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         let after_success = engine.score(&peer);
         assert!(after_success > after_fail, "Success should increase score");
     }
@@ -462,26 +448,22 @@ mod tests {
 
         // Build up some trust
         for _ in 0..20 {
-            engine
-                .update_node_stats(&peer1, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer1, NodeStatisticsUpdate::CorrectResponse);
         }
         for _ in 0..10 {
-            engine
-                .update_node_stats(&peer2, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer2, NodeStatisticsUpdate::FailedResponse);
         }
 
         let score1_before = engine.score(&peer1);
         let score2_before = engine.score(&peer2);
 
         // Export
-        let snapshot = engine.export_snapshot().await;
+        let snapshot = engine.export_snapshot();
         assert_eq!(snapshot.peers.len(), 2);
 
         // Import into fresh engine
         let engine2 = TrustEngine::new();
-        engine2.import_snapshot(&snapshot).await;
+        engine2.import_snapshot(&snapshot);
 
         let score1_after = engine2.score(&peer1);
         let score2_after = engine2.score(&peer2);
@@ -520,7 +502,7 @@ mod tests {
         };
 
         let engine = TrustEngine::new();
-        engine.import_snapshot(&snapshot).await;
+        engine.import_snapshot(&snapshot);
 
         let score = engine.score(&peer);
         // Score should be restored at 0.9 — offline time doesn't decay
@@ -544,7 +526,7 @@ mod tests {
         };
 
         let engine = TrustEngine::new();
-        engine.import_snapshot(&snapshot).await;
+        engine.import_snapshot(&snapshot);
 
         let score = engine.score(&peer);
         assert!(
@@ -571,7 +553,7 @@ mod tests {
         };
 
         let engine = TrustEngine::new();
-        engine.import_snapshot(&snapshot).await;
+        engine.import_snapshot(&snapshot);
 
         let score = engine.score(&peer);
         assert!(
@@ -597,9 +579,7 @@ mod tests {
         let before = engine.score(&peer);
 
         // Attempt a failure with negative weight — should be rejected
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, -5.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, -5.0);
         let after_negative = engine.score(&peer);
         assert!(
             (before - after_negative).abs() < f64::EPSILON,
@@ -607,9 +587,7 @@ mod tests {
         );
 
         // Attempt a success with negative weight — also a no-op
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, -1.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, -1.0);
         let after_negative_success = engine.score(&peer);
         assert!(
             (before - after_negative_success).abs() < f64::EPSILON,
@@ -617,9 +595,7 @@ mod tests {
         );
 
         // Confirm normal weight still works after negative attempts
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0);
         let after_valid = engine.score(&peer);
         assert!(
             after_valid < before,
@@ -635,15 +611,11 @@ mod tests {
         let peer_b = PeerId::random();
 
         // Unit-weight failure for peer A
-        engine
-            .update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0)
-            .await;
+        engine.update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0);
         let score_a = engine.score(&peer_a);
 
         // Weight-5 failure for peer B
-        engine
-            .update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0)
-            .await;
+        engine.update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0);
         let score_b = engine.score(&peer_b);
 
         assert!(
@@ -659,12 +631,8 @@ mod tests {
         let engine2 = TrustEngine::new();
         let peer = PeerId::random();
 
-        engine1
-            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-            .await;
-        engine2
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0)
-            .await;
+        engine1.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
+        engine2.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0);
 
         let diff = (engine1.score(&peer) - engine2.score(&peer)).abs();
         assert!(
@@ -694,9 +662,7 @@ mod tests {
         // Repeated weight-3 failures from neutral (0.5) should push well below 0.15.
         let failure_count = 10;
         for _ in 0..failure_count {
-            engine
-                .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
-                .await;
+            engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0);
         }
 
         let score = engine.score(&peer);
@@ -718,9 +684,7 @@ mod tests {
         let peer = PeerId::random();
 
         // Internal success (unit weight)
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         let after_success = engine.score(&peer);
         assert!(
             after_success > DEFAULT_NEUTRAL_TRUST,
@@ -728,9 +692,7 @@ mod tests {
         );
 
         // Consumer failure with weight 3 — should outweigh the single success
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0);
         let after_failure = engine.score(&peer);
 
         assert!(
@@ -755,15 +717,9 @@ mod tests {
         let peer = PeerId::random();
 
         // Mix of internal and consumer events
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-            .await;
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 2.0)
-            .await;
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 2.0);
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
 
         // Score should reflect the combined influence, not just internal events.
         let score = engine.score(&peer);
@@ -788,9 +744,7 @@ mod tests {
         let peer = PeerId::random();
 
         // Apply a consumer failure with weight 3
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0);
         let after_failure = engine.score(&peer);
         assert!(
             after_failure < DEFAULT_NEUTRAL_TRUST,
@@ -830,9 +784,7 @@ mod tests {
 
         // Start below trust protection with some failures
         for _ in 0..5 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let low_score = engine.score(&peer);
         assert!(
@@ -843,9 +795,7 @@ mod tests {
         // Consumer-reported successes with weight 3 should lift the score
         let success_rounds = 30;
         for _ in 0..success_rounds {
-            engine
-                .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 3.0)
-                .await;
+            engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 3.0);
         }
         let restored_score = engine.score(&peer);
         assert!(

@@ -26,12 +26,14 @@ use std::num::NonZeroUsize;
 /// Maximum subnet tracking entries before evicting oldest (prevents memory DoS)
 const BOOTSTRAP_MAX_TRACKED_SUBNETS: usize = 50_000;
 
-/// Default exact-IP limit for `BootstrapIpLimiter`.
-/// Used when `IPDiversityConfig::max_per_ip` is `None`.
-const BOOTSTRAP_DEFAULT_IP_LIMIT: usize = 2;
+/// Max nodes sharing an exact IP address per bucket/close-group.
+/// Used by both `DhtCoreEngine` and `BootstrapIpLimiter` when
+/// `IPDiversityConfig::max_per_ip` is `None`.
+pub const IP_EXACT_LIMIT: usize = 2;
 
 /// Default K value for `BootstrapIpLimiter` when the actual K is not known
 /// (e.g. standalone test construction). Matches `DHTConfig::DEFAULT_K_VALUE`.
+#[cfg(test)]
 const DEFAULT_K_VALUE: usize = 20;
 
 /// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
@@ -150,7 +152,11 @@ pub struct BootstrapIpLimiter {
 
 impl BootstrapIpLimiter {
     /// Create a new IP diversity enforcer with loopback disabled and default K.
-    #[allow(dead_code)]
+    ///
+    /// Uses [`DEFAULT_K_VALUE`] — production code should prefer
+    /// [`with_loopback_and_k`](Self::with_loopback_and_k) to stay consistent
+    /// with the configured bucket size.
+    #[cfg(test)]
     pub fn new(config: IPDiversityConfig) -> Self {
         Self::with_loopback(config, false)
     }
@@ -158,8 +164,10 @@ impl BootstrapIpLimiter {
     /// Create a new IP diversity enforcer with explicit loopback setting and
     /// default K value.
     ///
-    /// `allow_loopback` should come from the single source of truth
-    /// (e.g. `NodeConfig.allow_loopback`), not from the diversity config.
+    /// Uses [`DEFAULT_K_VALUE`] — production code should prefer
+    /// [`with_loopback_and_k`](Self::with_loopback_and_k) to stay consistent
+    /// with the configured bucket size.
+    #[cfg(test)]
     pub fn with_loopback(config: IPDiversityConfig, allow_loopback: bool) -> Self {
         Self::with_loopback_and_k(config, allow_loopback, DEFAULT_K_VALUE)
     }
@@ -216,7 +224,7 @@ impl BootstrapIpLimiter {
             return false;
         }
 
-        let ip_limit = self.config.max_per_ip.unwrap_or(BOOTSTRAP_DEFAULT_IP_LIMIT);
+        let ip_limit = self.config.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
         let subnet_limit = self
             .config
             .max_per_subnet

@@ -143,7 +143,7 @@ impl AdaptiveDHT {
     ///
     /// # Errors
     ///
-    /// Returns an error if `block_threshold` is not in `[0.0, 1.0]` or if
+    /// Returns an error if `block_threshold` is not in `[0.0, 0.5)` or if
     /// the underlying `DhtNetworkManager` fails to initialise.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -187,22 +187,17 @@ impl AdaptiveDHT {
                 // called with an invalid weight.
                 if weight > 0.0 {
                     let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
-                    let is_success = matches!(event, TrustEvent::ApplicationSuccess(_));
-                    let update = if is_success {
-                        NodeStatisticsUpdate::CorrectResponse
-                    } else {
-                        NodeStatisticsUpdate::FailedResponse
-                    };
-                    self.trust_engine
-                        .update_node_stats_weighted(peer_id, update, clamped_weight)
-                        .await;
+                    self.trust_engine.update_node_stats_weighted(
+                        peer_id,
+                        event.to_stats_update(),
+                        clamped_weight,
+                    );
                 }
             }
             _ => {
                 // Internal events: unit weight
                 self.trust_engine
-                    .update_node_stats(peer_id, event.to_stats_update())
-                    .await;
+                    .update_node_stats(peer_id, event.to_stats_update());
             }
         }
 
@@ -373,9 +368,7 @@ mod tests {
 
         // Record successes — score should rise above neutral
         for _ in 0..10 {
-            engine
-                .update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update())
-                .await;
+            engine.update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update());
         }
 
         assert!(engine.score(&peer) > DEFAULT_NEUTRAL_TRUST);
@@ -389,9 +382,7 @@ mod tests {
 
         // Record only failures — score should be 0.0 immediately
         for _ in 0..20 {
-            engine
-                .update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update())
-                .await;
+            engine.update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update());
         }
 
         let trust = engine.score(&bad_peer);
@@ -408,9 +399,7 @@ mod tests {
         let peer = PeerId::random();
 
         for _ in 0..100 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         }
 
         let score = engine.score(&peer);
@@ -454,9 +443,7 @@ mod tests {
 
         // Phase 2: Some successes — peer is trusted
         for _ in 0..20 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         }
         let good_score = engine.score(&peer);
         assert!(
@@ -466,9 +453,7 @@ mod tests {
 
         // Phase 3: Peer starts failing — score drops
         for _ in 0..200 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let bad_score = engine.score(&peer);
         assert!(
@@ -497,9 +482,7 @@ mod tests {
 
         // Peer with some successes — above threshold
         for _ in 0..5 {
-            engine
-                .update_node_stats(&peer_above, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer_above, NodeStatisticsUpdate::CorrectResponse);
         }
         assert!(
             engine.score(&peer_above) >= threshold,
@@ -508,9 +491,7 @@ mod tests {
 
         // Peer with only failures — below threshold
         for _ in 0..50 {
-            engine
-                .update_node_stats(&peer_below, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer_below, NodeStatisticsUpdate::FailedResponse);
         }
         assert!(
             engine.score(&peer_below) < threshold,
@@ -531,9 +512,7 @@ mod tests {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        engine
-            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-            .await;
+        engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
 
         // A single failure from neutral (0.5) should give ~0.45, still above 0.15
         assert!(
@@ -551,17 +530,13 @@ mod tests {
 
         // Build up trust
         for _ in 0..50 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse);
         }
         let trusted_score = engine.score(&peer);
 
         // A few failures shouldn't block
         for _ in 0..3 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
 
         assert!(
@@ -583,14 +558,12 @@ mod tests {
 
         // Block the peer
         for _ in 0..100 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         assert!(engine.score(&peer) < DEFAULT_BLOCK_THRESHOLD);
 
         // Remove and check — should be back to neutral
-        engine.remove_node(&peer).await;
+        engine.remove_node(&peer);
         assert!(
             (engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
             "Removed peer should return to neutral"
@@ -608,9 +581,7 @@ mod tests {
         let peer = PeerId::random();
 
         let before = engine.score(&peer);
-        engine
-            .update_node_stats(&peer, TrustEvent::ApplicationSuccess(1.0).to_stats_update())
-            .await;
+        engine.update_node_stats(&peer, TrustEvent::ApplicationSuccess(1.0).to_stats_update());
         let after = engine.score(&peer);
 
         assert!(
@@ -626,12 +597,8 @@ mod tests {
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
 
-        engine
-            .update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0)
-            .await;
-        engine
-            .update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0)
-            .await;
+        engine.update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0);
+        engine.update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0);
 
         assert!(
             engine.score(&peer_b) < engine.score(&peer_a),
@@ -650,9 +617,7 @@ mod tests {
         // Zero weight should be a no-op (but this is validated in AdaptiveDHT,
         // not TrustEngine directly). If called on TrustEngine with weight 0,
         // the EMA formula with weight=0 produces alpha_w=0, so score stays unchanged.
-        engine
-            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 0.0)
-            .await;
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 0.0);
         let after_zero = engine.score(&peer);
 
         // With weight 0: alpha_w = 1 - (1-0.1)^0 = 1 - 1 = 0, so no change
@@ -684,23 +649,19 @@ mod tests {
         let peer_unclamped = PeerId::random();
 
         // Weight 5 (MAX_CONSUMER_WEIGHT) for peer_clamped
-        engine
-            .update_node_stats_weighted(
-                &peer_clamped,
-                NodeStatisticsUpdate::FailedResponse,
-                MAX_CONSUMER_WEIGHT,
-            )
-            .await;
+        engine.update_node_stats_weighted(
+            &peer_clamped,
+            NodeStatisticsUpdate::FailedResponse,
+            MAX_CONSUMER_WEIGHT,
+        );
         let score_at_max = engine.score(&peer_clamped);
 
         // Weight 100 (should NOT be clamped at TrustEngine level) for peer_unclamped
-        engine
-            .update_node_stats_weighted(
-                &peer_unclamped,
-                NodeStatisticsUpdate::FailedResponse,
-                100.0,
-            )
-            .await;
+        engine.update_node_stats_weighted(
+            &peer_unclamped,
+            NodeStatisticsUpdate::FailedResponse,
+            100.0,
+        );
         let score_at_100 = engine.score(&peer_unclamped);
 
         assert!(
@@ -726,9 +687,7 @@ mod tests {
         // First, build the peer up to just barely above the block threshold.
         // From neutral (0.5), a few failures bring the score down.
         for _ in 0..5 {
-            engine
-                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
-                .await;
+            engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let score_before = engine.score(&peer);
         // Should still be above block threshold after just 5 unit failures from 0.5.
@@ -739,13 +698,11 @@ mod tests {
 
         // A heavy consumer failure should push it below the block threshold.
         for _ in 0..10 {
-            engine
-                .update_node_stats_weighted(
-                    &peer,
-                    NodeStatisticsUpdate::FailedResponse,
-                    MAX_CONSUMER_WEIGHT,
-                )
-                .await;
+            engine.update_node_stats_weighted(
+                &peer,
+                NodeStatisticsUpdate::FailedResponse,
+                MAX_CONSUMER_WEIGHT,
+            );
         }
         let score_after = engine.score(&peer);
         assert!(
