@@ -1264,6 +1264,25 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Evict a blocked peer from the routing table, cancel in-flight RPCs,
+    /// and disconnect at the transport layer.
+    ///
+    /// Unlike [`record_peer_failure`], this does NOT record a trust event —
+    /// the caller has already updated the trust score (e.g. via
+    /// `AdaptiveDHT::report_trust_event`). This avoids double-counting.
+    pub(crate) async fn evict_blocked_peer(&self, peer_id: &PeerId) {
+        let mut dht = self.dht.write().await;
+        let rt_events = dht.remove_node_by_id(peer_id).await;
+        drop(dht);
+        self.broadcast_routing_events(&rt_events);
+        self.cancel_operations_for_peer(peer_id);
+        let _ = self.transport.disconnect_peer(peer_id).await;
+        tracing::info!(
+            peer = peer_id.to_hex(),
+            "Evicted blocked peer (consumer trust event)"
+        );
+    }
+
     /// Check if a peer's trust score is below the block threshold.
     ///
     /// Returns `true` if the peer should be blocked (trust too low).

@@ -200,6 +200,15 @@ impl AdaptiveDHT {
                     .await;
             }
         }
+
+        // Block check (Design Section 13.1 step 5): if the score crossed
+        // below BLOCK_THRESHOLD, evict the peer from the routing table,
+        // cancel in-flight RPCs, and disconnect at the transport layer.
+        if self.config.block_threshold > 0.0
+            && self.trust_engine.score(peer_id) < self.config.block_threshold
+        {
+            self.dht_manager.evict_blocked_peer(peer_id).await;
+        }
     }
 
     /// Get the current trust score for a peer (synchronous).
