@@ -64,6 +64,7 @@ saorsa-transport = "0.30.1"
 dirs = "6.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 lru = "0.16"
+tempfile = "3.17"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)

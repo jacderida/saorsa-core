@@ -315,7 +315,7 @@ async fn trust_removal_unblocks_peer() {
     );
 
     // Remove from trust engine → reset to neutral
-    node.trust_engine().remove_node(&peer).await;
+    node.trust_engine().remove_node(&peer);
     assert!((node.peer_trust(&peer) - 0.5).abs() < f64::EPSILON);
 
     // Should no longer be blocked

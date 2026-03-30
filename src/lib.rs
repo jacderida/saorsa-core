@@ -60,12 +60,17 @@ pub mod identity;
 pub use address::MultiAddr;
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
+// DHT types — peer discovery, routing, and network events
+pub use dht::Key;
+pub use dht_network_manager::{DHTNode, DhtNetworkEvent};
+
 // Bootstrap
 pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
+pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
 
 // Trust & Adaptive DHT
 pub use adaptive::dht::{AdaptiveDhtConfig, TrustEvent};
-pub use adaptive::trust::TrustEngine;
+pub use adaptive::trust::{TrustEngine, TrustRecord};
 
 // Security
 pub use security::IPDiversityConfig;

@@ -17,25 +17,15 @@
 //! Uses saorsa-transport's BootstrapCache internally with additional Sybil protection
 //! via rate limiting and IP diversity enforcement.
 
+pub mod cache;
 pub mod manager;
 
 // Re-export the primary BootstrapManager (wraps saorsa-transport)
 pub use manager::BootstrapManager;
 pub use manager::{BootstrapConfig, BootstrapStats};
 
-use std::net::IpAddr;
-use std::net::Ipv6Addr;
-
-/// Convert an IP address to IPv6
-///
-/// IPv4 addresses are converted to IPv6-mapped format (::ffff:a.b.c.d)
-/// IPv6 addresses are returned as-is
-pub fn ip_to_ipv6(ip: &IpAddr) -> Ipv6Addr {
-    match ip {
-        IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
-        IpAddr::V6(ipv6) => *ipv6,
-    }
-}
+// Re-export close group cache types
+pub use cache::{CachedCloseGroupPeer, CloseGroupCache};
 
 #[cfg(test)]
 mod tests {

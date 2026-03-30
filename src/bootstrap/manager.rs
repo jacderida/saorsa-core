@@ -21,8 +21,9 @@
 //! All core caching functionality is delegated to saorsa-transport.
 
 use crate::error::BootstrapError;
+use crate::network::DHTConfig;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
-use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
+use crate::security::{BootstrapIpLimiter, IPDiversityConfig};
 use crate::{P2PError, Result};
 use parking_lot::Mutex;
 use saorsa_transport::bootstrap_cache::{
@@ -68,15 +69,16 @@ impl Default for BootstrapConfig {
 pub struct BootstrapManager {
     cache: Arc<AntBootstrapCache>,
     rate_limiter: JoinRateLimiter,
-    diversity_enforcer: Mutex<IPDiversityEnforcer>,
+    ip_limiter: Mutex<BootstrapIpLimiter>,
     diversity_config: IPDiversityConfig,
     maintenance_handle: Option<JoinHandle<()>>,
 }
 
 impl BootstrapManager {
-    async fn with_config_and_loopback(
+    async fn with_config_loopback_and_k(
         config: BootstrapConfig,
         allow_loopback: bool,
+        k_value: usize,
     ) -> Result<Self> {
         let ant_config = BootstrapCacheConfig::builder()
             .cache_dir(&config.cache_dir)
@@ -93,9 +95,10 @@ impl BootstrapManager {
         Ok(Self {
             cache: Arc::new(cache),
             rate_limiter: JoinRateLimiter::new(config.rate_limit),
-            diversity_enforcer: Mutex::new(IPDiversityEnforcer::with_loopback(
+            ip_limiter: Mutex::new(BootstrapIpLimiter::with_loopback_and_k(
                 config.diversity.clone(),
                 allow_loopback,
+                k_value,
             )),
             diversity_config: config.diversity,
             maintenance_handle: None,
@@ -109,14 +112,15 @@ impl BootstrapManager {
 
     /// Create a new bootstrap manager with custom configuration
     pub async fn with_config(config: BootstrapConfig) -> Result<Self> {
-        Self::with_config_and_loopback(config, false).await
+        Self::with_config_loopback_and_k(config, false, DHTConfig::DEFAULT_K_VALUE).await
     }
 
     /// Create a new bootstrap manager from a `BootstrapConfig` and a `NodeConfig`.
     ///
     /// Derives the loopback policy from `node_config.allow_loopback` and merges
     /// the node-level `diversity_config` (if set) so the transport and bootstrap
-    /// layers stay consistent.
+    /// layers stay consistent. Passes `k_value` through so bootstrap subnet
+    /// limits match the routing table.
     pub async fn with_node_config(
         mut config: BootstrapConfig,
         node_config: &crate::network::NodeConfig,
@@ -124,7 +128,12 @@ impl BootstrapManager {
         if let Some(ref diversity) = node_config.diversity_config {
             config.diversity = diversity.clone();
         }
-        Self::with_config_and_loopback(config, node_config.allow_loopback).await
+        Self::with_config_loopback_and_k(
+            config,
+            node_config.allow_loopback,
+            node_config.dht_config.k_value,
+        )
+        .await
     }
 
     /// Start background maintenance tasks (delegated to saorsa-transport)
@@ -160,17 +169,9 @@ impl BootstrapManager {
         })?;
 
         // IP diversity check (scoped to avoid holding lock across await)
-        let ipv6 = super::ip_to_ipv6(&ip);
         {
-            let mut diversity = self.diversity_enforcer.lock();
-            let analysis = diversity.analyze_ip(ipv6).map_err(|e| {
-                warn!("IP analysis failed for {}: {}", ip, e);
-                P2PError::Bootstrap(BootstrapError::InvalidData(
-                    format!("IP analysis failed: {e}").into(),
-                ))
-            })?;
-
-            if !diversity.can_accept_node(&analysis) {
+            let mut diversity = self.ip_limiter.lock();
+            if !diversity.can_accept(ip) {
                 warn!("IP diversity limit exceeded for {}", ip);
                 return Err(P2PError::Bootstrap(BootstrapError::RateLimited(
                     "IP diversity limits exceeded".to_string().into(),
@@ -178,7 +179,7 @@ impl BootstrapManager {
             }
 
             // Track in diversity enforcer
-            if let Err(e) = diversity.add_node(&analysis) {
+            if let Err(e) = diversity.track(ip) {
                 warn!("Failed to track IP diversity for {}: {}", ip, e);
             }
         } // Lock released here before await
@@ -328,7 +329,8 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        // Use a non-loopback address — loopback is rejected when allow_loopback=false
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
 
         // Add peer
         let result = manager.add_peer(&addr, vec![addr]).await;
@@ -345,7 +347,7 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
         let result = manager.add_peer(&addr, vec![]).await;
 
         assert!(result.is_err());
@@ -534,21 +536,8 @@ mod tests {
         // Very restrictive rate limiting - only 2 joins per /24 subnet per hour
         // Use permissive diversity config to isolate rate limiting behavior
         let diversity_config = IPDiversityConfig {
-            max_nodes_per_ipv6_64: 100,
-            max_nodes_per_ipv6_48: 100,
-            max_nodes_per_ipv6_32: 100,
-            max_nodes_per_ipv4_32: None, // No static cap for rate limit test
-            max_nodes_per_ipv4_24: None,
-            max_nodes_per_ipv4_16: None,
-            ipv4_limit_floor: None,
-            ipv4_limit_ceiling: None,
-            ipv6_limit_floor: None,
-            ipv6_limit_ceiling: None,
-            max_per_ip_cap: 100,
-            max_network_fraction: 1.0,
-            max_nodes_per_asn: 1000,
-            enable_geolocation_check: false,
-            min_geographic_diversity: 0,
+            max_per_ip: Some(usize::MAX),
+            max_per_subnet: Some(usize::MAX),
         };
 
         let config = BootstrapConfig {

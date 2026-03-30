@@ -21,14 +21,17 @@
 use crate::{
     P2PError, PeerId, Result,
     adaptive::TrustEngine,
+    adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
     dht::core_engine::NodeInfo,
-    dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
+    dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -48,9 +51,6 @@ const MAX_CANDIDATE_NODES: usize = 200;
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Number of closest nodes to return in DHT lookups (Kademlia K parameter)
-const DHT_CLOSEST_NODES_COUNT: usize = 8;
-
 /// Request timeout for DHT message handlers (30 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
@@ -63,6 +63,36 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 /// Maximum time to wait for the identity-exchange handshake after dialling
 /// a peer. The actual timeout is `min(request_timeout, this)`.
 const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time to wait for a stale peer's ping response during admission contention.
+const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum concurrent stale revalidation passes across all buckets.
+const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
+
+/// Maximum concurrent pings within a single stale revalidation pass.
+const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
+
+/// Consecutive non-improving iterations before a network lookup terminates.
+const LOOKUP_STAGNATION_LIMIT: usize = 3;
+
+/// Duration after which a bucket without activity is considered stale.
+const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
+
+/// Minimum self-lookup interval (randomized between min and max).
+const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Maximum self-lookup interval.
+const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Periodic refresh cadence for stale k-buckets.
+const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Routing table size below which automatic re-bootstrap is triggered.
+const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
+
+/// Minimum time between consecutive auto re-bootstrap attempts.
+const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
 /// DHT node representation for network operations.
 ///
@@ -85,9 +115,7 @@ pub type SerializableDHTNode = DHTNode;
 pub struct DhtNetworkConfig {
     /// This node's peer ID
     pub peer_id: PeerId,
-    /// DHT configuration
-    pub dht_config: DHTConfig,
-    /// Network node configuration
+    /// Network node configuration (includes DHT settings via `NodeConfig.dht_config`)
     pub node_config: NodeConfig,
     /// Request timeout for DHT operations
     pub request_timeout: Duration,
@@ -201,17 +229,32 @@ pub struct DhtNetworkManager {
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
+    /// Global semaphore limiting concurrent stale revalidation passes.
+    /// Prevents a flood of revalidation attempts from consuming excessive
+    /// resources when many buckets have stale peers simultaneously.
+    revalidation_semaphore: Arc<Semaphore>,
+    /// Per-bucket revalidation state: tracks active revalidation to prevent
+    /// concurrent revalidation passes on the same bucket.
+    /// Uses `parking_lot::Mutex` (not tokio) because it is never held across
+    /// `.await` and its `Drop`-based guard cleanup requires synchronous locking.
+    bucket_revalidation_active: Arc<parking_lot::Mutex<HashSet<usize>>>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
     event_handler_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the periodic self-lookup background task
+    self_lookup_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the periodic bucket refresh background task
+    bucket_refresh_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
+    /// cooldown to avoid hammering bootstrap peers during transient churn.
+    last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
 }
 
 /// DHT operation context
 ///
 /// Uses oneshot channel for response delivery to eliminate TOCTOU races.
 /// The sender is stored here; the receiver is held by wait_for_response().
-#[allow(dead_code)]
 struct DhtOperationContext {
     /// Operation type
     operation: DhtNetworkOperation,
@@ -248,6 +291,25 @@ pub enum DhtNetworkEvent {
     PeerDiscovered { peer_id: PeerId, dht_key: Key },
     /// DHT peer disconnected
     PeerDisconnected { peer_id: PeerId },
+    /// The K-closest peers to this node's own address have changed.
+    ///
+    /// Emitted after routing table mutations (peer added, removed, or evicted)
+    /// when the set of K-closest peers differs from the previous snapshot.
+    /// Callers implementing replication can use this to detect close-group
+    /// topology changes and trigger neighbor-sync or responsibility
+    /// recomputation.
+    KClosestPeersChanged {
+        /// K-closest peer IDs before the mutation.
+        old: Vec<PeerId>,
+        /// K-closest peer IDs after the mutation.
+        new: Vec<PeerId>,
+    },
+    /// New peer added to the routing table.
+    PeerAdded { peer_id: PeerId },
+    /// Peer removed from the routing table (eviction, blocking, or departure).
+    PeerRemoved { peer_id: PeerId },
+    /// Bootstrap process completed.
+    BootstrapComplete { num_peers: usize },
     /// DHT operation completed
     OperationCompleted {
         operation: String,
@@ -284,19 +346,33 @@ pub struct DhtNetworkStats {
     pub routing_table_size: usize,
 }
 
-impl DhtNetworkManager {
-    fn init_dht_core(local_peer_id: &PeerId, allow_loopback: bool) -> Result<DhtCoreEngine> {
-        DhtCoreEngine::new(*local_peer_id, allow_loopback)
-            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))
-    }
+/// RAII guard that removes a bucket index from the per-bucket revalidation set
+/// on drop, ensuring the slot is released even if the revalidation panics or
+/// returns early.
+struct BucketRevalidationGuard {
+    active: Arc<parking_lot::Mutex<HashSet<usize>>>,
+    bucket_idx: usize,
+}
 
+impl Drop for BucketRevalidationGuard {
+    fn drop(&mut self) {
+        self.active.lock().remove(&self.bucket_idx);
+    }
+}
+
+impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
         trust_engine: Option<Arc<TrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let mut dht_instance =
-            Self::init_dht_core(&config.peer_id, config.node_config.allow_loopback)?;
+        let mut dht_instance = DhtCoreEngine::new(
+            config.peer_id,
+            config.node_config.dht_config.k_value,
+            config.node_config.allow_loopback,
+            config.block_threshold,
+        )
+        .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
 
         // Propagate IP diversity settings from the node config into the DHT
         // core engine so diversity overrides take effect on routing table
@@ -323,9 +399,19 @@ impl DhtNetworkManager {
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
+            revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
+            bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
+            self_lookup_handle: Arc::new(RwLock::new(None)),
+            bucket_refresh_handle: Arc::new(RwLock::new(None)),
+            last_rebootstrap: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Kademlia K parameter — bucket size and lookup count.
+    fn k_value(&self) -> usize {
+        self.config.node_config.dht_config.k_value
     }
 
     /// Handle a FindNode request by returning the closest nodes from the local routing table.
@@ -339,9 +425,7 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
-        let candidate_nodes = self
-            .find_closest_nodes_local(key, DHT_CLOSEST_NODES_COUNT)
-            .await;
+        let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
         let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
 
         Ok(DhtNetworkResult::NodesFound {
@@ -397,8 +481,220 @@ impl DhtNetworkManager {
         // Reconcile peers that may have connected before event subscription.
         self.reconcile_connected_peers().await;
 
+        // Spawn periodic maintenance background tasks.
+        self.spawn_self_lookup_task();
+        self.spawn_bucket_refresh_task();
+
         info!("DHT Network Manager started successfully");
         Ok(())
+    }
+
+    /// Spawn the periodic self-lookup background task.
+    ///
+    /// Runs an iterative FIND_NODE(self) at a randomised interval between
+    /// [`SELF_LOOKUP_INTERVAL_MIN`] and [`SELF_LOOKUP_INTERVAL_MAX`] to keep
+    /// the close neighbourhood fresh and discover newly joined peers.
+    fn spawn_self_lookup_task(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let handle_slot = Arc::clone(&self.self_lookup_handle);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let interval =
+                    Self::randomised_interval(SELF_LOOKUP_INTERVAL_MIN, SELF_LOOKUP_INTERVAL_MAX);
+
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = shutdown.cancelled() => break,
+                }
+
+                if let Err(e) = this.trigger_self_lookup().await {
+                    warn!("Periodic self-lookup failed: {e}");
+                }
+
+                // Check if routing table is depleted after the self-lookup.
+                this.maybe_rebootstrap().await;
+            }
+        });
+        // Store handle synchronously — this runs once during start().
+        // Use try_write to avoid blocking; if contended, the handle is lost
+        // (acceptable: shutdown still signals via cancellation token).
+        if let Ok(mut guard) = handle_slot.try_write() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// Spawn the periodic bucket refresh background task.
+    ///
+    /// Every [`BUCKET_REFRESH_INTERVAL`], finds stale buckets (not refreshed
+    /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
+    /// a random key in each stale bucket's range. This populates stale buckets
+    /// with fresh peers.
+    fn spawn_bucket_refresh_task(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let handle_slot = Arc::clone(&self.bucket_refresh_handle);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(BUCKET_REFRESH_INTERVAL) => {}
+                    () = shutdown.cancelled() => break,
+                }
+
+                let stale_indices = this
+                    .dht
+                    .read()
+                    .await
+                    .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
+                    .await;
+
+                if stale_indices.is_empty() {
+                    trace!("Bucket refresh: no stale buckets");
+                    continue;
+                }
+
+                debug!("Bucket refresh: {} stale buckets", stale_indices.len());
+                let k = this.k_value();
+
+                for bucket_idx in stale_indices {
+                    let random_key = {
+                        let dht = this.dht.read().await;
+                        dht.generate_random_key_for_bucket(bucket_idx)
+                    };
+                    let Some(key) = random_key else {
+                        continue;
+                    };
+
+                    let key_bytes: Key = *key.as_bytes();
+                    match this.find_closest_nodes_network(&key_bytes, k).await {
+                        Ok(nodes) => {
+                            trace!(
+                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                nodes.len()
+                            );
+                            for dht_node in nodes {
+                                if dht_node.peer_id == this.config.peer_id {
+                                    continue;
+                                }
+                                if let Some(addr) =
+                                    Self::first_dialable_address(&dht_node.addresses)
+                                {
+                                    this.dial_candidate(&dht_node.peer_id, &addr).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
+                        }
+                    }
+                }
+
+                // Check if routing table is depleted after refresh.
+                this.maybe_rebootstrap().await;
+            }
+        });
+        if let Ok(mut guard) = handle_slot.try_write() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// Trigger an immediate self-lookup to refresh the close neighborhood.
+    ///
+    /// Performs an iterative FIND_NODE for this node's own key and attempts to
+    /// admit any newly discovered peers into the routing table.
+    pub async fn trigger_self_lookup(&self) -> Result<()> {
+        let self_id = self.config.peer_id;
+        let self_key: Key = *self_id.as_bytes();
+        let k = self.k_value();
+
+        match self.find_closest_nodes_network(&self_key, k).await {
+            Ok(nodes) => {
+                debug!("Self-lookup discovered {} peers", nodes.len());
+                for dht_node in nodes {
+                    if dht_node.peer_id == self_id {
+                        continue;
+                    }
+                    // Dial if not already connected
+                    if let Some(addr) = Self::first_dialable_address(&dht_node.addresses) {
+                        self.dial_candidate(&dht_node.peer_id, &addr).await;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Self-lookup failed: {e}");
+                Err(e)
+            }
+        }
+    }
+
+    /// Trigger automatic re-bootstrap if the routing table has fallen below
+    /// [`AUTO_REBOOTSTRAP_THRESHOLD`] and the cooldown has elapsed.
+    ///
+    /// Uses currently connected peers as bootstrap seeds. The cooldown prevents
+    /// hammering bootstrap nodes during transient network partitions.
+    async fn maybe_rebootstrap(&self) {
+        let rt_size = self.get_routing_table_size().await;
+        if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
+            return;
+        }
+
+        // Enforce cooldown to avoid bootstrap storms.
+        {
+            let mut guard = self.last_rebootstrap.lock().await;
+            if let Some(last) = *guard
+                && last.elapsed() < REBOOTSTRAP_COOLDOWN
+            {
+                trace!(
+                    "Auto re-bootstrap skipped: cooldown ({:?} remaining)",
+                    REBOOTSTRAP_COOLDOWN.saturating_sub(last.elapsed())
+                );
+                return;
+            }
+            *guard = Some(Instant::now());
+        }
+
+        info!(
+            "Auto re-bootstrap: routing table size ({rt_size}) below threshold ({})",
+            AUTO_REBOOTSTRAP_THRESHOLD
+        );
+
+        // Collect currently connected peers to use as bootstrap seeds.
+        let connected = self.transport.connected_peers().await;
+        if connected.is_empty() {
+            debug!("Auto re-bootstrap: no connected peers to bootstrap from");
+            return;
+        }
+
+        match self.bootstrap_from_peers(&connected).await {
+            Ok(discovered) => {
+                info!("Auto re-bootstrap discovered {discovered} peers");
+            }
+            Err(e) => {
+                warn!("Auto re-bootstrap failed: {e}");
+            }
+        }
+    }
+
+    /// Compute a randomised duration between `min` and `max`.
+    ///
+    /// Uses [`PeerId::random()`] as a cheap entropy source to avoid the `gen`
+    /// keyword reserved in Rust edition 2024. This is not cryptographically
+    /// secure but sufficient for jittering maintenance timers.
+    fn randomised_interval(min: Duration, max: Duration) -> Duration {
+        let range_secs = max.as_secs().saturating_sub(min.as_secs());
+        if range_secs == 0 {
+            return min;
+        }
+        let random_bytes = PeerId::random();
+        let bytes = random_bytes.to_bytes();
+        let random_value = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let jitter = Duration::from_secs(random_value % (range_secs + 1));
+        min + jitter
     }
 
     /// Perform DHT peer discovery from already-connected bootstrap peers.
@@ -427,6 +723,16 @@ impl DhtNetworkManager {
                 }
             }
         }
+
+        // Emit BootstrapComplete event with the current routing table size.
+        let rt_size = self.get_routing_table_size().await;
+        if self.event_tx.receiver_count() > 0 {
+            let _ = self
+                .event_tx
+                .send(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
+        }
+        info!("Bootstrap complete: routing table has {rt_size} peers");
+
         Ok(seen.len())
     }
 
@@ -446,14 +752,19 @@ impl DhtNetworkManager {
         // Signal background tasks to stop
         self.dht.read().await.signal_shutdown();
 
-        // Join the event handler task
-        if let Some(handle) = self.event_handler_handle.write().await.take() {
-            match handle.await {
-                Ok(()) => debug!("Event handler task stopped cleanly"),
-                Err(e) if e.is_cancelled() => debug!("Event handler task was cancelled"),
-                Err(e) => warn!("Event handler task panicked: {}", e),
+        // Join all background tasks
+        async fn join_task(name: &str, slot: &RwLock<Option<tokio::task::JoinHandle<()>>>) {
+            if let Some(handle) = slot.write().await.take() {
+                match handle.await {
+                    Ok(()) => debug!("{name} task stopped cleanly"),
+                    Err(e) if e.is_cancelled() => debug!("{name} task was cancelled"),
+                    Err(e) => warn!("{name} task panicked: {e}"),
+                }
             }
         }
+        join_task("event handler", &self.event_handler_handle).await;
+        join_task("self-lookup", &self.self_lookup_handle).await;
+        join_task("bucket refresh", &self.bucket_refresh_handle).await;
 
         info!("DHT Network Manager stopped");
         Ok(())
@@ -468,9 +779,7 @@ impl DhtNetworkManager {
     pub async fn find_node(&self, key: &Key) -> Result<DhtNetworkResult> {
         info!("Finding nodes closest to key: {}", hex::encode(key));
 
-        let closest_nodes = self
-            .find_closest_nodes_network(key, DHT_CLOSEST_NODES_COUNT * 2)
-            .await?;
+        let closest_nodes = self.find_closest_nodes_network(key, self.k_value()).await?;
         let serializable_nodes: Vec<SerializableDHTNode> = closest_nodes.into_iter().collect();
 
         info!(
@@ -568,6 +877,37 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Find closest nodes to a key using the local routing table, including
+    /// the local node itself in the candidate set.
+    ///
+    /// This is the self-inclusive variant of [`find_closest_nodes_local`] and
+    /// corresponds to `SelfInclusiveRT(N)` in replication designs — the local
+    /// routing table plus the local node. It allows callers to compute
+    /// `IsResponsible(self, K)` by checking whether self appears in the
+    /// top-N results.
+    ///
+    /// Results are sorted by XOR distance to the key and truncated to `count`.
+    pub async fn find_closest_nodes_local_with_self(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        // Get `count` routing-table peers, append self, sort, and truncate
+        // back to `count`. Self may displace the farthest peer.
+        let mut nodes = self.find_closest_nodes_local(key, count).await;
+
+        nodes.push(self.local_dht_node());
+
+        let key_peer = PeerId::from_bytes(*key);
+        nodes.sort_by(|a, b| {
+            let da = a.peer_id.xor_distance(&key_peer);
+            let db = b.peer_id.xor_distance(&key_peer);
+            da.cmp(&db)
+        });
+        nodes.truncate(count);
+        nodes
+    }
+
     /// Find closest nodes to a key using iterative network lookup.
     ///
     /// This implements Kademlia-style iterative lookup:
@@ -610,7 +950,8 @@ impl DhtNetworkManager {
                 candidates.push_back(node);
             }
         }
-        let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
+        let mut stagnation_counter: usize = 0;
+        let target_key = DhtKey::from_bytes(*key);
 
         for iteration in 0..MAX_ITERATIONS {
             if candidates.is_empty() {
@@ -621,14 +962,23 @@ impl DhtNetworkManager {
                 break;
             }
 
-            // Select up to ALPHA unqueried nodes to query
+            // Select up to ALPHA unqueried, non-blocked nodes to query
             let mut batch: Vec<DHTNode> = Vec::new();
             while batch.len() < ALPHA && !candidates.is_empty() {
                 if let Some(node) = candidates.pop_front() {
                     queued_peer_ids.remove(&node.peer_id);
-                    if !queried_nodes.contains(&node.peer_id) {
-                        batch.push(node);
+                    if queried_nodes.contains(&node.peer_id) {
+                        continue;
                     }
+                    // Skip peers whose trust score is below the block threshold
+                    if self.is_peer_blocked(&node.peer_id) {
+                        trace!(
+                            "[NETWORK] Skipping blocked peer {} in lookup",
+                            node.peer_id.to_hex()
+                        );
+                        continue;
+                    }
+                    batch.push(node);
                 }
             }
 
@@ -645,6 +995,9 @@ impl DhtNetworkManager {
                 iteration,
                 batch.len()
             );
+
+            // Capture the closest distance before this iteration for stagnation detection.
+            let pre_iteration_closest = best_nodes.first().map(|n| n.peer_id.distance(&target_key));
 
             // Query nodes in parallel
             // saorsa-transport connection multiplexing lets us keep a single transport socket
@@ -669,17 +1022,21 @@ impl DhtNetworkManager {
 
             let results = futures::future::join_all(query_futures).await;
 
-            let mut found_new_closer = false;
             for (peer_id, result) in results {
                 queried_nodes.insert(peer_id);
 
                 match result {
-                    Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
+                    Ok(DhtNetworkResult::NodesFound { mut nodes, .. }) => {
                         self.record_peer_success(&peer_id).await;
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
+                        // Truncate response to K closest to the lookup key to
+                        // limit amplification from a single response and bound
+                        // per-iteration memory growth.
+                        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+                        nodes.truncate(self.k_value());
                         for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
                                 || queued_peer_ids.contains(&node.peer_id)
@@ -710,7 +1067,6 @@ impl DhtNetworkManager {
                                 }
                                 queued_peer_ids.insert(node.peer_id);
                                 candidates.push_back(node);
-                                found_new_closer = true;
                             }
                         }
                     }
@@ -723,7 +1079,10 @@ impl DhtNetworkManager {
                             peer_id.to_hex()
                         );
                         let mut dht = self.dht.write().await;
-                        dht.remove_node_by_id(&peer_id).await;
+                        let rt_events = dht.remove_node_by_id(&peer_id).await;
+                        drop(dht);
+                        self.broadcast_routing_events(&rt_events);
+                        let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
                         self.record_peer_success(&peer_id).await;
@@ -734,7 +1093,15 @@ impl DhtNetworkManager {
                     }
                     Err(e) => {
                         trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
-                        self.record_peer_failure(&peer_id).await;
+                        // Skip trust recording for cancelled operations — the
+                        // blocking decision has already been made (Section 7.4 step 2a).
+                        if !matches!(
+                            e,
+                            P2PError::Network(NetworkError::OperationCancelled(_))
+                                | P2PError::Network(NetworkError::PeerBlocked(_))
+                        ) {
+                            self.record_peer_failure(&peer_id).await;
+                        }
                         // Don't add failed nodes to best_nodes - they are unresponsive
                     }
                 }
@@ -745,24 +1112,32 @@ impl DhtNetworkManager {
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
-            if !found_new_closer {
-                info!("[NETWORK] Converged after {} iterations", iteration + 1);
-                break;
-            }
+            // Stagnation detection: if the closest peer in best_nodes is
+            // strictly closer than before this iteration, reset the counter;
+            // otherwise increment it. Stop after LOOKUP_STAGNATION_LIMIT
+            // consecutive non-improving iterations.
+            let post_iteration_closest =
+                best_nodes.first().map(|n| n.peer_id.distance(&target_key));
 
-            let snapshot: BTreeSet<PeerId> = queued_peer_ids.iter().cloned().collect();
-            if let Some(previous) = &previous_candidate_snapshot
-                && !snapshot.is_empty()
-                && *previous == snapshot
-            {
-                info!(
-                    "[NETWORK] {}: Candidate set stagnated after {} iterations, stopping",
-                    self.config.peer_id.to_hex(),
-                    iteration + 1
-                );
-                break;
+            let improved = match (&pre_iteration_closest, &post_iteration_closest) {
+                (Some(before), Some(after)) => after < before,
+                (None, Some(_)) => true, // went from empty to having a result
+                _ => false,
+            };
+
+            if improved {
+                stagnation_counter = 0;
+            } else {
+                stagnation_counter += 1;
+                if stagnation_counter >= LOOKUP_STAGNATION_LIMIT {
+                    info!(
+                        "[NETWORK] Lookup stagnated after {} non-improving iterations (iteration {})",
+                        LOOKUP_STAGNATION_LIMIT,
+                        iteration + 1
+                    );
+                    break;
+                }
             }
-            previous_candidate_snapshot = Some(snapshot);
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
@@ -866,31 +1241,31 @@ impl DhtNetworkManager {
 
     async fn record_peer_success(&self, peer_id: &PeerId) {
         if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-                )
-                .await;
+            engine.update_node_stats(
+                peer_id,
+                crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
+            );
         }
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
         if let Some(ref engine) = self.trust_engine {
-            engine
-                .update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::FailedResponse,
-                )
-                .await;
+            engine.update_node_stats(
+                peer_id,
+                crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+            );
 
             // Immediately evict and disconnect if trust has crossed the block threshold
             if self.config.block_threshold > 0.0
                 && engine.score(peer_id) < self.config.block_threshold
             {
                 let mut dht = self.dht.write().await;
-                dht.remove_node_by_id(peer_id).await;
+                let rt_events = dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
+                self.broadcast_routing_events(&rt_events);
+                // Cancel in-flight RPCs — cancelled operations must not record
+                // trust events (Section 7.4 step 2a).
+                self.cancel_operations_for_peer(peer_id);
                 let _ = self.transport.disconnect_peer(peer_id).await;
                 tracing::info!(
                     peer = peer_id.to_hex(),
@@ -900,6 +1275,25 @@ impl DhtNetworkManager {
                 );
             }
         }
+    }
+
+    /// Evict a blocked peer from the routing table, cancel in-flight RPCs,
+    /// and disconnect at the transport layer.
+    ///
+    /// Unlike [`record_peer_failure`], this does NOT record a trust event —
+    /// the caller has already updated the trust score (e.g. via
+    /// `AdaptiveDHT::report_trust_event`). This avoids double-counting.
+    pub(crate) async fn evict_blocked_peer(&self, peer_id: &PeerId) {
+        let mut dht = self.dht.write().await;
+        let rt_events = dht.remove_node_by_id(peer_id).await;
+        drop(dht);
+        self.broadcast_routing_events(&rt_events);
+        self.cancel_operations_for_peer(peer_id);
+        let _ = self.transport.disconnect_peer(peer_id).await;
+        tracing::info!(
+            peer = peer_id.to_hex(),
+            "Evicted blocked peer (consumer trust event)"
+        );
     }
 
     /// Check if a peer's trust score is below the block threshold.
@@ -917,25 +1311,64 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Cancel all in-flight operations targeting a blocked peer.
+    ///
+    /// Drops the oneshot senders so that the response waiters get a
+    /// `RecvError` and know the operation was cancelled. Cancelled
+    /// operations MUST NOT record trust events — the blocking decision
+    /// has already been made (Section 7.4 step 2a).
+    fn cancel_operations_for_peer(&self, peer_id: &PeerId) {
+        let mut ops = match self.active_operations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "active_operations mutex poisoned in cancel_operations_for_peer, recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        ops.retain(|_id, ctx| {
+            if ctx.peer_id == *peer_id {
+                // Drop the oneshot sender — the waiter will get RecvError
+                // and should NOT record a trust event for this cancellation.
+                tracing::debug!(
+                    peer = peer_id.to_hex(),
+                    op = ?ctx.operation,
+                    "Cancelling in-flight operation for blocked peer"
+                );
+                false // remove from map
+            } else {
+                true // keep
+            }
+        });
+    }
+
     /// Remove expired operations from `active_operations`.
     ///
     /// Uses a 2x timeout multiplier as safety margin. Called at the start of
     /// `send_dht_request` to clean up orphaned entries from dropped futures.
     fn sweep_expired_operations(&self) {
-        if let Ok(mut ops) = self.active_operations.lock() {
-            let now = Instant::now();
-            ops.retain(|id, ctx| {
-                let expired = now.duration_since(ctx.started_at) > ctx.timeout * 2;
-                if expired {
-                    warn!(
-                        "Sweeping expired DHT operation {id} (age {:?}, timeout {:?})",
-                        now.duration_since(ctx.started_at),
-                        ctx.timeout
-                    );
-                }
-                !expired
-            });
-        }
+        let mut ops = match self.active_operations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "active_operations mutex poisoned in sweep_expired_operations, recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let now = Instant::now();
+        ops.retain(|id, ctx| {
+            let expired = now.duration_since(ctx.started_at) > ctx.timeout * 2;
+            if expired {
+                warn!(
+                    "Sweeping expired DHT operation {id} (age {:?}, timeout {:?})",
+                    now.duration_since(ctx.started_at),
+                    ctx.timeout
+                );
+            }
+            !expired
+        });
     }
 
     /// Send a DHT request to a specific peer.
@@ -1104,7 +1537,9 @@ impl DhtNetworkManager {
                 );
 
                 // Wait for response via oneshot channel with timeout
-                let result = self.wait_for_response(&message_id, response_rx).await;
+                let result = self
+                    .wait_for_response(&message_id, response_rx, peer_id)
+                    .await;
                 match &result {
                     Ok(r) => info!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
@@ -1251,12 +1686,18 @@ impl DhtNetworkManager {
     /// operation context. When handle_dht_response receives a response, it sends
     /// through the channel. This function awaits on the receiver with timeout.
     ///
+    /// When the oneshot sender is dropped (e.g. by `cancel_operations_for_peer`),
+    /// the receiver gets a `RecvError`. If the peer is blocked at that point,
+    /// we return `OperationCancelled` so the caller knows not to record a trust
+    /// event (Section 7.4 step 2a).
+    ///
     /// Note: cleanup of `active_operations` is handled by explicit removal in the
     /// caller (`send_dht_request`), so this method does not remove entries itself.
     async fn wait_for_response(
         &self,
         _message_id: &str,
         response_rx: oneshot::Receiver<(PeerId, DhtNetworkResult)>,
+        peer_id: &PeerId,
     ) -> Result<DhtNetworkResult> {
         let response_timeout = self.config.request_timeout;
 
@@ -1264,12 +1705,19 @@ impl DhtNetworkManager {
         match tokio::time::timeout(response_timeout, response_rx).await {
             Ok(Ok((_source, result))) => Ok(result),
             Ok(Err(_recv_error)) => {
-                // Channel closed without response (sender dropped)
-                // This can happen if handle_dht_response rejected the response
-                // or if the operation was cleaned up elsewhere
-                Err(P2PError::Network(NetworkError::ProtocolError(
-                    "Response channel closed unexpectedly".into(),
-                )))
+                // Channel closed without response (sender dropped).
+                // If the peer was blocked (cancel_operations_for_peer dropped
+                // the sender), return OperationCancelled so callers skip trust
+                // event recording (Section 7.4 step 2a).
+                if self.is_peer_blocked(peer_id) {
+                    Err(P2PError::Network(NetworkError::OperationCancelled(
+                        *peer_id,
+                    )))
+                } else {
+                    Err(P2PError::Network(NetworkError::ProtocolError(
+                        "Response channel closed unexpectedly".into(),
+                    )))
+                }
             }
             Err(_timeout) => Err(P2PError::Network(NetworkError::Timeout)),
         }
@@ -1688,16 +2136,63 @@ impl DhtNetworkManager {
             let node_info = NodeInfo {
                 id: node_id,
                 addresses,
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             };
 
-            if let Err(e) = self.dht.write().await.add_node(node_info).await {
-                warn!(
-                    "Failed to add peer {} to DHT routing table: {}",
-                    app_peer_id_hex, e
-                );
-            } else {
-                info!("Added peer {} to DHT routing table", app_peer_id_hex);
+            let trust_fn = |peer_id: &PeerId| -> f64 {
+                self.trust_engine
+                    .as_ref()
+                    .map(|engine| engine.score(peer_id))
+                    .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+            };
+            let add_result = self.dht.write().await.add_node(node_info, &trust_fn).await;
+            match add_result {
+                Ok(AdmissionResult::Admitted(rt_events)) => {
+                    info!("Added peer {} to DHT routing table", app_peer_id_hex);
+                    self.broadcast_routing_events(&rt_events);
+                }
+                Ok(AdmissionResult::StaleRevalidationNeeded {
+                    candidate,
+                    candidate_ips,
+                    candidate_bucket_idx,
+                    stale_peers,
+                }) => {
+                    debug!(
+                        "Peer {} admission deferred: {} stale peers need revalidation",
+                        app_peer_id_hex,
+                        stale_peers.len()
+                    );
+                    match self
+                        .revalidate_and_retry_admission(
+                            candidate,
+                            candidate_ips,
+                            candidate_bucket_idx,
+                            stale_peers,
+                            &trust_fn,
+                        )
+                        .await
+                    {
+                        Ok(rt_events) => {
+                            info!(
+                                "Added peer {} to DHT routing table after stale revalidation",
+                                app_peer_id_hex
+                            );
+                            self.broadcast_routing_events(&rt_events);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Stale revalidation for peer {} failed: {}",
+                                app_peer_id_hex, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to add peer {} to DHT routing table: {}",
+                        app_peer_id_hex, e
+                    );
+                }
             }
         }
 
@@ -1856,6 +2351,159 @@ impl DhtNetworkManager {
         Ok(())
     }
 
+    /// Attempt stale peer revalidation and retry admission for a candidate.
+    ///
+    /// Called when `add_node` returns [`AdmissionResult::StaleRevalidationNeeded`].
+    /// Pings stale peers (with the DHT write lock released), evicts non-responders,
+    /// and re-evaluates the candidate for admission.
+    ///
+    /// Concurrency is bounded by a global semaphore ([`MAX_CONCURRENT_REVALIDATIONS`])
+    /// and per-bucket tracking to prevent concurrent revalidation of the same bucket.
+    async fn revalidate_and_retry_admission(
+        &self,
+        candidate: NodeInfo,
+        candidate_ips: Vec<IpAddr>,
+        bucket_idx: usize,
+        stale_peers: Vec<(PeerId, usize)>,
+        trust_fn: &impl Fn(&PeerId) -> f64,
+    ) -> anyhow::Result<Vec<RoutingTableEvent>> {
+        if stale_peers.is_empty() {
+            return Err(anyhow::anyhow!("no stale peers to revalidate"));
+        }
+
+        // Try acquire global semaphore (non-blocking to avoid stalling the caller).
+        let _permit = self
+            .revalidation_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("global revalidation limit reached"))?;
+
+        // Try acquire per-bucket slot to prevent concurrent revalidation.
+        // Note: guards only the candidate's target bucket, not all buckets in
+        // stale_peers (which may span multiple buckets after routing-neighborhood
+        // merge). The DHT write lock provides correctness; this guard only
+        // prevents redundant ping work on the same bucket.
+        {
+            let mut active = self.bucket_revalidation_active.lock();
+            if active.contains(&bucket_idx) {
+                return Err(anyhow::anyhow!(
+                    "revalidation already in progress for bucket {bucket_idx}"
+                ));
+            }
+            active.insert(bucket_idx);
+        }
+
+        // Ensure the per-bucket slot is released on all exit paths.
+        let _bucket_guard = BucketRevalidationGuard {
+            active: self.bucket_revalidation_active.clone(),
+            bucket_idx,
+        };
+
+        // --- Ping stale peers concurrently with DHT write lock released ---
+        // Process in chunks to bound concurrent pings while still parallelising
+        // within each chunk (total wall time: chunks * STALE_REVALIDATION_TIMEOUT
+        // instead of stale_peers.len() * STALE_REVALIDATION_TIMEOUT).
+        let mut evicted_peers = Vec::new();
+        let mut retained_peers = Vec::new();
+
+        for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
+            let results = futures::future::join_all(chunk.iter().map(|(peer_id, _)| async {
+                let responded =
+                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                (*peer_id, responded)
+            }))
+            .await;
+
+            for (peer_id, responded) in results {
+                if responded {
+                    retained_peers.push(peer_id);
+                } else {
+                    evicted_peers.push(peer_id);
+                }
+            }
+        }
+
+        // Record trust events for revalidation outcomes.
+        if let Some(ref engine) = self.trust_engine {
+            for peer_id in &retained_peers {
+                engine.update_node_stats(
+                    peer_id,
+                    crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
+                );
+            }
+            for peer_id in &evicted_peers {
+                engine.update_node_stats(
+                    peer_id,
+                    crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+                );
+            }
+        }
+
+        if evicted_peers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "all stale peers responded — no room for candidate"
+            ));
+        }
+
+        // --- Re-acquire write lock: evict non-responders and retry admission ---
+        let mut dht = self.dht.write().await;
+        let mut all_events = Vec::new();
+
+        for peer_id in &evicted_peers {
+            let removal_events = dht.remove_node_by_id(peer_id).await;
+            all_events.extend(removal_events);
+        }
+
+        let admission_events = dht
+            .re_evaluate_admission(candidate, &candidate_ips, trust_fn)
+            .await?;
+        all_events.extend(admission_events);
+
+        Ok(all_events)
+    }
+
+    /// Ping a peer to check liveness.
+    ///
+    /// Reuses the existing [`send_dht_request`](Self::send_dht_request) flow
+    /// which handles serialization, connection setup, and response tracking.
+    /// Used during stale peer revalidation to determine which peers should
+    /// be evicted.
+    async fn ping_peer(&self, peer_id: &PeerId) -> anyhow::Result<()> {
+        self.send_dht_request(peer_id, DhtNetworkOperation::Ping, None)
+            .await
+            .map(|_| ())
+            .context("ping failed")
+    }
+
+    /// Translate core engine routing table events into network events and broadcast them.
+    fn broadcast_routing_events(&self, events: &[RoutingTableEvent]) {
+        if self.event_tx.receiver_count() == 0 {
+            return;
+        }
+        for event in events {
+            match event {
+                RoutingTableEvent::PeerAdded(id) => {
+                    let _ = self
+                        .event_tx
+                        .send(DhtNetworkEvent::PeerAdded { peer_id: *id });
+                }
+                RoutingTableEvent::PeerRemoved(id) => {
+                    let _ = self
+                        .event_tx
+                        .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
+                }
+                RoutingTableEvent::KClosestPeersChanged { old, new } => {
+                    let _ = self.event_tx.send(DhtNetworkEvent::KClosestPeersChanged {
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     /// Get current statistics
     pub async fn get_stats(&self) -> DhtNetworkStats {
         self.stats.read().await.clone()
@@ -1883,6 +2531,36 @@ impl DhtNetworkManager {
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
         let dht_guard = self.dht.read().await;
         dht_guard.has_node(peer_id).await
+    }
+
+    /// Return every peer currently in the DHT routing table.
+    ///
+    /// Only peers that passed the `is_dht_participant` security gate are
+    /// included. Useful for diagnostics and for callers that need the full
+    /// `LocalRT(self)` set (e.g. replication hint construction).
+    ///
+    /// The routing table holds at most `256 * k_value` entries, so
+    /// collecting them is inexpensive.
+    pub async fn routing_table_peers(&self) -> Vec<DHTNode> {
+        let dht_guard = self.dht.read().await;
+        let nodes = dht_guard.all_nodes().await;
+        drop(dht_guard);
+        nodes
+            .into_iter()
+            .map(|node| {
+                let reliability = self
+                    .trust_engine
+                    .as_ref()
+                    .map(|engine| engine.score(&node.id))
+                    .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                DHTNode {
+                    peer_id: node.id,
+                    addresses: node.addresses,
+                    distance: None,
+                    reliability,
+                }
+            })
+            .collect()
     }
 
     /// Get this node's peer ID.
@@ -1925,7 +2603,6 @@ impl Default for DhtNetworkConfig {
     fn default() -> Self {
         Self {
             peer_id: PeerId::from_bytes([0u8; 32]),
-            dht_config: DHTConfig::default(),
             node_config: NodeConfig::default(),
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
@@ -2005,6 +2682,35 @@ mod tests {
             matches!(deserialized, DhtNetworkResult::PeerRejected),
             "round-tripped result should be PeerRejected, got: {deserialized:?}"
         );
+    }
+
+    #[test]
+    fn test_bootstrap_complete_event_construction() {
+        let event = DhtNetworkEvent::BootstrapComplete { num_peers: 42 };
+        assert!(
+            matches!(event, DhtNetworkEvent::BootstrapComplete { num_peers: 42 }),
+            "BootstrapComplete event should carry the peer count"
+        );
+    }
+
+    #[test]
+    fn test_k_closest_changed_event_uses_old_new_naming() {
+        let old = vec![PeerId::random(), PeerId::random()];
+        let new = vec![PeerId::random()];
+        let event = DhtNetworkEvent::KClosestPeersChanged {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        match event {
+            DhtNetworkEvent::KClosestPeersChanged {
+                old: got_old,
+                new: got_new,
+            } => {
+                assert_eq!(got_old, old);
+                assert_eq!(got_new, new);
+            }
+            _ => panic!("expected KClosestPeersChanged"),
+        }
     }
 
     #[test]
