@@ -749,17 +749,64 @@ impl TransportHandle {
             channel_id, protocol
         );
 
-        if !self.peers.read().await.contains_key(channel_id) {
-            return Err(P2PError::Network(NetworkError::PeerNotFound(
-                channel_id.to_string().into(),
-            )));
+        // If the peer isn't in `self.peers`, register it on the fly.
+        // Hole-punched connections are accepted at the transport layer and
+        // registered in P2pEndpoint::connected_peers, but the event chain
+        // to populate TransportHandle::peers may not have completed yet.
+        //
+        // Uses a single write lock with entry() to avoid a TOCTOU race
+        // where a concurrent event handler could insert a fully-populated
+        // PeerInfo between a read-check and our write.
+        // Double-checked locking: only take a write lock when the channel
+        // is not yet registered, avoiding write-lock contention on every send.
+        {
+            let needs_insert = {
+                let peers = self.peers.read().await;
+                !peers.contains_key(channel_id)
+            };
+
+            if needs_insert {
+                let mut peers = self.peers.write().await;
+                peers.entry(channel_id.to_string()).or_insert_with(|| {
+                    info!(
+                        "send_on_channel: registering new channel {} on the fly",
+                        channel_id
+                    );
+                    let addresses = channel_id
+                        .parse::<std::net::SocketAddr>()
+                        .map(|addr| vec![MultiAddr::quic(addr)])
+                        .unwrap_or_default();
+                    PeerInfo {
+                        channel_id: channel_id.to_string(),
+                        addresses,
+                        status: ConnectionStatus::Connected,
+                        last_seen: Instant::now(),
+                        connected_at: Instant::now(),
+                        protocols: Vec::new(),
+                        heartbeat_count: 0,
+                    }
+                });
+            }
         }
 
+        // NOTE: We no longer *reject* sends based on is_connection_active().
+        //
+        // Hole-punch and NAT-traversed connections have a registration delay
+        // (the ConnectionEvent chain takes ~500ms). During this window, the
+        // connection IS live at the QUIC level but not yet in
+        // active_connections. Using is_connection_active() as a hard gate
+        // here would reject valid sends.
+        //
+        // Instead, we always attempt the actual QUIC send and let
+        // P2pEndpoint::send() return PeerNotFound naturally if the
+        // connection doesn't exist. The is_connection_active() check below
+        // is used only to opportunistically populate active_connections,
+        // not to decide whether we send.
         if !self.is_connection_active(channel_id).await {
-            self.remove_channel(channel_id).await;
-            return Err(P2PError::Network(NetworkError::ConnectionClosed {
-                peer_id: channel_id.to_string().into(),
-            }));
+            self.active_connections
+                .write()
+                .await
+                .insert(channel_id.to_string());
         }
 
         let raw_data_len = data.len();
@@ -799,6 +846,9 @@ impl TransportHandle {
             );
         } else {
             warn!("Failed to send message to channel {}", channel_id);
+            // Clean up the optimistic active_connections entry so stale
+            // entries don't accumulate for unknown channels.
+            self.active_connections.write().await.remove(channel_id);
         }
 
         result
@@ -1249,14 +1299,9 @@ impl TransportHandle {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(MESSAGE_RECV_CHANNEL_CAPACITY);
 
-        let mut handles = Vec::new();
-
-        if let Some(v6) = self.dual_node.v6.as_ref() {
-            handles.push(v6.spawn_recv_task(tx.clone(), self.shutdown.clone()));
-        }
-        if let Some(v4) = self.dual_node.v4.as_ref() {
-            handles.push(v4.spawn_recv_task(tx.clone(), self.shutdown.clone()));
-        }
+        let mut handles = self
+            .dual_node
+            .spawn_recv_tasks(tx.clone(), self.shutdown.clone());
         drop(tx);
 
         let event_tx = self.event_tx.clone();
