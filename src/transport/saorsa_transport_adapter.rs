@@ -810,19 +810,19 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             if endpoint.inner_is_connected(addr) {
                 return true;
             }
-            if let Some(ref alt) = mapped {
-                if endpoint.inner_is_connected(alt) {
-                    return true;
-                }
+            if let Some(ref alt) = mapped
+                && endpoint.inner_is_connected(alt)
+            {
+                return true;
             }
             // Also check the link transport capabilities cache
             if node.is_connected(addr).await {
                 return true;
             }
-            if let Some(ref alt) = mapped {
-                if node.is_connected(alt).await {
-                    return true;
-                }
+            if let Some(ref alt) = mapped
+                && node.is_connected(alt).await
+            {
+                return true;
             }
         }
         false
@@ -1064,15 +1064,10 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// form `[::ffff:x.x.x.x]` that the v6 transport expects.
     /// Used on all addresses entering the transport from saorsa-core.
     fn to_mapped_if_needed(&self, addr: &SocketAddr) -> SocketAddr {
-        if self.is_dual_stack {
-            if let SocketAddr::V4(v4) = addr {
-                return SocketAddr::V6(SocketAddrV6::new(
-                    v4.ip().to_ipv6_mapped(),
-                    v4.port(),
-                    0,
-                    0,
-                ));
-            }
+        if self.is_dual_stack
+            && let SocketAddr::V4(v4) = addr
+        {
+            return SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0));
         }
         *addr
     }
