@@ -23,13 +23,15 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::NodeInfo,
-    dht::{DhtCoreEngine, DhtKey, Key},
+    dht::core_engine::{MAX_PEERS_PER_RESPONSE, NodeInfo},
+    dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -61,6 +63,33 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 /// Maximum time to wait for the identity-exchange handshake after dialling
 /// a peer. The actual timeout is `min(request_timeout, this)`.
 const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time to wait for a stale peer's ping response during admission contention.
+const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum concurrent stale revalidation passes across all buckets.
+const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
+
+/// Consecutive non-improving iterations before a network lookup terminates.
+const LOOKUP_STAGNATION_LIMIT: usize = 3;
+
+/// Duration after which a bucket without activity is considered stale.
+const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
+
+/// Minimum self-lookup interval (randomized between min and max).
+const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Maximum self-lookup interval.
+const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Periodic refresh cadence for stale k-buckets.
+const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Routing table size below which automatic re-bootstrap is triggered.
+const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
+
+/// Minimum time between consecutive auto re-bootstrap attempts.
+const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
 /// DHT node representation for network operations.
 ///
@@ -201,17 +230,26 @@ pub struct DhtNetworkManager {
     /// Updated after every routing table mutation; compared to detect
     /// `KClosestPeersChanged` events.
     k_closest_peers: Mutex<HashSet<PeerId>>,
+    /// Global semaphore limiting concurrent stale revalidation passes.
+    /// Prevents a flood of revalidation attempts from consuming excessive
+    /// resources when many buckets have stale peers simultaneously.
+    revalidation_semaphore: Arc<Semaphore>,
+    /// Per-bucket revalidation state: tracks active revalidation to prevent
+    /// concurrent revalidation passes on the same bucket.
+    bucket_revalidation_active: Arc<tokio::sync::Mutex<HashSet<usize>>>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
     event_handler_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
+    /// cooldown to avoid hammering bootstrap peers during transient churn.
+    last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
 }
 
 /// DHT operation context
 ///
 /// Uses oneshot channel for response delivery to eliminate TOCTOU races.
 /// The sender is stored here; the receiver is held by wait_for_response().
-#[allow(dead_code)]
 struct DhtOperationContext {
     /// Operation type
     operation: DhtNetworkOperation,
@@ -261,6 +299,12 @@ pub enum DhtNetworkEvent {
         /// Peers that left the K-closest set.
         removed: Vec<PeerId>,
     },
+    /// New peer added to the routing table.
+    PeerAdded { peer_id: PeerId },
+    /// Peer removed from the routing table (eviction, blocking, or departure).
+    PeerRemoved { peer_id: PeerId },
+    /// Bootstrap process completed.
+    BootstrapComplete { num_peers: usize },
     /// DHT operation completed
     OperationCompleted {
         operation: String,
@@ -297,6 +341,24 @@ pub struct DhtNetworkStats {
     pub routing_table_size: usize,
 }
 
+/// RAII guard that removes a bucket index from the per-bucket revalidation set
+/// on drop, ensuring the slot is released even if the revalidation panics or
+/// returns early.
+struct BucketRevalidationGuard {
+    active: Arc<tokio::sync::Mutex<HashSet<usize>>>,
+    bucket_idx: usize,
+}
+
+impl Drop for BucketRevalidationGuard {
+    fn drop(&mut self) {
+        // Cannot use .await in Drop, so use blocking_lock which is safe
+        // because the tokio::sync::Mutex is not held across .await at
+        // this point (the guard is dropped at the end of the async fn).
+        let mut guard = self.active.blocking_lock();
+        guard.remove(&self.bucket_idx);
+    }
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -307,6 +369,7 @@ impl DhtNetworkManager {
             config.peer_id,
             config.node_config.dht_config.k_value,
             config.node_config.allow_loopback,
+            config.block_threshold,
         )
         .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
 
@@ -336,8 +399,11 @@ impl DhtNetworkManager {
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
             k_closest_peers: Mutex::new(HashSet::new()),
+            revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
+            bucket_revalidation_active: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
+            last_rebootstrap: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -413,8 +479,209 @@ impl DhtNetworkManager {
         // Reconcile peers that may have connected before event subscription.
         self.reconcile_connected_peers().await;
 
+        // Spawn periodic maintenance background tasks.
+        self.spawn_self_lookup_task();
+        self.spawn_bucket_refresh_task();
+
         info!("DHT Network Manager started successfully");
         Ok(())
+    }
+
+    /// Spawn the periodic self-lookup background task.
+    ///
+    /// Runs an iterative FIND_NODE(self) at a randomised interval between
+    /// [`SELF_LOOKUP_INTERVAL_MIN`] and [`SELF_LOOKUP_INTERVAL_MAX`] to keep
+    /// the close neighbourhood fresh and discover newly joined peers.
+    fn spawn_self_lookup_task(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let interval =
+                    Self::randomised_interval(SELF_LOOKUP_INTERVAL_MIN, SELF_LOOKUP_INTERVAL_MAX);
+
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = shutdown.cancelled() => break,
+                }
+
+                if let Err(e) = this.trigger_self_lookup().await {
+                    warn!("Periodic self-lookup failed: {e}");
+                }
+
+                // Check if routing table is depleted after the self-lookup.
+                this.maybe_rebootstrap().await;
+            }
+        });
+    }
+
+    /// Spawn the periodic bucket refresh background task.
+    ///
+    /// Every [`BUCKET_REFRESH_INTERVAL`], finds stale buckets (not refreshed
+    /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
+    /// a random key in each stale bucket's range. This populates stale buckets
+    /// with fresh peers.
+    fn spawn_bucket_refresh_task(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(BUCKET_REFRESH_INTERVAL) => {}
+                    () = shutdown.cancelled() => break,
+                }
+
+                let stale_indices = this
+                    .dht
+                    .read()
+                    .await
+                    .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
+                    .await;
+
+                if stale_indices.is_empty() {
+                    trace!("Bucket refresh: no stale buckets");
+                    continue;
+                }
+
+                debug!("Bucket refresh: {} stale buckets", stale_indices.len());
+                let k = this.k_value();
+
+                for bucket_idx in stale_indices {
+                    let random_key = {
+                        let dht = this.dht.read().await;
+                        dht.generate_random_key_for_bucket(bucket_idx)
+                    };
+                    let Some(key) = random_key else {
+                        continue;
+                    };
+
+                    let key_bytes: Key = *key.as_bytes();
+                    match this.find_closest_nodes_network(&key_bytes, k).await {
+                        Ok(nodes) => {
+                            trace!(
+                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                nodes.len()
+                            );
+                            for dht_node in nodes {
+                                if dht_node.peer_id == this.config.peer_id {
+                                    continue;
+                                }
+                                if let Some(addr) =
+                                    Self::first_dialable_address(&dht_node.addresses)
+                                {
+                                    this.dial_candidate(&dht_node.peer_id, &addr).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
+                        }
+                    }
+                }
+
+                // Check if routing table is depleted after refresh.
+                this.maybe_rebootstrap().await;
+            }
+        });
+    }
+
+    /// Trigger an immediate self-lookup to refresh the close neighborhood.
+    ///
+    /// Performs an iterative FIND_NODE for this node's own key and attempts to
+    /// admit any newly discovered peers into the routing table.
+    pub async fn trigger_self_lookup(&self) -> Result<()> {
+        let self_id = self.config.peer_id;
+        let self_key: Key = *self_id.as_bytes();
+        let k = self.k_value();
+
+        match self.find_closest_nodes_network(&self_key, k).await {
+            Ok(nodes) => {
+                debug!("Self-lookup discovered {} peers", nodes.len());
+                for dht_node in nodes {
+                    if dht_node.peer_id == self_id {
+                        continue;
+                    }
+                    // Dial if not already connected
+                    if let Some(addr) = Self::first_dialable_address(&dht_node.addresses) {
+                        self.dial_candidate(&dht_node.peer_id, &addr).await;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Self-lookup failed: {e}");
+                Err(e)
+            }
+        }
+    }
+
+    /// Trigger automatic re-bootstrap if the routing table has fallen below
+    /// [`AUTO_REBOOTSTRAP_THRESHOLD`] and the cooldown has elapsed.
+    ///
+    /// Uses currently connected peers as bootstrap seeds. The cooldown prevents
+    /// hammering bootstrap nodes during transient network partitions.
+    async fn maybe_rebootstrap(&self) {
+        let rt_size = self.get_routing_table_size().await;
+        if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
+            return;
+        }
+
+        // Enforce cooldown to avoid bootstrap storms.
+        {
+            let mut guard = self.last_rebootstrap.lock().await;
+            if let Some(last) = *guard
+                && last.elapsed() < REBOOTSTRAP_COOLDOWN
+            {
+                trace!(
+                    "Auto re-bootstrap skipped: cooldown ({:?} remaining)",
+                    REBOOTSTRAP_COOLDOWN.saturating_sub(last.elapsed())
+                );
+                return;
+            }
+            *guard = Some(Instant::now());
+        }
+
+        info!(
+            "Auto re-bootstrap: routing table size ({rt_size}) below threshold ({})",
+            AUTO_REBOOTSTRAP_THRESHOLD
+        );
+
+        // Collect currently connected peers to use as bootstrap seeds.
+        let connected = self.transport.connected_peers().await;
+        if connected.is_empty() {
+            debug!("Auto re-bootstrap: no connected peers to bootstrap from");
+            return;
+        }
+
+        match self.bootstrap_from_peers(&connected).await {
+            Ok(discovered) => {
+                info!("Auto re-bootstrap discovered {discovered} peers");
+            }
+            Err(e) => {
+                warn!("Auto re-bootstrap failed: {e}");
+            }
+        }
+    }
+
+    /// Compute a randomised duration between `min` and `max`.
+    ///
+    /// Uses [`PeerId::random()`] as a cheap entropy source to avoid the `gen`
+    /// keyword reserved in Rust edition 2024. This is not cryptographically
+    /// secure but sufficient for jittering maintenance timers.
+    fn randomised_interval(min: Duration, max: Duration) -> Duration {
+        let range_secs = max.as_secs().saturating_sub(min.as_secs());
+        if range_secs == 0 {
+            return min;
+        }
+        let random_bytes = PeerId::random();
+        let bytes = random_bytes.to_bytes();
+        let random_value = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let jitter = Duration::from_secs(random_value % (range_secs + 1));
+        min + jitter
     }
 
     /// Perform DHT peer discovery from already-connected bootstrap peers.
@@ -443,6 +710,16 @@ impl DhtNetworkManager {
                 }
             }
         }
+
+        // Emit BootstrapComplete event with the current routing table size.
+        let rt_size = self.get_routing_table_size().await;
+        if self.event_tx.receiver_count() > 0 {
+            let _ = self
+                .event_tx
+                .send(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
+        }
+        info!("Bootstrap complete: routing table has {rt_size} peers");
+
         Ok(seen.len())
     }
 
@@ -655,7 +932,8 @@ impl DhtNetworkManager {
                 candidates.push_back(node);
             }
         }
-        let mut previous_candidate_snapshot: Option<BTreeSet<PeerId>> = None;
+        let mut stagnation_counter: usize = 0;
+        let target_key = DhtKey::from_bytes(*key);
 
         for iteration in 0..MAX_ITERATIONS {
             if candidates.is_empty() {
@@ -666,14 +944,23 @@ impl DhtNetworkManager {
                 break;
             }
 
-            // Select up to ALPHA unqueried nodes to query
+            // Select up to ALPHA unqueried, non-blocked nodes to query
             let mut batch: Vec<DHTNode> = Vec::new();
             while batch.len() < ALPHA && !candidates.is_empty() {
                 if let Some(node) = candidates.pop_front() {
                     queued_peer_ids.remove(&node.peer_id);
-                    if !queried_nodes.contains(&node.peer_id) {
-                        batch.push(node);
+                    if queried_nodes.contains(&node.peer_id) {
+                        continue;
                     }
+                    // Skip peers whose trust score is below the block threshold
+                    if self.is_peer_blocked(&node.peer_id) {
+                        trace!(
+                            "[NETWORK] Skipping blocked peer {} in lookup",
+                            node.peer_id.to_hex()
+                        );
+                        continue;
+                    }
+                    batch.push(node);
                 }
             }
 
@@ -690,6 +977,9 @@ impl DhtNetworkManager {
                 iteration,
                 batch.len()
             );
+
+            // Capture the closest distance before this iteration for stagnation detection.
+            let pre_iteration_closest = best_nodes.first().map(|n| n.peer_id.distance(&target_key));
 
             // Query nodes in parallel
             // saorsa-transport connection multiplexing lets us keep a single transport socket
@@ -714,17 +1004,21 @@ impl DhtNetworkManager {
 
             let results = futures::future::join_all(query_futures).await;
 
-            let mut found_new_closer = false;
             for (peer_id, result) in results {
                 queried_nodes.insert(peer_id);
 
                 match result {
-                    Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
+                    Ok(DhtNetworkResult::NodesFound { mut nodes, .. }) => {
                         self.record_peer_success(&peer_id).await;
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
+                        // Truncate response to MAX_PEERS_PER_RESPONSE closest
+                        // to the lookup key to limit amplification from a single
+                        // response and bound per-iteration memory growth.
+                        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+                        nodes.truncate(MAX_PEERS_PER_RESPONSE);
                         for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
                                 || queued_peer_ids.contains(&node.peer_id)
@@ -755,7 +1049,6 @@ impl DhtNetworkManager {
                                 }
                                 queued_peer_ids.insert(node.peer_id);
                                 candidates.push_back(node);
-                                found_new_closer = true;
                             }
                         }
                     }
@@ -768,8 +1061,9 @@ impl DhtNetworkManager {
                             peer_id.to_hex()
                         );
                         let mut dht = self.dht.write().await;
-                        dht.remove_node_by_id(&peer_id).await;
+                        let rt_events = dht.remove_node_by_id(&peer_id).await;
                         drop(dht);
+                        self.broadcast_routing_events(&rt_events);
                         self.check_and_emit_k_closest_changed().await;
                     }
                     Ok(_) => {
@@ -792,24 +1086,32 @@ impl DhtNetworkManager {
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
-            if !found_new_closer {
-                info!("[NETWORK] Converged after {} iterations", iteration + 1);
-                break;
-            }
+            // Stagnation detection: if the closest peer in best_nodes is
+            // strictly closer than before this iteration, reset the counter;
+            // otherwise increment it. Stop after LOOKUP_STAGNATION_LIMIT
+            // consecutive non-improving iterations.
+            let post_iteration_closest =
+                best_nodes.first().map(|n| n.peer_id.distance(&target_key));
 
-            let snapshot: BTreeSet<PeerId> = queued_peer_ids.iter().cloned().collect();
-            if let Some(previous) = &previous_candidate_snapshot
-                && !snapshot.is_empty()
-                && *previous == snapshot
-            {
-                info!(
-                    "[NETWORK] {}: Candidate set stagnated after {} iterations, stopping",
-                    self.config.peer_id.to_hex(),
-                    iteration + 1
-                );
-                break;
+            let improved = match (&pre_iteration_closest, &post_iteration_closest) {
+                (Some(before), Some(after)) => after < before,
+                (None, Some(_)) => true, // went from empty to having a result
+                _ => false,
+            };
+
+            if improved {
+                stagnation_counter = 0;
+            } else {
+                stagnation_counter += 1;
+                if stagnation_counter >= LOOKUP_STAGNATION_LIMIT {
+                    info!(
+                        "[NETWORK] Lookup stagnated after {} non-improving iterations (iteration {})",
+                        LOOKUP_STAGNATION_LIMIT,
+                        iteration + 1
+                    );
+                    break;
+                }
             }
-            previous_candidate_snapshot = Some(snapshot);
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
@@ -936,8 +1238,9 @@ impl DhtNetworkManager {
                 && engine.score(peer_id) < self.config.block_threshold
             {
                 let mut dht = self.dht.write().await;
-                dht.remove_node_by_id(peer_id).await;
+                let rt_events = dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
+                self.broadcast_routing_events(&rt_events);
                 self.check_and_emit_k_closest_changed().await;
                 let _ = self.transport.disconnect_peer(peer_id).await;
                 tracing::info!(
@@ -1736,7 +2039,7 @@ impl DhtNetworkManager {
             let node_info = NodeInfo {
                 id: node_id,
                 addresses,
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             };
 
             let trust_fn = |peer_id: &PeerId| -> f64 {
@@ -1748,14 +2051,53 @@ impl DhtNetworkManager {
             // Bind the result so the write guard drops before the branches —
             // check_and_emit_k_closest_changed needs a read lock.
             let add_result = self.dht.write().await.add_node(node_info, &trust_fn).await;
-            if let Err(e) = add_result {
-                warn!(
-                    "Failed to add peer {} to DHT routing table: {}",
-                    app_peer_id_hex, e
-                );
-            } else {
-                info!("Added peer {} to DHT routing table", app_peer_id_hex);
-                self.check_and_emit_k_closest_changed().await;
+            match add_result {
+                Ok(AdmissionResult::Admitted(rt_events)) => {
+                    info!("Added peer {} to DHT routing table", app_peer_id_hex);
+                    self.broadcast_routing_events(&rt_events);
+                    self.check_and_emit_k_closest_changed().await;
+                }
+                Ok(AdmissionResult::StaleRevalidationNeeded {
+                    candidate,
+                    candidate_ips,
+                    stale_peers,
+                }) => {
+                    debug!(
+                        "Peer {} admission deferred: {} stale peers need revalidation",
+                        app_peer_id_hex,
+                        stale_peers.len()
+                    );
+                    match self
+                        .revalidate_and_retry_admission(
+                            candidate,
+                            candidate_ips,
+                            stale_peers,
+                            &trust_fn,
+                        )
+                        .await
+                    {
+                        Ok(rt_events) => {
+                            info!(
+                                "Added peer {} to DHT routing table after stale revalidation",
+                                app_peer_id_hex
+                            );
+                            self.broadcast_routing_events(&rt_events);
+                            self.check_and_emit_k_closest_changed().await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Stale revalidation for peer {} failed: {}",
+                                app_peer_id_hex, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to add peer {} to DHT routing table: {}",
+                        app_peer_id_hex, e
+                    );
+                }
             }
         }
 
@@ -1912,6 +2254,155 @@ impl DhtNetworkManager {
         *self.event_handler_handle.write().await = Some(handle);
 
         Ok(())
+    }
+
+    /// Attempt stale peer revalidation and retry admission for a candidate.
+    ///
+    /// Called when `add_node` returns [`AdmissionResult::StaleRevalidationNeeded`].
+    /// Pings stale peers (with the DHT write lock released), evicts non-responders,
+    /// and re-evaluates the candidate for admission.
+    ///
+    /// Concurrency is bounded by a global semaphore ([`MAX_CONCURRENT_REVALIDATIONS`])
+    /// and per-bucket tracking to prevent concurrent revalidation of the same bucket.
+    async fn revalidate_and_retry_admission(
+        &self,
+        candidate: NodeInfo,
+        candidate_ips: Vec<IpAddr>,
+        stale_peers: Vec<(PeerId, usize)>,
+        trust_fn: &impl Fn(&PeerId) -> f64,
+    ) -> anyhow::Result<Vec<RoutingTableEvent>> {
+        let bucket_idx = stale_peers
+            .first()
+            .map(|(_, idx)| *idx)
+            .ok_or_else(|| anyhow::anyhow!("no stale peers to revalidate"))?;
+
+        // Try acquire global semaphore (non-blocking to avoid stalling the caller).
+        let _permit = self
+            .revalidation_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("global revalidation limit reached"))?;
+
+        // Try acquire per-bucket slot to prevent concurrent revalidation.
+        {
+            let mut active = self.bucket_revalidation_active.lock().await;
+            if active.contains(&bucket_idx) {
+                return Err(anyhow::anyhow!(
+                    "revalidation already in progress for bucket {bucket_idx}"
+                ));
+            }
+            active.insert(bucket_idx);
+        }
+
+        // Ensure the per-bucket slot is released on all exit paths.
+        let _bucket_guard = BucketRevalidationGuard {
+            active: self.bucket_revalidation_active.clone(),
+            bucket_idx,
+        };
+
+        // --- Ping stale peers with DHT write lock released ---
+        let mut evicted_peers = Vec::new();
+        let mut retained_peers = Vec::new();
+
+        for (peer_id, _) in &stale_peers {
+            let responded =
+                tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+
+            if responded {
+                retained_peers.push(*peer_id);
+            } else {
+                evicted_peers.push(*peer_id);
+            }
+        }
+
+        // Record trust events for revalidation outcomes.
+        if let Some(ref engine) = self.trust_engine {
+            for peer_id in &retained_peers {
+                engine
+                    .update_node_stats(
+                        peer_id,
+                        crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
+                    )
+                    .await;
+            }
+            for peer_id in &evicted_peers {
+                engine
+                    .update_node_stats(
+                        peer_id,
+                        crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+                    )
+                    .await;
+            }
+        }
+
+        if evicted_peers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "all stale peers responded — no room for candidate"
+            ));
+        }
+
+        // --- Re-acquire write lock: evict non-responders and retry admission ---
+        let mut dht = self.dht.write().await;
+        let mut all_events = Vec::new();
+
+        for peer_id in &evicted_peers {
+            let removal_events = dht.remove_node_by_id(peer_id).await;
+            all_events.extend(removal_events);
+        }
+
+        let admission_events = dht
+            .re_evaluate_admission(candidate, &candidate_ips, trust_fn)
+            .await?;
+        all_events.extend(admission_events);
+
+        Ok(all_events)
+    }
+
+    /// Ping a peer to check liveness.
+    ///
+    /// Reuses the existing [`send_dht_request`](Self::send_dht_request) flow
+    /// which handles serialization, connection setup, and response tracking.
+    /// Used during stale peer revalidation to determine which peers should
+    /// be evicted.
+    async fn ping_peer(&self, peer_id: &PeerId) -> anyhow::Result<()> {
+        self.send_dht_request(peer_id, DhtNetworkOperation::Ping, None)
+            .await
+            .map(|_| ())
+            .context("ping failed")
+    }
+
+    /// Translate core engine routing table events into network events and broadcast them.
+    fn broadcast_routing_events(&self, events: &[RoutingTableEvent]) {
+        if self.event_tx.receiver_count() == 0 {
+            return;
+        }
+        for event in events {
+            match event {
+                RoutingTableEvent::PeerAdded(id) => {
+                    let _ = self
+                        .event_tx
+                        .send(DhtNetworkEvent::PeerAdded { peer_id: *id });
+                }
+                RoutingTableEvent::PeerRemoved(id) => {
+                    let _ = self
+                        .event_tx
+                        .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
+                }
+                RoutingTableEvent::KClosestPeersChanged { old, new } => {
+                    let added: Vec<PeerId> =
+                        new.iter().filter(|id| !old.contains(id)).copied().collect();
+                    let removed: Vec<PeerId> =
+                        old.iter().filter(|id| !new.contains(id)).copied().collect();
+                    if !added.is_empty() || !removed.is_empty() {
+                        let _ = self
+                            .event_tx
+                            .send(DhtNetworkEvent::KClosestPeersChanged { added, removed });
+                    }
+                }
+            }
+        }
     }
 
     /// Recompute the K-closest peers to self and emit a

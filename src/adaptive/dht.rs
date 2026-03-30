@@ -31,6 +31,10 @@ use std::sync::Arc;
 /// Default trust score threshold below which a peer is evicted and blocked
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
 
+/// Maximum weight multiplier per single consumer-reported event.
+/// Caps the influence of any single consumer event on the EMA.
+const MAX_CONSUMER_WEIGHT: f64 = 5.0;
+
 /// Configuration for the AdaptiveDHT layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -72,9 +76,9 @@ impl AdaptiveDhtConfig {
 ///
 /// Each variant maps to an internal [`NodeStatisticsUpdate`] with appropriate severity.
 /// Only events that saorsa-core can directly observe are included here.
-/// Application-level events (data verification, storage checks) belong in
-/// the consuming application and should be added when that layer exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Consumer-reported events carry a weight multiplier that controls the
+/// severity of the update (clamped to [`MAX_CONSUMER_WEIGHT`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrustEvent {
     // === Positive signals ===
     /// Peer provided a correct response to a request
@@ -87,18 +91,26 @@ pub enum TrustEvent {
     ConnectionFailed,
     /// Connection attempt timed out
     ConnectionTimeout,
+
+    // === Consumer-reported signals ===
+    /// Consumer-reported: peer completed an application-level task successfully.
+    /// Weight controls severity (clamped to MAX_CONSUMER_WEIGHT).
+    ApplicationSuccess(f64),
+    /// Consumer-reported: peer failed an application-level task.
+    /// Weight controls severity (clamped to MAX_CONSUMER_WEIGHT).
+    ApplicationFailure(f64),
 }
 
 impl TrustEvent {
     /// Convert a TrustEvent to the internal NodeStatisticsUpdate
     fn to_stats_update(self) -> NodeStatisticsUpdate {
         match self {
-            TrustEvent::SuccessfulResponse | TrustEvent::SuccessfulConnection => {
-                NodeStatisticsUpdate::CorrectResponse
-            }
-            TrustEvent::ConnectionFailed | TrustEvent::ConnectionTimeout => {
-                NodeStatisticsUpdate::FailedResponse
-            }
+            TrustEvent::SuccessfulResponse
+            | TrustEvent::SuccessfulConnection
+            | TrustEvent::ApplicationSuccess(_) => NodeStatisticsUpdate::CorrectResponse,
+            TrustEvent::ConnectionFailed
+            | TrustEvent::ConnectionTimeout
+            | TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
         }
     }
 }
@@ -159,13 +171,35 @@ impl AdaptiveDHT {
 
     /// Report a trust event for a peer.
     ///
-    /// Records a network-observable outcome (connection success/failure)
-    /// that the DHT layer did not record automatically. See [`TrustEvent`]
-    /// for the supported variants.
+    /// For internal events (connection success/failure), applies unit weight.
+    /// For consumer-reported events ([`TrustEvent::ApplicationSuccess`] /
+    /// [`TrustEvent::ApplicationFailure`]), validates and clamps the weight
+    /// to [`MAX_CONSUMER_WEIGHT`]. Zero or negative weights are silently
+    /// ignored (no-op).
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
-        self.trust_engine
-            .update_node_stats(peer_id, event.to_stats_update())
-            .await;
+        match event {
+            TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
+                // Weight validation: reject <= 0, clamp > MAX_CONSUMER_WEIGHT
+                if weight <= 0.0 {
+                    return; // no-op for zero/negative weights
+                }
+                let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
+                let update = match event {
+                    TrustEvent::ApplicationSuccess(_) => NodeStatisticsUpdate::CorrectResponse,
+                    TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
+                    _ => return, // unreachable but satisfies the compiler
+                };
+                self.trust_engine
+                    .update_node_stats_weighted(peer_id, update, clamped_weight)
+                    .await;
+            }
+            _ => {
+                // Internal events: unit weight
+                self.trust_engine
+                    .update_node_stats(peer_id, event.to_stats_update())
+                    .await;
+            }
+        }
     }
 
     /// Get the current trust score for a peer (synchronous).
@@ -212,6 +246,14 @@ impl AdaptiveDHT {
         self.dht_manager.stop().await
     }
 
+    /// Trigger an immediate self-lookup to refresh the close neighborhood.
+    ///
+    /// Delegates to [`DhtNetworkManager::trigger_self_lookup`] which performs
+    /// an iterative FIND_NODE for this node's own key.
+    pub async fn trigger_self_lookup(&self) -> Result<()> {
+        self.dht_manager.trigger_self_lookup().await
+    }
+
     /// Look up connectable addresses for a peer.
     ///
     /// Checks the DHT routing table first, then falls back to the transport
@@ -238,6 +280,10 @@ mod tests {
             TrustEvent::SuccessfulConnection.to_stats_update(),
             NodeStatisticsUpdate::CorrectResponse
         ));
+        assert!(matches!(
+            TrustEvent::ApplicationSuccess(1.0).to_stats_update(),
+            NodeStatisticsUpdate::CorrectResponse
+        ));
 
         // Failure events map to FailedResponse
         assert!(matches!(
@@ -246,6 +292,10 @@ mod tests {
         ));
         assert!(matches!(
             TrustEvent::ConnectionTimeout.to_stats_update(),
+            NodeStatisticsUpdate::FailedResponse
+        ));
+        assert!(matches!(
+            TrustEvent::ApplicationFailure(1.0).to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
         ));
     }
@@ -350,6 +400,8 @@ mod tests {
             TrustEvent::SuccessfulConnection,
             TrustEvent::ConnectionFailed,
             TrustEvent::ConnectionTimeout,
+            TrustEvent::ApplicationSuccess(1.0),
+            TrustEvent::ApplicationFailure(3.0),
         ];
 
         for event in events {
@@ -517,5 +569,204 @@ mod tests {
             (engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
             "Removed peer should return to neutral"
         );
+    }
+
+    // =========================================================================
+    // Consumer trust event tests (Design Matrix 53, 60, 61, 62)
+    // =========================================================================
+
+    /// Test 53: consumer reward improves trust
+    #[tokio::test]
+    async fn test_consumer_reward_improves_trust() {
+        let engine = Arc::new(TrustEngine::new());
+        let peer = PeerId::random();
+
+        let before = engine.score(&peer);
+        engine
+            .update_node_stats(&peer, TrustEvent::ApplicationSuccess(1.0).to_stats_update())
+            .await;
+        let after = engine.score(&peer);
+
+        assert!(
+            after > before,
+            "consumer reward should improve trust: {before} -> {after}"
+        );
+    }
+
+    /// Test 60: higher weight produces larger score impact
+    #[tokio::test]
+    async fn test_higher_weight_larger_impact() {
+        let engine = Arc::new(TrustEngine::new());
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        engine
+            .update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0)
+            .await;
+        engine
+            .update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0)
+            .await;
+
+        assert!(
+            engine.score(&peer_b) < engine.score(&peer_a),
+            "weight-5 failure should have larger impact than weight-1"
+        );
+    }
+
+    /// Test 62: zero and negative weights rejected
+    #[tokio::test]
+    async fn test_zero_negative_weights_noop() {
+        let engine = Arc::new(TrustEngine::new());
+        let peer = PeerId::random();
+
+        let neutral = engine.score(&peer);
+
+        // Zero weight should be a no-op (but this is validated in AdaptiveDHT,
+        // not TrustEngine directly). If called on TrustEngine with weight 0,
+        // the EMA formula with weight=0 produces alpha_w=0, so score stays unchanged.
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 0.0)
+            .await;
+        let after_zero = engine.score(&peer);
+
+        // With weight 0: alpha_w = 1 - (1-0.1)^0 = 1 - 1 = 0, so no change
+        assert!(
+            (after_zero - neutral).abs() < 1e-10,
+            "zero-weight should not change score: {neutral} -> {after_zero}"
+        );
+    }
+
+    // =======================================================================
+    // Phase 8: Integration test matrix — missing coverage
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // Test 61: Weight clamping at MAX_CONSUMER_WEIGHT
+    // -----------------------------------------------------------------------
+    // Full clamping happens in AdaptiveDHT::report_trust_event (which requires
+    // a transport setup we can't construct in a unit test). Instead we verify
+    // that TrustEngine does NOT clamp — proving that the caller is responsible
+    // for clamping. This validates the design's layering.
+
+    /// At the TrustEngine level, weight 100 must have MORE impact than weight 5,
+    /// confirming that TrustEngine does not clamp. The clamping contract
+    /// belongs to AdaptiveDHT::report_trust_event.
+    #[tokio::test]
+    async fn test_trust_engine_does_not_clamp_weights() {
+        let engine = Arc::new(TrustEngine::new());
+        let peer_clamped = PeerId::random();
+        let peer_unclamped = PeerId::random();
+
+        // Weight 5 (MAX_CONSUMER_WEIGHT) for peer_clamped
+        engine
+            .update_node_stats_weighted(
+                &peer_clamped,
+                NodeStatisticsUpdate::FailedResponse,
+                MAX_CONSUMER_WEIGHT,
+            )
+            .await;
+        let score_at_max = engine.score(&peer_clamped);
+
+        // Weight 100 (should NOT be clamped at TrustEngine level) for peer_unclamped
+        engine
+            .update_node_stats_weighted(
+                &peer_unclamped,
+                NodeStatisticsUpdate::FailedResponse,
+                100.0,
+            )
+            .await;
+        let score_at_100 = engine.score(&peer_unclamped);
+
+        assert!(
+            score_at_100 < score_at_max,
+            "TrustEngine should not clamp: weight-100 ({score_at_100}) should have more impact than weight-{MAX_CONSUMER_WEIGHT} ({score_at_max})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 55: Consumer penalty triggers blocking and eviction
+    // -----------------------------------------------------------------------
+    // At this layer we verify that enough failures push trust below the block
+    // threshold. Actual eviction from the routing table is handled by
+    // DhtNetworkManager (covered by Test 36 in core_engine tests).
+
+    /// A peer slightly above the block threshold can be pushed below it by
+    /// a single consumer-reported failure of sufficient weight.
+    #[tokio::test]
+    async fn test_consumer_penalty_triggers_blocking() {
+        let engine = Arc::new(TrustEngine::new());
+        let peer = PeerId::random();
+
+        // First, build the peer up to just barely above the block threshold.
+        // From neutral (0.5), a few failures bring the score down.
+        for _ in 0..5 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+        let score_before = engine.score(&peer);
+        // Should still be above block threshold after just 5 unit failures from 0.5.
+        assert!(
+            score_before > DEFAULT_BLOCK_THRESHOLD,
+            "should be above block threshold: {score_before}"
+        );
+
+        // A heavy consumer failure should push it below the block threshold.
+        for _ in 0..10 {
+            engine
+                .update_node_stats_weighted(
+                    &peer,
+                    NodeStatisticsUpdate::FailedResponse,
+                    MAX_CONSUMER_WEIGHT,
+                )
+                .await;
+        }
+        let score_after = engine.score(&peer);
+        assert!(
+            score_after < DEFAULT_BLOCK_THRESHOLD,
+            "after heavy consumer failures, score {score_after} should be below block threshold {DEFAULT_BLOCK_THRESHOLD}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustEvent to_stats_update is exhaustive
+    // -----------------------------------------------------------------------
+
+    /// Verify that all consumer-reported event variants correctly map to the
+    /// expected NodeStatisticsUpdate direction (success -> CorrectResponse,
+    /// failure -> FailedResponse).
+    #[test]
+    fn test_consumer_event_direction_mapping() {
+        // Success variants all map to CorrectResponse
+        let success_events = [
+            TrustEvent::ApplicationSuccess(0.5),
+            TrustEvent::ApplicationSuccess(1.0),
+            TrustEvent::ApplicationSuccess(5.0),
+        ];
+        for event in success_events {
+            assert!(
+                matches!(
+                    event.to_stats_update(),
+                    NodeStatisticsUpdate::CorrectResponse
+                ),
+                "{event:?} should map to CorrectResponse"
+            );
+        }
+
+        // Failure variants all map to FailedResponse
+        let failure_events = [
+            TrustEvent::ApplicationFailure(0.5),
+            TrustEvent::ApplicationFailure(1.0),
+            TrustEvent::ApplicationFailure(5.0),
+        ];
+        for event in failure_events {
+            assert!(
+                matches!(
+                    event.to_stats_update(),
+                    NodeStatisticsUpdate::FailedResponse
+                ),
+                "{event:?} should map to FailedResponse"
+            );
+        }
     }
 }

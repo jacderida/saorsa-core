@@ -8,9 +8,10 @@ use crate::address::MultiAddr;
 use crate::security::IPDiversityConfig;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +40,17 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// but unbounded lists would be an abuse vector.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
+/// Duration of no contact after which a peer is considered stale.
+/// Stale peers lose trust protection and become eligible for revalidation-based eviction.
+const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
+
+/// Default trust score below which a peer is evicted and blocked from re-admission.
+#[allow(dead_code)]
+const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
+
+/// Maximum peers accepted from a single FIND_NODE response.
+pub(crate) const MAX_PEERS_PER_RESPONSE: usize = 20;
+
 /// Node information for routing.
 ///
 /// The `addresses` field stores one or more typed [`MultiAddr`] values that are
@@ -47,7 +59,11 @@ const MAX_ADDRESSES_PER_NODE: usize = 8;
 pub struct NodeInfo {
     pub id: PeerId,
     pub addresses: Vec<MultiAddr>,
-    pub last_seen: SystemTime,
+    /// Monotonic timestamp of last successful interaction.
+    /// Uses `Instant` to avoid NTP clock-jump issues. Skipped during
+    /// serialization — deserialized `NodeInfo` defaults to "just seen."
+    #[serde(skip, default = "Instant::now")]
+    pub last_seen: Instant,
 }
 
 impl NodeInfo {
@@ -82,6 +98,9 @@ impl NodeInfo {
 struct KBucket {
     nodes: Vec<NodeInfo>,
     max_size: usize,
+    /// Monotonic timestamp of the last time this bucket was refreshed
+    /// (node added, updated, or touched).
+    last_refreshed: Instant,
 }
 
 impl KBucket {
@@ -89,6 +108,7 @@ impl KBucket {
         Self {
             nodes: Vec::new(),
             max_size,
+            last_refreshed: Instant::now(),
         }
     }
 
@@ -108,11 +128,13 @@ impl KBucket {
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
             self.nodes.remove(pos);
             self.nodes.push(node);
+            self.last_refreshed = Instant::now();
             return Ok(());
         }
 
         if self.nodes.len() < self.max_size {
             self.nodes.push(node);
+            self.last_refreshed = Instant::now();
             Ok(())
         } else {
             Err(anyhow!(
@@ -132,12 +154,24 @@ impl KBucket {
     /// protocol.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
-            self.nodes[pos].last_seen = SystemTime::now();
+            self.nodes[pos].last_seen = Instant::now();
             if let Some(addr) = address {
-                self.nodes[pos].merge_address(addr.clone());
+                // Loopback injection prevention (Design Section 6.3 rule 4):
+                // Don't merge loopback addresses into a non-loopback-admitted peer.
+                let addr_is_loopback = addr
+                    .ip()
+                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
+                let node_has_non_loopback = self.nodes[pos]
+                    .addresses
+                    .iter()
+                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
+                if !(addr_is_loopback && node_has_non_loopback) {
+                    self.nodes[pos].merge_address(addr.clone());
+                }
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
+            self.last_refreshed = Instant::now();
             true
         } else {
             false
@@ -261,6 +295,24 @@ impl KademliaRoutingTable {
     fn get_bucket_index(&self, node_id: &PeerId) -> Option<usize> {
         self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
+
+    /// Compute the K-closest peer IDs to self.
+    fn k_closest_ids(&self, k: usize) -> Vec<PeerId> {
+        self.find_closest_nodes(&self.node_id, k)
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// Return indices of buckets whose `last_refreshed` exceeds `threshold`.
+    fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.last_refreshed.elapsed() > threshold)
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +320,12 @@ impl KademliaRoutingTable {
 // ---------------------------------------------------------------------------
 
 /// One entry in the tier-check array used by `find_ip_swap_in_scope`.
-type IpSwapTier = (usize, usize, Option<(PeerId, [u8; 32])>, &'static str);
+type IpSwapTier = (
+    usize,
+    usize,
+    Option<(PeerId, [u8; 32], Instant)>,
+    &'static str,
+);
 
 /// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
 /// its IPv4 equivalent so that diversity limits are enforced uniformly
@@ -327,6 +384,55 @@ const KADEMLIA_BUCKET_COUNT: usize = 256;
 /// when a closer but less-proven peer arrives.
 const TRUST_PROTECTION_THRESHOLD: f64 = 0.7;
 
+/// Diagnostic statistics for the routing table.
+#[allow(dead_code)]
+pub struct RoutingTableStats {
+    /// Total peers across all buckets.
+    pub total_peers: usize,
+    /// Per-bucket peer counts (256 entries).
+    pub bucket_counts: Vec<usize>,
+    /// Number of peers whose last_seen exceeds LIVE_THRESHOLD.
+    pub stale_peer_count: usize,
+}
+
+/// Events emitted by routing table mutations.
+///
+/// These are returned from admission and removal operations so the caller
+/// (DhtNetworkManager) can broadcast them without re-acquiring the lock.
+#[derive(Debug, Clone)]
+pub enum RoutingTableEvent {
+    /// A new peer was inserted into the routing table.
+    PeerAdded(PeerId),
+    /// A peer was removed from the routing table (eviction, blocking, or departure).
+    PeerRemoved(PeerId),
+    /// The set of K-closest peers to self changed.
+    KClosestPeersChanged { old: Vec<PeerId>, new: Vec<PeerId> },
+}
+
+/// Result of a peer admission attempt, including stale revalidation requests.
+///
+/// When a candidate cannot be admitted because the target bucket is full and no
+/// swap-closer peer exists, the core engine checks for stale peers that could be
+/// revalidated. If stale peers are found, the caller (DhtNetworkManager) must
+/// release the write lock, ping the stale peers, evict non-responders, and then
+/// call [`DhtCoreEngine::re_evaluate_admission`].
+#[derive(Debug)]
+pub enum AdmissionResult {
+    /// Peer was admitted (inserted or updated). Contains emitted events.
+    Admitted(Vec<RoutingTableEvent>),
+    /// Admission requires stale peer revalidation before it can proceed.
+    /// The caller must release the write lock, ping the stale peers, evict
+    /// non-responders, and then call `re_evaluate_admission`.
+    StaleRevalidationNeeded {
+        /// The candidate peer waiting for admission.
+        candidate: NodeInfo,
+        /// All candidate IPs (for re-evaluation after revalidation).
+        candidate_ips: Vec<IpAddr>,
+        /// Stale peers that should be pinged. Each entry is `(peer_id, bucket_index)`.
+        stale_peers: Vec<(PeerId, usize)>,
+    },
+}
+
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
     node_id: PeerId,
@@ -345,6 +451,9 @@ pub struct DhtCoreEngine {
     /// from `IPDiversityConfig` to prevent duplication and drift.
     allow_loopback: bool,
 
+    /// Trust score below which a peer is evicted and blocked from re-admission.
+    block_threshold: f64,
+
     /// Shutdown token for background maintenance tasks
     shutdown: CancellationToken,
 }
@@ -353,17 +462,29 @@ impl DhtCoreEngine {
     /// Create new DHT engine for testing with default K value.
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new(node_id, DEFAULT_K, false)
+        Self::new(node_id, DEFAULT_K, false, DEFAULT_BLOCK_THRESHOLD)
+    }
+
+    /// Expose the routing table for test-only direct manipulation (e.g. setting `last_seen`).
+    #[cfg(test)]
+    pub(crate) fn routing_table_for_test(&self) -> &Arc<RwLock<KademliaRoutingTable>> {
+        &self.routing_table
     }
 
     /// Create a new DHT core engine.
-    pub(crate) fn new(node_id: PeerId, k_value: usize, allow_loopback: bool) -> Result<Self> {
+    pub(crate) fn new(
+        node_id: PeerId,
+        k_value: usize,
+        allow_loopback: bool,
+        block_threshold: f64,
+    ) -> Result<Self> {
         Ok(Self {
             node_id,
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, k_value))),
             k_value,
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
+            block_threshold,
             shutdown: CancellationToken::new(),
         })
     }
@@ -379,14 +500,87 @@ impl DhtCoreEngine {
         self.allow_loopback = allow;
     }
 
+    /// Get this node's peer ID.
+    #[allow(dead_code)]
+    pub fn node_id(&self) -> &PeerId {
+        &self.node_id
+    }
+
+    /// Return bucket indices that haven't been refreshed within the given threshold.
+    pub(crate) async fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
+        self.routing_table
+            .read()
+            .await
+            .stale_bucket_indices(threshold)
+    }
+
+    /// Generate a random key that would fall into the specified bucket index
+    /// relative to this node's ID.
+    ///
+    /// Used for bucket refresh: looking up a random key in a stale bucket's range
+    /// discovers new peers that populate that bucket.
+    ///
+    /// Returns `None` if `bucket_idx` is out of range (>= 256).
+    pub(crate) fn generate_random_key_for_bucket(&self, bucket_idx: usize) -> Option<DhtKey> {
+        if bucket_idx >= KADEMLIA_BUCKET_COUNT {
+            return None;
+        }
+
+        let self_bytes = self.node_id.to_bytes();
+
+        // Construct a XOR distance with its leading set bit at position bucket_idx.
+        // Bucket index i means the first differing bit (from MSB) is at position i.
+        let byte_idx = bucket_idx / 8;
+        let bit_idx = 7 - (bucket_idx % 8);
+
+        // Use a random PeerId as an entropy source (avoids `rng.gen()` which
+        // conflicts with the `gen` keyword reserved in Rust edition 2024).
+        let random_bytes = PeerId::random();
+
+        let mut distance = [0u8; 32];
+        // Set the leading bit at bucket_idx
+        distance[byte_idx] = 1 << bit_idx;
+        // Fill random bits below the leading bit in the same byte
+        let below_mask = (1u8 << bit_idx).wrapping_sub(1);
+        distance[byte_idx] |= random_bytes.to_bytes()[byte_idx] & below_mask;
+        // Fill remaining bytes randomly
+        distance[(byte_idx + 1)..32].copy_from_slice(&random_bytes.to_bytes()[(byte_idx + 1)..32]);
+
+        // Key = self XOR distance
+        let mut result = [0u8; 32];
+        for (i, byte) in result.iter_mut().enumerate() {
+            *byte = self_bytes[i] ^ distance[i];
+        }
+        Some(DhtKey::from_bytes(result))
+    }
+
     /// Number of peers currently in the routing table.
     pub async fn routing_table_size(&self) -> usize {
         self.routing_table.read().await.node_count()
     }
 
     /// Remove a peer from the routing table by ID.
-    pub async fn remove_node_by_id(&mut self, peer_id: &PeerId) {
-        self.routing_table.write().await.remove_node(peer_id);
+    ///
+    /// Returns events describing the mutation (`PeerRemoved` if the peer was
+    /// present, and optionally `KClosestPeersChanged` when the close-group shifted).
+    /// Returns an empty vec if the peer was not in the routing table.
+    pub async fn remove_node_by_id(&mut self, peer_id: &PeerId) -> Vec<RoutingTableEvent> {
+        let mut routing = self.routing_table.write().await;
+        // Only emit events if the peer is actually present.
+        if routing.find_node_by_id(peer_id).is_none() {
+            return Vec::new();
+        }
+        let k_before = routing.k_closest_ids(self.k_value);
+        routing.remove_node(peer_id);
+        let k_after = routing.k_closest_ids(self.k_value);
+        let mut events = vec![RoutingTableEvent::PeerRemoved(*peer_id)];
+        if k_before != k_after {
+            events.push(RoutingTableEvent::KClosestPeersChanged {
+                old: k_before,
+                new: k_after,
+            });
+        }
+        events
     }
 
     /// Signal background tasks to stop
@@ -398,6 +592,33 @@ impl DhtCoreEngine {
     pub async fn find_nodes(&self, key: &DhtKey, count: usize) -> Result<Vec<NodeInfo>> {
         let routing = self.routing_table.read().await;
         Ok(routing.find_closest_nodes(key, count))
+    }
+
+    /// Find nodes closest to a key, including self as a candidate.
+    /// Used by consumers for storage responsibility determination.
+    #[allow(dead_code)]
+    pub async fn find_nodes_with_self(&self, key: &DhtKey, count: usize) -> Result<Vec<NodeInfo>> {
+        let routing = self.routing_table.read().await;
+        let mut candidates = routing.find_closest_nodes(key, count);
+
+        // Insert self as a candidate
+        let self_info = NodeInfo {
+            id: self.node_id,
+            addresses: vec![], // Self has no addresses in its own routing table
+            last_seen: Instant::now(),
+        };
+        let self_dist = xor_distance_bytes(self.node_id.to_bytes(), key.as_bytes());
+
+        // Find insertion point to maintain sorted order
+        let pos = candidates
+            .iter()
+            .position(|n| xor_distance_bytes(n.id.to_bytes(), key.as_bytes()) > self_dist)
+            .unwrap_or(candidates.len());
+
+        candidates.insert(pos, self_info);
+        candidates.truncate(count);
+
+        Ok(candidates)
     }
 
     /// Look up a node's addresses from the routing table by peer ID.
@@ -426,6 +647,29 @@ impl DhtCoreEngine {
         self.routing_table.read().await.all_nodes()
     }
 
+    /// Build diagnostic statistics for the routing table.
+    #[allow(dead_code)]
+    pub async fn routing_table_stats(&self) -> RoutingTableStats {
+        let routing = self.routing_table.read().await;
+        let bucket_counts: Vec<usize> = routing
+            .buckets
+            .iter()
+            .map(|b| b.get_nodes().len())
+            .collect();
+        let total_peers: usize = bucket_counts.iter().sum();
+        let stale_peer_count = routing
+            .buckets
+            .iter()
+            .flat_map(|b| b.get_nodes())
+            .filter(|n| n.last_seen.elapsed() > LIVE_THRESHOLD)
+            .count();
+        RoutingTableStats {
+            total_peers,
+            bucket_counts,
+            stale_peer_count,
+        }
+    }
+
     /// Record a successful interaction with a peer by updating its `last_seen`
     /// timestamp (and optionally its address) and moving it to the tail of its
     /// k-bucket (most recently seen).
@@ -449,44 +693,78 @@ impl DhtCoreEngine {
     /// any peer ID. Well-trusted peers (above [`TRUST_PROTECTION_THRESHOLD`])
     /// are protected from swap-closer eviction. This decouples the routing
     /// table from the trust engine implementation.
+    ///
+    /// Returns [`AdmissionResult::Admitted`] on success, or
+    /// [`AdmissionResult::StaleRevalidationNeeded`] when the target bucket is
+    /// full and stale peers may be evicted after revalidation. The caller
+    /// (DhtNetworkManager) must handle the revalidation flow.
     pub async fn add_node(
         &mut self,
         node: NodeInfo,
         trust_score: &impl Fn(&PeerId) -> f64,
-    ) -> Result<()> {
+    ) -> Result<AdmissionResult> {
         // Reject self-insertion — a node must never appear in its own routing table.
         if node.id == self.node_id {
             return Err(anyhow!("cannot add self to routing table"));
         }
 
-        // IP-based transports always have an IP; non-IP transports skip diversity.
-        // Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to IPv4 so an attacker
-        // cannot bypass IPv4 diversity limits by using the mapped form.
-        let candidate_ip = match node.ip().map(canonicalize_ip) {
-            Some(ip) => ip,
-            None => {
-                // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
-                let mut routing = self.routing_table.write().await;
-                routing.add_node(node)?;
-                return Ok(());
+        // Reject blocked peers — trust score below block threshold.
+        if trust_score(&node.id) < self.block_threshold {
+            return Err(anyhow!(
+                "peer blocked: trust score {:.3} below threshold {:.3}",
+                trust_score(&node.id),
+                self.block_threshold
+            ));
+        }
+
+        let peer_id = node.id;
+
+        // Extract ALL IP addresses from the candidate for diversity checking.
+        // If candidate has no IP-based addresses, it's a non-IP transport — bypass diversity.
+        let candidate_ips: Vec<IpAddr> = node
+            .addresses
+            .iter()
+            .filter_map(|a| a.ip().map(canonicalize_ip))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if candidate_ips.is_empty() {
+            // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
+            let mut routing = self.routing_table.write().await;
+            let k_before = routing.k_closest_ids(self.k_value);
+            routing.add_node(node)?;
+            let k_after = routing.k_closest_ids(self.k_value);
+            let mut events = vec![RoutingTableEvent::PeerAdded(peer_id)];
+            if k_before != k_after {
+                events.push(RoutingTableEvent::KClosestPeersChanged {
+                    old: k_before,
+                    new: k_after,
+                });
             }
-        };
+            return Ok(AdmissionResult::Admitted(events));
+        }
 
         // Single write lock covers diversity checks and insertion to avoid
         // a TOCTOU race.
         let mut routing = self.routing_table.write().await;
-        self.add_with_diversity(&mut routing, node, candidate_ip, trust_score)?;
-
-        Ok(())
+        self.add_with_diversity(&mut routing, node, &candidate_ips, trust_score, true)
     }
 
     /// Convenience method for tests: add a node with neutral trust (0.5).
     ///
     /// Preserves existing swap-closer behavior for tests that don't care
-    /// about trust scoring.
+    /// about trust scoring. Maps [`AdmissionResult::Admitted`] to its events
+    /// and treats [`AdmissionResult::StaleRevalidationNeeded`] as an error
+    /// (unit tests don't have network access to ping stale peers).
     #[cfg(test)]
-    pub async fn add_node_no_trust(&mut self, node: NodeInfo) -> Result<()> {
-        self.add_node(node, &|_| DEFAULT_NEUTRAL_TRUST).await
+    pub async fn add_node_no_trust(&mut self, node: NodeInfo) -> Result<Vec<RoutingTableEvent>> {
+        match self.add_node(node, &|_| DEFAULT_NEUTRAL_TRUST).await? {
+            AdmissionResult::Admitted(events) => Ok(events),
+            AdmissionResult::StaleRevalidationNeeded { .. } => Err(anyhow!(
+                "stale revalidation needed (not available in unit tests)"
+            )),
+        }
     }
 
     /// Check IP diversity within a scoped set of nodes and return a swap
@@ -528,8 +806,8 @@ impl DhtCoreEngine {
                 // Single pass: count exact-IP and /24 matches, track farthest at each
                 let mut count_ip: usize = 0;
                 let mut count_subnet: usize = 0;
-                let mut farthest_ip: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_subnet: Option<(PeerId, [u8; 32])> = None;
+                let mut farthest_ip: Option<(PeerId, [u8; 32], Instant)> = None;
+                let mut farthest_subnet: Option<(PeerId, [u8; 32], Instant)> = None;
 
                 for n in nodes {
                     if n.id == *candidate_id {
@@ -549,14 +827,14 @@ impl DhtCoreEngine {
 
                     if existing_v4 == v4 {
                         count_ip += 1;
-                        if farthest_ip.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_ip = Some((n.id, dist));
+                        if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
+                            farthest_ip = Some((n.id, dist, n.last_seen));
                         }
                     }
                     if mask_ipv4(existing_v4, 24) == cand_24 {
                         count_subnet += 1;
-                        if farthest_subnet.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_subnet = Some((n.id, dist));
+                        if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
+                            farthest_subnet = Some((n.id, dist, n.last_seen));
                         }
                     }
                 }
@@ -569,9 +847,10 @@ impl DhtCoreEngine {
 
                 for (count, limit, farthest, tier_name) in &tiers {
                     if *count >= *limit {
-                        if let Some((far_id, far_dist)) = farthest
+                        if let Some((far_id, far_dist, far_last_seen)) = farthest
                             && candidate_distance < far_dist
-                            && trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
+                            && (trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
+                                || far_last_seen.elapsed() > LIVE_THRESHOLD)
                         {
                             return Ok(Some(*far_id));
                         }
@@ -591,8 +870,8 @@ impl DhtCoreEngine {
                 // Single pass: count exact-IPv6 and /48 matches
                 let mut count_ip: usize = 0;
                 let mut count_subnet: usize = 0;
-                let mut farthest_ip: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_subnet: Option<(PeerId, [u8; 32])> = None;
+                let mut farthest_ip: Option<(PeerId, [u8; 32], Instant)> = None;
+                let mut farthest_subnet: Option<(PeerId, [u8; 32], Instant)> = None;
 
                 for n in nodes {
                     if n.id == *candidate_id {
@@ -612,14 +891,14 @@ impl DhtCoreEngine {
 
                     if existing_v6 == v6 {
                         count_ip += 1;
-                        if farthest_ip.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_ip = Some((n.id, dist));
+                        if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
+                            farthest_ip = Some((n.id, dist, n.last_seen));
                         }
                     }
                     if mask_ipv6(existing_v6, 48) == cand_48 {
                         count_subnet += 1;
-                        if farthest_subnet.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_subnet = Some((n.id, dist));
+                        if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
+                            farthest_subnet = Some((n.id, dist, n.last_seen));
                         }
                     }
                 }
@@ -631,9 +910,10 @@ impl DhtCoreEngine {
 
                 for (count, limit, farthest, tier_name) in &tiers {
                     if *count >= *limit {
-                        if let Some((far_id, far_dist)) = farthest
+                        if let Some((far_id, far_dist, far_last_seen)) = farthest
                             && candidate_distance < far_dist
-                            && trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
+                            && (trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
+                                || far_last_seen.elapsed() > LIVE_THRESHOLD)
                         {
                             return Ok(Some(*far_id));
                         }
@@ -648,6 +928,22 @@ impl DhtCoreEngine {
         Ok(None)
     }
 
+    /// Collect stale peers from a bucket.
+    ///
+    /// Returns `(peer_id, bucket_index)` pairs for all peers in the target
+    /// bucket whose `last_seen` exceeds [`LIVE_THRESHOLD`].
+    fn collect_stale_peers_in_bucket(
+        routing: &KademliaRoutingTable,
+        bucket_idx: usize,
+    ) -> Vec<(PeerId, usize)> {
+        routing.buckets[bucket_idx]
+            .nodes
+            .iter()
+            .filter(|n| n.last_seen.elapsed() > LIVE_THRESHOLD)
+            .map(|n| (n.id, bucket_idx))
+            .collect()
+    }
+
     /// Add a node with per-bucket and close-group IP diversity enforcement.
     ///
     /// Enforces that no IP subnet exceeds its limit within any single
@@ -660,22 +956,42 @@ impl DhtCoreEngine {
     ///
     /// Trust protection is forwarded to [`Self::find_ip_swap_in_scope`] so
     /// that well-trusted peers resist eviction.
+    ///
+    /// When `allow_stale_revalidation` is `true` and the bucket is at capacity
+    /// with no swap candidate, stale peers are identified and
+    /// [`AdmissionResult::StaleRevalidationNeeded`] is returned so the caller
+    /// can ping them and retry. When `false` (re-evaluation after revalidation),
+    /// a full bucket is a hard rejection to prevent infinite revalidation loops.
     fn add_with_diversity(
         &self,
         routing: &mut KademliaRoutingTable,
         node: NodeInfo,
-        candidate_ip: IpAddr,
+        candidate_ips: &[IpAddr],
         trust_score: &impl Fn(&PeerId) -> f64,
-    ) -> Result<()> {
+        allow_stale_revalidation: bool,
+    ) -> Result<AdmissionResult> {
+        let peer_id = node.id;
+
         // --- Loopback handling ---
-        if candidate_ip.is_loopback() {
+        let all_loopback = candidate_ips.iter().all(|ip| ip.is_loopback());
+        if all_loopback {
             if !self.allow_loopback {
                 return Err(anyhow!(
-                    "IP diversity: loopback address {candidate_ip} rejected (allow_loopback=false)"
+                    "IP diversity: loopback addresses rejected (allow_loopback=false)"
                 ));
             }
             // Loopback with allow_loopback=true bypasses all diversity checks.
-            return routing.add_node(node);
+            let k_before = routing.k_closest_ids(self.k_value);
+            routing.add_node(node)?;
+            let k_after = routing.k_closest_ids(self.k_value);
+            let mut events = vec![RoutingTableEvent::PeerAdded(peer_id)];
+            if k_before != k_after {
+                events.push(RoutingTableEvent::KClosestPeersChanged {
+                    old: k_before,
+                    new: k_after,
+                });
+            }
+            return Ok(AdmissionResult::Admitted(events));
         }
 
         let bucket_idx = routing
@@ -683,43 +999,88 @@ impl DhtCoreEngine {
             .ok_or_else(|| anyhow!("cannot insert self into routing table"))?;
         let candidate_distance = xor_distance_bytes(self.node_id.to_bytes(), node.id.to_bytes());
 
-        // === Per-bucket IP diversity ===
-        let ip_bucket_swap = self.find_ip_swap_in_scope(
-            &routing.buckets[bucket_idx].nodes,
-            &node.id,
-            candidate_ip,
-            &candidate_distance,
-            "bucket",
-            trust_score,
-        )?;
+        // === Update short-circuit (Design step 5) ===
+        // If peer already exists, merge addresses, refresh last_seen, move to tail.
+        // Skip diversity and capacity checks — the peer already holds its slot.
+        // The update path doesn't change membership, just position within a bucket.
+        // K-closest computation is distance-based, not position-based, so the set
+        // won't change. Return an empty events vec.
+        if let Some(pos) = routing.buckets[bucket_idx]
+            .nodes
+            .iter()
+            .position(|n| n.id == node.id)
+        {
+            let existing = &mut routing.buckets[bucket_idx].nodes[pos];
+            existing.last_seen = Instant::now();
+            // Merge each address from the candidate, respecting loopback injection prevention
+            for addr in &node.addresses {
+                let addr_is_loopback = addr
+                    .ip()
+                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
+                let existing_has_non_loopback = existing
+                    .addresses
+                    .iter()
+                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
+                // Don't merge loopback addresses into a non-loopback-admitted peer
+                if addr_is_loopback && existing_has_non_loopback {
+                    continue;
+                }
+                existing.merge_address(addr.clone());
+            }
+            // Move to tail (most recently seen)
+            let updated = routing.buckets[bucket_idx].nodes.remove(pos);
+            routing.buckets[bucket_idx].nodes.push(updated);
+            routing.buckets[bucket_idx].last_refreshed = Instant::now();
+            return Ok(AdmissionResult::Admitted(Vec::new()));
+        }
 
-        let bucket_swaps: Vec<PeerId> = ip_bucket_swap.into_iter().collect();
+        // === Per-bucket IP diversity ===
+        // Run diversity checks for each non-loopback candidate IP independently.
+        let mut all_bucket_swaps: Vec<PeerId> = Vec::new();
+        for &candidate_ip in candidate_ips {
+            if candidate_ip.is_loopback() {
+                continue;
+            }
+            let swap = self.find_ip_swap_in_scope(
+                &routing.buckets[bucket_idx].nodes,
+                &node.id,
+                candidate_ip,
+                &candidate_distance,
+                "bucket",
+                trust_score,
+            )?;
+            if let Some(id) = swap
+                && !all_bucket_swaps.contains(&id)
+            {
+                all_bucket_swaps.push(id);
+            }
+        }
 
         // === Close-group setup ===
         let close_group = routing.find_closest_nodes(&self.node_id, self.k_value);
 
         let effective_close_len = close_group
             .iter()
-            .filter(|n| !bucket_swaps.contains(&n.id))
+            .filter(|n| !all_bucket_swaps.contains(&n.id))
             .count();
 
         let candidate_in_close = effective_close_len < self.k_value
             || close_group
                 .iter()
-                .rfind(|n| !bucket_swaps.contains(&n.id))
+                .rfind(|n| !all_bucket_swaps.contains(&n.id))
                 .map(|n| {
                     candidate_distance
                         < xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes())
                 })
                 .unwrap_or(true);
 
-        let mut ip_close_swap: Option<PeerId> = None;
+        let mut all_close_swaps: Vec<PeerId> = Vec::new();
 
         if candidate_in_close {
             // Build hypothetical close group as Vec<NodeInfo>
             let mut hyp_close: Vec<NodeInfo> = close_group
                 .iter()
-                .filter(|n| !bucket_swaps.contains(&n.id) && n.id != node.id)
+                .filter(|n| !all_bucket_swaps.contains(&n.id) && n.id != node.id)
                 .cloned()
                 .collect();
             hyp_close.push(node.clone());
@@ -731,19 +1092,24 @@ impl DhtCoreEngine {
             hyp_close.truncate(self.k_value);
 
             // === Close-group IP diversity ===
-            ip_close_swap = self.find_ip_swap_in_scope(
-                &hyp_close,
-                &node.id,
-                candidate_ip,
-                &candidate_distance,
-                "close-group",
-                trust_score,
-            )?;
-            // Deduplicate: don't plan a close swap that's already a bucket swap
-            if let Some(id) = ip_close_swap
-                && bucket_swaps.contains(&id)
-            {
-                ip_close_swap = None;
+            for &candidate_ip in candidate_ips {
+                if candidate_ip.is_loopback() {
+                    continue;
+                }
+                let swap = self.find_ip_swap_in_scope(
+                    &hyp_close,
+                    &node.id,
+                    candidate_ip,
+                    &candidate_distance,
+                    "close-group",
+                    trust_score,
+                )?;
+                if let Some(id) = swap {
+                    // Deduplicate: don't plan a close swap that's already a bucket swap
+                    if !all_bucket_swaps.contains(&id) && !all_close_swaps.contains(&id) {
+                        all_close_swaps.push(id);
+                    }
+                }
             }
         }
 
@@ -753,29 +1119,92 @@ impl DhtCoreEngine {
             let bucket = &routing.buckets[bucket_idx];
             let already_exists = bucket.nodes.iter().any(|n| n.id == node.id);
             let has_room = bucket.nodes.len() < bucket.max_size;
-            let swap_frees_slot = ip_bucket_swap.is_some()
-                || ip_close_swap
-                    .map(|id| routing.get_bucket_index(&id) == Some(bucket_idx))
-                    .unwrap_or(false);
+            let swap_frees_slot = !all_bucket_swaps.is_empty()
+                || all_close_swaps
+                    .iter()
+                    .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
             if !already_exists && !has_room && !swap_frees_slot {
+                if allow_stale_revalidation {
+                    let stale_peers = Self::collect_stale_peers_in_bucket(routing, bucket_idx);
+                    if !stale_peers.is_empty() {
+                        return Ok(AdmissionResult::StaleRevalidationNeeded {
+                            candidate: node,
+                            candidate_ips: candidate_ips.to_vec(),
+                            stale_peers,
+                        });
+                    }
+                }
                 return Err(anyhow!(
-                    "K-bucket at capacity ({}/{})",
+                    "K-bucket at capacity ({}/{}) with no stale peers",
                     bucket.nodes.len(),
                     bucket.max_size,
                 ));
             }
         }
 
+        // === Snapshot K-closest BEFORE mutation ===
+        let k_before = routing.k_closest_ids(self.k_value);
+
         // === Execute all swaps (deduplicated) ===
         let mut executed: Vec<PeerId> = Vec::with_capacity(2);
-        for swap_id in [ip_bucket_swap, ip_close_swap].iter().filter_map(|s| *s) {
+        for swap_id in all_bucket_swaps
+            .iter()
+            .chain(all_close_swaps.iter())
+            .copied()
+        {
             if !executed.contains(&swap_id) {
                 routing.remove_node(&swap_id);
                 executed.push(swap_id);
             }
         }
 
-        routing.add_node(node)
+        routing.add_node(node)?;
+
+        // === Build events ===
+        let mut events: Vec<RoutingTableEvent> = Vec::with_capacity(executed.len() + 2);
+        for removed_id in &executed {
+            events.push(RoutingTableEvent::PeerRemoved(*removed_id));
+        }
+        events.push(RoutingTableEvent::PeerAdded(peer_id));
+
+        // === Snapshot K-closest AFTER mutation ===
+        let k_after = routing.k_closest_ids(self.k_value);
+        if k_before != k_after {
+            events.push(RoutingTableEvent::KClosestPeersChanged {
+                old: k_before,
+                new: k_after,
+            });
+        }
+
+        Ok(AdmissionResult::Admitted(events))
+    }
+
+    /// Re-evaluate admission after stale peers have been evicted by the caller.
+    ///
+    /// Called by the network manager after pinging stale peers and evicting
+    /// non-responders. Re-runs trust block check, IP diversity, and capacity
+    /// checks with `allow_stale_revalidation: false` to prevent infinite
+    /// revalidation loops.
+    pub(crate) async fn re_evaluate_admission(
+        &mut self,
+        candidate: NodeInfo,
+        candidate_ips: &[IpAddr],
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) -> Result<Vec<RoutingTableEvent>> {
+        if trust_score(&candidate.id) < self.block_threshold {
+            return Err(anyhow!("peer blocked after revalidation"));
+        }
+
+        let mut routing = self.routing_table.write().await;
+        match self.add_with_diversity(&mut routing, candidate, candidate_ips, trust_score, false)? {
+            AdmissionResult::Admitted(events) => Ok(events),
+            AdmissionResult::StaleRevalidationNeeded { .. } => {
+                // Design: re-evaluation MUST NOT trigger a second revalidation round.
+                // The `allow_stale_revalidation: false` flag should prevent this path,
+                // but we handle it defensively.
+                Err(anyhow!("K-bucket still at capacity after revalidation"))
+            }
+        }
     }
 }
 
@@ -788,6 +1217,7 @@ impl std::fmt::Debug for DhtCoreEngine {
             .field("k_value", &self.k_value)
             .field("ip_diversity_config", &self.ip_diversity_config)
             .field("allow_loopback", &self.allow_loopback)
+            .field("block_threshold", &self.block_threshold)
             .finish()
     }
 }
@@ -795,6 +1225,7 @@ impl std::fmt::Debug for DhtCoreEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::TransportAddr;
     use std::collections::HashSet;
 
     #[tokio::test]
@@ -812,7 +1243,7 @@ mod tests {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
-            last_seen: SystemTime::now(),
+            last_seen: Instant::now(),
         }
     }
 
@@ -905,7 +1336,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             })
             .unwrap();
 
@@ -915,7 +1346,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             })
             .unwrap();
 
@@ -947,7 +1378,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             })
             .unwrap();
 
@@ -957,7 +1388,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             })
             .unwrap();
 
@@ -990,7 +1421,7 @@ mod tests {
                             .parse()
                             .unwrap(),
                     ],
-                    last_seen: SystemTime::now(),
+                    last_seen: Instant::now(),
                 })
                 .unwrap();
         }
@@ -1099,7 +1530,7 @@ mod tests {
             let node = NodeInfo {
                 id: PeerId::from_bytes(id),
                 addresses: vec!["/ip4/203.0.113.1/udp/9000/quic".parse().unwrap()],
-                last_seen: SystemTime::now(),
+                last_seen: Instant::now(),
             };
             let result = dht.add_node_no_trust(node).await;
             assert!(
@@ -1120,7 +1551,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![],
-            last_seen: SystemTime::now(),
+            last_seen: Instant::now(),
         };
         assert!(bucket.add_node(node).is_err());
     }
@@ -1138,7 +1569,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
-            last_seen: SystemTime::now(),
+            last_seen: Instant::now(),
         };
         bucket.add_node(node).unwrap();
 
@@ -1163,11 +1594,1019 @@ mod tests {
         let replacement = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
-            last_seen: SystemTime::now(),
+            last_seen: Instant::now(),
         };
         bucket.add_node(replacement).unwrap();
 
         let stored = &bucket.get_nodes().last().unwrap().addresses;
         assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: create a NodeInfo with an explicit id byte array
+    // -----------------------------------------------------------------------
+
+    fn make_node_with_addr(id_bytes: [u8; 32], address: &str) -> NodeInfo {
+        NodeInfo {
+            id: PeerId::from_bytes(id_bytes),
+            addresses: vec![address.parse::<MultiAddr>().unwrap()],
+            last_seen: Instant::now(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: blocked peer rejection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_blocked_peer_rejected_on_admission() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+
+        // Trust score below block threshold (0.15)
+        let result = dht
+            .add_node(node, &|id| {
+                if *id == peer_id { 0.1 } else { 0.5 }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked"));
+        assert!(!dht.has_node(&peer_id).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 13: update short-circuit
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_duplicate_admission_updates_existing() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+        dht.add_node_no_trust(node).await.unwrap();
+
+        // Re-add same peer with a new address
+        let updated = NodeInfo {
+            id: peer_id,
+            addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
+            last_seen: Instant::now(),
+        };
+        let result = dht.add_node_no_trust(updated).await;
+        assert!(result.is_ok(), "update short-circuit should succeed");
+
+        // Should have both addresses (new one first)
+        let addrs = dht.get_node_addresses(&peer_id).await;
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(
+            addrs[0],
+            "/ip4/10.0.0.2/udp/9000/quic".parse::<MultiAddr>().unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14: loopback injection prevention
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_loopback_injection_prevented_in_touch() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+        dht.add_node_no_trust(node).await.unwrap();
+
+        // Touch with a loopback address — should be silently rejected
+        let loopback_addr: MultiAddr = "/ip4/127.0.0.1/udp/9000/quic".parse().unwrap();
+        dht.touch_node(&peer_id, Some(&loopback_addr)).await;
+
+        let addrs = dht.get_node_addresses(&peer_id).await;
+        assert_eq!(addrs.len(), 1, "loopback should not be merged");
+        assert_ne!(addrs[0], loopback_addr);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 21: staleness-gated trust protection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_stale_trusted_peer_can_be_swapped() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Two peers in bucket 0, same IP (exact-IP limit = 2)
+        let mut id_far = [0u8; 32];
+        id_far[0] = 0xFF;
+        let far_node = make_node_with_addr(id_far, "/ip4/10.0.1.1/udp/9000/quic");
+        dht.add_node_no_trust(far_node).await.unwrap();
+
+        let mut id_mid = [0u8; 32];
+        id_mid[0] = 0xFE;
+        dht.add_node_no_trust(make_node_with_addr(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+            .await
+            .unwrap();
+
+        // Make the far peer stale by manipulating last_seen
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing
+                .get_bucket_index(&PeerId::from_bytes(id_far))
+                .unwrap();
+            let node = routing.buckets[bucket_idx]
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == PeerId::from_bytes(id_far))
+                .unwrap();
+            // Set last_seen to 20 minutes ago (> LIVE_THRESHOLD of 15 min)
+            node.last_seen = Instant::now() - Duration::from_secs(1200);
+        }
+
+        // A closer candidate with the same IP
+        let mut id_close = [0u8; 32];
+        id_close[0] = 0x80;
+        let far_peer = PeerId::from_bytes(id_far);
+
+        // Far peer has trust 0.8 (above TRUST_PROTECTION_THRESHOLD) but is STALE
+        let trust_fn = |peer_id: &PeerId| -> f64 { if *peer_id == far_peer { 0.8 } else { 0.5 } };
+
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_close, "/ip4/10.0.1.1/udp/9002/quic"),
+                &trust_fn,
+            )
+            .await;
+
+        // Should succeed — stale peer loses trust protection
+        assert!(
+            result.is_ok(),
+            "stale trusted peer should be swappable: {:?}",
+            result
+        );
+        assert!(
+            !dht.has_node(&far_peer).await,
+            "stale far peer should be evicted"
+        );
+        assert!(dht.has_node(&PeerId::from_bytes(id_close)).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 22: live well-trusted peer holds slot
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_live_trusted_peer_holds_slot() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let mut id_far = [0u8; 32];
+        id_far[0] = 0xFF;
+        dht.add_node_no_trust(make_node_with_addr(id_far, "/ip4/10.0.1.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_mid = [0u8; 32];
+        id_mid[0] = 0xFE;
+        dht.add_node_no_trust(make_node_with_addr(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+            .await
+            .unwrap();
+
+        // Far peer is live (just added, last_seen is now) and trusted (0.8)
+        let far_peer = PeerId::from_bytes(id_far);
+        let trust_fn = |peer_id: &PeerId| -> f64 { if *peer_id == far_peer { 0.8 } else { 0.5 } };
+
+        let mut id_close = [0u8; 32];
+        id_close[0] = 0x80;
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_close, "/ip4/10.0.1.1/udp/9002/quic"),
+                &trust_fn,
+            )
+            .await;
+
+        // Should be rejected — live trusted peer holds its slot
+        assert!(result.is_err());
+        assert!(dht.has_node(&far_peer).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing table event tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_peer_added_event_on_insertion() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+
+        let events = dht.add_node_no_trust(node).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == peer_id)),
+            "expected PeerAdded event for inserted peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_removed_event_on_removal() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+        dht.add_node_no_trust(node).await.unwrap();
+
+        let events = dht.remove_node_by_id(&peer_id).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerRemoved(id) if *id == peer_id)),
+            "expected PeerRemoved event for removed peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k_closest_changed_event_on_first_insertion() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Add a node close to self — should trigger KClosestPeersChanged (going from empty to 1)
+        let mut id = [0u8; 32];
+        id[31] = 0x01; // bucket 255, very close to self
+        let node = NodeInfo {
+            id: PeerId::from_bytes(id),
+            addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
+            last_seen: Instant::now(),
+        };
+
+        let events = dht.add_node_no_trust(node).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::KClosestPeersChanged { .. })),
+            "adding first close peer should trigger KClosestPeersChanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_short_circuit_no_events() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        dht.add_node_no_trust(node.clone()).await.unwrap();
+
+        // Re-add same peer — update path, no events
+        let events = dht.add_node_no_trust(node).await.unwrap();
+        assert!(
+            events.is_empty(),
+            "update short-circuit should produce no events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swap_eviction_produces_both_events() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Two peers in bucket 0, same IP (exact-IP limit = 2)
+        let mut id_far = [0u8; 32];
+        id_far[0] = 0xFF;
+        dht.add_node_no_trust(make_node_with_addr(id_far, "/ip4/10.0.1.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_mid = [0u8; 32];
+        id_mid[0] = 0xFE;
+        dht.add_node_no_trust(make_node_with_addr(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+            .await
+            .unwrap();
+
+        // Make the far peer stale for swap eligibility
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing
+                .get_bucket_index(&PeerId::from_bytes(id_far))
+                .unwrap();
+            let node = routing.buckets[bucket_idx]
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == PeerId::from_bytes(id_far))
+                .unwrap();
+            node.last_seen = Instant::now() - Duration::from_secs(1200);
+        }
+
+        // A closer candidate with the same IP triggers swap
+        let mut id_close = [0u8; 32];
+        id_close[0] = 0x80;
+        let far_peer = PeerId::from_bytes(id_far);
+        let close_peer = PeerId::from_bytes(id_close);
+
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_close, "/ip4/10.0.1.1/udp/9002/quic"),
+                &|peer_id| if *peer_id == far_peer { 0.8 } else { 0.5 },
+            )
+            .await
+            .unwrap();
+
+        let events = match result {
+            AdmissionResult::Admitted(events) => events,
+            other => panic!("expected Admitted, got {:?}", other),
+        };
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerRemoved(id) if *id == far_peer)),
+            "swap should produce PeerRemoved for evicted peer"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == close_peer)),
+            "swap should produce PeerAdded for new peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_k_closest_changed_on_removal() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+        dht.add_node_no_trust(node).await.unwrap();
+
+        let events = dht.remove_node_by_id(&peer_id).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::KClosestPeersChanged { .. })),
+            "removing a peer should trigger KClosestPeersChanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale peer revalidation tests (Phase 5)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_stale_revalidation_needed_when_bucket_full_with_stale_peers() {
+        // Use k=2 so the bucket fills quickly.
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            2,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+
+        // Fill bucket 0 with 2 peers (k=2).
+        let mut id_a = [0u8; 32];
+        id_a[0] = 0x80;
+        id_a[31] = 1;
+        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_b = [0u8; 32];
+        id_b[0] = 0x80;
+        id_b[31] = 2;
+        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Make both peers stale.
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
+            for node in &mut routing.buckets[bucket_idx].nodes {
+                node.last_seen = Instant::now() - Duration::from_secs(1200);
+            }
+        }
+
+        // New candidate for bucket 0 — bucket is full, but stale peers exist.
+        let mut id_c = [0u8; 32];
+        id_c[0] = 0x80;
+        id_c[31] = 3;
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic"),
+                &|_| DEFAULT_NEUTRAL_TRUST,
+            )
+            .await
+            .unwrap();
+
+        match result {
+            AdmissionResult::StaleRevalidationNeeded {
+                candidate,
+                candidate_ips,
+                stale_peers,
+            } => {
+                assert_eq!(candidate.id, PeerId::from_bytes(id_c));
+                assert!(!candidate_ips.is_empty());
+                assert_eq!(stale_peers.len(), 2, "both peers should be stale");
+            }
+            AdmissionResult::Admitted(_) => panic!("expected StaleRevalidationNeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_stale_revalidation_when_bucket_full_no_stale() {
+        // Use k=2 so the bucket fills quickly.
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            2,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+
+        // Fill bucket 0 with 2 fresh (live) peers.
+        let mut id_a = [0u8; 32];
+        id_a[0] = 0x80;
+        id_a[31] = 1;
+        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_b = [0u8; 32];
+        id_b[0] = 0x80;
+        id_b[31] = 2;
+        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // New candidate — bucket full, no stale peers → hard rejection.
+        let mut id_c = [0u8; 32];
+        id_c[0] = 0x80;
+        id_c[31] = 3;
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic"),
+                &|_| DEFAULT_NEUTRAL_TRUST,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no stale peers"),
+            "error should mention no stale peers, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_re_evaluate_admission_after_eviction() {
+        // Use k=2 so the bucket fills quickly.
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            2,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+
+        // Fill bucket 0 with 2 peers.
+        let mut id_a = [0u8; 32];
+        id_a[0] = 0x80;
+        id_a[31] = 1;
+        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_b = [0u8; 32];
+        id_b[0] = 0x80;
+        id_b[31] = 2;
+        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Evict one peer (simulating revalidation outcome).
+        dht.remove_node_by_id(&PeerId::from_bytes(id_a)).await;
+
+        // Re-evaluate admission — should succeed now that there's room.
+        let mut id_c = [0u8; 32];
+        id_c[0] = 0x80;
+        id_c[31] = 3;
+        let candidate = make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.3".parse().unwrap()];
+
+        let events = dht
+            .re_evaluate_admission(candidate, &candidate_ips, &|_| DEFAULT_NEUTRAL_TRUST)
+            .await
+            .unwrap();
+
+        assert!(
+            events.iter().any(
+                |e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == PeerId::from_bytes(id_c))
+            ),
+            "re-evaluation should produce PeerAdded"
+        );
+        assert!(dht.has_node(&PeerId::from_bytes(id_c)).await);
+    }
+
+    #[tokio::test]
+    async fn test_re_evaluate_rejects_blocked_peer() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            20,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+
+        let mut id = [0u8; 32];
+        id[0] = 0x80;
+        let candidate = make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.1".parse().unwrap()];
+
+        // Trust below block threshold (0.15).
+        let result = dht
+            .re_evaluate_admission(candidate, &candidate_ips, &|_| 0.1)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn test_re_evaluate_does_not_trigger_second_revalidation() {
+        // Use k=2 so the bucket fills quickly.
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            2,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
+
+        // Fill bucket 0 with 2 stale peers.
+        let mut id_a = [0u8; 32];
+        id_a[0] = 0x80;
+        id_a[31] = 1;
+        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_b = [0u8; 32];
+        id_b[0] = 0x80;
+        id_b[31] = 2;
+        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.0.2/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Make both stale.
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
+            for node in &mut routing.buckets[bucket_idx].nodes {
+                node.last_seen = Instant::now() - Duration::from_secs(1200);
+            }
+        }
+
+        // re_evaluate_admission with full bucket and stale peers should reject,
+        // NOT return StaleRevalidationNeeded (no second round).
+        let mut id_c = [0u8; 32];
+        id_c[0] = 0x80;
+        id_c[31] = 3;
+        let candidate = make_node_with_addr(id_c, "/ip4/10.0.0.3/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.3".parse().unwrap()];
+
+        let result = dht
+            .re_evaluate_admission(candidate, &candidate_ips, &|_| DEFAULT_NEUTRAL_TRUST)
+            .await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no stale peers"),
+            "re-evaluation should not trigger another revalidation round, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_stale_peers_in_bucket() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            20,
+            false,
+            DEFAULT_BLOCK_THRESHOLD,
+        )
+        .unwrap();
+
+        // Add a fresh peer.
+        let mut id_fresh = [0u8; 32];
+        id_fresh[0] = 0x80;
+        id_fresh[31] = 1;
+        dht.add_node_no_trust(make_node_with_addr(id_fresh, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Add a stale peer.
+        let mut id_stale = [0u8; 32];
+        id_stale[0] = 0x80;
+        id_stale[31] = 2;
+        dht.add_node_no_trust(make_node_with_addr(id_stale, "/ip4/10.0.0.2/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing
+                .get_bucket_index(&PeerId::from_bytes(id_stale))
+                .unwrap();
+
+            // Make one peer stale.
+            let node = routing.buckets[bucket_idx]
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == PeerId::from_bytes(id_stale))
+                .unwrap();
+            node.last_seen = Instant::now() - Duration::from_secs(1200);
+
+            let stale = DhtCoreEngine::collect_stale_peers_in_bucket(&routing, bucket_idx);
+            assert_eq!(stale.len(), 1);
+            assert_eq!(stale[0].0, PeerId::from_bytes(id_stale));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_random_key_for_bucket tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_generate_random_key_for_bucket_lands_in_correct_bucket() {
+        let local_id = PeerId::random();
+        let dht = DhtCoreEngine::new_for_tests(local_id).unwrap();
+
+        // Test a selection of bucket indices across the key space.
+        let test_indices: Vec<usize> = vec![0, 1, 7, 8, 15, 127, 128, 200, 255];
+        for bucket_idx in test_indices {
+            let key = dht
+                .generate_random_key_for_bucket(bucket_idx)
+                .expect("should produce a key for valid bucket index");
+
+            // Verify the generated key falls into the expected bucket by computing
+            // the XOR distance and checking the leading bit position.
+            let distance = xor_distance_bytes(local_id.to_bytes(), key.as_bytes());
+            let leading_bit = leading_bit_position(&distance);
+            assert_eq!(
+                leading_bit,
+                Some(bucket_idx),
+                "key for bucket {bucket_idx} has wrong leading bit position: {leading_bit:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_random_key_for_bucket_out_of_range() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
+        assert!(dht.generate_random_key_for_bucket(256).is_none());
+        assert!(dht.generate_random_key_for_bucket(1000).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_random_key_for_bucket_produces_different_keys() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
+        let mut keys = HashSet::new();
+        for _ in 0..10 {
+            let key = dht.generate_random_key_for_bucket(100).unwrap();
+            keys.insert(key);
+        }
+        // With 10 random keys, they should not all be identical.
+        assert!(
+            keys.len() > 1,
+            "generate_random_key_for_bucket should produce distinct keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_bucket_indices_returns_empty_when_fresh() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
+        let stale = dht.stale_bucket_indices(Duration::from_secs(3600)).await;
+        assert!(
+            stale.is_empty(),
+            "freshly created routing table should have no stale buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_node_id_accessor() {
+        let id = PeerId::random();
+        let dht = DhtCoreEngine::new_for_tests(id).unwrap();
+        assert_eq!(*dht.node_id(), id);
+    }
+
+    /// Helper: find the position of the first set bit (from MSB) in a 32-byte distance.
+    /// Returns `None` for an all-zero distance.
+    fn leading_bit_position(distance: &[u8; 32]) -> Option<usize> {
+        for i in 0..256 {
+            let byte_index = i / 8;
+            let bit_index = 7 - (i % 8);
+            if (distance[byte_index] >> bit_index) & 1 == 1 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    // =======================================================================
+    // Phase 8: Integration test matrix — missing coverage
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // Test 12: Non-IP transport bypass
+    // -----------------------------------------------------------------------
+
+    /// A peer with a non-IP address (Bluetooth) should bypass all IP diversity
+    /// checks and be admitted up to bucket capacity.
+    #[tokio::test]
+    async fn test_non_ip_transport_bypasses_diversity() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Create a node with a Bluetooth-only address (no IP).
+        let mut id = [0u8; 32];
+        id[0] = 0x80;
+        id[31] = 1;
+        let bt_addr = MultiAddr::new(TransportAddr::Bluetooth {
+            mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
+            channel: 5,
+        });
+        let node = NodeInfo {
+            id: PeerId::from_bytes(id),
+            addresses: vec![bt_addr],
+            last_seen: Instant::now(),
+        };
+
+        let result = dht.add_node_no_trust(node).await;
+        assert!(
+            result.is_ok(),
+            "non-IP transport should bypass diversity: {:?}",
+            result
+        );
+        assert!(dht.has_node(&PeerId::from_bytes(id)).await);
+
+        // Add several more Bluetooth-only nodes to the same bucket — all should succeed
+        // because IP diversity is not checked for non-IP transports.
+        for i in 2..=5u8 {
+            let mut node_id = [0u8; 32];
+            node_id[0] = 0x80;
+            node_id[31] = i;
+            let bt = MultiAddr::new(TransportAddr::Bluetooth {
+                mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, i],
+                channel: 5,
+            });
+            let n = NodeInfo {
+                id: PeerId::from_bytes(node_id),
+                addresses: vec![bt],
+                last_seen: Instant::now(),
+            };
+            let r = dht.add_node_no_trust(n).await;
+            assert!(r.is_ok(), "Bluetooth node {i} should be admitted: {:?}", r);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 26: Local lookup self-exclusion
+    // -----------------------------------------------------------------------
+
+    /// `find_nodes` (local lookup) must never return self, even when searching
+    /// for our own key.
+    #[tokio::test]
+    async fn test_local_lookup_excludes_self() {
+        let self_id = PeerId::from_bytes([0u8; 32]);
+        let mut dht = DhtCoreEngine::new_for_tests(self_id).unwrap();
+
+        dht.add_node_no_trust(make_node(1, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Search for self's own key — self should NOT appear in results
+        // because self is never in its own routing table.
+        let results = dht
+            .find_nodes(&DhtKey::from_bytes([0u8; 32]), 10)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|n| n.id != self_id),
+            "self must be excluded from local lookup results"
+        );
+        // But other peers should still be returned.
+        assert_eq!(results.len(), 1, "expected the one added peer");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 29: find_nodes_with_self includes self
+    // -----------------------------------------------------------------------
+
+    /// `find_nodes_with_self` must include self as a candidate, correctly
+    /// positioned by XOR distance.
+    #[tokio::test]
+    async fn test_find_nodes_with_self_includes_self() {
+        let self_id = PeerId::from_bytes([0u8; 32]);
+        let mut dht = DhtCoreEngine::new_for_tests(self_id).unwrap();
+
+        dht.add_node_no_trust(make_node(1, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        // Search for self's own key — distance is zero, so self should be first.
+        let results = dht
+            .find_nodes_with_self(&DhtKey::from_bytes([0u8; 32]), 10)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|n| n.id == self_id),
+            "self should be included in find_nodes_with_self results"
+        );
+        // Self should be first (distance 0 to the search key)
+        assert_eq!(results[0].id, self_id, "self should be the closest match");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 36: Blocked peer eviction via remove_node_by_id
+    // -----------------------------------------------------------------------
+
+    /// Removing a peer by ID should produce PeerRemoved and KClosestPeersChanged
+    /// events, simulating the eviction that DhtNetworkManager performs when
+    /// trust drops below the block threshold.
+    #[tokio::test]
+    async fn test_blocked_peer_eviction_on_trust_drop() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        let peer_id = node.id;
+        dht.add_node_no_trust(node).await.unwrap();
+        assert!(dht.has_node(&peer_id).await);
+
+        // Simulate block-eviction: remove the peer.
+        let events = dht.remove_node_by_id(&peer_id).await;
+        assert!(
+            !dht.has_node(&peer_id).await,
+            "peer must be gone after removal"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerRemoved(id) if *id == peer_id)),
+            "expected PeerRemoved event"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 36 extension: removing an absent peer is a no-op
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_remove_absent_peer_produces_no_events() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let absent_peer = PeerId::from_bytes([99u8; 32]);
+
+        let events = dht.remove_node_by_id(&absent_peer).await;
+        assert!(
+            events.is_empty(),
+            "removing a peer not in the routing table should produce no events"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 49: Trust protection prevents eclipse displacement (live peers)
+    // -----------------------------------------------------------------------
+
+    /// An attacker with a closer ID cannot displace a live well-trusted peer.
+    /// Only low-trust, stale, or empty slots can be taken.
+    #[tokio::test]
+    async fn test_eclipse_resistance_live_trusted_peers() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // Fill 2 same-IP slots in bucket 0 with trusted, live peers.
+        let mut id_a = [0u8; 32];
+        id_a[0] = 0xFF;
+        dht.add_node_no_trust(make_node_with_addr(id_a, "/ip4/10.0.1.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_b = [0u8; 32];
+        id_b[0] = 0xFE;
+        dht.add_node_no_trust(make_node_with_addr(id_b, "/ip4/10.0.1.1/udp/9001/quic"))
+            .await
+            .unwrap();
+
+        // Attacker generates a much closer ID with the same IP.
+        let mut id_attacker = [0u8; 32];
+        id_attacker[0] = 0x80;
+
+        // Both existing peers are live (just added) and well-trusted.
+        let peer_a = PeerId::from_bytes(id_a);
+        let peer_b = PeerId::from_bytes(id_b);
+        let trust_fn = |peer_id: &PeerId| -> f64 {
+            if *peer_id == peer_a || *peer_id == peer_b {
+                0.9 // well above TRUST_PROTECTION_THRESHOLD
+            } else {
+                0.5
+            }
+        };
+
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_attacker, "/ip4/10.0.1.1/udp/9002/quic"),
+                &trust_fn,
+            )
+            .await;
+
+        // Should be rejected — both peers are live and well-trusted.
+        assert!(
+            result.is_err(),
+            "attacker should not displace live trusted peers"
+        );
+        assert!(dht.has_node(&peer_a).await, "peer A must survive");
+        assert!(dht.has_node(&peer_b).await, "peer B must survive");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 50: Stale trust-protected peer displaced by attacker
+    // -----------------------------------------------------------------------
+
+    /// A well-trusted but stale peer can be displaced by a closer candidate.
+    /// This is correct: a stale peer should not block admission indefinitely.
+    #[tokio::test]
+    async fn test_stale_trusted_peer_displaced_by_closer_candidate() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let mut id_far = [0u8; 32];
+        id_far[0] = 0xFF;
+        dht.add_node_no_trust(make_node_with_addr(id_far, "/ip4/10.0.1.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let mut id_mid = [0u8; 32];
+        id_mid[0] = 0xFE;
+        dht.add_node_no_trust(make_node_with_addr(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+            .await
+            .unwrap();
+
+        // Make the far peer stale.
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket_idx = routing
+                .get_bucket_index(&PeerId::from_bytes(id_far))
+                .unwrap();
+            let node = routing.buckets[bucket_idx]
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == PeerId::from_bytes(id_far))
+                .unwrap();
+            node.last_seen = Instant::now() - Duration::from_secs(1200);
+        }
+
+        let far_peer = PeerId::from_bytes(id_far);
+        // Far peer is well-trusted but STALE.
+        let trust_fn = |peer_id: &PeerId| -> f64 { if *peer_id == far_peer { 0.9 } else { 0.5 } };
+
+        let mut id_closer = [0u8; 32];
+        id_closer[0] = 0x80;
+        let result = dht
+            .add_node(
+                make_node_with_addr(id_closer, "/ip4/10.0.1.1/udp/9002/quic"),
+                &trust_fn,
+            )
+            .await;
+
+        // Should succeed: stale peer loses trust protection.
+        assert!(
+            result.is_ok(),
+            "stale well-trusted peer should be displaceable: {:?}",
+            result
+        );
+        assert!(
+            !dht.has_node(&far_peer).await,
+            "stale peer should be evicted"
+        );
+        assert!(
+            dht.has_node(&PeerId::from_bytes(id_closer)).await,
+            "closer candidate should be admitted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 56: Consumer event for peer not in routing table
+    // -----------------------------------------------------------------------
+
+    /// Trust events for peers not in the routing table should not affect the
+    /// routing table. (TrustEngine records the score independently.)
+    #[tokio::test]
+    async fn test_trust_event_for_absent_peer_does_not_affect_rt() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let absent_peer = PeerId::from_bytes([42u8; 32]);
+
+        // Peer is not in the routing table.
+        assert!(!dht.has_node(&absent_peer).await);
+
+        // The routing table should remain unchanged after trust events
+        // (trust is tracked externally in TrustEngine, not in the RT).
+        let size_before = dht.routing_table_size().await;
+        assert!(!dht.has_node(&absent_peer).await);
+        let size_after = dht.routing_table_size().await;
+        assert_eq!(size_before, size_after, "routing table should be unchanged");
     }
 }

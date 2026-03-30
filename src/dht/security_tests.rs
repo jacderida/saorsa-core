@@ -1,14 +1,14 @@
 use crate::PeerId;
 use crate::dht::core_engine::{DhtCoreEngine, NodeInfo};
 use crate::security::IPDiversityConfig;
-use std::time::SystemTime;
+use std::time::Instant;
 
 /// Helper: create a NodeInfo with a specific PeerId (from byte array) and address.
 fn make_node_with_id(id_bytes: [u8; 32], addr: &str) -> NodeInfo {
     NodeInfo {
         id: PeerId::from_bytes(id_bytes),
         addresses: vec![addr.parse().unwrap()],
-        last_seen: SystemTime::now(),
+        last_seen: Instant::now(),
     }
 }
 
@@ -432,7 +432,7 @@ async fn test_self_insertion_rejected() -> anyhow::Result<()> {
     let self_node = NodeInfo {
         id: self_id,
         addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-        last_seen: SystemTime::now(),
+        last_seen: Instant::now(),
     };
     let result = engine.add_node_no_trust(self_node).await;
     assert!(result.is_err());

@@ -86,12 +86,24 @@ impl PeerTrust {
         }
     }
 
-    /// Apply a new observation via EMA, after first applying decay.
-    fn record(&mut self, observation: f64) {
+    /// Apply a new observation via weighted EMA, after first applying decay.
+    ///
+    /// The weight controls how heavily this observation influences the score.
+    /// `(1-α)^W * score + (1-(1-α)^W) * observation` generalizes the unit-weight
+    /// formula and is equivalent to applying `W` consecutive unit-weight updates
+    /// for integer W.
+    fn record_weighted(&mut self, observation: f64, weight: f64) {
         self.apply_decay();
-        self.score = (1.0 - EMA_WEIGHT) * self.score + EMA_WEIGHT * observation;
+        let alpha_w = 1.0 - (1.0 - EMA_WEIGHT).powf(weight);
+        self.score = (1.0 - alpha_w) * self.score + alpha_w * observation;
         self.score = self.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE);
         self.last_updated = Instant::now();
+    }
+
+    /// Apply a new observation via EMA with unit weight, after first applying decay.
+    #[allow(dead_code)] // design API: retained as convenience wrapper for record_weighted
+    fn record(&mut self, observation: f64) {
+        self.record_weighted(observation, 1.0);
     }
 
     /// Get the current score with decay applied (does not mutate).
@@ -166,6 +178,20 @@ impl TrustEngine {
 
     /// Record a peer interaction outcome
     pub async fn update_node_stats(&self, node_id: &PeerId, update: NodeStatisticsUpdate) {
+        self.update_node_stats_weighted(node_id, update, 1.0).await;
+    }
+
+    /// Record a peer interaction outcome with an explicit weight.
+    ///
+    /// Weight `1.0` is equivalent to a single internal event. Higher weights
+    /// amplify the observation's influence on the EMA. The caller is responsible
+    /// for validating/clamping the weight before calling this method.
+    pub async fn update_node_stats_weighted(
+        &self,
+        node_id: &PeerId,
+        update: NodeStatisticsUpdate,
+        weight: f64,
+    ) {
         let mut peers = self.peers.write();
         let entry = peers.entry(*node_id).or_insert_with(PeerTrust::new);
 
@@ -174,7 +200,7 @@ impl TrustEngine {
             NodeStatisticsUpdate::FailedResponse => FAILURE_OBSERVATION,
         };
 
-        entry.record(observation);
+        entry.record_weighted(observation, weight);
     }
 
     /// Get current trust score for a peer (synchronous).
@@ -552,6 +578,233 @@ mod tests {
         assert!(
             (score - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
             "Infinity score should fall back to neutral, got {score}"
+        );
+    }
+
+    /// Test: weighted EMA has larger impact than unit weight
+    #[tokio::test]
+    async fn test_weighted_ema_larger_impact() {
+        let engine = TrustEngine::new();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        // Unit-weight failure for peer A
+        engine
+            .update_node_stats_weighted(&peer_a, NodeStatisticsUpdate::FailedResponse, 1.0)
+            .await;
+        let score_a = engine.score(&peer_a);
+
+        // Weight-5 failure for peer B
+        engine
+            .update_node_stats_weighted(&peer_b, NodeStatisticsUpdate::FailedResponse, 5.0)
+            .await;
+        let score_b = engine.score(&peer_b);
+
+        assert!(
+            score_b < score_a,
+            "weight-5 failure ({score_b}) should produce lower score than weight-1 ({score_a})"
+        );
+    }
+
+    /// Test: weight-1 weighted path is equivalent to the original unit-weight path
+    #[tokio::test]
+    async fn test_unit_weight_equivalence() {
+        let engine1 = TrustEngine::new();
+        let engine2 = TrustEngine::new();
+        let peer = PeerId::random();
+
+        engine1
+            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+            .await;
+        engine2
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0)
+            .await;
+
+        let diff = (engine1.score(&peer) - engine2.score(&peer)).abs();
+        assert!(
+            diff < 1e-10,
+            "unit-weight paths should be equivalent, diff={diff}"
+        );
+    }
+
+    // =======================================================================
+    // Phase 8: Integration test matrix — missing coverage
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // Test 54: Consumer penalty degrades trust to blocking
+    // -----------------------------------------------------------------------
+
+    /// Repeated high-weight failures should push a peer's trust score below
+    /// the block threshold (0.15), eventually making it eligible for eviction.
+    #[tokio::test]
+    async fn test_consumer_penalty_degrades_to_blocking() {
+        /// Block threshold matching the value in adaptive/dht.rs
+        const BLOCK_THRESHOLD: f64 = 0.15;
+
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Repeated weight-3 failures from neutral (0.5) should push well below 0.15.
+        let failure_count = 10;
+        for _ in 0..failure_count {
+            engine
+                .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
+                .await;
+        }
+
+        let score = engine.score(&peer);
+        assert!(
+            score < BLOCK_THRESHOLD,
+            "after {failure_count} weight-3 failures, score {score} should be below block threshold {BLOCK_THRESHOLD}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 58: Consumer and internal events combine in same EMA
+    // -----------------------------------------------------------------------
+
+    /// Internal (weight-1) and consumer-reported (weight-3) events feed the
+    /// same EMA. A heavier failure should outweigh a lighter success.
+    #[tokio::test]
+    async fn test_consumer_and_internal_events_combine() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Internal success (unit weight)
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+            .await;
+        let after_success = engine.score(&peer);
+        assert!(
+            after_success > DEFAULT_NEUTRAL_TRUST,
+            "single success should raise above neutral"
+        );
+
+        // Consumer failure with weight 3 — should outweigh the single success
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
+            .await;
+        let after_failure = engine.score(&peer);
+
+        assert!(
+            after_failure < after_success,
+            "weight-3 failure ({after_failure}) should outweigh weight-1 success ({after_success})"
+        );
+        assert!(
+            after_failure < DEFAULT_NEUTRAL_TRUST,
+            "net effect ({after_failure}) should be below neutral ({DEFAULT_NEUTRAL_TRUST})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 59: Consumer trust query reflects all event sources
+    // -----------------------------------------------------------------------
+
+    /// `score()` returns a single EMA value shaped by a mix of internal and
+    /// consumer-reported events — there is no separate "consumer score."
+    #[tokio::test]
+    async fn test_trust_query_reflects_all_event_sources() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Mix of internal and consumer events
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::CorrectResponse)
+            .await;
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 2.0)
+            .await;
+        engine
+            .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+            .await;
+
+        // Score should reflect the combined influence, not just internal events.
+        let score = engine.score(&peer);
+        // With 1 unit-success + 1 weight-2-success + 1 unit-failure, the net
+        // effect is positive (3 success-units vs 1 failure-unit).
+        assert!(
+            score > DEFAULT_NEUTRAL_TRUST,
+            "combined score {score} should be above neutral (net positive events)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 63: Time decay applies to consumer events
+    // -----------------------------------------------------------------------
+
+    /// Consumer-reported events are subject to the same time decay as internal
+    /// events. After enough idle time, the score should decay back toward
+    /// neutral (0.5).
+    #[tokio::test]
+    async fn test_time_decay_applies_to_consumer_events() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Apply a consumer failure with weight 3
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0)
+            .await;
+        let after_failure = engine.score(&peer);
+        assert!(
+            after_failure < DEFAULT_NEUTRAL_TRUST,
+            "after failure, score {after_failure} should be below neutral"
+        );
+
+        // Simulate 3+ days of idle time
+        let three_days = std::time::Duration::from_secs(3 * 24 * 3600);
+        engine.simulate_elapsed(&peer, three_days).await;
+
+        let after_decay = engine.score(&peer);
+        assert!(
+            after_decay > after_failure,
+            "score should decay toward neutral: {after_failure} -> {after_decay}"
+        );
+        // After 3 days from a moderate failure, the score should be close to neutral.
+        let distance_from_neutral = (after_decay - DEFAULT_NEUTRAL_TRUST).abs();
+        assert!(
+            distance_from_neutral < 0.15,
+            "after 3 days, score {after_decay} should be near neutral (distance {distance_from_neutral})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 57: Consumer rewards restore trust protection
+    // -----------------------------------------------------------------------
+
+    /// A peer with trust below TRUST_PROTECTION_THRESHOLD (0.7) can be
+    /// restored above that threshold by enough consumer success events.
+    #[tokio::test]
+    async fn test_consumer_rewards_restore_trust_protection() {
+        /// Trust protection threshold from core_engine.rs
+        const TRUST_PROTECTION_THRESHOLD: f64 = 0.7;
+
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // Start below trust protection with some failures
+        for _ in 0..5 {
+            engine
+                .update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+        let low_score = engine.score(&peer);
+        assert!(
+            low_score < TRUST_PROTECTION_THRESHOLD,
+            "peer should start below trust protection: {low_score}"
+        );
+
+        // Consumer-reported successes with weight 3 should lift the score
+        let success_rounds = 30;
+        for _ in 0..success_rounds {
+            engine
+                .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, 3.0)
+                .await;
+        }
+        let restored_score = engine.score(&peer);
+        assert!(
+            restored_score >= TRUST_PROTECTION_THRESHOLD,
+            "after {success_rounds} weight-3 successes, score {restored_score} should be >= {TRUST_PROTECTION_THRESHOLD}"
         );
     }
 }
