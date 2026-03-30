@@ -229,17 +229,15 @@ pub struct DhtNetworkManager {
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
-    /// Tracked set of K-closest peers to self for change detection.
-    /// Updated after every routing table mutation; compared to detect
-    /// `KClosestPeersChanged` events.
-    k_closest_peers: Mutex<HashSet<PeerId>>,
     /// Global semaphore limiting concurrent stale revalidation passes.
     /// Prevents a flood of revalidation attempts from consuming excessive
     /// resources when many buckets have stale peers simultaneously.
     revalidation_semaphore: Arc<Semaphore>,
     /// Per-bucket revalidation state: tracks active revalidation to prevent
     /// concurrent revalidation passes on the same bucket.
-    bucket_revalidation_active: Arc<std::sync::Mutex<HashSet<usize>>>,
+    /// Uses `parking_lot::Mutex` (not tokio) because it is never held across
+    /// `.await` and its `Drop`-based guard cleanup requires synchronous locking.
+    bucket_revalidation_active: Arc<parking_lot::Mutex<HashSet<usize>>>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -297,10 +295,10 @@ pub enum DhtNetworkEvent {
     /// topology changes and trigger neighbor-sync or responsibility
     /// recomputation.
     KClosestPeersChanged {
-        /// Peers that entered the K-closest set.
-        added: Vec<PeerId>,
-        /// Peers that left the K-closest set.
-        removed: Vec<PeerId>,
+        /// K-closest peer IDs before the mutation.
+        old: Vec<PeerId>,
+        /// K-closest peer IDs after the mutation.
+        new: Vec<PeerId>,
     },
     /// New peer added to the routing table.
     PeerAdded { peer_id: PeerId },
@@ -348,14 +346,13 @@ pub struct DhtNetworkStats {
 /// on drop, ensuring the slot is released even if the revalidation panics or
 /// returns early.
 struct BucketRevalidationGuard {
-    active: Arc<std::sync::Mutex<HashSet<usize>>>,
+    active: Arc<parking_lot::Mutex<HashSet<usize>>>,
     bucket_idx: usize,
 }
 
 impl Drop for BucketRevalidationGuard {
     fn drop(&mut self) {
-        let mut guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(&self.bucket_idx);
+        self.active.lock().remove(&self.bucket_idx);
     }
 }
 
@@ -398,9 +395,8 @@ impl DhtNetworkManager {
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
-            k_closest_peers: Mutex::new(HashSet::new()),
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
-            bucket_revalidation_active: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
@@ -1064,7 +1060,6 @@ impl DhtNetworkManager {
                         let rt_events = dht.remove_node_by_id(&peer_id).await;
                         drop(dht);
                         self.broadcast_routing_events(&rt_events);
-                        self.check_and_emit_k_closest_changed().await;
                     }
                     Ok(_) => {
                         self.record_peer_success(&peer_id).await;
@@ -1249,7 +1244,6 @@ impl DhtNetworkManager {
                 let rt_events = dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
                 self.broadcast_routing_events(&rt_events);
-                self.check_and_emit_k_closest_changed().await;
                 // Cancel in-flight RPCs — cancelled operations must not record
                 // trust events (Section 7.4 step 2a).
                 self.cancel_operations_for_peer(peer_id);
@@ -1275,7 +1269,6 @@ impl DhtNetworkManager {
         let rt_events = dht.remove_node_by_id(peer_id).await;
         drop(dht);
         self.broadcast_routing_events(&rt_events);
-        self.check_and_emit_k_closest_changed().await;
         self.cancel_operations_for_peer(peer_id);
         let _ = self.transport.disconnect_peer(peer_id).await;
         tracing::info!(
@@ -2133,14 +2126,11 @@ impl DhtNetworkManager {
                     .map(|engine| engine.score(peer_id))
                     .unwrap_or(DEFAULT_NEUTRAL_TRUST)
             };
-            // Bind the result so the write guard drops before the branches —
-            // check_and_emit_k_closest_changed needs a read lock.
             let add_result = self.dht.write().await.add_node(node_info, &trust_fn).await;
             match add_result {
                 Ok(AdmissionResult::Admitted(rt_events)) => {
                     info!("Added peer {} to DHT routing table", app_peer_id_hex);
                     self.broadcast_routing_events(&rt_events);
-                    self.check_and_emit_k_closest_changed().await;
                 }
                 Ok(AdmissionResult::StaleRevalidationNeeded {
                     candidate,
@@ -2169,7 +2159,6 @@ impl DhtNetworkManager {
                                 app_peer_id_hex
                             );
                             self.broadcast_routing_events(&rt_events);
-                            self.check_and_emit_k_closest_changed().await;
                         }
                         Err(e) => {
                             warn!(
@@ -2376,10 +2365,7 @@ impl DhtNetworkManager {
         // merge). The DHT write lock provides correctness; this guard only
         // prevents redundant ping work on the same bucket.
         {
-            let mut active = self
-                .bucket_revalidation_active
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut active = self.bucket_revalidation_active.lock();
             if active.contains(&bucket_idx) {
                 return Err(anyhow::anyhow!(
                     "revalidation already in progress for bucket {bucket_idx}"
@@ -2493,53 +2479,13 @@ impl DhtNetworkManager {
                         .event_tx
                         .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
                 }
-                RoutingTableEvent::KClosestPeersChanged { .. } => {
-                    // Handled by check_and_emit_k_closest_changed after each
-                    // mutation — that path does snapshot diffing which is more
-                    // robust than forwarding core engine events directly.
+                RoutingTableEvent::KClosestPeersChanged { old, new } => {
+                    let _ = self.event_tx.send(DhtNetworkEvent::KClosestPeersChanged {
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
                 }
             }
-        }
-    }
-
-    /// Recompute the K-closest peers to self and emit a
-    /// [`DhtNetworkEvent::KClosestPeersChanged`] event if the set differs
-    /// from the previous snapshot.
-    ///
-    /// Call after every routing table mutation (add, remove, evict).
-    async fn check_and_emit_k_closest_changed(&self) {
-        let k = self.k_value();
-        let own_key: Key = *self.config.peer_id.to_bytes();
-        let current: HashSet<PeerId> = self
-            .find_closest_nodes_local(&own_key, k)
-            .await
-            .into_iter()
-            .map(|n| n.peer_id)
-            .collect();
-
-        let (added, removed) = {
-            let mut prev = self
-                .k_closest_peers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if *prev == current {
-                return;
-            }
-            let added: Vec<PeerId> = current.difference(&prev).copied().collect();
-            let removed: Vec<PeerId> = prev.difference(&current).copied().collect();
-            *prev = current;
-            (added, removed)
-        };
-
-        debug!(
-            "K-closest peers changed: +{} -{} peers",
-            added.len(),
-            removed.len()
-        );
-        if self.event_tx.receiver_count() > 0 {
-            let _ = self
-                .event_tx
-                .send(DhtNetworkEvent::KClosestPeersChanged { added, removed });
         }
     }
 
@@ -2582,15 +2528,22 @@ impl DhtNetworkManager {
     /// collecting them is inexpensive.
     pub async fn routing_table_peers(&self) -> Vec<DHTNode> {
         let dht_guard = self.dht.read().await;
-        dht_guard
-            .all_nodes()
-            .await
+        let nodes = dht_guard.all_nodes().await;
+        drop(dht_guard);
+        nodes
             .into_iter()
-            .map(|node| DHTNode {
-                peer_id: node.id,
-                addresses: node.addresses,
-                distance: None,
-                reliability: SELF_RELIABILITY_SCORE,
+            .map(|node| {
+                let reliability = self
+                    .trust_engine
+                    .as_ref()
+                    .map(|engine| engine.score(&node.id))
+                    .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                DHTNode {
+                    peer_id: node.id,
+                    addresses: node.addresses,
+                    distance: None,
+                    reliability,
+                }
             })
             .collect()
     }
@@ -2714,6 +2667,35 @@ mod tests {
             matches!(deserialized, DhtNetworkResult::PeerRejected),
             "round-tripped result should be PeerRejected, got: {deserialized:?}"
         );
+    }
+
+    #[test]
+    fn test_bootstrap_complete_event_construction() {
+        let event = DhtNetworkEvent::BootstrapComplete { num_peers: 42 };
+        assert!(
+            matches!(event, DhtNetworkEvent::BootstrapComplete { num_peers: 42 }),
+            "BootstrapComplete event should carry the peer count"
+        );
+    }
+
+    #[test]
+    fn test_k_closest_changed_event_uses_old_new_naming() {
+        let old = vec![PeerId::random(), PeerId::random()];
+        let new = vec![PeerId::random()];
+        let event = DhtNetworkEvent::KClosestPeersChanged {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        match event {
+            DhtNetworkEvent::KClosestPeersChanged {
+                old: got_old,
+                new: got_new,
+            } => {
+                assert_eq!(got_old, old);
+                assert_eq!(got_new, new);
+            }
+            _ => panic!("expected KClosestPeersChanged"),
+        }
     }
 
     #[test]

@@ -26,13 +26,32 @@ use std::num::NonZeroUsize;
 /// Maximum subnet tracking entries before evicting oldest (prevents memory DoS)
 const BOOTSTRAP_MAX_TRACKED_SUBNETS: usize = 50_000;
 
-/// Default subnet limit for `BootstrapIpLimiter` (/48 IPv6, /24 IPv4).
-/// Used when `IPDiversityConfig::max_per_subnet` is `None`.
-const BOOTSTRAP_DEFAULT_SUBNET_LIMIT: usize = 2;
-
 /// Default exact-IP limit for `BootstrapIpLimiter`.
 /// Used when `IPDiversityConfig::max_per_ip` is `None`.
 const BOOTSTRAP_DEFAULT_IP_LIMIT: usize = 2;
+
+/// Default K value for `BootstrapIpLimiter` when the actual K is not known
+/// (e.g. standalone test construction). Matches `DHTConfig::DEFAULT_K_VALUE`.
+const DEFAULT_K_VALUE: usize = 20;
+
+/// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
+/// its IPv4 equivalent so that diversity limits are enforced uniformly
+/// regardless of which address family the transport layer reports.
+pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+/// Compute the subnet diversity limit from the active K value.
+/// At least 1 node per subnet is always permitted.
+pub const fn ip_subnet_limit(k: usize) -> usize {
+    if k / 4 > 0 { k / 4 } else { 1 }
+}
 
 /// Configuration for IP diversity enforcement at two tiers: exact IP and subnet.
 ///
@@ -120,6 +139,9 @@ pub struct BootstrapIpLimiter {
     /// has a single source of truth in the owning component (`NodeConfig`,
     /// `BootstrapManager`, etc.) rather than being copied into every config.
     allow_loopback: bool,
+    /// K value from DHT config, used to derive subnet limits consistent with
+    /// the routing table's `ip_subnet_limit(k)`.
+    k_value: usize,
     /// Count of nodes per exact IP address
     ip_counts: LruCache<IpAddr, usize>,
     /// Count of nodes per subnet (/24 IPv4, /48 IPv6)
@@ -127,37 +149,38 @@ pub struct BootstrapIpLimiter {
 }
 
 impl BootstrapIpLimiter {
-    /// Create a new IP diversity enforcer with loopback disabled.
+    /// Create a new IP diversity enforcer with loopback disabled and default K.
     #[allow(dead_code)]
     pub fn new(config: IPDiversityConfig) -> Self {
         Self::with_loopback(config, false)
     }
 
-    /// Create a new IP diversity enforcer with explicit loopback setting.
+    /// Create a new IP diversity enforcer with explicit loopback setting and
+    /// default K value.
     ///
     /// `allow_loopback` should come from the single source of truth
     /// (e.g. `NodeConfig.allow_loopback`), not from the diversity config.
     pub fn with_loopback(config: IPDiversityConfig, allow_loopback: bool) -> Self {
+        Self::with_loopback_and_k(config, allow_loopback, DEFAULT_K_VALUE)
+    }
+
+    /// Create a new IP diversity enforcer with explicit loopback setting and K value.
+    ///
+    /// The `k_value` is used to derive the subnet limit (`k/4`) so that bootstrap
+    /// and routing table diversity limits stay consistent.
+    pub fn with_loopback_and_k(
+        config: IPDiversityConfig,
+        allow_loopback: bool,
+        k_value: usize,
+    ) -> Self {
         let cache_size =
             NonZeroUsize::new(BOOTSTRAP_MAX_TRACKED_SUBNETS).unwrap_or(NonZeroUsize::MIN);
         Self {
             config,
             allow_loopback,
+            k_value,
             ip_counts: LruCache::new(cache_size),
             subnet_counts: LruCache::new(cache_size),
-        }
-    }
-
-    /// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
-    /// its IPv4 equivalent so that diversity limits cannot be bypassed by
-    /// using the mapped form for the same network location.
-    fn canonicalize(ip: IpAddr) -> IpAddr {
-        match ip {
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(v6)),
-            other => other,
         }
     }
 
@@ -181,9 +204,11 @@ impl BootstrapIpLimiter {
 
     /// Check if a new node with the given IP can be accepted under diversity limits.
     pub fn can_accept(&self, ip: IpAddr) -> bool {
-        let ip = Self::canonicalize(ip);
-        if ip.is_loopback() && self.allow_loopback {
-            return true;
+        let ip = canonicalize_ip(ip);
+
+        // Loopback: bypass all checks when allowed, reject outright when not.
+        if ip.is_loopback() {
+            return self.allow_loopback;
         }
 
         // Reject addresses that are never valid peer endpoints.
@@ -195,7 +220,7 @@ impl BootstrapIpLimiter {
         let subnet_limit = self
             .config
             .max_per_subnet
-            .unwrap_or(BOOTSTRAP_DEFAULT_SUBNET_LIMIT);
+            .unwrap_or(ip_subnet_limit(self.k_value));
 
         // Check exact IP limit
         if let Some(&count) = self.ip_counts.peek(&ip)
@@ -219,7 +244,7 @@ impl BootstrapIpLimiter {
     ///
     /// Returns an error if the IP would exceed diversity limits.
     pub fn track(&mut self, ip: IpAddr) -> Result<()> {
-        let ip = Self::canonicalize(ip);
+        let ip = canonicalize_ip(ip);
         if !self.can_accept(ip) {
             return Err(anyhow!("IP diversity limits exceeded"));
         }
@@ -237,7 +262,7 @@ impl BootstrapIpLimiter {
     /// Remove a tracked IP address from the diversity enforcer.
     #[allow(dead_code)]
     pub fn untrack(&mut self, ip: IpAddr) {
-        let ip = Self::canonicalize(ip);
+        let ip = canonicalize_ip(ip);
         if let Some(count) = self.ip_counts.peek_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -424,11 +449,16 @@ mod tests {
         assert!(enforcer.can_accept(loopback_v4));
         assert!(enforcer.can_accept(loopback_v6));
 
-        // With loopback disabled (default)
-        let mut enforcer_no_lb = BootstrapIpLimiter::new(config);
-        enforcer_no_lb.track(loopback_v4).unwrap();
-        // After tracking once, should be rejected (limit=1)
-        assert!(!enforcer_no_lb.can_accept(loopback_v4));
+        // With loopback disabled (default) — rejected outright, not tracked
+        let enforcer_no_lb = BootstrapIpLimiter::new(config);
+        assert!(
+            !enforcer_no_lb.can_accept(loopback_v4),
+            "loopback should be rejected when allow_loopback=false"
+        );
+        assert!(
+            !enforcer_no_lb.can_accept(loopback_v6),
+            "loopback IPv6 should be rejected when allow_loopback=false"
+        );
     }
 
     #[test]
@@ -448,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_limits_are_two() {
+    fn test_default_ip_limit_is_two() {
         let config = IPDiversityConfig::default();
         let mut enforcer = BootstrapIpLimiter::new(config);
 
@@ -460,6 +490,26 @@ mod tests {
 
         // Third should fail
         assert!(!enforcer.can_accept(ip1));
+    }
+
+    #[test]
+    fn test_default_subnet_limit_matches_k() {
+        // With default K=20, subnet limit should be K/4 = 5
+        let config = IPDiversityConfig::default();
+        let mut enforcer = BootstrapIpLimiter::new(config);
+
+        // Track 5 IPs in the same /24 subnet — all should succeed
+        for i in 1..=5 {
+            let ip: IpAddr = format!("10.0.1.{i}").parse().unwrap();
+            enforcer.track(ip).unwrap();
+        }
+
+        // 6th in same subnet should be rejected
+        let ip6: IpAddr = "10.0.1.6".parse().unwrap();
+        assert!(
+            !enforcer.can_accept(ip6),
+            "6th peer in same /24 should exceed K/4=5 subnet limit"
+        );
     }
 
     #[test]

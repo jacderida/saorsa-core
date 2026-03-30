@@ -21,6 +21,7 @@
 //! All core caching functionality is delegated to saorsa-transport.
 
 use crate::error::BootstrapError;
+use crate::network::DHTConfig;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
 use crate::security::{BootstrapIpLimiter, IPDiversityConfig};
 use crate::{P2PError, Result};
@@ -74,9 +75,10 @@ pub struct BootstrapManager {
 }
 
 impl BootstrapManager {
-    async fn with_config_and_loopback(
+    async fn with_config_loopback_and_k(
         config: BootstrapConfig,
         allow_loopback: bool,
+        k_value: usize,
     ) -> Result<Self> {
         let ant_config = BootstrapCacheConfig::builder()
             .cache_dir(&config.cache_dir)
@@ -93,9 +95,10 @@ impl BootstrapManager {
         Ok(Self {
             cache: Arc::new(cache),
             rate_limiter: JoinRateLimiter::new(config.rate_limit),
-            ip_limiter: Mutex::new(BootstrapIpLimiter::with_loopback(
+            ip_limiter: Mutex::new(BootstrapIpLimiter::with_loopback_and_k(
                 config.diversity.clone(),
                 allow_loopback,
+                k_value,
             )),
             diversity_config: config.diversity,
             maintenance_handle: None,
@@ -109,14 +112,15 @@ impl BootstrapManager {
 
     /// Create a new bootstrap manager with custom configuration
     pub async fn with_config(config: BootstrapConfig) -> Result<Self> {
-        Self::with_config_and_loopback(config, false).await
+        Self::with_config_loopback_and_k(config, false, DHTConfig::DEFAULT_K_VALUE).await
     }
 
     /// Create a new bootstrap manager from a `BootstrapConfig` and a `NodeConfig`.
     ///
     /// Derives the loopback policy from `node_config.allow_loopback` and merges
     /// the node-level `diversity_config` (if set) so the transport and bootstrap
-    /// layers stay consistent.
+    /// layers stay consistent. Passes `k_value` through so bootstrap subnet
+    /// limits match the routing table.
     pub async fn with_node_config(
         mut config: BootstrapConfig,
         node_config: &crate::network::NodeConfig,
@@ -124,7 +128,12 @@ impl BootstrapManager {
         if let Some(ref diversity) = node_config.diversity_config {
             config.diversity = diversity.clone();
         }
-        Self::with_config_and_loopback(config, node_config.allow_loopback).await
+        Self::with_config_loopback_and_k(
+            config,
+            node_config.allow_loopback,
+            node_config.dht_config.k_value,
+        )
+        .await
     }
 
     /// Start background maintenance tasks (delegated to saorsa-transport)
@@ -320,7 +329,8 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        // Use a non-loopback address — loopback is rejected when allow_loopback=false
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
 
         // Add peer
         let result = manager.add_peer(&addr, vec![addr]).await;
@@ -337,7 +347,7 @@ mod tests {
         let config = test_config(&temp_dir);
         let manager = BootstrapManager::with_config(config).await.unwrap();
 
-        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
         let result = manager.add_peer(&addr, vec![]).await;
 
         assert!(result.is_err());

@@ -57,12 +57,14 @@ impl Default for AdaptiveDhtConfig {
 impl AdaptiveDhtConfig {
     /// Validate that all config values are within acceptable ranges.
     ///
-    /// Returns `Err` if `block_threshold` is outside `[0.0, 1.0]` or is NaN.
+    /// Returns `Err` if `block_threshold` is outside `[0.0, 0.5)` or is NaN.
+    /// Values >= 0.5 (neutral trust) would block all unknown peers on first
+    /// contact since they start at neutral (0.5).
     pub fn validate(&self) -> crate::error::P2pResult<()> {
-        if !(0.0..=1.0).contains(&self.block_threshold) || self.block_threshold.is_nan() {
+        if !(0.0..0.5).contains(&self.block_threshold) || self.block_threshold.is_nan() {
             return Err(crate::error::P2PError::Validation(
                 format!(
-                    "block_threshold must be in [0.0, 1.0], got {}",
+                    "block_threshold must be in [0.0, 0.5), got {}",
                     self.block_threshold
                 )
                 .into(),
@@ -322,7 +324,17 @@ mod tests {
 
     #[test]
     fn test_block_threshold_validation_rejects_invalid() {
-        for &bad in &[-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        // Values outside [0.0, 0.5) or non-finite should be rejected.
+        // 0.5 would block all unknown peers (they start at neutral 0.5).
+        for &bad in &[
+            -0.1,
+            0.5,
+            1.0,
+            1.1,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             let config = AdaptiveDhtConfig {
                 block_threshold: bad,
             };
@@ -335,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_block_threshold_validation_accepts_valid() {
-        for &good in &[0.0, 0.15, 0.5, 1.0] {
+        for &good in &[0.0, 0.15, 0.49] {
             let config = AdaptiveDhtConfig {
                 block_threshold: good,
             };

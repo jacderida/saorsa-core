@@ -584,6 +584,49 @@ mod tests {
         );
     }
 
+    /// Test: negative weights are rejected and do not corrupt the trust score.
+    ///
+    /// The `record_weighted` guard (`weight <= 0.0`) prevents negative weights
+    /// from reversing the observation direction. This test confirms that
+    /// calling `update_node_stats_weighted` with a negative weight is a no-op.
+    #[tokio::test]
+    async fn test_negative_weight_is_noop() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        let before = engine.score(&peer);
+
+        // Attempt a failure with negative weight — should be rejected
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, -5.0)
+            .await;
+        let after_negative = engine.score(&peer);
+        assert!(
+            (before - after_negative).abs() < f64::EPSILON,
+            "negative weight should be a no-op: before={before}, after={after_negative}"
+        );
+
+        // Attempt a success with negative weight — also a no-op
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::CorrectResponse, -1.0)
+            .await;
+        let after_negative_success = engine.score(&peer);
+        assert!(
+            (before - after_negative_success).abs() < f64::EPSILON,
+            "negative weight success should be a no-op: before={before}, after={after_negative_success}"
+        );
+
+        // Confirm normal weight still works after negative attempts
+        engine
+            .update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0)
+            .await;
+        let after_valid = engine.score(&peer);
+        assert!(
+            after_valid < before,
+            "valid weight-1 failure should reduce score: before={before}, after={after_valid}"
+        );
+    }
+
     /// Test: weighted EMA has larger impact than unit weight
     #[tokio::test]
     async fn test_weighted_ema_larger_impact() {

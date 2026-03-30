@@ -5,7 +5,7 @@
 
 use crate::PeerId;
 use crate::address::MultiAddr;
-use crate::security::IPDiversityConfig;
+use crate::security::{IPDiversityConfig, canonicalize_ip};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -336,19 +336,6 @@ type IpSwapTier = (
     Option<(PeerId, [u8; 32], Instant)>,
     &'static str,
 );
-
-/// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
-/// its IPv4 equivalent so that diversity limits are enforced uniformly
-/// regardless of which address family the transport layer reports.
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    }
-}
 
 /// Zero out the host bits of an IPv4 address beyond `prefix_len`.
 fn mask_ipv4(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
@@ -1028,6 +1015,17 @@ impl DhtCoreEngine {
         allow_stale_revalidation: bool,
     ) -> Result<AdmissionResult> {
         let peer_id = node.id;
+
+        // --- Reject invalid addresses ---
+        // Multicast and unspecified addresses are never valid peer endpoints.
+        if candidate_ips
+            .iter()
+            .any(|ip| ip.is_unspecified() || ip.is_multicast())
+        {
+            return Err(anyhow!(
+                "IP diversity: multicast or unspecified addresses rejected"
+            ));
+        }
 
         // --- Loopback handling ---
         let all_loopback = candidate_ips.iter().all(|ip| ip.is_loopback());
