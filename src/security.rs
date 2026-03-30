@@ -88,6 +88,23 @@ impl IPDiversityConfig {
             max_per_subnet: Some(usize::MAX),
         }
     }
+
+    /// Validate IP diversity parameter safety constraints (Section 4 points 1-2).
+    ///
+    /// Returns `Err` if any explicit limit is less than 1.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(limit) = self.max_per_ip
+            && limit < 1
+        {
+            anyhow::bail!("max_per_ip must be >= 1 (got {limit})");
+        }
+        if let Some(limit) = self.max_per_subnet
+            && limit < 1
+        {
+            anyhow::bail!("max_per_subnet must be >= 1 (got {limit})");
+        }
+        Ok(())
+    }
 }
 
 /// IP diversity enforcement system

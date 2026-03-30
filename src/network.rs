@@ -571,6 +571,34 @@ impl DHTConfig {
     const DEFAULT_K_VALUE: usize = 20;
     const DEFAULT_ALPHA_VALUE: usize = 3;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
+    /// Minimum k_value — values below this produce degenerate routing behavior.
+    const MIN_K_VALUE: usize = 4;
+
+    /// Validate parameter safety constraints (Section 4 points 1-13).
+    ///
+    /// Returns `Err` if any constraint is violated.
+    pub fn validate(&self) -> Result<()> {
+        if self.k_value < Self::MIN_K_VALUE {
+            return Err(P2PError::Validation(
+                format!(
+                    "k_value must be >= {} (got {}), values below {} produce degenerate behavior",
+                    Self::MIN_K_VALUE,
+                    self.k_value,
+                    Self::MIN_K_VALUE,
+                )
+                .into(),
+            ));
+        }
+        if self.alpha_value < 1 {
+            return Err(P2PError::Validation(
+                format!("alpha_value must be >= 1 (got {})", self.alpha_value).into(),
+            ));
+        }
+        if self.refresh_interval.is_zero() {
+            return Err(P2PError::Validation("refresh_interval must be > 0".into()));
+        }
+        Ok(())
+    }
 }
 
 impl Default for DHTConfig {
@@ -780,6 +808,15 @@ impl P2PNode {
 
         // Derive the canonical peer ID from the cryptographic identity.
         let peer_id = *node_identity.peer_id();
+
+        // Validate parameter safety constraints (Section 4 points 1-13).
+        // Reject invalid config early, before any resources are allocated.
+        config.dht_config.validate()?;
+        if let Some(ref diversity) = config.diversity_config {
+            diversity
+                .validate()
+                .map_err(|e| P2PError::Validation(format!("IP diversity config: {e}").into()))?;
+        }
 
         // Initialize bootstrap cache manager
         let bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
@@ -1905,6 +1942,18 @@ impl P2PNode {
         {
             Ok(count) => info!("DHT peer discovery found {} peers", count),
             Err(e) => warn!("DHT peer discovery failed: {}", e),
+        }
+
+        // Perform two consecutive self-lookups to fully refresh the close
+        // neighborhood. The second lookup may discover peers that joined or
+        // became reachable during the first lookup (Section 11.2 step 5).
+        const SELF_LOOKUP_ROUNDS: u8 = 2;
+        for i in 1..=SELF_LOOKUP_ROUNDS {
+            if let Err(e) = self.dht_manager().trigger_self_lookup().await {
+                warn!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} failed: {e}");
+            } else {
+                debug!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} completed");
+            }
         }
 
         // Mark node as bootstrapped - we have connected to bootstrap peers

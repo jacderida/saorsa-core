@@ -1075,7 +1075,15 @@ impl DhtNetworkManager {
                     }
                     Err(e) => {
                         trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
-                        self.record_peer_failure(&peer_id).await;
+                        // Skip trust recording for cancelled operations — the
+                        // blocking decision has already been made (Section 7.4 step 2a).
+                        if !matches!(
+                            e,
+                            P2PError::Network(NetworkError::OperationCancelled(_))
+                                | P2PError::Network(NetworkError::PeerBlocked(_))
+                        ) {
+                            self.record_peer_failure(&peer_id).await;
+                        }
                         // Don't add failed nodes to best_nodes - they are unresponsive
                     }
                 }
@@ -1242,6 +1250,9 @@ impl DhtNetworkManager {
                 drop(dht); // Release write lock before disconnect
                 self.broadcast_routing_events(&rt_events);
                 self.check_and_emit_k_closest_changed().await;
+                // Cancel in-flight RPCs — cancelled operations must not record
+                // trust events (Section 7.4 step 2a).
+                self.cancel_operations_for_peer(peer_id);
                 let _ = self.transport.disconnect_peer(peer_id).await;
                 tracing::info!(
                     peer = peer_id.to_hex(),
@@ -1265,6 +1276,31 @@ impl DhtNetworkManager {
             engine.score(peer_id) < self.config.block_threshold
         } else {
             false
+        }
+    }
+
+    /// Cancel all in-flight operations targeting a blocked peer.
+    ///
+    /// Drops the oneshot senders so that the response waiters get a
+    /// `RecvError` and know the operation was cancelled. Cancelled
+    /// operations MUST NOT record trust events — the blocking decision
+    /// has already been made (Section 7.4 step 2a).
+    fn cancel_operations_for_peer(&self, peer_id: &PeerId) {
+        if let Ok(mut ops) = self.active_operations.lock() {
+            ops.retain(|_id, ctx| {
+                if ctx.peer_id == *peer_id {
+                    // Drop the oneshot sender — the waiter will get RecvError
+                    // and should NOT record a trust event for this cancellation.
+                    tracing::debug!(
+                        peer = peer_id.to_hex(),
+                        op = ?ctx.operation,
+                        "Cancelling in-flight operation for blocked peer"
+                    );
+                    false // remove from map
+                } else {
+                    true // keep
+                }
+            });
         }
     }
 
@@ -1455,7 +1491,9 @@ impl DhtNetworkManager {
                 );
 
                 // Wait for response via oneshot channel with timeout
-                let result = self.wait_for_response(&message_id, response_rx).await;
+                let result = self
+                    .wait_for_response(&message_id, response_rx, peer_id)
+                    .await;
                 match &result {
                     Ok(r) => info!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
@@ -1602,12 +1640,18 @@ impl DhtNetworkManager {
     /// operation context. When handle_dht_response receives a response, it sends
     /// through the channel. This function awaits on the receiver with timeout.
     ///
+    /// When the oneshot sender is dropped (e.g. by `cancel_operations_for_peer`),
+    /// the receiver gets a `RecvError`. If the peer is blocked at that point,
+    /// we return `OperationCancelled` so the caller knows not to record a trust
+    /// event (Section 7.4 step 2a).
+    ///
     /// Note: cleanup of `active_operations` is handled by explicit removal in the
     /// caller (`send_dht_request`), so this method does not remove entries itself.
     async fn wait_for_response(
         &self,
         _message_id: &str,
         response_rx: oneshot::Receiver<(PeerId, DhtNetworkResult)>,
+        peer_id: &PeerId,
     ) -> Result<DhtNetworkResult> {
         let response_timeout = self.config.request_timeout;
 
@@ -1615,12 +1659,19 @@ impl DhtNetworkManager {
         match tokio::time::timeout(response_timeout, response_rx).await {
             Ok(Ok((_source, result))) => Ok(result),
             Ok(Err(_recv_error)) => {
-                // Channel closed without response (sender dropped)
-                // This can happen if handle_dht_response rejected the response
-                // or if the operation was cleaned up elsewhere
-                Err(P2PError::Network(NetworkError::ProtocolError(
-                    "Response channel closed unexpectedly".into(),
-                )))
+                // Channel closed without response (sender dropped).
+                // If the peer was blocked (cancel_operations_for_peer dropped
+                // the sender), return OperationCancelled so callers skip trust
+                // event recording (Section 7.4 step 2a).
+                if self.is_peer_blocked(peer_id) {
+                    Err(P2PError::Network(NetworkError::OperationCancelled(
+                        *peer_id,
+                    )))
+                } else {
+                    Err(P2PError::Network(NetworkError::ProtocolError(
+                        "Response channel closed unexpectedly".into(),
+                    )))
+                }
             }
             Err(_timeout) => Err(P2PError::Network(NetworkError::Timeout)),
         }
