@@ -18,7 +18,8 @@ name = "saorsa-core"
 # 0.18.1: enforce address invariants in KBucket::add_node
 # 0.19.0: NAT traversal timeouts, dual-stack normalisation, connection reliability
 # 0.20.0: simplify IP diversity, stale-peer fixes, cache atomicity improvements
-version = "0.20.0"
+# 0.21.0: penalty-only trust model, distance-sorted lookup candidates, stale docs cleanup
+version = "0.21.0"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
