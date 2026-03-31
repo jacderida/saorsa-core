@@ -30,7 +30,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -43,8 +43,8 @@ use uuid::Uuid;
 const MIN_CONCURRENT_OPERATIONS: usize = 10;
 
 /// Maximum candidate nodes queue size to prevent memory exhaustion attacks.
-/// We keep this as a FIFO so the oldest (K-bucket-style) entries remain preferred
-/// and simply drop newer candidates once the queue is full.
+/// Candidates are sorted by XOR distance to the lookup target (closest first).
+/// When at capacity, a closer newcomer evicts the farthest existing candidate.
 const MAX_CANDIDATE_NODES: usize = 200;
 
 /// Maximum size for incoming DHT messages (64 KB) to prevent memory exhaustion DoS
@@ -72,9 +72,6 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
-
-/// Consecutive non-improving iterations before a network lookup terminates.
-const LOOKUP_STAGNATION_LIMIT: usize = 3;
 
 /// Duration after which a bucket without activity is considered stale.
 const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
@@ -931,9 +928,9 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
+        let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
-        let mut queued_peer_ids: HashSet<PeerId> = HashSet::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
@@ -942,16 +939,24 @@ impl DhtNetworkManager {
         best_nodes.push(self.local_dht_node());
         self.mark_self_queried(&mut queried_nodes);
 
+        // Candidates sorted by XOR distance to target (closest first).
+        // Composite key (distance, peer_id) ensures uniqueness when two peers
+        // share the same distance.
+        let mut candidates: BTreeMap<(Key, PeerId), DHTNode> = BTreeMap::new();
+
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
-        let mut candidates: VecDeque<DHTNode> = VecDeque::new();
         for node in initial {
-            if queued_peer_ids.insert(node.peer_id) {
-                candidates.push_back(node);
+            if !queried_nodes.contains(&node.peer_id) {
+                let dist = node.peer_id.distance(&target_key);
+                candidates.entry((dist, node.peer_id)).or_insert(node);
             }
         }
-        let mut stagnation_counter: usize = 0;
-        let target_key = DhtKey::from_bytes(*key);
+
+        // Snapshot of the top-K peer IDs from the previous iteration.
+        // Stagnation = the entire top-K set is unchanged AND no unqueried
+        // candidate is closer than the current worst member of top-K.
+        let mut previous_top_k: Vec<PeerId> = Vec::new();
 
         for iteration in 0..MAX_ITERATIONS {
             if candidates.is_empty() {
@@ -962,24 +967,27 @@ impl DhtNetworkManager {
                 break;
             }
 
-            // Select up to ALPHA unqueried, non-blocked nodes to query
+            // Select up to ALPHA closest unqueried, non-blocked nodes to query.
+            // BTreeMap is sorted by (distance, peer_id), so first_entry()
+            // always yields the closest candidate.
             let mut batch: Vec<DHTNode> = Vec::new();
-            while batch.len() < ALPHA && !candidates.is_empty() {
-                if let Some(node) = candidates.pop_front() {
-                    queued_peer_ids.remove(&node.peer_id);
-                    if queried_nodes.contains(&node.peer_id) {
-                        continue;
-                    }
-                    // Skip peers whose trust score is below the block threshold
-                    if self.is_peer_blocked(&node.peer_id) {
-                        trace!(
-                            "[NETWORK] Skipping blocked peer {} in lookup",
-                            node.peer_id.to_hex()
-                        );
-                        continue;
-                    }
-                    batch.push(node);
+            while batch.len() < ALPHA {
+                let Some(entry) = candidates.first_entry() else {
+                    break;
+                };
+                let node = entry.remove();
+                if queried_nodes.contains(&node.peer_id) {
+                    continue;
                 }
+                // Skip peers whose trust score is below the block threshold
+                if self.is_peer_blocked(&node.peer_id) {
+                    trace!(
+                        "[NETWORK] Skipping blocked peer {} in lookup",
+                        node.peer_id.to_hex()
+                    );
+                    continue;
+                }
+                batch.push(node);
             }
 
             if batch.is_empty() {
@@ -995,9 +1003,6 @@ impl DhtNetworkManager {
                 iteration,
                 batch.len()
             );
-
-            // Capture the closest distance before this iteration for stagnation detection.
-            let pre_iteration_closest = best_nodes.first().map(|n| n.peer_id.distance(&target_key));
 
             // Query nodes in parallel
             // saorsa-transport connection multiplexing lets us keep a single transport socket
@@ -1039,35 +1044,34 @@ impl DhtNetworkManager {
                         nodes.truncate(self.k_value());
                         for node in nodes {
                             if queried_nodes.contains(&node.peer_id)
-                                || queued_peer_ids.contains(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
                             {
                                 continue;
                             }
-                            // A candidate is "dominated" only if we already have K
-                            // best_nodes AND the candidate is no closer than the
-                            // farthest node in our best set. best_nodes is sorted
-                            // by distance at the end of each iteration, so .last()
-                            // is the farthest.
-                            let dominated = best_nodes.len() >= count
-                                && best_nodes.last().is_some_and(|worst| {
-                                    matches!(
-                                        Self::compare_node_distance(&node, worst, key),
-                                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater
-                                    )
-                                });
-                            if !dominated {
-                                if candidates.len() >= MAX_CANDIDATE_NODES {
-                                    trace!(
-                                        "[NETWORK] Candidate queue at capacity ({}), dropping {}",
-                                        MAX_CANDIDATE_NODES,
-                                        node.peer_id.to_hex()
-                                    );
-                                    continue;
-                                }
-                                queued_peer_ids.insert(node.peer_id);
-                                candidates.push_back(node);
+                            let dist = node.peer_id.distance(&target_key);
+                            let cand_key = (dist, node.peer_id);
+                            if candidates.contains_key(&cand_key) {
+                                continue;
                             }
+                            if candidates.len() >= MAX_CANDIDATE_NODES {
+                                // At capacity — evict the farthest candidate if the
+                                // new one is closer, otherwise drop the new one.
+                                let farthest_key = candidates.keys().next_back().copied();
+                                match farthest_key {
+                                    Some(fk) if cand_key < fk => {
+                                        candidates.remove(&fk);
+                                    }
+                                    _ => {
+                                        trace!(
+                                            "[NETWORK] Candidate queue at capacity ({}), dropping {}",
+                                            MAX_CANDIDATE_NODES,
+                                            node.peer_id.to_hex()
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            candidates.insert(cand_key, node);
                         }
                     }
                     Ok(DhtNetworkResult::PeerRejected) => {
@@ -1112,32 +1116,35 @@ impl DhtNetworkManager {
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
-            // Stagnation detection: if the closest peer in best_nodes is
-            // strictly closer than before this iteration, reset the counter;
-            // otherwise increment it. Stop after LOOKUP_STAGNATION_LIMIT
-            // consecutive non-improving iterations.
-            let post_iteration_closest =
-                best_nodes.first().map(|n| n.peer_id.distance(&target_key));
-
-            let improved = match (&pre_iteration_closest, &post_iteration_closest) {
-                (Some(before), Some(after)) => after < before,
-                (None, Some(_)) => true, // went from empty to having a result
-                _ => false,
-            };
-
-            if improved {
-                stagnation_counter = 0;
-            } else {
-                stagnation_counter += 1;
-                if stagnation_counter >= LOOKUP_STAGNATION_LIMIT {
+            // Stagnation: compare the entire top-K set, not just closest distance.
+            let current_top_k: Vec<PeerId> = best_nodes.iter().map(|n| n.peer_id).collect();
+            if current_top_k == previous_top_k {
+                // If we haven't filled K slots yet, any remaining candidate
+                // could improve the result — keep going.
+                if best_nodes.len() < count && !candidates.is_empty() {
+                    previous_top_k = current_top_k;
+                    continue;
+                }
+                // Top-K didn't change, but don't stop if a queued candidate is
+                // closer than the farthest member of top-K — it could still
+                // improve the result once queried.
+                let has_promising_candidate = best_nodes.last().is_some_and(|worst| {
+                    let worst_dist = worst.peer_id.distance(&target_key);
+                    candidates
+                        .keys()
+                        .next()
+                        .is_some_and(|(dist, _)| *dist < worst_dist)
+                });
+                if !has_promising_candidate {
                     info!(
-                        "[NETWORK] Lookup stagnated after {} non-improving iterations (iteration {})",
-                        LOOKUP_STAGNATION_LIMIT,
+                        "[NETWORK] {}: Top-K converged after {} iterations",
+                        self.config.peer_id.to_hex(),
                         iteration + 1
                     );
                     break;
                 }
             }
+            previous_top_k = current_top_k;
         }
 
         best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
