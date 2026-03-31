@@ -1556,7 +1556,11 @@ impl DhtNetworkManager {
         // Exclude cancelled operations (the blocking decision already
         // recorded trust — Section 7.4 step 2a).
         if let Err(ref e) = result
-            && !matches!(e, P2PError::Network(NetworkError::OperationCancelled(_)))
+            && !matches!(
+                e,
+                P2PError::Network(NetworkError::OperationCancelled(_))
+                    | P2PError::Network(NetworkError::PeerBlocked(_))
+            )
         {
             self.record_peer_failure(peer_id).await;
         }

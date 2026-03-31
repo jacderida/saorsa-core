@@ -348,7 +348,7 @@ Algorithm:
 5. Return `best_nodes` (may include self).
 
 Properties:
-- **Per-lookup isolation**: Each invocation of `find_closest_nodes_network` maintains its own `best_nodes` set, queried set, and stagnation counter. Concurrent lookups (e.g., a self-lookup and a consumer-triggered lookup running simultaneously) do not share or interfere with each other's state. They may independently query the same remote peers and independently record trust outcomes.
+- **Per-lookup isolation**: Each invocation of `find_closest_nodes_network` maintains its own `best_nodes` set, queried set, and top-K convergence state. Concurrent lookups (e.g., a self-lookup and a consumer-triggered lookup running simultaneously) do not share or interfere with each other's state. They may independently query the same remote peers and independently record trust outcomes.
 - Makes network requests: MUST NOT be called from within DHT request handlers (deadlock risk).
 - Trust recording: each RPC outcome is fed to the trust subsystem.
 - Blocked peers: silently excluded from query candidates (they are not in `LocalRT`).
@@ -680,7 +680,7 @@ Use this list to find design flaws before coding:
     - The worst-case time to detect a departed close peer is `max(SELF_LOOKUP_INTERVAL) + LIVE_THRESHOLD` (25 minutes at reference values). A peer that departs immediately after being touched can hold its slot until the next self-lookup discovers a replacement candidate and triggers admission contention. For distant peers not subject to admission contention, staleness is unbounded but harmless (see item 7). Close peers are naturally contacted frequently, so this worst case requires the peer to depart during a quiet period with no consumer-layer interactions.
 
 16. **Sparse network lookup termination**:
-    - In sparse networks with intermittent connectivity, `LOOKUP_STAGNATION_LIMIT` (3) may cause lookups to terminate before finding the true K-closest peers. The stagnation counter resets only when the closest peer improves, not when new non-closest peers are discovered. Consumers that need higher confidence in sparse networks can issue multiple lookups or increase `LOOKUP_STAGNATION_LIMIT`. The default value is tuned for networks with reasonable peer density.
+    - The iterative lookup terminates when the entire top-K set stabilises across consecutive iterations and no unqueried candidate is closer than the farthest member of top-K. In sparse networks with intermittent connectivity, this may still terminate before finding the true K-closest peers if all reachable candidates have been queried. Consumers that need higher confidence in sparse networks can issue multiple lookups. The convergence check is distance-aware: as long as any queued candidate is closer than the current worst member, the lookup continues.
 
 ## 15. Pre-Implementation Test Matrix
 
