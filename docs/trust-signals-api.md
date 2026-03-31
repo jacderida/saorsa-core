@@ -69,8 +69,8 @@ are not rewarded.
 
 | Event | Severity | Description | Where it fires |
 |-------|----------|-------------|----------------|
-| `ConnectionFailed` | 1x penalty (core) | Could not establish connection | `send_request()` error, `dial_candidate()` error |
-| `ConnectionTimeout` | 1x penalty (core) | Connection attempt timed out | `send_request()` timeout, `dial_candidate()` timeout |
+| `ConnectionFailed` | 1x penalty (core) | Could not establish connection | `send_request()` error, `send_dht_request()` RPC failure |
+| `ConnectionTimeout` | 1x penalty (core) | Connection attempt timed out | `send_request()` timeout, `send_dht_request()` RPC timeout |
 | `ApplicationSuccess(w)` | Weighted reward (consumer) | Peer completed an application-level task | Consumer code |
 | `ApplicationFailure(w)` | Weighted penalty (consumer) | Peer failed an application-level task | Consumer code |
 

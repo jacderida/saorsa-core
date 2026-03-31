@@ -344,7 +344,7 @@ Algorithm:
    c. For each failed query, record trust penalty (`ConnectionFailed`/`ConnectionTimeout`). Successful responses are the expected baseline and do not generate trust events.
    d. For each response, accept at most `MAX_PEERS_PER_RESPONSE` peers (closest to `K` first; additional entries are silently dropped). Merge accepted peers into `best_nodes`, deduplicating by `PeerId`.
    e. Sort `best_nodes` by `Distance(K, node)`, truncate to `count`.
-   f. Convergence check: if the closest peer in `best_nodes` after this iteration is strictly closer (by XOR distance to `K`) than the closest peer before this iteration, reset the stagnation counter to 0. Otherwise, increment it. Stop when the stagnation counter reaches `LOOKUP_STAGNATION_LIMIT` or all candidates in `best_nodes` have been queried.
+   f. Convergence check: compare the entire top-K set of peer IDs against the previous iteration. If the set is unchanged AND no unqueried candidate in the queue is closer than the farthest member of top-K, the lookup has converged — stop. If top-K hasn't filled `count` slots yet, continue regardless.
 5. Return `best_nodes` (may include self).
 
 Properties:

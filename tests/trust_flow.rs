@@ -93,7 +93,7 @@ async fn failures_lower_trust_below_neutral() {
 // Trust event variants
 // ---------------------------------------------------------------------------
 
-/// All TrustEvent variants affect the score (no panics, no no-ops).
+/// All TrustEvent variants with valid weights affect the score (no panics, no no-ops for valid inputs).
 #[tokio::test]
 async fn all_trust_event_variants_affect_score() {
     let node = P2PNode::new(test_node_config()).await.unwrap();
