@@ -119,8 +119,8 @@ async fn peer_at_threshold_is_not_blocked() {
     let peer = PeerId::random();
 
     // Push score down partway but not below threshold
-    // From 0.5, ~5 failures gives approximately 0.5 * 0.9^5 ≈ 0.295 (well above 0.15)
-    for _ in 0..5 {
+    // From 0.5, 2 failures gives approximately 0.5 * 0.7^2 ≈ 0.245 (above 0.15)
+    for _ in 0..2 {
         node.report_trust_event(&peer, TrustEvent::ConnectionFailed)
             .await;
     }

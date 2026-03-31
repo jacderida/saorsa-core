@@ -5,8 +5,9 @@
 saorsa-core provides a response-rate trust system for tracking node reliability.
 The trust system is owned by `AdaptiveDHT`, which is the sole authority on peer trust scores.
 
-DHT-internal events (iterative lookup success/failure) are recorded automatically.
-External callers can report additional network-observable outcomes via `TrustEvent`.
+Core only records penalties — successful responses are the expected baseline
+and do not warrant a reward. Positive trust signals are the consumer's
+responsibility via `TrustEvent::ApplicationSuccess`.
 
 The trust system enables:
 - **Sybil resistance**: Malicious nodes are downscored automatically
@@ -19,10 +20,10 @@ The trust system enables:
 ```rust
 use saorsa_core::{P2PNode, TrustEvent};
 
-// After successful data retrieval from a peer:
-node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+// Consumer rewards peer after successful application-level operation:
+node.report_trust_event(&peer_id, TrustEvent::ApplicationSuccess(1.0)).await;
 
-// After a connection failure:
+// Report a connection failure (penalty):
 node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
 
 // Check peer trust before operations:
@@ -36,9 +37,9 @@ if trust < 0.3 {
 
 ### `report_trust_event(peer_id, event)`
 
-Report a network-observable trust event for a peer. Use this for connection
-outcomes that the DHT layer did not record automatically (e.g. failures
-observed by the application's own request paths).
+Report a trust event for a peer. Core penalties (connection failures) are
+recorded automatically by the DHT layer. Consumers use this API to report
+application-level outcomes (rewards and additional penalties).
 
 ```rust
 pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent)
@@ -62,16 +63,16 @@ pub fn trust_engine(&self) -> &Arc<TrustEngine>
 
 ## TrustEvent Enum
 
-Only network-observable events are included. Application-level events
-(data verification, storage checks) will be added as `TrustEvent` variants
-when saorsa-node's data layer is built.
+Core only records penalties. Rewards are the consumer's responsibility via
+`ApplicationSuccess`. Successful responses are the expected baseline and
+are not rewarded.
 
 | Event | Severity | Description | Where it fires |
 |-------|----------|-------------|----------------|
-| `SuccessfulResponse` | Positive | Peer responded to a request | `send_request()` success |
-| `SuccessfulConnection` | Positive | Peer connected and authenticated | `handle_peer_connected()` |
-| `ConnectionFailed` | 1x penalty | Could not establish connection | `send_request()` error, `dial_candidate()` error |
-| `ConnectionTimeout` | 1x penalty | Connection attempt timed out | `send_request()` timeout, `dial_candidate()` timeout |
+| `ConnectionFailed` | 1x penalty (core) | Could not establish connection | `send_request()` error, `send_dht_request()` RPC failure |
+| `ConnectionTimeout` | 1x penalty (core) | Connection attempt timed out | `send_request()` timeout, `send_dht_request()` RPC timeout |
+| `ApplicationSuccess(w)` | Weighted reward (consumer) | Peer completed an application-level task | Consumer code |
+| `ApplicationFailure(w)` | Weighted penalty (consumer) | Peer failed an application-level task | Consumer code |
 
 Note: Peer disconnects are normal connection lifecycle — they do not affect trust.
 
@@ -108,5 +109,5 @@ P2PNode
 
 - **TrustEngine** is the sole authority on peer trust scores
 - **AdaptiveDHT** owns TrustEngine and DhtNetworkManager
-- **DhtNetworkManager** records trust for DHT operations (iterative lookups)
-- **P2PNode** exposes `report_trust_event()` for additional network-observable signals
+- **DhtNetworkManager** records trust penalties for DHT operations (failed lookups, dial failures)
+- **P2PNode** exposes `report_trust_event()` for consumer rewards and additional penalties

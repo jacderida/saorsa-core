@@ -917,16 +917,15 @@ impl P2PNode {
 
     /// Report a trust event for a peer.
     ///
-    /// Records a network-observable outcome (connection success/failure)
-    /// that the DHT layer did not record automatically. See [`TrustEvent`]
-    /// for the supported variants.
+    /// Core only records penalties (connection failures). Positive trust
+    /// signals are the consumer's responsibility via [`TrustEvent::ApplicationSuccess`].
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// use saorsa_core::adaptive::TrustEvent;
     ///
-    /// node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
+    /// node.report_trust_event(&peer_id, TrustEvent::ApplicationSuccess(1.0)).await;
     /// node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
     /// ```
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
@@ -949,13 +948,13 @@ impl P2PNode {
     // Request/Response API — Automatic Trust Feedback
     // =========================================================================
 
-    /// Send a request to a peer and wait for a response with automatic trust reporting.
+    /// Send a request to a peer and wait for a response with automatic trust penalty reporting.
     ///
     /// Unlike fire-and-forget `send_message()`, this method:
     /// 1. Wraps the payload in a `RequestResponseEnvelope` with a unique message ID
     /// 2. Sends it on the `/rr/<protocol>` protocol prefix
     /// 3. Waits for a matching response (or timeout)
-    /// 4. Automatically reports success or failure to the trust engine
+    /// 4. Automatically reports failure to the trust engine (success is the expected baseline)
     ///
     /// The remote peer's handler should call `send_response()` with the
     /// incoming message ID to route the response back.
@@ -996,11 +995,7 @@ impl P2PNode {
             .send_request(peer_id, protocol, data, timeout)
             .await
         {
-            Ok(resp) => {
-                self.report_trust_event(peer_id, TrustEvent::SuccessfulResponse)
-                    .await;
-                Ok(resp)
-            }
+            Ok(resp) => Ok(resp),
             Err(e) => {
                 let event = if matches!(&e, P2PError::Timeout(_)) {
                     TrustEvent::ConnectionTimeout
