@@ -1962,9 +1962,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.6.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
+checksum = "53412bac6247548e2164c7d7f67854aa104ea7d5901efd99622fdf05205496f6"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2479,8 +2479,6 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbe38ad2be12e4be34e203e79a33eab1664c23a4b65a1ff4b08973ae9af01f01"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2502,7 +2500,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pin-project-lite",
- "quinn-udp 0.6.1",
+ "quinn-udp 0.6.0",
  "rand 0.8.5",
  "rcgen",
  "regex",

@@ -84,6 +84,11 @@ pub enum ConnectionEvent {
         remote_address: SocketAddr,
         reason: String,
     },
+    /// A connected peer advertised a new reachable address (ADD_ADDRESS frame).
+    PeerAddressUpdated {
+        peer_addr: SocketAddr,
+        advertised_addr: SocketAddr,
+    },
 }
 
 /// Native saorsa-transport network node using LinkTransport abstraction
@@ -514,16 +519,14 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Wrap the entire send path in a 60-second timeout.
+        // Wrap the entire send path in a 15-second timeout.
         //
-        // dial_addr() may trigger connect_with_fallback() which includes
-        // hole-punching (15s per round) and relay attempts. Without this
-        // outer timeout, the send path can block indefinitely if the
-        // transport layer deadlocks or the NAT traversal enters a
-        // pathological retry loop. The caller (chunk_protocol) has its own
-        // per-request deadline, but that deadline only starts AFTER this
-        // send completes — so an unbounded send blocks everything.
-        const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+        // For chunk storage, the client should already have the correct
+        // address (relay or direct) from the DHT. Direct connections
+        // complete in <5s, so 15s is generous. A longer timeout (e.g. 60s)
+        // causes ~60s delays per unreachable peer when the DHT has stale
+        // NATted addresses, dominating upload time.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
         tokio::time::timeout(SEND_TIMEOUT, async {
             let conn = self
@@ -841,6 +844,68 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         if let Some(ref v4) = self.v4 {
             v4.transport.endpoint().shutdown().await;
         }
+    }
+
+    /// Spawn background tasks that forward `P2pEvent::PeerAddressUpdated`
+    /// from each stack's `P2pEndpoint` into a channel.
+    ///
+    /// Call after construction. The returned receiver yields
+    /// `(peer_addr, advertised_addr)` pairs when any connected peer
+    /// advertises a new address via ADD_ADDRESS frames.
+    pub fn spawn_peer_address_update_forwarder(
+        &self,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>,
+        tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            let mut p2p_rx = node.transport.endpoint().subscribe();
+            let tx_clone = tx.clone();
+            let relay_tx_clone = relay_tx.clone();
+            tokio::spawn(async move {
+                tracing::info!("ADDR_FWD: peer address update forwarder started");
+                loop {
+                    match p2p_rx.recv().await {
+                        Ok(saorsa_transport::P2pEvent::PeerAddressUpdated {
+                            peer_addr,
+                            advertised_addr,
+                        }) => {
+                            tracing::info!(
+                                "ADDR_FWD: received PeerAddressUpdated peer={} addr={}",
+                                peer_addr, advertised_addr
+                            );
+                            let _ = tx_clone.send((
+                                saorsa_transport::shared::normalize_socket_addr(peer_addr),
+                                saorsa_transport::shared::normalize_socket_addr(advertised_addr),
+                            ));
+                        }
+                        Ok(saorsa_transport::P2pEvent::RelayEstablished {
+                            relay_addr,
+                        }) => {
+                            tracing::info!(
+                                "ADDR_FWD: received RelayEstablished relay_addr={}",
+                                relay_addr
+                            );
+                            let _ = relay_tx_clone.send(relay_addr);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!("ADDR_FWD: channel closed, exiting");
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("ADDR_FWD: lagged {} events", n);
+                            continue;
+                        }
+                        Ok(_other) => {
+                            tracing::trace!("ADDR_FWD: ignoring non-address P2pEvent");
+                        }
+                    }
+                }
+            });
+        }
+        (rx, relay_rx)
     }
 
     /// Create dual nodes bound to IPv6 and IPv4 addresses with default
@@ -1344,6 +1409,13 @@ fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
         } => ConnectionEvent::Failed {
             remote_address: normalize_socket_addr(remote_address),
             reason,
+        },
+        ConnectionEvent::PeerAddressUpdated {
+            peer_addr,
+            advertised_addr,
+        } => ConnectionEvent::PeerAddressUpdated {
+            peer_addr: normalize_socket_addr(peer_addr),
+            advertised_addr: normalize_socket_addr(advertised_addr),
         },
     }
 }

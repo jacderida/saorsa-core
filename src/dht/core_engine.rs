@@ -130,11 +130,22 @@ impl KBucket {
         // arriving via deserialization or direct construction.
         node.addresses.truncate(MAX_ADDRESSES_PER_NODE);
 
-        // If the node is already in this bucket, replace it fully and move to
-        // tail (most-recently-seen) per standard Kademlia protocol.
+        // If the node is already in this bucket, merge addresses (preserving
+        // existing relay addresses at the front) and move to tail
+        // (most-recently-seen) per standard Kademlia protocol.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
-            self.nodes.remove(pos);
-            self.nodes.push(node);
+            let mut existing = self.nodes.remove(pos);
+            existing.last_seen = node.last_seen;
+            // Merge new addresses into existing, preserving order.
+            // Existing addresses (which may include relay addresses at the
+            // front from touch_node) take precedence.
+            for addr in node.addresses {
+                if !existing.addresses.contains(&addr) {
+                    existing.addresses.push(addr);
+                }
+            }
+            existing.addresses.truncate(MAX_ADDRESSES_PER_NODE);
+            self.nodes.push(existing);
             self.last_refreshed = Instant::now();
             return Ok(());
         }

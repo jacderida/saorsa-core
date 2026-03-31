@@ -1126,6 +1126,105 @@ impl P2PNode {
         self.connect_bootstrap_peers(close_group_cache.as_ref())
             .await?;
 
+        // Spawn background task to forward peer address updates to DHT.
+        // When a connected peer advertises a new address (e.g., relay), update
+        // the DHT routing table so future lookups return the new address.
+        //
+        // Also handles RelayEstablished events: when THIS node sets up a relay,
+        // it does a DHT self-lookup to connect to K closest peers. The transport
+        // layer's re-advertisement loop then sends ADD_ADDRESS to those peers,
+        // propagating the relay address beyond the initial direct connections.
+        {
+            let transport = Arc::clone(&self.transport);
+            let dht = self.adaptive_dht.dht_manager().clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = interval.tick() => {
+                            // Check for relay established events.
+                            // When this node sets up a relay, do a self-lookup to
+                            // connect to K closest peers for relay address propagation.
+                            if let Some(relay_addr) = transport.drain_relay_established().await {
+                                // Normalize IPv6-mapped addresses to IPv4 so the
+                                // announced address is dialable by IPv4-only clients.
+                                let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
+                                let relay_multi =
+                                    crate::MultiAddr::quic(normalized);
+                                info!(
+                                    "DHT_BRIDGE: relay established at {} — setting announced address and triggering self-lookup",
+                                    relay_addr
+                                );
+                                dht.set_relay_address(relay_multi).await;
+                                let own_key = *dht.peer_id().to_bytes();
+                                // Use K=8 (DHT_CLOSEST_NODES_COUNT) to
+                                // reach all nodes likely to be queried.
+                                match dht.find_closest_nodes_network(&own_key, 8).await {
+                                    Ok(nodes) => {
+                                        info!(
+                                            "DHT_BRIDGE: self-lookup found {} nodes — relay address will propagate via ADD_ADDRESS",
+                                            nodes.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "DHT_BRIDGE: self-lookup for relay propagation failed: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            let updates = transport.drain_peer_address_updates().await;
+                            if !updates.is_empty() {
+                                info!("DHT_BRIDGE: drained {} address updates", updates.len());
+                            }
+                            for (peer_addr, advertised_addr) in updates {
+                                info!(
+                                    "DHT_BRIDGE: processing update peer={} addr={} same_ip={}",
+                                    peer_addr, advertised_addr, peer_addr.ip() == advertised_addr.ip()
+                                );
+                                // Only update DHT when the advertised IP differs
+                                // from the peer's connection IP. Same-IP updates
+                                // are just different NATted ports (useless for
+                                // symmetric NAT); different-IP means a relay.
+                                if peer_addr.ip() == advertised_addr.ip() {
+                                    continue;
+                                }
+
+                                // Try exact addr match first, then fall back to IP match.
+                                // NAT connections use random source ports, so the
+                                // PeerAddressUpdated peer_addr (NATted) may not match
+                                // the channel key in the transport handle exactly.
+                                let peer_id = transport.peer_id_for_addr(&peer_addr).await
+                                    .or_else(|| {
+                                        // peer_id_for_addr returned None — likely a NATted
+                                        // connection address that doesn't match the channel key
+                                        warn!(
+                                            "DHT_BRIDGE: peer_id_for_addr({}) returned None — \
+                                             NAT node's channel key may differ from connection addr",
+                                            peer_addr
+                                        );
+                                        None
+                                    });
+                                if let Some(peer_id) = peer_id {
+                                    let normalized_adv = saorsa_transport::shared::normalize_socket_addr(advertised_addr);
+                                    let multi_addr = crate::MultiAddr::quic(normalized_adv);
+                                    info!(
+                                        "Updating DHT: peer {} relay address {} (connection was {})",
+                                        peer_id, advertised_addr, peer_addr
+                                    );
+                                    dht.touch_node(&peer_id, Some(&multi_addr)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         self.is_started
             .store(true, std::sync::atomic::Ordering::Release);
 
@@ -1943,12 +2042,26 @@ impl P2PNode {
         }
 
         if successful_connections == 0 {
-            if !used_cache {
-                warn!("Failed to connect to any bootstrap peers");
+            // Outbound connections failed — but for nodes behind symmetric NAT,
+            // the bootstrap peer may have already connected INBOUND to us.
+            // Wait briefly and check if we have any transport-level connections.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let transport_peers = self.transport.connected_peers().await;
+            if !transport_peers.is_empty() {
+                info!(
+                    "No outbound bootstrap succeeded, but {} inbound peer(s) connected — proceeding with DHT bootstrap",
+                    transport_peers.len()
+                );
+                connected_peer_ids = transport_peers;
+                successful_connections = connected_peer_ids.len();
+            } else {
+                if !used_cache {
+                    warn!("Failed to connect to any bootstrap peers");
+                }
+                // Starting a node should not be gated on immediate bootstrap connectivity.
+                // Keep running and allow background discovery / retries to populate peers later.
+                return Ok(());
             }
-            // Starting a node should not be gated on immediate bootstrap connectivity.
-            // Keep running and allow background discovery / retries to populate peers later.
-            return Ok(());
         }
 
         info!(
