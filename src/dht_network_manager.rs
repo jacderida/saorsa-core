@@ -479,8 +479,8 @@ impl DhtNetworkManager {
         self.reconcile_connected_peers().await;
 
         // Spawn periodic maintenance background tasks.
-        self.spawn_self_lookup_task();
-        self.spawn_bucket_refresh_task();
+        self.spawn_self_lookup_task().await;
+        self.spawn_bucket_refresh_task().await;
 
         info!("DHT Network Manager started successfully");
         Ok(())
@@ -491,7 +491,7 @@ impl DhtNetworkManager {
     /// Runs an iterative FIND_NODE(self) at a randomised interval between
     /// [`SELF_LOOKUP_INTERVAL_MIN`] and [`SELF_LOOKUP_INTERVAL_MAX`] to keep
     /// the close neighbourhood fresh and discover newly joined peers.
-    fn spawn_self_lookup_task(self: &Arc<Self>) {
+    async fn spawn_self_lookup_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
         let handle_slot = Arc::clone(&self.self_lookup_handle);
@@ -514,12 +514,7 @@ impl DhtNetworkManager {
                 this.maybe_rebootstrap().await;
             }
         });
-        // Store handle synchronously — this runs once during start().
-        // Use try_write to avoid blocking; if contended, the handle is lost
-        // (acceptable: shutdown still signals via cancellation token).
-        if let Ok(mut guard) = handle_slot.try_write() {
-            *guard = Some(handle);
-        }
+        *handle_slot.write().await = Some(handle);
     }
 
     /// Spawn the periodic bucket refresh background task.
@@ -528,7 +523,7 @@ impl DhtNetworkManager {
     /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
     /// a random key in each stale bucket's range. This populates stale buckets
     /// with fresh peers.
-    fn spawn_bucket_refresh_task(self: &Arc<Self>) {
+    async fn spawn_bucket_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
         let handle_slot = Arc::clone(&self.bucket_refresh_handle);
@@ -592,9 +587,7 @@ impl DhtNetworkManager {
                 this.maybe_rebootstrap().await;
             }
         });
-        if let Ok(mut guard) = handle_slot.try_write() {
-            *guard = Some(handle);
-        }
+        *handle_slot.write().await = Some(handle);
     }
 
     /// Trigger an immediate self-lookup to refresh the close neighborhood.
