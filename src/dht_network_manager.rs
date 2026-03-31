@@ -1090,16 +1090,8 @@ impl DhtNetworkManager {
                     }
                     Err(e) => {
                         trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
-                        // Skip trust recording for cancelled operations — the
-                        // blocking decision has already been made (Section 7.4 step 2a).
-                        if !matches!(
-                            e,
-                            P2PError::Network(NetworkError::OperationCancelled(_))
-                                | P2PError::Network(NetworkError::PeerBlocked(_))
-                        ) {
-                            self.record_peer_failure(&peer_id).await;
-                        }
-                        // Don't add failed nodes to best_nodes - they are unresponsive
+                        // Trust failure is recorded inside send_dht_request —
+                        // no additional recording needed here.
                     }
                 }
             }
@@ -1506,6 +1498,7 @@ impl DhtNetworkManager {
                         if let Ok(mut ops) = self.active_operations.lock() {
                             ops.remove(&message_id);
                         }
+                        self.record_peer_failure(peer_id).await;
                         return Err(P2PError::Network(NetworkError::ProtocolError(
                             format!("identity exchange with {} failed: {}", peer_hex, e).into(),
                         )));
@@ -1519,6 +1512,7 @@ impl DhtNetworkManager {
                 if let Ok(mut ops) = self.active_operations.lock() {
                     ops.remove(&message_id);
                 }
+                self.record_peer_failure(peer_id).await;
                 return Err(P2PError::Network(NetworkError::PeerNotFound(
                     format!("failed to dial {} at {}", peer_hex, address).into(),
                 )));
@@ -1566,6 +1560,16 @@ impl DhtNetworkManager {
         // Explicit cleanup — no Drop guard, no tokio::spawn required
         if let Ok(mut ops) = self.active_operations.lock() {
             ops.remove(&message_id);
+        }
+
+        // Record trust failure at the RPC level so every failed request
+        // (send error, response timeout, etc.) is counted exactly once.
+        // Exclude cancelled operations (the blocking decision already
+        // recorded trust — Section 7.4 step 2a).
+        if let Err(ref e) = result {
+            if !matches!(e, P2PError::Network(NetworkError::OperationCancelled(_))) {
+                self.record_peer_failure(peer_id).await;
+            }
         }
 
         result
@@ -1643,7 +1647,6 @@ impl DhtNetworkManager {
                     "dial_candidate: failed to connect to {} at {}: {}",
                     peer_hex, address, e
                 );
-                self.record_peer_failure(peer_id).await;
                 None
             }
             Err(_) => {
@@ -1651,7 +1654,6 @@ impl DhtNetworkManager {
                     "dial_candidate: timeout connecting to {} at {} (>{:?})",
                     peer_hex, address, dial_timeout
                 );
-                self.record_peer_failure(peer_id).await;
                 None
             }
         }
@@ -2425,18 +2427,14 @@ impl DhtNetworkManager {
             }
         }
 
-        // Record trust events for revalidation outcomes.
+        // Record trust success for retained peers. Failure recording is
+        // handled by send_dht_request (via record_peer_failure) so that each
+        // failed RPC produces exactly one trust penalty — no double-counting.
         if let Some(ref engine) = self.trust_engine {
             for peer_id in &retained_peers {
                 engine.update_node_stats(
                     peer_id,
                     crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-                );
-            }
-            for peer_id in &evicted_peers {
-                engine.update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::FailedResponse,
                 );
             }
         }
