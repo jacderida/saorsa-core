@@ -60,7 +60,7 @@ async fn successes_raise_trust_above_neutral() {
     let peer = PeerId::random();
 
     for _ in 0..20 {
-        node.report_trust_event(&peer, TrustEvent::SuccessfulResponse)
+        node.report_trust_event(&peer, TrustEvent::ApplicationSuccess(1.0))
             .await;
     }
 
@@ -93,15 +93,12 @@ async fn failures_lower_trust_below_neutral() {
 // Trust event variants
 // ---------------------------------------------------------------------------
 
-/// All four TrustEvent variants affect the score (no panics, no no-ops).
+/// All TrustEvent variants affect the score (no panics, no no-ops).
 #[tokio::test]
 async fn all_trust_event_variants_affect_score() {
     let node = P2PNode::new(test_node_config()).await.unwrap();
 
-    let positive_events = [
-        TrustEvent::SuccessfulResponse,
-        TrustEvent::SuccessfulConnection,
-    ];
+    let positive_events = [TrustEvent::ApplicationSuccess(1.0)];
     let negative_events = [TrustEvent::ConnectionFailed, TrustEvent::ConnectionTimeout];
 
     for event in positive_events {
@@ -171,7 +168,7 @@ async fn trusted_peer_resilient_to_occasional_failures() {
 
     // Build up trust
     for _ in 0..50 {
-        node.report_trust_event(&peer, TrustEvent::SuccessfulResponse)
+        node.report_trust_event(&peer, TrustEvent::ApplicationSuccess(1.0))
             .await;
     }
     let high_score = node.peer_trust(&peer);
@@ -205,7 +202,7 @@ async fn trust_engine_arc_shares_state_with_node() {
     let peer = PeerId::random();
 
     // Report via P2PNode
-    node.report_trust_event(&peer, TrustEvent::SuccessfulResponse)
+    node.report_trust_event(&peer, TrustEvent::ApplicationSuccess(1.0))
         .await;
 
     // Read via TrustEngine Arc
@@ -254,7 +251,7 @@ async fn peers_tracked_independently() {
     let neutral_peer = PeerId::random();
 
     for _ in 0..20 {
-        node.report_trust_event(&good_peer, TrustEvent::SuccessfulResponse)
+        node.report_trust_event(&good_peer, TrustEvent::ApplicationSuccess(1.0))
             .await;
         node.report_trust_event(&bad_peer, TrustEvent::ConnectionFailed)
             .await;
@@ -284,7 +281,7 @@ async fn trust_scores_bounded() {
 
     // Extreme successes
     for _ in 0..500 {
-        node.report_trust_event(&peer, TrustEvent::SuccessfulResponse)
+        node.report_trust_event(&peer, TrustEvent::ApplicationSuccess(1.0))
             .await;
     }
     let high = node.peer_trust(&peer);
@@ -372,7 +369,7 @@ async fn ema_blends_observations() {
     let after_fail = node.peer_trust(&peer);
 
     // One success
-    node.report_trust_event(&peer, TrustEvent::SuccessfulResponse)
+    node.report_trust_event(&peer, TrustEvent::ApplicationSuccess(1.0))
         .await;
     let after_recovery = node.peer_trust(&peer);
 

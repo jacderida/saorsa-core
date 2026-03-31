@@ -1025,7 +1025,6 @@ impl DhtNetworkManager {
 
                 match result {
                     Ok(DhtNetworkResult::NodesFound { mut nodes, .. }) => {
-                        self.record_peer_success(&peer_id).await;
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
@@ -1082,7 +1081,6 @@ impl DhtNetworkManager {
                         let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
-                        self.record_peer_success(&peer_id).await;
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
@@ -1229,15 +1227,6 @@ impl DhtNetworkManager {
     /// Return the first dialable address from a list of [`MultiAddr`] values.
     fn first_dialable_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
         Self::dialable_addresses(addresses).into_iter().next()
-    }
-
-    async fn record_peer_success(&self, peer_id: &PeerId) {
-        if let Some(ref engine) = self.trust_engine {
-            engine.update_node_stats(
-                peer_id,
-                crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-            );
-        }
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
@@ -1566,10 +1555,10 @@ impl DhtNetworkManager {
         // (send error, response timeout, etc.) is counted exactly once.
         // Exclude cancelled operations (the blocking decision already
         // recorded trust — Section 7.4 step 2a).
-        if let Err(ref e) = result {
-            if !matches!(e, P2PError::Network(NetworkError::OperationCancelled(_))) {
-                self.record_peer_failure(peer_id).await;
-            }
+        if let Err(ref e) = result
+            && !matches!(e, P2PError::Network(NetworkError::OperationCancelled(_)))
+        {
+            self.record_peer_failure(peer_id).await;
         }
 
         result
@@ -2198,9 +2187,6 @@ impl DhtNetworkManager {
             }
         }
 
-        // Record successful connection for trust scoring
-        self.record_peer_success(&node_id).await;
-
         if self.event_tx.receiver_count() > 0 {
             let _ = self.event_tx.send(DhtNetworkEvent::PeerDiscovered {
                 peer_id: node_id,
@@ -2427,17 +2413,9 @@ impl DhtNetworkManager {
             }
         }
 
-        // Record trust success for retained peers. Failure recording is
-        // handled by send_dht_request (via record_peer_failure) so that each
-        // failed RPC produces exactly one trust penalty — no double-counting.
-        if let Some(ref engine) = self.trust_engine {
-            for peer_id in &retained_peers {
-                engine.update_node_stats(
-                    peer_id,
-                    crate::adaptive::NodeStatisticsUpdate::CorrectResponse,
-                );
-            }
-        }
+        // Failure recording is handled by send_dht_request (via
+        // record_peer_failure) — no success recording needed since core
+        // only hands out penalties.
 
         if evicted_peers.is_empty() {
             return Err(anyhow::anyhow!(

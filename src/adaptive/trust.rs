@@ -35,16 +35,22 @@ const MIN_TRUST_SCORE: f64 = 0.0;
 /// Maximum trust score a peer can reach
 const MAX_TRUST_SCORE: f64 = 1.0;
 
-/// EMA weight for each new observation (higher = faster response to events)
-const EMA_WEIGHT: f64 = 0.1;
+/// EMA weight for each new observation (higher = faster response to events).
+///
+/// At 0.3, each failure moves the score 30% of the gap toward zero.
+/// 4 rapid failures from neutral (0.5) cross the block threshold (0.15).
+const EMA_WEIGHT: f64 = 0.3;
 
 /// Decay constant (per-second).
 ///
-/// Tuned so that the worst possible score (0.0) takes 3 days of idle time
-/// to decay back above the block threshold (0.15).
+/// Tuned so that a peer experiencing ~3 evenly-spaced failures per day
+/// converges to the block threshold (0.15). Fewer failures/day → survives,
+/// more → blocked. The worst score (0.0) decays back above 0.15 in ~1 day.
 ///
-/// Derivation: 0.15 = 0.5 - 0.5 * e^(-λ * 259200)  →  λ = -ln(0.7) / 259200
-const DECAY_LAMBDA: f64 = 1.3761e-6;
+/// Derivation: at steady state with 3 failures/day (T = 28800 s between events),
+/// 0.15 = 0.5·(1 − d) / (1 − 0.7·d)  →  d = 0.8861
+/// λ = −ln(0.8861) / 28800 ≈ 4.198 × 10⁻⁶
+const DECAY_LAMBDA: f64 = 4.198e-6;
 
 /// Per-node trust state
 #[derive(Debug, Clone)]
@@ -393,30 +399,30 @@ mod tests {
         assert!(after_success > after_fail, "Success should increase score");
     }
 
-    /// 3 days of idle time from worst score (0.0) should cross the block threshold (0.15).
+    /// 1 day of idle time from worst score (0.0) should cross the block threshold (0.15).
     ///
     /// Uses the pure `decay_score` function to avoid `Instant` subtraction,
     /// which panics on Windows if system uptime < the simulated duration.
     #[test]
-    fn test_worst_score_unblocks_after_3_days() {
-        let three_days_secs = (3 * 24 * 3600) as f64;
-        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, three_days_secs);
+    fn test_worst_score_unblocks_after_1_day() {
+        let one_day_secs = (24 * 3600) as f64;
+        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, one_day_secs);
 
         assert!(
             score >= 0.15,
-            "After 3 days, score {score} should be >= block threshold 0.15",
+            "After 1 day, score {score} should be >= block threshold 0.15",
         );
     }
 
-    /// Just under 3 days should NOT be enough to unblock
+    /// 22 hours should NOT be enough to unblock from worst score
     #[test]
-    fn test_worst_score_still_blocked_before_3_days() {
-        let just_under_3_days = (3 * 24 * 3600 - 3600) as f64; // 3 days minus 1 hour
-        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, just_under_3_days);
+    fn test_worst_score_still_blocked_before_1_day() {
+        let twenty_two_hours = (22 * 3600) as f64;
+        let score = PeerTrust::decay_score(MIN_TRUST_SCORE, twenty_two_hours);
 
         assert!(
             score < 0.15,
-            "Before 3 days, score {score} should still be < block threshold 0.15",
+            "Before 1 day, score {score} should still be < block threshold 0.15",
         );
     }
 
@@ -751,20 +757,20 @@ mod tests {
             "after failure, score {after_failure} should be below neutral"
         );
 
-        // Simulate 3+ days of idle time
-        let three_days = std::time::Duration::from_secs(3 * 24 * 3600);
-        engine.simulate_elapsed(&peer, three_days).await;
+        // Simulate 2 days of idle time
+        let two_days = std::time::Duration::from_secs(2 * 24 * 3600);
+        engine.simulate_elapsed(&peer, two_days).await;
 
         let after_decay = engine.score(&peer);
         assert!(
             after_decay > after_failure,
             "score should decay toward neutral: {after_failure} -> {after_decay}"
         );
-        // After 3 days from a moderate failure, the score should be close to neutral.
+        // After 2 days from a heavy failure, the score should be closer to neutral.
         let distance_from_neutral = (after_decay - DEFAULT_NEUTRAL_TRUST).abs();
         assert!(
-            distance_from_neutral < 0.15,
-            "after 3 days, score {after_decay} should be near neutral (distance {distance_from_neutral})"
+            distance_from_neutral < 0.2,
+            "after 2 days, score {after_decay} should be near neutral (distance {distance_from_neutral})"
         );
     }
 

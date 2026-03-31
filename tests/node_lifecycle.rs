@@ -268,7 +268,7 @@ async fn trust_events_work_before_start() {
     let node = P2PNode::new(test_config()).await.unwrap();
     let peer = saorsa_core::PeerId::random();
 
-    node.report_trust_event(&peer, saorsa_core::TrustEvent::SuccessfulResponse)
+    node.report_trust_event(&peer, saorsa_core::TrustEvent::ApplicationSuccess(1.0))
         .await;
 
     assert!(

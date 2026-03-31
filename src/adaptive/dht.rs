@@ -74,21 +74,17 @@ impl AdaptiveDhtConfig {
     }
 }
 
-/// Trust-relevant events observable by the saorsa-core network layer.
+/// Trust-relevant events for peer scoring.
 ///
-/// Each variant maps to an internal [`NodeStatisticsUpdate`] with appropriate severity.
-/// Only events that saorsa-core can directly observe are included here.
+/// Core only records **penalties** — successful responses are the expected
+/// baseline and do not warrant a reward.  Positive trust signals are the
+/// consumer's responsibility via [`ApplicationSuccess`](Self::ApplicationSuccess).
+///
 /// Consumer-reported events carry a weight multiplier that controls the
 /// severity of the update (clamped to [`MAX_CONSUMER_WEIGHT`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrustEvent {
-    // === Positive signals ===
-    /// Peer provided a correct response to a request
-    SuccessfulResponse,
-    /// Peer connection was established and authenticated
-    SuccessfulConnection,
-
-    // === Negative signals ===
+    // === Negative signals (core) ===
     /// Could not establish a connection to the peer
     ConnectionFailed,
     /// Connection attempt timed out
@@ -107,9 +103,7 @@ impl TrustEvent {
     /// Convert a TrustEvent to the internal NodeStatisticsUpdate
     fn to_stats_update(self) -> NodeStatisticsUpdate {
         match self {
-            TrustEvent::SuccessfulResponse
-            | TrustEvent::SuccessfulConnection
-            | TrustEvent::ApplicationSuccess(_) => NodeStatisticsUpdate::CorrectResponse,
+            TrustEvent::ApplicationSuccess(_) => NodeStatisticsUpdate::CorrectResponse,
             TrustEvent::ConnectionFailed
             | TrustEvent::ConnectionTimeout
             | TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
@@ -173,7 +167,7 @@ impl AdaptiveDHT {
 
     /// Report a trust event for a peer.
     ///
-    /// For internal events (connection success/failure), applies unit weight.
+    /// For core penalty events (connection failure/timeout), applies unit weight.
     /// For consumer-reported events ([`TrustEvent::ApplicationSuccess`] /
     /// [`TrustEvent::ApplicationFailure`]), validates and clamps the weight
     /// to [`MAX_CONSUMER_WEIGHT`]. Zero or negative weights are silently
@@ -282,21 +276,13 @@ mod tests {
 
     #[test]
     fn test_trust_event_mapping() {
-        // Positive events map to CorrectResponse
-        assert!(matches!(
-            TrustEvent::SuccessfulResponse.to_stats_update(),
-            NodeStatisticsUpdate::CorrectResponse
-        ));
-        assert!(matches!(
-            TrustEvent::SuccessfulConnection.to_stats_update(),
-            NodeStatisticsUpdate::CorrectResponse
-        ));
+        // Consumer success maps to CorrectResponse
         assert!(matches!(
             TrustEvent::ApplicationSuccess(1.0).to_stats_update(),
             NodeStatisticsUpdate::CorrectResponse
         ));
 
-        // Failure events map to FailedResponse
+        // Penalty events map to FailedResponse
         assert!(matches!(
             TrustEvent::ConnectionFailed.to_stats_update(),
             NodeStatisticsUpdate::FailedResponse
@@ -366,9 +352,9 @@ mod tests {
         // Unknown peer starts at neutral trust
         assert!((engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON);
 
-        // Record successes — score should rise above neutral
+        // Record consumer successes — score should rise above neutral
         for _ in 0..10 {
-            engine.update_node_stats(&peer, TrustEvent::SuccessfulResponse.to_stats_update());
+            engine.update_node_stats(&peer, TrustEvent::ApplicationSuccess(1.0).to_stats_update());
         }
 
         assert!(engine.score(&peer) > DEFAULT_NEUTRAL_TRUST);
@@ -411,8 +397,6 @@ mod tests {
     #[test]
     fn test_all_trust_events_produce_valid_updates() {
         let events = [
-            TrustEvent::SuccessfulResponse,
-            TrustEvent::SuccessfulConnection,
             TrustEvent::ConnectionFailed,
             TrustEvent::ConnectionTimeout,
             TrustEvent::ApplicationSuccess(1.0),
@@ -461,13 +445,13 @@ mod tests {
             "After many failures, peer should be blocked: {bad_score}"
         );
 
-        // Phase 4: Time passes (3+ days) — score decays back toward neutral
-        let three_days = std::time::Duration::from_secs(3 * 24 * 3600);
-        engine.simulate_elapsed(&peer, three_days).await;
+        // Phase 4: Time passes (1+ day) — score decays back toward neutral
+        let one_day = std::time::Duration::from_secs(24 * 3600);
+        engine.simulate_elapsed(&peer, one_day).await;
         let recovered_score = engine.score(&peer);
         assert!(
             recovered_score >= DEFAULT_BLOCK_THRESHOLD,
-            "After 3 days idle, peer should be unblocked: {recovered_score}"
+            "After 1 day idle, peer should be unblocked: {recovered_score}"
         );
     }
 
@@ -684,13 +668,12 @@ mod tests {
         let engine = Arc::new(TrustEngine::new());
         let peer = PeerId::random();
 
-        // First, build the peer up to just barely above the block threshold.
-        // From neutral (0.5), a few failures bring the score down.
-        for _ in 0..5 {
+        // First, bring the peer down to just above the block threshold.
+        // From neutral (0.5), 2 failures bring it to ~0.245 (still above 0.15).
+        for _ in 0..2 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let score_before = engine.score(&peer);
-        // Should still be above block threshold after just 5 unit failures from 0.5.
         assert!(
             score_before > DEFAULT_BLOCK_THRESHOLD,
             "should be above block threshold: {score_before}"

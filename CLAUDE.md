@@ -117,9 +117,9 @@ Example trust signal hook:
 ```rust
 use saorsa_core::TrustEvent;
 
-// Report application-level outcomes via P2PNode
-node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse).await;
-node.report_trust_event(&peer_id, TrustEvent::ConnectionFailed).await;
+// Core only records penalties — rewards are the consumer's responsibility
+node.report_trust_event(&peer_id, TrustEvent::ApplicationSuccess(1.0)).await;
+node.report_trust_event(&peer_id, TrustEvent::ApplicationFailure(1.0)).await;
 ```
 
 ### Multi-Layer P2P Architecture

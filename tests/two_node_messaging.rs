@@ -219,7 +219,7 @@ async fn trust_event_for_connected_peer() {
     // Report positive trust
     for _ in 0..10 {
         node_a
-            .report_trust_event(&peer_b, TrustEvent::SuccessfulResponse)
+            .report_trust_event(&peer_b, TrustEvent::ApplicationSuccess(1.0))
             .await;
     }
 
