@@ -1149,24 +1149,28 @@ impl P2PNode {
                             // connect to K closest peers for relay address propagation.
                             if let Some(relay_addr) = transport.drain_relay_established().await {
                                 // Normalize IPv6-mapped addresses to IPv4 so the
-                                // announced address is dialable by IPv4-only clients.
+                                // published address is dialable by IPv4-only clients.
                                 let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
                                 let relay_multi =
                                     crate::MultiAddr::quic(normalized);
                                 info!(
-                                    "DHT_BRIDGE: relay established at {} — setting announced address and triggering self-lookup",
+                                    "DHT_BRIDGE: relay established at {} — self-lookup then PublishAddress to K closest",
                                     relay_addr
                                 );
-                                dht.set_relay_address(relay_multi).await;
                                 let own_key = *dht.peer_id().to_bytes();
-                                // Use K=8 (DHT_CLOSEST_NODES_COUNT) to
-                                // reach all nodes likely to be queried.
+                                // Self-lookup to discover K closest peers, then
+                                // send PublishAddress to each. This is O(K) messages
+                                // sent once, not a field on every DHT message.
                                 match dht.find_closest_nodes_network(&own_key, 8).await {
                                     Ok(nodes) => {
                                         info!(
-                                            "DHT_BRIDGE: self-lookup found {} nodes — relay address will propagate via ADD_ADDRESS",
+                                            "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
                                             nodes.len()
                                         );
+                                        dht.publish_address_to_peers(
+                                            vec![relay_multi],
+                                            &nodes,
+                                        ).await;
                                     }
                                     Err(e) => {
                                         warn!(

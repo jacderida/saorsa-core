@@ -137,6 +137,10 @@ pub enum DhtNetworkOperation {
     Join,
     /// Leave the DHT network gracefully
     Leave,
+    /// Publish the sender's preferred routable addresses (e.g., relay address).
+    /// Receiving nodes update their routing table for the sender. Sent once
+    /// after relay setup to K closest peers, not on every message.
+    PublishAddress { addresses: Vec<crate::MultiAddr> },
 }
 
 /// DHT network operation result
@@ -161,6 +165,8 @@ pub enum DhtNetworkResult {
     LeaveSuccess,
     /// The remote peer has blocked us — do not penalise their trust score
     PeerRejected,
+    /// Acknowledgement of a PublishAddress request
+    PublishAddressAck,
     /// Operation failed
     Error { operation: String, error: String },
 }
@@ -186,11 +192,6 @@ pub struct DhtNetworkMessage {
     pub ttl: u8,
     /// Hop count for routing
     pub hop_count: u8,
-    /// Sender's preferred routable addresses (e.g., relay address for NAT nodes).
-    /// Receiving nodes should use these for routing table updates instead of the
-    /// transport-level connection address, which may be a NATted ephemeral port.
-    #[serde(default)]
-    pub announced_addresses: Vec<crate::MultiAddr>,
 }
 
 /// DHT message types
@@ -251,9 +252,6 @@ pub struct DhtNetworkManager {
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
-    /// Relay address to announce in DHT messages (set when MASQUE relay is active).
-    /// Nodes receiving messages from us will use this to update their routing tables.
-    relay_address: Arc<RwLock<Option<crate::MultiAddr>>>,
 }
 
 /// DHT operation context
@@ -411,7 +409,6 @@ impl DhtNetworkManager {
             self_lookup_handle: Arc::new(RwLock::new(None)),
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
-            relay_address: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1399,14 +1396,6 @@ impl DhtNetworkManager {
 
         let message_id = Uuid::new_v4().to_string();
 
-        let announced = self
-            .relay_address
-            .read()
-            .await
-            .as_ref()
-            .map(|a| vec![a.clone()])
-            .unwrap_or_default();
-
         let message = DhtNetworkMessage {
             message_id: message_id.clone(),
             source: self.config.peer_id,
@@ -1414,7 +1403,6 @@ impl DhtNetworkManager {
             message_type: DhtMessageType::Request,
             payload: operation,
             result: None, // Requests don't have results
-            announced_addresses: announced,
             timestamp: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|_| {
@@ -1883,13 +1871,19 @@ impl DhtNetworkManager {
             }
             DhtNetworkOperation::Leave => {
                 debug!("Handling LEAVE request from: {}", authenticated_sender);
-                // Remove the leaving node from our routing table
-                // TODO: Implement node removal from DHT routing table
-                // let dht_guard = self.dht.write().await;
-                // if let Err(e) = dht_guard.remove_node(authenticated_sender).await {
-                //     warn!("Failed to remove leaving node from routing table: {}", e);
-                // }
                 Ok(DhtNetworkResult::LeaveSuccess)
+            }
+            DhtNetworkOperation::PublishAddress { addresses } => {
+                info!(
+                    "Handling PUBLISH_ADDRESS from {}: {} addresses",
+                    authenticated_sender,
+                    addresses.len()
+                );
+                let dht = self.dht.read().await;
+                for addr in addresses {
+                    dht.touch_node(authenticated_sender, Some(addr)).await;
+                }
+                Ok(DhtNetworkResult::PublishAddressAck)
             }
         }
     }
@@ -2019,6 +2013,7 @@ impl DhtNetworkManager {
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
+            DhtNetworkResult::PublishAddressAck => request.payload.clone(),
             DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
@@ -2044,7 +2039,6 @@ impl DhtNetworkManager {
                 .as_secs(),
             ttl: request.ttl.saturating_sub(1),
             hop_count: request.hop_count.saturating_add(1),
-            announced_addresses: Vec::new(), // Responses don't need self-announcement
         })
     }
 
@@ -2055,7 +2049,7 @@ impl DhtNetworkManager {
     /// routing table entry to move it to the tail of its k-bucket and refresh
     /// the stored address so that `FindNode` responses stay current when a peer
     /// reconnects from a different endpoint.
-    async fn update_peer_info(&self, peer_id: PeerId, message: &DhtNetworkMessage) {
+    async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
                 "Ignoring DHT peer update for unauthenticated transport peer {}",
@@ -2064,46 +2058,32 @@ impl DhtNetworkManager {
             return;
         };
 
-        // Prefer announced addresses from the DHT message (e.g., relay address
-        // that the sender explicitly wants us to use for routing). Fall back to
-        // the transport-layer address if no announcement is present.
-        let address = if !message.announced_addresses.is_empty() {
-            // The sender included a preferred routable address (e.g., relay).
-            // Use the first announced address for the routing table.
-            let addr = &message.announced_addresses[0];
-            info!(
-                "update_peer_info: using announced address {} for peer {}",
-                addr, app_peer_id.to_hex()
-            );
-            Some(addr.clone())
-        } else {
-            // No announcement — use transport address, but only if the peer
-            // doesn't already have a relay address at the front of its address
-            // list. This prevents NATted addresses from overwriting relay entries.
-            let transport_addr = self
-                .transport
-                .peer_info(&app_peer_id)
-                .await
-                .and_then(|info| Self::first_dialable_address(&info.addresses));
+        // Use the transport-layer address, but only if the peer doesn't already
+        // have a relay address at the front of its address list. This prevents
+        // NATted addresses from overwriting relay entries set by PublishAddress.
+        let transport_addr = self
+            .transport
+            .peer_info(&app_peer_id)
+            .await
+            .and_then(|info| Self::first_dialable_address(&info.addresses));
 
-            if let Some(ref addr) = transport_addr {
-                let dht = self.dht.read().await;
-                let has_relay_front = dht
-                    .get_node_addresses(&app_peer_id)
-                    .await
-                    .first()
-                    .and_then(|front| front.ip())
-                    .is_some_and(|front_ip| {
-                        addr.ip().is_some_and(|transport_ip| front_ip != transport_ip)
-                    });
-                if has_relay_front {
-                    None // Don't overwrite relay with NATted address
-                } else {
-                    transport_addr
-                }
+        let address = if let Some(ref addr) = transport_addr {
+            let dht = self.dht.read().await;
+            let has_relay_front = dht
+                .get_node_addresses(&app_peer_id)
+                .await
+                .first()
+                .and_then(|front| front.ip())
+                .is_some_and(|front_ip| {
+                    addr.ip().is_some_and(|transport_ip| front_ip != transport_ip)
+                });
+            if has_relay_front {
+                None // Don't overwrite relay with NATted address
             } else {
-                None
+                transport_addr
             }
+        } else {
+            None
         };
 
         let dht = self.dht.read().await;
@@ -2627,10 +2607,40 @@ impl DhtNetworkManager {
         &self.config.peer_id
     }
 
-    /// Set the relay address to announce in all outgoing DHT messages.
-    /// Called when this node establishes a MASQUE relay.
-    pub async fn set_relay_address(&self, addr: crate::MultiAddr) {
-        *self.relay_address.write().await = Some(addr);
+    /// Send a PublishAddress request to a list of peers, telling them to
+    /// store the given addresses for this node in their routing tables.
+    /// Used after relay setup to propagate the relay address to K closest peers.
+    pub async fn publish_address_to_peers(
+        &self,
+        addresses: Vec<crate::MultiAddr>,
+        peers: &[DHTNode],
+    ) {
+        let op = DhtNetworkOperation::PublishAddress {
+            addresses: addresses.clone(),
+        };
+        for peer in peers {
+            if peer.peer_id == self.config.peer_id {
+                continue; // Skip self
+            }
+            match self
+                .send_dht_request(&peer.peer_id, op.clone(), Self::first_dialable_address(&peer.addresses).as_ref())
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Published address to peer {}",
+                        peer.peer_id.to_hex()
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to publish address to peer {}: {}",
+                        peer.peer_id.to_hex(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Get the local listen address of this node's P2P network
@@ -2790,7 +2800,6 @@ mod tests {
             timestamp: 0,
             ttl: 10,
             hop_count: 0,
-            announced_addresses: Vec::new(),
         };
 
         // Serialize & deserialize the full response message to verify
@@ -2805,7 +2814,6 @@ mod tests {
             timestamp: 0,
             ttl: request.ttl.saturating_sub(1),
             hop_count: request.hop_count.saturating_add(1),
-            announced_addresses: Vec::new(),
         };
 
         let bytes = postcard::to_stdvec(&response).expect("serialize response");
