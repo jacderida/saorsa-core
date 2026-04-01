@@ -37,20 +37,21 @@ const MAX_TRUST_SCORE: f64 = 1.0;
 
 /// EMA weight for each new observation (higher = faster response to events).
 ///
-/// At 0.3, each failure moves the score 30% of the gap toward zero.
-/// 4 rapid failures from neutral (0.5) cross the block threshold (0.15).
-const EMA_WEIGHT: f64 = 0.3;
+/// At 0.124, each failure moves the score ~12.4% of the gap toward zero.
+/// 3 rapid failures from neutral (0.5) cross the swap threshold (0.35).
+const EMA_WEIGHT: f64 = 0.124;
 
 /// Decay constant (per-second).
 ///
 /// Tuned so that a peer experiencing ~3 evenly-spaced failures per day
-/// converges to the swap threshold (0.15). Fewer failures/day → survives,
-/// more → swap-eligible. The worst score (0.0) decays back above 0.15 in ~1 day.
+/// converges to the swap threshold (0.35). Fewer failures/day → survives,
+/// more → swap-eligible. The worst score (0.0) decays back above 0.35 in ~1 day.
 ///
 /// Derivation: at steady state with 3 failures/day (T = 28800 s between events),
-/// 0.15 = 0.5·(1 − d) / (1 − 0.7·d)  →  d = 0.8861
-/// λ = −ln(0.8861) / 28800 ≈ 4.198 × 10⁻⁶
-const DECAY_LAMBDA: f64 = 4.198e-6;
+/// s = 0.5·(1−α)·(1−d) / (1−(1−α)·d) = 0.35  with  α = 0.124
+/// Recovery constraint: e^(−λ·86400) = 0.3  →  λ = −ln(0.3)/86400 ≈ 1.394 × 10⁻⁵
+/// d = e^(−λ·28800) ≈ 0.6694
+const DECAY_LAMBDA: f64 = 1.394e-5;
 
 /// Per-node trust state
 #[derive(Debug, Clone)]
@@ -399,18 +400,18 @@ mod tests {
         assert!(after_success > after_fail, "Success should increase score");
     }
 
-    /// 1 day of idle time from worst score (0.0) should cross the block threshold (0.15).
+    /// 1 day of idle time from worst score (0.0) should cross the swap threshold (0.35).
     ///
     /// Uses the pure `decay_score` function to avoid `Instant` subtraction,
     /// which panics on Windows if system uptime < the simulated duration.
     #[test]
-    fn test_worst_score_unblocks_after_1_day() {
+    fn test_worst_score_recovers_after_1_day() {
         let one_day_secs = (24 * 3600) as f64;
         let score = PeerTrust::decay_score(MIN_TRUST_SCORE, one_day_secs);
 
         assert!(
-            score >= 0.15,
-            "After 1 day, score {score} should be >= block threshold 0.15",
+            score >= 0.35,
+            "After 1 day, score {score} should be >= swap threshold 0.35",
         );
     }
 
@@ -421,8 +422,8 @@ mod tests {
         let score = PeerTrust::decay_score(MIN_TRUST_SCORE, twenty_two_hours);
 
         assert!(
-            score < 0.15,
-            "Before 1 day, score {score} should still be < block threshold 0.15",
+            score < 0.35,
+            "Before 1 day, score {score} should still be < swap threshold 0.35",
         );
     }
 
@@ -656,16 +657,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Repeated high-weight failures should push a peer's trust score below
-    /// the swap threshold (0.15), making it eligible for swap-out.
+    /// the swap threshold (0.35), making it eligible for swap-out.
     #[tokio::test]
     async fn test_consumer_penalty_degrades_below_swap_threshold() {
         /// Swap threshold matching the value in adaptive/dht.rs
-        const SWAP_THRESHOLD: f64 = 0.15;
+        const SWAP_THRESHOLD: f64 = 0.35;
 
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
-        // Repeated weight-3 failures from neutral (0.5) should push well below 0.15.
+        // Repeated weight-3 failures from neutral (0.5) should push well below 0.35.
         let failure_count = 10;
         for _ in 0..failure_count {
             engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 3.0);

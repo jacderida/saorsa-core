@@ -228,7 +228,7 @@ pub struct NodeConfig {
     /// swap-out from the routing table when better candidates arrive. Use
     /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
     ///
-    /// Default: enabled with a swap threshold of 0.15.
+    /// Default: enabled with a swap threshold of 0.35.
     #[serde(default)]
     pub adaptive_dht_config: AdaptiveDhtConfig,
 
@@ -479,7 +479,7 @@ impl NodeConfigBuilder {
     /// no enforcement effect.
     ///
     /// When `true` (the default), peers whose trust score falls below the
-    /// swap threshold (0.15) become eligible for replacement when a
+    /// swap threshold (0.35) become eligible for replacement when a
     /// better candidate arrives.
     ///
     /// For fine-grained control over the threshold, use

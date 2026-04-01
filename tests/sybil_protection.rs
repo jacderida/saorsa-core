@@ -23,7 +23,7 @@ use saorsa_core::{AdaptiveDhtConfig, NodeConfig, P2PNode, PeerId, TrustEvent};
 use std::time::Duration;
 
 /// Default swap threshold.
-const SWAP_THRESHOLD: f64 = 0.15;
+const SWAP_THRESHOLD: f64 = 0.35;
 
 /// Helper: local test config.
 fn test_config() -> NodeConfig {

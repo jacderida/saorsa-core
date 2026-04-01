@@ -46,7 +46,7 @@ const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
 
 /// Default trust score below which a peer is eligible for swap-out.
 #[allow(dead_code)]
-const DEFAULT_SWAP_THRESHOLD: f64 = 0.15;
+const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
 /// Node information for routing.
 ///
@@ -2811,7 +2811,7 @@ mod tests {
         let new_peer = PeerId::from_bytes(new_id);
         let low_trust_peer = PeerId::from_bytes(ids[2]);
 
-        // Peer ids[2] has trust 0.05 (below 0.15 threshold), others at 0.5
+        // Peer ids[2] has trust 0.05 (below 0.35 threshold), others at 0.5
         let result = dht
             .add_node(
                 make_node_with_addr(new_id, "/ip4/10.0.4.1/udp/9000/quic"),

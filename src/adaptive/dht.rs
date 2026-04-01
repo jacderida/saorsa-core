@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Default trust score threshold below which a peer is eligible for swap-out
-const DEFAULT_SWAP_THRESHOLD: f64 = 0.15;
+const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
 /// Maximum weight multiplier per single consumer-reported event.
 /// Caps the influence of any single consumer event on the EMA.
@@ -42,7 +42,7 @@ pub struct AdaptiveDhtConfig {
     /// Trust score below which a peer becomes eligible for swap-out from
     /// the routing table when a better candidate is available.
     /// Peers are NOT immediately evicted.
-    /// Default: 0.15
+    /// Default: 0.35
     pub swap_threshold: f64,
 }
 
@@ -486,7 +486,7 @@ mod tests {
 
         engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
 
-        // A single failure from neutral (0.5) should give ~0.45, still above 0.15
+        // A single failure from neutral (0.5) should give ~0.44, still above 0.35
         assert!(
             engine.score(&peer) >= DEFAULT_SWAP_THRESHOLD,
             "One failure from neutral should not cross swap threshold: {}",
@@ -657,7 +657,7 @@ mod tests {
         let peer = PeerId::random();
 
         // First, bring the peer down to just above the swap threshold.
-        // From neutral (0.5), 2 failures bring it to ~0.245 (still above 0.15).
+        // From neutral (0.5), 2 failures bring it to ~0.384 (still above 0.35).
         for _ in 0..2 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }

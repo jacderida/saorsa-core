@@ -24,7 +24,7 @@ use saorsa_core::{AdaptiveDhtConfig, NodeConfig, P2PNode, PeerId, TrustEvent};
 const NEUTRAL_TRUST: f64 = 0.5;
 
 /// Default block threshold below which peers are evicted.
-const SWAP_THRESHOLD: f64 = 0.15;
+const SWAP_THRESHOLD: f64 = 0.35;
 
 /// Helper: create a local-only test node config (loopback, ephemeral port, IPv4 only).
 fn test_node_config() -> NodeConfig {
