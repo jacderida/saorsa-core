@@ -1161,7 +1161,7 @@ impl P2PNode {
                                 // Self-lookup to discover K closest peers, then
                                 // send PublishAddress to each. This is O(K) messages
                                 // sent once, not a field on every DHT message.
-                                match dht.find_closest_nodes_network(&own_key, 8).await {
+                                match dht.find_closest_nodes_network(&own_key, dht.k_value()).await {
                                     Ok(nodes) => {
                                         info!(
                                             "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
@@ -1198,21 +1198,11 @@ impl P2PNode {
                                     continue;
                                 }
 
-                                // Try exact addr match first, then fall back to IP match.
-                                // NAT connections use random source ports, so the
-                                // PeerAddressUpdated peer_addr (NATted) may not match
-                                // the channel key in the transport handle exactly.
-                                let peer_id = transport.peer_id_for_addr(&peer_addr).await
-                                    .or_else(|| {
-                                        // peer_id_for_addr returned None — likely a NATted
-                                        // connection address that doesn't match the channel key
-                                        warn!(
-                                            "DHT_BRIDGE: peer_id_for_addr({}) returned None — \
-                                             NAT node's channel key may differ from connection addr",
-                                            peer_addr
-                                        );
-                                        None
-                                    });
+                                // Look up peer ID by address (tries both IPv4 and
+                                // IPv4-mapped IPv6 forms via dual_stack_alternate).
+                                // For symmetric NAT, this may fail because the
+                                // connection's channel key uses a different NATted port.
+                                let peer_id = transport.peer_id_for_addr(&peer_addr).await;
                                 if let Some(peer_id) = peer_id {
                                     let normalized_adv = saorsa_transport::shared::normalize_socket_addr(advertised_addr);
                                     let multi_addr = crate::MultiAddr::quic(normalized_adv);

@@ -413,7 +413,8 @@ impl DhtNetworkManager {
     }
 
     /// Kademlia K parameter — bucket size and lookup count.
-    fn k_value(&self) -> usize {
+    /// Get the configured Kademlia K value (bucket size / close group size).
+    pub fn k_value(&self) -> usize {
         self.config.node_config.dht_config.k_value
     }
 
@@ -434,7 +435,7 @@ impl DhtNetworkManager {
         // Log addresses being returned in FIND_NODE response
         for node in &closer_nodes {
             let addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
-            info!(
+            debug!(
                 "FIND_NODE response: peer={} addresses={:?}",
                 node.peer_id.to_hex(),
                 addrs
@@ -716,12 +717,11 @@ impl DhtNetworkManager {
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        let all_addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
                         let first = Self::first_dialable_address(&node.addresses);
-                        info!(
-                            "DHT bootstrap: peer={} all_addresses={:?} first_dialable={:?}",
+                        debug!(
+                            "DHT bootstrap: peer={} num_addresses={} first_dialable={:?}",
                             node.peer_id.to_hex(),
-                            all_addrs,
+                            node.addresses.len(),
                             first.as_ref().map(|a| a.to_string())
                         );
                         if seen.insert(node.peer_id) {
@@ -1647,6 +1647,13 @@ impl DhtNetworkManager {
             );
             return None;
         }
+        // Set the target peer ID so hole-punch PUNCH_ME_NOW uses it for
+        // routing. This is essential for symmetric NAT where the coordinator
+        // can't match the target by socket address.
+        self.transport
+            .set_hole_punch_target_peer_id(Some(*peer_id.to_bytes()))
+            .await;
+
         let dial_timeout = self
             .transport
             .connection_timeout()
@@ -2018,7 +2025,9 @@ impl DhtNetworkManager {
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
-            DhtNetworkResult::PublishAddressAck => request.payload.clone(),
+            // Use Ping as a lightweight ack — avoids echoing the full
+            // PublishAddress payload (which contains the address list).
+            DhtNetworkResult::PublishAddressAck => DhtNetworkOperation::Ping,
             DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
@@ -2540,6 +2549,11 @@ impl DhtNetworkManager {
         dht.touch_node(peer_id, address).await
     }
 
+    /// Update a node's address with an explicit type tag.
+    ///
+    /// Prefer over [`Self::touch_node`] when the address class is known
+    /// (e.g., `AddressType::Relay` for relay addresses so they are stored
+    /// at the front of the address list).
     pub async fn touch_node_typed(
         &self,
         peer_id: &PeerId,
@@ -2629,14 +2643,15 @@ impl DhtNetworkManager {
                 continue; // Skip self
             }
             match self
-                .send_dht_request(&peer.peer_id, op.clone(), Self::first_dialable_address(&peer.addresses).as_ref())
+                .send_dht_request(
+                    &peer.peer_id,
+                    op.clone(),
+                    Self::first_dialable_address(&peer.addresses).as_ref(),
+                )
                 .await
             {
                 Ok(_) => {
-                    info!(
-                        "Published address to peer {}",
-                        peer.peer_id.to_hex()
-                    );
+                    info!("Published address to peer {}", peer.peer_id.to_hex());
                 }
                 Err(e) => {
                     debug!(

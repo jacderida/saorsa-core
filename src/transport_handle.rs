@@ -117,7 +117,8 @@ pub struct TransportHandle {
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
     /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
-    peer_address_update_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+    peer_address_update_rx:
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
     /// Relay established events — received when this node sets up a MASQUE relay.
     relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SocketAddr>>,
     connection_timeout: Duration,
@@ -485,26 +486,16 @@ impl TransportHandle {
 
         // Try the exact stringified address first.
         let channel_id = addr.to_string();
-        if let Some(peers) = c2p.get(&channel_id) {
-            if let Some(peer_id) = peers.iter().next().copied() {
-                return Some(peer_id);
-            }
+        if let Some(peer_id) = c2p.get(&channel_id).and_then(|p| p.iter().next().copied()) {
+            return Some(peer_id);
         }
 
         // The channel key may be stored as IPv4-mapped IPv6 (e.g., "[::ffff:1.2.3.4]:PORT")
         // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
-        // Try the alternate form.
-        let Some(alt_addr) = saorsa_transport::shared::dual_stack_alternate(addr) else {
-            return None;
-        };
+        let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
         let alt_channel_id = alt_addr.to_string();
-        if let Some(peers) = c2p.get(&alt_channel_id) {
-            if let Some(peer_id) = peers.iter().next().copied() {
-                return Some(peer_id);
-            }
-        }
-
-        None
+        c2p.get(&alt_channel_id)
+            .and_then(|p| p.iter().next().copied())
     }
 
     /// Drain pending peer address updates from ADD_ADDRESS frames.
@@ -586,6 +577,12 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
+    /// Set the target peer ID for the next hole-punch attempt.
+    /// See [`P2pEndpoint::set_hole_punch_target_peer_id`].
+    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
+        self.dual_node.set_hole_punch_target_peer_id(peer_id).await;
+    }
+
     /// Connect to a peer at the given address.
     ///
     /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
@@ -1381,6 +1378,7 @@ impl TransportHandle {
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
         let self_peer_id = *self.node_identity.peer_id();
+        let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((from_addr, bytes)) = rx.recv().await {
@@ -1414,6 +1412,13 @@ impl TransportHandle {
                             }
                             // Drop the lock before emitting events.
                             drop(p2c);
+
+                            // Register peer ID at the low-level transport
+                            // endpoint so PUNCH_ME_NOW relay can find this
+                            // peer by identity instead of socket address.
+                            dual_node_for_peer_reg
+                                .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                                .await;
 
                             if is_new_peer {
                                 peer_user_agents

@@ -799,6 +799,32 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
 
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
+    /// Set the target peer ID for the next hole-punch attempt. The P2pEndpoint
+    /// uses this in PUNCH_ME_NOW to let the coordinator match by peer identity
+    /// instead of socket address — essential for symmetric NAT.
+    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            node.transport
+                .endpoint()
+                .set_hole_punch_target_peer_id(peer_id)
+                .await;
+        }
+    }
+
+    /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
+    /// relay routing. Called when identity exchange completes on a connection.
+    pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            let endpoint = node.transport.endpoint();
+            endpoint.register_connection_peer_id(addr, peer_id);
+            // Also register the dual-stack alternate form (IPv4 ↔ IPv4-mapped IPv6)
+            // so peer ID routing works regardless of which form the connection uses.
+            if let Some(alt) = saorsa_transport::shared::dual_stack_alternate(&addr) {
+                endpoint.register_connection_peer_id(alt, peer_id);
+            }
+        }
+    }
+
     /// Check if a peer has a live QUIC connection via either stack.
     ///
     /// Checks the underlying P2pEndpoint's NatTraversalEndpoint connections
@@ -865,25 +891,24 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
             tokio::spawn(async move {
-                tracing::info!("ADDR_FWD: peer address update forwarder started");
+                tracing::debug!("ADDR_FWD: peer address update forwarder started");
                 loop {
                     match p2p_rx.recv().await {
                         Ok(saorsa_transport::P2pEvent::PeerAddressUpdated {
                             peer_addr,
                             advertised_addr,
                         }) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "ADDR_FWD: received PeerAddressUpdated peer={} addr={}",
-                                peer_addr, advertised_addr
+                                peer_addr,
+                                advertised_addr
                             );
                             let _ = tx_clone.send((
                                 saorsa_transport::shared::normalize_socket_addr(peer_addr),
                                 saorsa_transport::shared::normalize_socket_addr(advertised_addr),
                             ));
                         }
-                        Ok(saorsa_transport::P2pEvent::RelayEstablished {
-                            relay_addr,
-                        }) => {
+                        Ok(saorsa_transport::P2pEvent::RelayEstablished { relay_addr }) => {
                             tracing::info!(
                                 "ADDR_FWD: received RelayEstablished relay_addr={}",
                                 relay_addr
