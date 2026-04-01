@@ -1881,7 +1881,12 @@ impl DhtNetworkManager {
                 );
                 let dht = self.dht.read().await;
                 for addr in addresses {
-                    dht.touch_node(authenticated_sender, Some(addr)).await;
+                    dht.touch_node_typed(
+                        authenticated_sender,
+                        Some(addr),
+                        crate::dht::AddressType::Relay,
+                    )
+                    .await;
                 }
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
@@ -2058,36 +2063,25 @@ impl DhtNetworkManager {
             return;
         };
 
-        // Use the transport-layer address, but only if the peer doesn't already
-        // have a relay address at the front of its address list. This prevents
-        // NATted addresses from overwriting relay entries set by PublishAddress.
+        // Transport-layer address is tagged as Direct. The typed merge
+        // ensures it never displaces a Relay address at the front.
+        // NATted addresses (from NAT connections) are handled separately
+        // by the DHT bridge which tags them explicitly.
         let transport_addr = self
             .transport
             .peer_info(&app_peer_id)
             .await
             .and_then(|info| Self::first_dialable_address(&info.addresses));
 
-        let address = if let Some(ref addr) = transport_addr {
-            let dht = self.dht.read().await;
-            let has_relay_front = dht
-                .get_node_addresses(&app_peer_id)
-                .await
-                .first()
-                .and_then(|front| front.ip())
-                .is_some_and(|front_ip| {
-                    addr.ip().is_some_and(|transport_ip| front_ip != transport_ip)
-                });
-            if has_relay_front {
-                None // Don't overwrite relay with NATted address
-            } else {
-                transport_addr
-            }
-        } else {
-            None
-        };
-
         let dht = self.dht.read().await;
-        if dht.touch_node(&app_peer_id, address.as_ref()).await {
+        if dht
+            .touch_node_typed(
+                &app_peer_id,
+                transport_addr.as_ref(),
+                crate::dht::AddressType::Direct,
+            )
+            .await
+        {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
     }
@@ -2179,9 +2173,11 @@ impl DhtNetworkManager {
                 app_peer_id_hex, user_agent
             );
         } else {
+            let address_types = vec![crate::dht::AddressType::Direct; addresses.len()];
             let node_info = NodeInfo {
                 id: node_id,
                 addresses,
+                address_types,
                 last_seen: Instant::now(),
             };
 
@@ -2542,6 +2538,16 @@ impl DhtNetworkManager {
     pub async fn touch_node(&self, peer_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let dht = self.dht.read().await;
         dht.touch_node(peer_id, address).await
+    }
+
+    pub async fn touch_node_typed(
+        &self,
+        peer_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: crate::dht::AddressType,
+    ) -> bool {
+        let dht = self.dht.read().await;
+        dht.touch_node_typed(peer_id, address, addr_type).await
     }
 
     pub async fn get_stats(&self) -> DhtNetworkStats {

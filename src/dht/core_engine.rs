@@ -40,6 +40,26 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// but unbounded lists would be an abuse vector.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
+/// Maximum NATted addresses to keep per node. Symmetric NAT generates a
+/// different address per peer — keeping them all is wasteful since none are
+/// directly reachable. We keep 1 for diagnostic/logging purposes.
+const MAX_NATTED_ADDRESSES: usize = 1;
+
+/// Address classification for priority ordering and staleness eviction.
+///
+/// Relay addresses are always preferred over Direct, which are preferred over
+/// NATted. The `merge_typed_address` method uses this for insertion ordering
+/// and the eviction of excess NATted entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddressType {
+    /// Address through a MASQUE relay server (always reachable)
+    Relay,
+    /// Direct public IP address (reachable without NAT traversal)
+    Direct,
+    /// NATted address (ephemeral, typically unreachable from outside)
+    NATted,
+}
+
 /// Duration of no contact after which a peer is considered stale.
 /// Stale peers lose trust protection and become eligible for revalidation-based eviction.
 const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
@@ -56,6 +76,11 @@ const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
 pub struct NodeInfo {
     pub id: PeerId,
     pub addresses: Vec<MultiAddr>,
+    /// Type tag for each address, parallel to `addresses` by index.
+    /// Defaults to empty on deserialization (legacy nodes); callers treat
+    /// untagged addresses as `Direct`.
+    #[serde(default)]
+    pub address_types: Vec<AddressType>,
     /// Monotonic timestamp of last successful interaction.
     /// Uses `Instant` to avoid NTP clock-jump issues. Skipped during
     /// serialization — deserialized `NodeInfo` defaults to "just seen."
@@ -88,16 +113,88 @@ impl NodeInfo {
             .collect()
     }
 
-    /// Merge a new address into this node's address list.
-    ///
-    /// If the address is already present it is moved to the front (most
-    /// recently seen). New addresses are prepended. The list is capped at
-    /// [`MAX_ADDRESSES_PER_NODE`].
+    /// Merge a new address with default type `Direct`.
+    /// Prefer `merge_typed_address` when the type is known.
     pub fn merge_address(&mut self, addr: MultiAddr) {
-        // Remove existing duplicate so the re-insert moves it to the front.
-        self.addresses.retain(|a| a != &addr);
-        self.addresses.insert(0, addr);
+        self.merge_typed_address(addr, AddressType::Direct);
+    }
+
+    /// Merge a new address with an explicit type tag.
+    ///
+    /// Insertion position depends on type priority: Relay → Direct → NATted.
+    /// Relay addresses always go to the front. NATted addresses go to the
+    /// back and are evicted beyond [`MAX_NATTED_ADDRESSES`].
+    pub fn merge_typed_address(&mut self, addr: MultiAddr, addr_type: AddressType) {
+        // Ensure address_types is in sync with addresses (legacy compat)
+        while self.address_types.len() < self.addresses.len() {
+            self.address_types.push(AddressType::Direct);
+        }
+
+        // Remove existing duplicate (same address may be re-classified)
+        if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
+            self.addresses.remove(pos);
+            if pos < self.address_types.len() {
+                self.address_types.remove(pos);
+            }
+        }
+
+        // Insert based on type priority
+        match addr_type {
+            AddressType::Relay => {
+                // Always at front
+                self.addresses.insert(0, addr);
+                self.address_types.insert(0, AddressType::Relay);
+            }
+            AddressType::Direct => {
+                // After all Relay entries, before NATted
+                let pos = self
+                    .address_types
+                    .iter()
+                    .position(|t| *t == AddressType::NATted)
+                    .unwrap_or(self.addresses.len());
+                self.addresses.insert(pos, addr);
+                self.address_types.insert(pos, AddressType::Direct);
+            }
+            AddressType::NATted => {
+                // At the back
+                self.addresses.push(addr);
+                self.address_types.push(AddressType::NATted);
+
+                // Evict excess NATted addresses (keep only MAX_NATTED_ADDRESSES)
+                let natted_count = self
+                    .address_types
+                    .iter()
+                    .filter(|t| **t == AddressType::NATted)
+                    .count();
+                if natted_count > MAX_NATTED_ADDRESSES {
+                    // Remove oldest NATted entries (earliest in the list)
+                    let mut to_remove = natted_count - MAX_NATTED_ADDRESSES;
+                    let mut i = 0;
+                    while i < self.address_types.len() && to_remove > 0 {
+                        if self.address_types[i] == AddressType::NATted {
+                            self.addresses.remove(i);
+                            self.address_types.remove(i);
+                            to_remove -= 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cap total addresses
         self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
+        self.address_types.truncate(MAX_ADDRESSES_PER_NODE);
+    }
+
+    /// Get the address type at the given index. Returns `Direct` for
+    /// untagged addresses (legacy compatibility).
+    pub fn address_type_at(&self, index: usize) -> AddressType {
+        self.address_types
+            .get(index)
+            .copied()
+            .unwrap_or(AddressType::Direct)
     }
 }
 
@@ -168,14 +265,19 @@ impl KBucket {
     }
 
     /// Update `last_seen` (and optionally merge an address) for a node, then
-    /// move it to the tail of the bucket (most recently seen) per Kademlia
+    /// Update `last_seen` (and optionally merge a typed address) for a node,
+    /// then move it to the tail of the bucket (most recently seen) per Kademlia
     /// protocol.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
+    fn touch_node_typed(
+        &mut self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = Instant::now();
             if let Some(addr) = address {
                 // Loopback injection prevention (Design Section 6.3 rule 4):
-                // Don't merge loopback addresses into a non-loopback-admitted peer.
                 let addr_is_loopback = addr
                     .ip()
                     .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
@@ -184,7 +286,7 @@ impl KBucket {
                     .iter()
                     .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
                 if !(addr_is_loopback && node_has_non_loopback) {
-                    self.nodes[pos].merge_address(addr.clone());
+                    self.nodes[pos].merge_typed_address(addr.clone(), addr_type);
                 }
             }
             let node = self.nodes.remove(pos);
@@ -234,12 +336,19 @@ impl KademliaRoutingTable {
         }
     }
 
-    /// Update `last_seen` (and optionally merge an address) for a node and
+    /// Update `last_seen` (and optionally merge a typed address) for a node and
     /// move it to the tail of its k-bucket. Returns `true` if the node was found.
-    fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
+    fn touch_node(
+        &mut self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
         match self.get_bucket_index(node_id) {
-            Some(bucket_index) => self.buckets[bucket_index].touch_node(node_id, address),
-            None => false, // Self is never in the routing table
+            Some(bucket_index) => {
+                self.buckets[bucket_index].touch_node_typed(node_id, address, addr_type)
+            }
+            None => false,
         }
     }
 
@@ -635,7 +744,8 @@ impl DhtCoreEngine {
         // Insert self as a candidate
         let self_info = NodeInfo {
             id: self.node_id,
-            addresses: vec![], // Self has no addresses in its own routing table
+            addresses: vec![],
+            address_types: vec![],
             last_seen: Instant::now(),
         };
         let self_dist = xor_distance_bytes(self.node_id.to_bytes(), key.as_bytes());
@@ -711,7 +821,17 @@ impl DhtCoreEngine {
     /// peer reconnects from a different endpoint.
     pub async fn touch_node(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let mut routing = self.routing_table.write().await;
-        routing.touch_node(node_id, address)
+        routing.touch_node(node_id, address, AddressType::Direct)
+    }
+
+    pub async fn touch_node_typed(
+        &self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
+        let mut routing = self.routing_table.write().await;
+        routing.touch_node(node_id, address, addr_type)
     }
 
     /// Add a node to the DHT with security checks.
@@ -759,7 +879,7 @@ impl DhtCoreEngine {
             // diversity path's update logic at the "Design step 5" block).
             if routing.find_node_by_id(&peer_id).is_some() {
                 for addr in &node.addresses {
-                    routing.touch_node(&peer_id, Some(addr));
+                    routing.touch_node(&peer_id, Some(addr), AddressType::Direct);
                 }
                 return Ok(AdmissionResult::Admitted(vec![]));
             }
@@ -1075,7 +1195,7 @@ impl DhtCoreEngine {
             // refresh last_seen without emitting PeerAdded.
             if routing.find_node_by_id(&peer_id).is_some() {
                 for addr in &node.addresses {
-                    routing.touch_node(&peer_id, Some(addr));
+                    routing.touch_node(&peer_id, Some(addr), AddressType::Direct);
                 }
                 return Ok(AdmissionResult::Admitted(vec![]));
             }
@@ -1377,6 +1497,7 @@ mod tests {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
+            address_types: vec![AddressType::Direct],
             last_seen: Instant::now(),
         }
     }

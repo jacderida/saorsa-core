@@ -8,7 +8,7 @@ pub mod core_engine;
 pub mod network_integration;
 
 // Re-export core engine types
-pub use core_engine::{AdmissionResult, DhtCoreEngine, DhtKey, RoutingTableEvent};
+pub use core_engine::{AddressType, AdmissionResult, DhtCoreEngine, DhtKey, RoutingTableEvent};
 
 /// DHT key type (256-bit)
 pub type Key = [u8; 32];

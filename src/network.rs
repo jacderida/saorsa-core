@@ -1220,7 +1220,12 @@ impl P2PNode {
                                         "Updating DHT: peer {} relay address {} (connection was {})",
                                         peer_id, advertised_addr, peer_addr
                                     );
-                                    dht.touch_node(&peer_id, Some(&multi_addr)).await;
+                                    dht.touch_node_typed(
+                                        &peer_id,
+                                        Some(&multi_addr),
+                                        crate::dht::AddressType::Relay,
+                                    )
+                                    .await;
                                 }
                             }
                         }
