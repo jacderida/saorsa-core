@@ -216,9 +216,6 @@ pub enum NetworkError {
     #[error("Protocol error: {0}")]
     ProtocolError(Cow<'static, str>),
 
-    #[error("Operation cancelled (peer disconnected): {0}")]
-    OperationCancelled(crate::PeerId),
-
     #[error("Bind error: {0}")]
     BindError(Cow<'static, str>),
 }

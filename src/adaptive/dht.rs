@@ -348,13 +348,13 @@ mod tests {
         assert!(engine.score(&peer) > DEFAULT_NEUTRAL_TRUST);
     }
 
-    /// Test: failures reduce trust below block threshold
+    /// Test: failures reduce trust below swap threshold
     #[tokio::test]
     async fn test_failures_reduce_trust_below_swap_threshold() {
         let engine = Arc::new(TrustEngine::new());
         let bad_peer = PeerId::random();
 
-        // Record only failures — score should be 0.0 immediately
+        // Record only failures — score should drop toward zero
         for _ in 0..20 {
             engine.update_node_stats(&bad_peer, TrustEvent::ConnectionFailed.to_stats_update());
         }
@@ -362,7 +362,7 @@ mod tests {
         let trust = engine.score(&bad_peer);
         assert!(
             trust < DEFAULT_SWAP_THRESHOLD,
-            "Bad peer trust {trust} should be below block threshold {DEFAULT_SWAP_THRESHOLD}"
+            "Bad peer trust {trust} should be below swap threshold {DEFAULT_SWAP_THRESHOLD}"
         );
     }
 

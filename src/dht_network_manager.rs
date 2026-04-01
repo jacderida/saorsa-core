@@ -1455,11 +1455,7 @@ impl DhtNetworkManager {
 
         // Record trust failure at the RPC level so every failed request
         // (send error, response timeout, etc.) is counted exactly once.
-        // Exclude cancelled operations (the disconnection decision already
-        // recorded trust — Section 7.4 step 2a).
-        if let Err(ref e) = result
-            && !matches!(e, P2PError::Network(NetworkError::OperationCancelled(_)))
-        {
+        if result.is_err() {
             self.record_peer_failure(peer_id).await;
         }
 
@@ -1622,7 +1618,7 @@ impl DhtNetworkManager {
             ));
         }
 
-        // Deserialize message (needed before block check so we can send a rejection response)
+        // Deserialize message
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
 

@@ -192,7 +192,7 @@ async fn builder_client_mode() {
     assert_eq!(node.config().mode, NodeMode::Client);
 }
 
-/// Builder `.trust_enforcement(false)` sets block threshold to 0.0.
+/// Builder `.trust_enforcement(false)` sets swap threshold to 0.0.
 #[tokio::test]
 async fn builder_trust_enforcement_toggle() {
     let config_off = NodeConfig::builder()

@@ -1222,7 +1222,9 @@ impl DhtCoreEngine {
                 // When a bucket is full and no IP-diversity swap is available,
                 // find the lowest-trust peer below swap_threshold and replace
                 // it directly. No revalidation ping needed.
-                if self.swap_threshold > 0.0 {
+                // Only swap when the candidate itself is above the threshold
+                // to avoid replacing a low-trust peer with an even worse one.
+                if self.swap_threshold > 0.0 && trust_score(&peer_id) >= self.swap_threshold {
                     let lowest = bucket
                         .nodes
                         .iter()
@@ -1232,9 +1234,7 @@ impl DhtCoreEngine {
                             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                         });
 
-                    if let Some((swap_id, _)) = lowest
-                        && !all_bucket_swaps.contains(&swap_id)
-                    {
+                    if let Some((swap_id, _)) = lowest {
                         all_bucket_swaps.push(swap_id);
                     }
                 }
