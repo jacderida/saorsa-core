@@ -44,9 +44,9 @@ const MAX_ADDRESSES_PER_NODE: usize = 8;
 /// Stale peers lose trust protection and become eligible for revalidation-based eviction.
 const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
 
-/// Default trust score below which a peer is evicted and blocked from re-admission.
+/// Default trust score below which a peer is eligible for swap-out.
 #[allow(dead_code)]
-const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
+const DEFAULT_SWAP_THRESHOLD: f64 = 0.15;
 
 /// Node information for routing.
 ///
@@ -391,7 +391,7 @@ pub struct RoutingTableStats {
 pub enum RoutingTableEvent {
     /// A new peer was inserted into the routing table.
     PeerAdded(PeerId),
-    /// A peer was removed from the routing table (eviction, blocking, or departure).
+    /// A peer was removed from the routing table (swap-out, eviction, or departure).
     PeerRemoved(PeerId),
     /// The set of K-closest peers to self changed.
     /// Fields retained for the design API; the network manager uses snapshot
@@ -446,8 +446,8 @@ pub struct DhtCoreEngine {
     /// from `IPDiversityConfig` to prevent duplication and drift.
     allow_loopback: bool,
 
-    /// Trust score below which a peer is evicted and blocked from re-admission.
-    block_threshold: f64,
+    /// Trust score below which a peer is eligible for swap-out.
+    swap_threshold: f64,
 
     /// Duration of no contact after which a peer is considered stale.
     /// Defaults to [`LIVE_THRESHOLD`]; overridden in tests to avoid
@@ -463,7 +463,7 @@ impl DhtCoreEngine {
     /// Create new DHT engine for testing with default K value.
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new(node_id, DEFAULT_K, false, DEFAULT_BLOCK_THRESHOLD)
+        Self::new(node_id, DEFAULT_K, false, DEFAULT_SWAP_THRESHOLD)
     }
 
     /// Expose the routing table for test-only direct manipulation (e.g. setting `last_seen`).
@@ -477,14 +477,14 @@ impl DhtCoreEngine {
         node_id: PeerId,
         k_value: usize,
         allow_loopback: bool,
-        block_threshold: f64,
+        swap_threshold: f64,
     ) -> Result<Self> {
         if k_value < 4 {
             return Err(anyhow!("k_value must be >= 4 (got {k_value})"));
         }
-        if !(0.0..1.0).contains(&block_threshold) || block_threshold.is_nan() {
+        if !(0.0..1.0).contains(&swap_threshold) || swap_threshold.is_nan() {
             return Err(anyhow!(
-                "block_threshold must be in [0.0, 1.0), got {block_threshold}"
+                "swap_threshold must be in [0.0, 1.0), got {swap_threshold}"
             ));
         }
         Ok(Self {
@@ -493,7 +493,7 @@ impl DhtCoreEngine {
             k_value,
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
-            block_threshold,
+            swap_threshold,
             live_threshold: LIVE_THRESHOLD,
             shutdown: CancellationToken::new(),
         })
@@ -1024,15 +1024,6 @@ impl DhtCoreEngine {
     ) -> Result<AdmissionResult> {
         let peer_id = node.id;
 
-        // --- Block check under write lock (Invariant 10) ---
-        let score = trust_score(&peer_id);
-        if score < self.block_threshold {
-            return Err(anyhow!(
-                "peer blocked: trust score {score:.3} below threshold {:.3}",
-                self.block_threshold
-            ));
-        }
-
         // --- Reject invalid addresses ---
         // Multicast and unspecified addresses are never valid peer endpoints.
         if candidate_ips
@@ -1227,44 +1218,73 @@ impl DhtCoreEngine {
                     .iter()
                     .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
             if !already_exists && !has_room && !swap_frees_slot {
-                if allow_stale_revalidation {
-                    let mut stale_peers = Self::collect_stale_peers_in_bucket(
-                        routing,
-                        bucket_idx,
-                        self.live_threshold,
-                    );
-
-                    // Merge stale routing-neighborhood violators (Design Section 7.5):
-                    // close-group swap targets that are stale and not already in the
-                    // bucket-level set. Evicting these may resolve the close-group
-                    // diversity violation and (if they happen to reside in the same
-                    // bucket) free capacity for the candidate.
-                    for close_swap_id in &all_close_swaps {
-                        if stale_peers.iter().any(|(id, _)| id == close_swap_id) {
-                            continue;
-                        }
-                        if let Some(swap_bucket_idx) = routing.get_bucket_index(close_swap_id)
-                            && let Some(swap_node) = routing.find_node_by_id(close_swap_id)
-                            && swap_node.last_seen.elapsed() > self.live_threshold
-                        {
-                            stale_peers.push((*close_swap_id, swap_bucket_idx));
-                        }
-                    }
-
-                    if !stale_peers.is_empty() {
-                        return Ok(AdmissionResult::StaleRevalidationNeeded {
-                            candidate: node,
-                            candidate_ips: candidate_ips.to_vec(),
-                            candidate_bucket_idx: bucket_idx,
-                            stale_peers,
+                // --- Trust-based swap-out (lazy eviction) ---
+                // When a bucket is full and no IP-diversity swap is available,
+                // find the lowest-trust peer below swap_threshold and replace
+                // it directly. No revalidation ping needed.
+                if self.swap_threshold > 0.0 {
+                    let lowest = bucket
+                        .nodes
+                        .iter()
+                        .map(|n| (n.id, trust_score(&n.id)))
+                        .filter(|(_, score)| *score < self.swap_threshold)
+                        .min_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                         });
+
+                    if let Some((swap_id, _)) = lowest
+                        && !all_bucket_swaps.contains(&swap_id)
+                    {
+                        all_bucket_swaps.push(swap_id);
                     }
                 }
-                return Err(anyhow!(
-                    "K-bucket at capacity ({}/{}) with no stale peers",
-                    bucket.nodes.len(),
-                    bucket.max_size,
-                ));
+
+                // Re-check capacity after potential trust swap
+                let swap_frees_slot_now = !all_bucket_swaps.is_empty()
+                    || all_close_swaps
+                        .iter()
+                        .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
+
+                if !swap_frees_slot_now {
+                    if allow_stale_revalidation {
+                        let mut stale_peers = Self::collect_stale_peers_in_bucket(
+                            routing,
+                            bucket_idx,
+                            self.live_threshold,
+                        );
+
+                        // Merge stale routing-neighborhood violators (Design Section 7.5):
+                        // close-group swap targets that are stale and not already in the
+                        // bucket-level set. Evicting these may resolve the close-group
+                        // diversity violation and (if they happen to reside in the same
+                        // bucket) free capacity for the candidate.
+                        for close_swap_id in &all_close_swaps {
+                            if stale_peers.iter().any(|(id, _)| id == close_swap_id) {
+                                continue;
+                            }
+                            if let Some(swap_bucket_idx) = routing.get_bucket_index(close_swap_id)
+                                && let Some(swap_node) = routing.find_node_by_id(close_swap_id)
+                                && swap_node.last_seen.elapsed() > self.live_threshold
+                            {
+                                stale_peers.push((*close_swap_id, swap_bucket_idx));
+                            }
+                        }
+
+                        if !stale_peers.is_empty() {
+                            return Ok(AdmissionResult::StaleRevalidationNeeded {
+                                candidate: node,
+                                candidate_ips: candidate_ips.to_vec(),
+                                candidate_bucket_idx: bucket_idx,
+                                stale_peers,
+                            });
+                        }
+                    }
+                    return Err(anyhow!(
+                        "K-bucket at capacity ({}/{}) with no stale peers",
+                        bucket.nodes.len(),
+                        bucket.max_size,
+                    ));
+                }
             }
         }
 
@@ -1308,7 +1328,7 @@ impl DhtCoreEngine {
     /// Re-evaluate admission after stale peers have been evicted by the caller.
     ///
     /// Called by the network manager after pinging stale peers and evicting
-    /// non-responders. Re-runs trust block check, IP diversity, and capacity
+    /// non-responders. Re-runs IP diversity, trust-based swap-out, and capacity
     /// checks with `allow_stale_revalidation: false` to prevent infinite
     /// revalidation loops.
     pub(crate) async fn re_evaluate_admission(
@@ -1317,7 +1337,6 @@ impl DhtCoreEngine {
         candidate_ips: &[IpAddr],
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<Vec<RoutingTableEvent>> {
-        // Block check moved into add_with_diversity (Invariant 10: under write lock).
         let mut routing = self.routing_table.write().await;
         match self.add_with_diversity(&mut routing, candidate, candidate_ips, trust_score, false)? {
             AdmissionResult::Admitted(events) => Ok(events),
@@ -1340,7 +1359,7 @@ impl std::fmt::Debug for DhtCoreEngine {
             .field("k_value", &self.k_value)
             .field("ip_diversity_config", &self.ip_diversity_config)
             .field("allow_loopback", &self.allow_loopback)
-            .field("block_threshold", &self.block_threshold)
+            .field("swap_threshold", &self.swap_threshold)
             .finish()
     }
 }
@@ -1749,25 +1768,25 @@ mod tests {
     const TEST_STALE_AGE: Duration = Duration::from_secs(2);
 
     // -----------------------------------------------------------------------
-    // Test 4: blocked peer rejection
+    // Test 4: low-trust peer admission (lazy swap-out model)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_blocked_peer_rejected_on_admission() {
+    async fn test_low_trust_candidate_still_admitted() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
         let peer_id = node.id;
 
-        // Trust score below block threshold (0.15)
+        // Candidate with trust below swap threshold is still admitted
+        // (lazy swap-out model: no admission blocking)
         let result = dht
             .add_node(node, &|id| {
                 if *id == peer_id { 0.1 } else { 0.5 }
             })
             .await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("blocked"));
-        assert!(!dht.has_node(&peer_id).await);
+        assert!(result.is_ok(), "low-trust candidate should be admitted");
+        assert!(dht.has_node(&peer_id).await);
     }
 
     // -----------------------------------------------------------------------
@@ -2088,7 +2107,7 @@ mod tests {
             PeerId::from_bytes([0u8; 32]),
             4,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
@@ -2153,7 +2172,7 @@ mod tests {
             PeerId::from_bytes([0u8; 32]),
             4,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
@@ -2197,7 +2216,7 @@ mod tests {
             PeerId::from_bytes([0u8; 32]),
             4,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
@@ -2243,12 +2262,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_re_evaluate_rejects_blocked_peer() {
+    async fn test_re_evaluate_admits_low_trust_candidate() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             20,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
 
@@ -2257,13 +2276,15 @@ mod tests {
         let candidate = make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic");
         let candidate_ips = vec!["10.0.0.1".parse().unwrap()];
 
-        // Trust below block threshold (0.15).
+        // Trust below swap threshold — should still be admitted
         let result = dht
             .re_evaluate_admission(candidate, &candidate_ips, &|_| 0.1)
             .await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("blocked"));
+        assert!(
+            result.is_ok(),
+            "low-trust candidate should be admitted via re-evaluate"
+        );
     }
 
     #[tokio::test]
@@ -2273,7 +2294,7 @@ mod tests {
             PeerId::from_bytes([0u8; 32]),
             4,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
         dht.set_ip_diversity_config(crate::security::IPDiversityConfig::testnet());
@@ -2330,7 +2351,7 @@ mod tests {
             PeerId::from_bytes([0u8; 32]),
             20,
             false,
-            DEFAULT_BLOCK_THRESHOLD,
+            DEFAULT_SWAP_THRESHOLD,
         )
         .unwrap();
         dht.set_live_threshold(TEST_LIVE_THRESHOLD);
@@ -2569,14 +2590,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 36: Blocked peer eviction via remove_node_by_id
+    // Test 36: Peer removal via remove_node_by_id
     // -----------------------------------------------------------------------
 
-    /// Removing a peer by ID should produce PeerRemoved and KClosestPeersChanged
-    /// events, simulating the eviction that DhtNetworkManager performs when
-    /// trust drops below the block threshold.
+    /// Removing a peer by ID should produce PeerRemoved events.
     #[tokio::test]
-    async fn test_blocked_peer_eviction_on_trust_drop() {
+    async fn test_peer_removal_produces_events() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
 
         let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
@@ -2584,7 +2603,7 @@ mod tests {
         dht.add_node_no_trust(node).await.unwrap();
         assert!(dht.has_node(&peer_id).await);
 
-        // Simulate block-eviction: remove the peer.
+        // Graceful removal (e.g. peer departed).
         let events = dht.remove_node_by_id(&peer_id).await;
         assert!(
             !dht.has_node(&peer_id).await,
@@ -2754,5 +2773,229 @@ mod tests {
         assert!(!dht.has_node(&absent_peer).await);
         let size_after = dht.routing_table_size().await;
         assert_eq!(size_before, size_after, "routing table should be unchanged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Trust-based swap-out tests
+    // -----------------------------------------------------------------------
+
+    /// When a bucket is full, the lowest-trust peer below swap_threshold is
+    /// replaced by a new candidate without revalidation.
+    #[tokio::test]
+    async fn test_trust_swap_out_replaces_lowest_trust_peer() {
+        // K=4 so we can fill a bucket quickly. All peers go into the
+        // high-bit bucket (byte 0 has bit 7 set, our node_id is [0; 32]).
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+
+        // Fill bucket with 4 peers, each on a unique IP
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        for i in 0..4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80 + i; // all land in same bucket (bit 7 set)
+            ids.push(id);
+            let addr = format!("/ip4/10.0.{}.1/udp/9000/quic", i);
+            dht.add_node(make_node_with_addr(id, &addr), &|_| 0.5)
+                .await
+                .unwrap();
+        }
+
+        // New candidate on a unique IP
+        let mut new_id = [0u8; 32];
+        new_id[0] = 0x84;
+        let new_peer = PeerId::from_bytes(new_id);
+        let low_trust_peer = PeerId::from_bytes(ids[2]);
+
+        // Peer ids[2] has trust 0.05 (below 0.15 threshold), others at 0.5
+        let result = dht
+            .add_node(
+                make_node_with_addr(new_id, "/ip4/10.0.4.1/udp/9000/quic"),
+                &|id| {
+                    if *id == low_trust_peer { 0.05 } else { 0.5 }
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = match result {
+            AdmissionResult::Admitted(events) => events,
+            other => panic!("expected Admitted, got {other:?}"),
+        };
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerRemoved(id) if *id == low_trust_peer)),
+            "low-trust peer should be swapped out"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerAdded(id) if *id == new_peer)),
+            "new candidate should be added"
+        );
+        assert!(dht.has_node(&new_peer).await);
+        assert!(!dht.has_node(&low_trust_peer).await);
+    }
+
+    /// When multiple peers are below the swap threshold, only the lowest-trust
+    /// peer is swapped out.
+    #[tokio::test]
+    async fn test_trust_swap_out_picks_lowest_when_multiple_below_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        for i in 0..4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80 + i;
+            ids.push(id);
+            let addr = format!("/ip4/10.0.{}.1/udp/9000/quic", i);
+            dht.add_node(make_node_with_addr(id, &addr), &|_| 0.5)
+                .await
+                .unwrap();
+        }
+
+        let peer_a = PeerId::from_bytes(ids[1]); // will have trust 0.10
+        let peer_b = PeerId::from_bytes(ids[3]); // will have trust 0.05
+
+        let mut new_id = [0u8; 32];
+        new_id[0] = 0x84;
+
+        let result = dht
+            .add_node(
+                make_node_with_addr(new_id, "/ip4/10.0.4.1/udp/9000/quic"),
+                &|id| {
+                    if *id == peer_a {
+                        0.10
+                    } else if *id == peer_b {
+                        0.05
+                    } else {
+                        0.5
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = match result {
+            AdmissionResult::Admitted(events) => events,
+            other => panic!("expected Admitted, got {other:?}"),
+        };
+
+        // Only the lowest-trust peer (0.05) should be evicted
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerRemoved(id) if *id == peer_b)),
+            "peer with lowest trust (0.05) should be swapped out"
+        );
+        assert!(
+            dht.has_node(&peer_a).await,
+            "peer with trust 0.10 should remain (only one swap needed)"
+        );
+    }
+
+    /// When all peers in the bucket are above the swap threshold, no trust-based
+    /// swap occurs and the system falls through to stale revalidation.
+    #[tokio::test]
+    async fn test_no_trust_swap_when_all_peers_above_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+
+        for i in 0..4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80 + i;
+            let addr = format!("/ip4/10.0.{}.1/udp/9000/quic", i);
+            dht.add_node(make_node_with_addr(id, &addr), &|_| 0.5)
+                .await
+                .unwrap();
+        }
+
+        let mut new_id = [0u8; 32];
+        new_id[0] = 0x84;
+
+        // All peers at neutral (0.5) — no trust-based swap possible
+        let result = dht
+            .add_node(
+                make_node_with_addr(new_id, "/ip4/10.0.4.1/udp/9000/quic"),
+                &|_| 0.5,
+            )
+            .await;
+
+        // Should get StaleRevalidationNeeded (default allow_stale_revalidation=true
+        // in add_node) or error — NOT Admitted
+        match result {
+            Ok(AdmissionResult::Admitted(_)) => {
+                panic!("should not be admitted when bucket is full with no low-trust peers")
+            }
+            Ok(AdmissionResult::StaleRevalidationNeeded { .. }) => {
+                // Expected: falls through to stale revalidation
+            }
+            Err(_) => {
+                // Also acceptable: no stale peers found
+            }
+        }
+    }
+
+    /// With swap_threshold = 0.0, trust-based swap-out is disabled.
+    #[tokio::test]
+    async fn test_no_trust_swap_when_threshold_is_zero() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            0.0, // disabled
+        )
+        .unwrap();
+
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        for i in 0..4u8 {
+            let mut id = [0u8; 32];
+            id[0] = 0x80 + i;
+            ids.push(id);
+            let addr = format!("/ip4/10.0.{}.1/udp/9000/quic", i);
+            dht.add_node(make_node_with_addr(id, &addr), &|_| 0.5)
+                .await
+                .unwrap();
+        }
+
+        let low_peer = PeerId::from_bytes(ids[0]);
+        let mut new_id = [0u8; 32];
+        new_id[0] = 0x84;
+
+        // Even with a peer at trust 0.01, threshold=0 means no swap
+        let result = dht
+            .add_node(
+                make_node_with_addr(new_id, "/ip4/10.0.4.1/udp/9000/quic"),
+                &|id| if *id == low_peer { 0.01 } else { 0.5 },
+            )
+            .await;
+
+        match result {
+            Ok(AdmissionResult::Admitted(_)) => {
+                panic!("should not be admitted when swap is disabled and bucket is full")
+            }
+            _ => {
+                // Expected: stale revalidation or error
+            }
+        }
+        // Low-trust peer should still be in the table
+        assert!(dht.has_node(&low_peer).await);
     }
 }

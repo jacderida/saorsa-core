@@ -28,8 +28,8 @@ use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Default trust score threshold below which a peer is evicted and blocked
-const DEFAULT_BLOCK_THRESHOLD: f64 = 0.15;
+/// Default trust score threshold below which a peer is eligible for swap-out
+const DEFAULT_SWAP_THRESHOLD: f64 = 0.15;
 
 /// Maximum weight multiplier per single consumer-reported event.
 /// Caps the influence of any single consumer event on the EMA.
@@ -39,17 +39,17 @@ const MAX_CONSUMER_WEIGHT: f64 = 5.0;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdaptiveDhtConfig {
-    /// Trust score below which a peer is evicted from the routing table
-    /// and blocked from sending DHT messages or being re-added to the RT.
-    /// Eviction is immediate when a peer's score crosses this threshold.
+    /// Trust score below which a peer becomes eligible for swap-out from
+    /// the routing table when a better candidate is available.
+    /// Peers are NOT immediately evicted.
     /// Default: 0.15
-    pub block_threshold: f64,
+    pub swap_threshold: f64,
 }
 
 impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
-            block_threshold: DEFAULT_BLOCK_THRESHOLD,
+            swap_threshold: DEFAULT_SWAP_THRESHOLD,
         }
     }
 }
@@ -57,15 +57,15 @@ impl Default for AdaptiveDhtConfig {
 impl AdaptiveDhtConfig {
     /// Validate that all config values are within acceptable ranges.
     ///
-    /// Returns `Err` if `block_threshold` is outside `[0.0, 0.5)` or is NaN.
-    /// Values >= 0.5 (neutral trust) would block all unknown peers on first
-    /// contact since they start at neutral (0.5).
+    /// Returns `Err` if `swap_threshold` is outside `[0.0, 0.5)` or is NaN.
+    /// Values >= 0.5 (neutral trust) would make all unknown peers immediately
+    /// swap-eligible since they start at neutral (0.5).
     pub fn validate(&self) -> crate::error::P2pResult<()> {
-        if !(0.0..0.5).contains(&self.block_threshold) || self.block_threshold.is_nan() {
+        if !(0.0..0.5).contains(&self.swap_threshold) || self.swap_threshold.is_nan() {
             return Err(crate::error::P2PError::Validation(
                 format!(
-                    "block_threshold must be in [0.0, 0.5), got {}",
-                    self.block_threshold
+                    "swap_threshold must be in [0.0, 0.5), got {}",
+                    self.swap_threshold
                 )
                 .into(),
             ));
@@ -132,12 +132,12 @@ impl AdaptiveDHT {
     ///
     /// This creates the `TrustEngine` and the `DhtNetworkManager` with the
     /// trust engine injected. Call [`start`](Self::start) to begin DHT
-    /// operations. Trust scores are computed live — peers are evicted
-    /// immediately when their score crosses the block threshold.
+    /// operations. Trust scores are computed live — low-trust peers are
+    /// swapped out when better candidates arrive.
     ///
     /// # Errors
     ///
-    /// Returns an error if `block_threshold` is not in `[0.0, 0.5)` or if
+    /// Returns an error if `swap_threshold` is not in `[0.0, 0.5)` or if
     /// the underlying `DhtNetworkManager` fails to initialise.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -146,7 +146,7 @@ impl AdaptiveDHT {
     ) -> Result<Self> {
         adaptive_config.validate()?;
 
-        dht_config.block_threshold = adaptive_config.block_threshold;
+        dht_config.swap_threshold = adaptive_config.swap_threshold;
 
         let trust_engine = Arc::new(TrustEngine::new());
 
@@ -172,13 +172,13 @@ impl AdaptiveDHT {
     /// [`TrustEvent::ApplicationFailure`]), validates and clamps the weight
     /// to [`MAX_CONSUMER_WEIGHT`]. Zero or negative weights are silently
     /// ignored (no-op).
+    ///
+    /// Trust scores are updated immediately but low-trust peers are not
+    /// evicted — they remain in the routing table until a better candidate
+    /// arrives and triggers a swap-out.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
-                // Weight validation: reject <= 0, clamp > MAX_CONSUMER_WEIGHT.
-                // Only skip the trust update — the block check below still runs
-                // so that peers already below threshold get evicted even when
-                // called with an invalid weight.
                 if weight > 0.0 {
                     let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
                     self.trust_engine.update_node_stats_weighted(
@@ -193,17 +193,6 @@ impl AdaptiveDHT {
                 self.trust_engine
                     .update_node_stats(peer_id, event.to_stats_update());
             }
-        }
-
-        // Block check (Design Section 13.1 step 5): if the score crossed
-        // below BLOCK_THRESHOLD, evict the peer from the routing table,
-        // cancel in-flight RPCs, and disconnect at the transport layer.
-        // Runs unconditionally — even if the trust update was skipped above,
-        // the peer may have crossed the threshold from a previous event.
-        if self.config.block_threshold > 0.0
-            && self.trust_engine.score(peer_id) < self.config.block_threshold
-        {
-            self.dht_manager.evict_blocked_peer(peer_id).await;
         }
     }
 
@@ -240,8 +229,7 @@ impl AdaptiveDHT {
     /// Start the DHT manager.
     ///
     /// Trust scores are computed live — no background tasks needed.
-    /// Peers are evicted from the routing table immediately when their
-    /// trust drops below the block threshold.
+    /// Low-trust peers are swapped out when better candidates arrive.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await
     }
@@ -300,11 +288,11 @@ mod tests {
     #[test]
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
-        assert!((config.block_threshold - DEFAULT_BLOCK_THRESHOLD).abs() < f64::EPSILON);
+        assert!((config.swap_threshold - DEFAULT_SWAP_THRESHOLD).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_block_threshold_validation_rejects_invalid() {
+    fn test_swap_threshold_validation_rejects_invalid() {
         // Values outside [0.0, 0.5) or non-finite should be rejected.
         // 0.5 would block all unknown peers (they start at neutral 0.5).
         for &bad in &[
@@ -317,24 +305,24 @@ mod tests {
             f64::NEG_INFINITY,
         ] {
             let config = AdaptiveDhtConfig {
-                block_threshold: bad,
+                swap_threshold: bad,
             };
             assert!(
                 config.validate().is_err(),
-                "block_threshold {bad} should fail validation"
+                "swap_threshold {bad} should fail validation"
             );
         }
     }
 
     #[test]
-    fn test_block_threshold_validation_accepts_valid() {
+    fn test_swap_threshold_validation_accepts_valid() {
         for &good in &[0.0, 0.15, 0.49] {
             let config = AdaptiveDhtConfig {
-                block_threshold: good,
+                swap_threshold: good,
             };
             assert!(
                 config.validate().is_ok(),
-                "block_threshold {good} should pass validation"
+                "swap_threshold {good} should pass validation"
             );
         }
     }
@@ -362,7 +350,7 @@ mod tests {
 
     /// Test: failures reduce trust below block threshold
     #[tokio::test]
-    async fn test_failures_reduce_trust_below_block_threshold() {
+    async fn test_failures_reduce_trust_below_swap_threshold() {
         let engine = Arc::new(TrustEngine::new());
         let bad_peer = PeerId::random();
 
@@ -373,8 +361,8 @@ mod tests {
 
         let trust = engine.score(&bad_peer);
         assert!(
-            trust < DEFAULT_BLOCK_THRESHOLD,
-            "Bad peer trust {trust} should be below block threshold {DEFAULT_BLOCK_THRESHOLD}"
+            trust < DEFAULT_SWAP_THRESHOLD,
+            "Bad peer trust {trust} should be below block threshold {DEFAULT_SWAP_THRESHOLD}"
         );
     }
 
@@ -410,19 +398,19 @@ mod tests {
     }
 
     // =========================================================================
-    // End-to-end: peer lifecycle from trusted to blocked to unblocked
+    // End-to-end: peer lifecycle from trusted to swap-eligible to recovered
     // =========================================================================
 
-    /// Full lifecycle: good peer → fails → blocked → time passes → unblocked
+    /// Full lifecycle: good peer -> fails -> swap-eligible -> time passes -> recovered
     #[tokio::test]
-    async fn test_peer_lifecycle_block_and_recovery() {
+    async fn test_peer_lifecycle_trust_and_recovery() {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
         // Phase 1: Peer starts at neutral
         assert!(
-            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
-            "New peer should not be blocked"
+            engine.score(&peer) >= DEFAULT_SWAP_THRESHOLD,
+            "New peer should not be swap-eligible"
         );
 
         // Phase 2: Some successes — peer is trusted
@@ -435,14 +423,14 @@ mod tests {
             "Trusted peer: {good_score}"
         );
 
-        // Phase 3: Peer starts failing — score drops
+        // Phase 3: Peer starts failing — score drops below swap threshold
         for _ in 0..200 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let bad_score = engine.score(&peer);
         assert!(
-            bad_score < DEFAULT_BLOCK_THRESHOLD,
-            "After many failures, peer should be blocked: {bad_score}"
+            bad_score < DEFAULT_SWAP_THRESHOLD,
+            "After many failures, peer should be swap-eligible: {bad_score}"
         );
 
         // Phase 4: Time passes (1+ day) — score decays back toward neutral
@@ -450,16 +438,16 @@ mod tests {
         engine.simulate_elapsed(&peer, one_day).await;
         let recovered_score = engine.score(&peer);
         assert!(
-            recovered_score >= DEFAULT_BLOCK_THRESHOLD,
-            "After 1 day idle, peer should be unblocked: {recovered_score}"
+            recovered_score >= DEFAULT_SWAP_THRESHOLD,
+            "After 1 day idle, peer should have recovered: {recovered_score}"
         );
     }
 
-    /// Verify the block threshold works as a binary gate
+    /// Verify the swap threshold separates eligible from ineligible peers
     #[tokio::test]
-    async fn test_block_threshold_is_binary() {
+    async fn test_swap_threshold_is_binary() {
         let engine = TrustEngine::new();
-        let threshold = DEFAULT_BLOCK_THRESHOLD;
+        let threshold = DEFAULT_SWAP_THRESHOLD;
 
         let peer_above = PeerId::random();
         let peer_below = PeerId::random();
@@ -486,13 +474,13 @@ mod tests {
         let unknown = PeerId::random();
         assert!(
             engine.score(&unknown) >= threshold,
-            "Unknown peer at neutral should not be blocked"
+            "Unknown peer at neutral should not be swap-eligible"
         );
     }
 
-    /// Verify that a single failure doesn't immediately block a peer
+    /// Verify that a single failure doesn't make a peer swap-eligible
     #[tokio::test]
-    async fn test_single_failure_does_not_block() {
+    async fn test_single_failure_does_not_cross_swap_threshold() {
         let engine = TrustEngine::new();
         let peer = PeerId::random();
 
@@ -500,13 +488,13 @@ mod tests {
 
         // A single failure from neutral (0.5) should give ~0.45, still above 0.15
         assert!(
-            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
-            "One failure from neutral should not block: {}",
+            engine.score(&peer) >= DEFAULT_SWAP_THRESHOLD,
+            "One failure from neutral should not cross swap threshold: {}",
             engine.score(&peer)
         );
     }
 
-    /// Verify that a previously-trusted peer needs many failures to get blocked
+    /// Verify that a previously-trusted peer needs many failures to become swap-eligible
     #[tokio::test]
     async fn test_trusted_peer_resilient_to_occasional_failures() {
         let engine = TrustEngine::new();
@@ -518,14 +506,14 @@ mod tests {
         }
         let trusted_score = engine.score(&peer);
 
-        // A few failures shouldn't block
+        // A few failures shouldn't cross the swap threshold
         for _ in 0..3 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
 
         assert!(
-            engine.score(&peer) >= DEFAULT_BLOCK_THRESHOLD,
-            "3 failures after 50 successes should not block: {}",
+            engine.score(&peer) >= DEFAULT_SWAP_THRESHOLD,
+            "3 failures after 50 successes should not cross swap threshold: {}",
             engine.score(&peer)
         );
         assert!(
@@ -544,7 +532,7 @@ mod tests {
         for _ in 0..100 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
-        assert!(engine.score(&peer) < DEFAULT_BLOCK_THRESHOLD);
+        assert!(engine.score(&peer) < DEFAULT_SWAP_THRESHOLD);
 
         // Remove and check — should be back to neutral
         engine.remove_node(&peer);
@@ -655,31 +643,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 55: Consumer penalty triggers blocking and eviction
+    // Test 55: Consumer penalty pushes trust below swap threshold
     // -----------------------------------------------------------------------
-    // At this layer we verify that enough failures push trust below the block
-    // threshold. Actual eviction from the routing table is handled by
-    // DhtNetworkManager (covered by Test 36 in core_engine tests).
+    // At this layer we verify that enough failures push trust below the swap
+    // threshold. Actual swap-out from the routing table happens during
+    // admission (covered by trust swap-out tests in core_engine).
 
-    /// A peer slightly above the block threshold can be pushed below it by
-    /// a single consumer-reported failure of sufficient weight.
+    /// A peer slightly above the swap threshold can be pushed below it by
+    /// consumer-reported failures of sufficient weight.
     #[tokio::test]
-    async fn test_consumer_penalty_triggers_blocking() {
+    async fn test_consumer_penalty_crosses_swap_threshold() {
         let engine = Arc::new(TrustEngine::new());
         let peer = PeerId::random();
 
-        // First, bring the peer down to just above the block threshold.
+        // First, bring the peer down to just above the swap threshold.
         // From neutral (0.5), 2 failures bring it to ~0.245 (still above 0.15).
         for _ in 0..2 {
             engine.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         }
         let score_before = engine.score(&peer);
         assert!(
-            score_before > DEFAULT_BLOCK_THRESHOLD,
-            "should be above block threshold: {score_before}"
+            score_before > DEFAULT_SWAP_THRESHOLD,
+            "should be above swap threshold: {score_before}"
         );
 
-        // A heavy consumer failure should push it below the block threshold.
+        // Heavy consumer failures should push it below the swap threshold.
         for _ in 0..10 {
             engine.update_node_stats_weighted(
                 &peer,
@@ -689,8 +677,8 @@ mod tests {
         }
         let score_after = engine.score(&peer);
         assert!(
-            score_after < DEFAULT_BLOCK_THRESHOLD,
-            "after heavy consumer failures, score {score_after} should be below block threshold {DEFAULT_BLOCK_THRESHOLD}"
+            score_after < DEFAULT_SWAP_THRESHOLD,
+            "after heavy consumer failures, score {score_after} should be below swap threshold {DEFAULT_SWAP_THRESHOLD}"
         );
     }
 

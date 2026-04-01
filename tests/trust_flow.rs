@@ -24,7 +24,7 @@ use saorsa_core::{AdaptiveDhtConfig, NodeConfig, P2PNode, PeerId, TrustEvent};
 const NEUTRAL_TRUST: f64 = 0.5;
 
 /// Default block threshold below which peers are evicted.
-const BLOCK_THRESHOLD: f64 = 0.15;
+const SWAP_THRESHOLD: f64 = 0.15;
 
 /// Helper: create a local-only test node config (loopback, ephemeral port, IPv4 only).
 fn test_node_config() -> NodeConfig {
@@ -123,12 +123,12 @@ async fn all_trust_event_variants_affect_score() {
 }
 
 // ---------------------------------------------------------------------------
-// Trust-based blocking
+// Trust scoring and swap threshold
 // ---------------------------------------------------------------------------
 
-/// Sustained failures push a peer below the block threshold.
+/// Sustained failures push a peer below the swap threshold.
 #[tokio::test]
-async fn sustained_failures_drop_below_block_threshold() {
+async fn sustained_failures_drop_below_swap_threshold() {
     let node = P2PNode::new(test_node_config()).await.unwrap();
     let bad_peer = PeerId::random();
 
@@ -139,14 +139,14 @@ async fn sustained_failures_drop_below_block_threshold() {
 
     let score = node.peer_trust(&bad_peer);
     assert!(
-        score < BLOCK_THRESHOLD,
-        "After 50 failures, trust {score} should be below block threshold {BLOCK_THRESHOLD}"
+        score < SWAP_THRESHOLD,
+        "After 50 failures, trust {score} should be below swap threshold {SWAP_THRESHOLD}"
     );
 }
 
-/// A single failure from neutral does NOT block a peer.
+/// A single failure from neutral does NOT cross the swap threshold.
 #[tokio::test]
-async fn single_failure_does_not_block() {
+async fn single_failure_does_not_cross_swap_threshold() {
     let node = P2PNode::new(test_node_config()).await.unwrap();
     let peer = PeerId::random();
 
@@ -155,8 +155,8 @@ async fn single_failure_does_not_block() {
 
     let score = node.peer_trust(&peer);
     assert!(
-        score >= BLOCK_THRESHOLD,
-        "One failure from neutral should not block; score={score}, threshold={BLOCK_THRESHOLD}"
+        score >= SWAP_THRESHOLD,
+        "One failure from neutral should not cross threshold; score={score}, threshold={SWAP_THRESHOLD}"
     );
 }
 
@@ -181,7 +181,7 @@ async fn trusted_peer_resilient_to_occasional_failures() {
 
     let score_after = node.peer_trust(&peer);
     assert!(
-        score_after >= BLOCK_THRESHOLD,
+        score_after >= SWAP_THRESHOLD,
         "3 failures after 50 successes should not block; score={score_after}"
     );
     assert!(
@@ -300,22 +300,22 @@ async fn trust_scores_bounded() {
 // AdaptiveDHT config validation flows through P2PNode
 // ---------------------------------------------------------------------------
 
-/// Custom block threshold in AdaptiveDhtConfig is respected by the node.
+/// Custom swap threshold in AdaptiveDhtConfig is respected by the node.
 #[tokio::test]
-async fn custom_block_threshold_respected() {
+async fn custom_swap_threshold_respected() {
     let custom_threshold = 0.3;
     let config = NodeConfig::builder()
         .local(true)
         .port(0)
         .ipv6(false)
         .adaptive_dht_config(AdaptiveDhtConfig {
-            block_threshold: custom_threshold,
+            swap_threshold: custom_threshold,
         })
         .build()
         .unwrap();
 
     let node = P2PNode::new(config).await.unwrap();
-    let threshold = node.adaptive_dht().config().block_threshold;
+    let threshold = node.adaptive_dht().config().swap_threshold;
 
     assert!(
         (threshold - custom_threshold).abs() < f64::EPSILON,
@@ -323,9 +323,9 @@ async fn custom_block_threshold_respected() {
     );
 }
 
-/// Trust enforcement disabled (threshold 0.0) means no peers are ever blocked.
+/// Trust enforcement disabled (threshold 0.0) means no peers are ever swap-eligible.
 #[tokio::test]
-async fn trust_enforcement_disabled_never_blocks() {
+async fn trust_enforcement_disabled_no_swap_eligibility() {
     let config = NodeConfig::builder()
         .local(true)
         .port(0)
@@ -344,12 +344,12 @@ async fn trust_enforcement_disabled_never_blocks() {
     }
 
     let score = node.peer_trust(&peer);
-    let threshold = node.adaptive_dht().config().block_threshold;
+    let threshold = node.adaptive_dht().config().swap_threshold;
 
     // threshold is 0.0, so score (which is ≥0.0) is always >= threshold
     assert!(
         score >= threshold,
-        "With enforcement disabled (threshold={threshold}), score {score} should never be blocked"
+        "With enforcement disabled (threshold={threshold}), score {score} should be >= threshold"
     );
 }
 
@@ -379,28 +379,28 @@ async fn ema_blends_observations() {
     );
 }
 
-/// The block threshold from AdaptiveDhtConfig matches the default constant.
+/// The swap threshold from AdaptiveDhtConfig matches the default constant.
 #[tokio::test]
 async fn default_config_matches_expected_threshold() {
     let config = AdaptiveDhtConfig::default();
     assert!(
-        (config.block_threshold - BLOCK_THRESHOLD).abs() < f64::EPSILON,
+        (config.swap_threshold - SWAP_THRESHOLD).abs() < f64::EPSILON,
         "Default threshold {} != expected {}",
-        config.block_threshold,
-        BLOCK_THRESHOLD
+        config.swap_threshold,
+        SWAP_THRESHOLD
     );
 }
 
-/// Invalid block threshold values are rejected during node creation.
+/// Invalid swap threshold values are rejected during node creation.
 #[tokio::test]
-async fn invalid_block_threshold_rejected() {
+async fn invalid_swap_threshold_rejected() {
     for bad_threshold in [f64::NAN, f64::NEG_INFINITY, -0.1, 1.1, f64::INFINITY] {
         let config = NodeConfig::builder()
             .local(true)
             .port(0)
             .ipv6(false)
             .adaptive_dht_config(AdaptiveDhtConfig {
-                block_threshold: bad_threshold,
+                swap_threshold: bad_threshold,
             })
             .build();
 
@@ -411,7 +411,7 @@ async fn invalid_block_threshold_rejected() {
                 let result = P2PNode::new(config).await;
                 assert!(
                     result.is_err(),
-                    "Block threshold {bad_threshold} should be rejected"
+                    "Swap threshold {bad_threshold} should be rejected"
                 );
             }
         }

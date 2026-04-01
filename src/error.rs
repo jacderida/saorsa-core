@@ -204,9 +204,6 @@ pub enum NetworkError {
     #[error("Peer not found: {0}")]
     PeerNotFound(Cow<'static, str>),
 
-    #[error("Peer blocked (trust below threshold): {0}")]
-    PeerBlocked(crate::PeerId),
-
     #[error("Peer disconnected - peer: {peer}, reason: {reason}")]
     PeerDisconnected { peer: crate::PeerId, reason: String },
 
@@ -219,7 +216,7 @@ pub enum NetworkError {
     #[error("Protocol error: {0}")]
     ProtocolError(Cow<'static, str>),
 
-    #[error("Operation cancelled (peer blocked): {0}")]
+    #[error("Operation cancelled (peer disconnected): {0}")]
     OperationCancelled(crate::PeerId),
 
     #[error("Bind error: {0}")]

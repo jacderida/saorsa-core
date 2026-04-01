@@ -44,8 +44,8 @@ const EMA_WEIGHT: f64 = 0.3;
 /// Decay constant (per-second).
 ///
 /// Tuned so that a peer experiencing ~3 evenly-spaced failures per day
-/// converges to the block threshold (0.15). Fewer failures/day → survives,
-/// more → blocked. The worst score (0.0) decays back above 0.15 in ~1 day.
+/// converges to the swap threshold (0.15). Fewer failures/day → survives,
+/// more → swap-eligible. The worst score (0.0) decays back above 0.15 in ~1 day.
 ///
 /// Derivation: at steady state with 3 failures/day (T = 28800 s between events),
 /// 0.15 = 0.5·(1 − d) / (1 − 0.7·d)  →  d = 0.8861
@@ -414,9 +414,9 @@ mod tests {
         );
     }
 
-    /// 22 hours should NOT be enough to unblock from worst score
+    /// 22 hours should NOT be enough to recover from worst score
     #[test]
-    fn test_worst_score_still_blocked_before_1_day() {
+    fn test_worst_score_still_below_threshold_before_1_day() {
         let twenty_two_hours = (22 * 3600) as f64;
         let score = PeerTrust::decay_score(MIN_TRUST_SCORE, twenty_two_hours);
 
@@ -652,15 +652,15 @@ mod tests {
     // =======================================================================
 
     // -----------------------------------------------------------------------
-    // Test 54: Consumer penalty degrades trust to blocking
+    // Test 54: Consumer penalty degrades trust below swap threshold
     // -----------------------------------------------------------------------
 
     /// Repeated high-weight failures should push a peer's trust score below
-    /// the block threshold (0.15), eventually making it eligible for eviction.
+    /// the swap threshold (0.15), making it eligible for swap-out.
     #[tokio::test]
-    async fn test_consumer_penalty_degrades_to_blocking() {
-        /// Block threshold matching the value in adaptive/dht.rs
-        const BLOCK_THRESHOLD: f64 = 0.15;
+    async fn test_consumer_penalty_degrades_below_swap_threshold() {
+        /// Swap threshold matching the value in adaptive/dht.rs
+        const SWAP_THRESHOLD: f64 = 0.15;
 
         let engine = TrustEngine::new();
         let peer = PeerId::random();
@@ -673,8 +673,8 @@ mod tests {
 
         let score = engine.score(&peer);
         assert!(
-            score < BLOCK_THRESHOLD,
-            "after {failure_count} weight-3 failures, score {score} should be below block threshold {BLOCK_THRESHOLD}"
+            score < SWAP_THRESHOLD,
+            "after {failure_count} weight-3 failures, score {score} should be below swap threshold {SWAP_THRESHOLD}"
         );
     }
 
