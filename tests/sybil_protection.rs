@@ -11,19 +11,19 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! Integration tests for trust-based blocking as part of the sybil protection story.
+//! Integration tests for trust-based peer management (sybil protection).
 //!
-//! These tests verify that `send_request` correctly refuses to communicate with
-//! peers whose trust has dropped below the block threshold, and that the
-//! blocking integrates with the full P2PNode stack.
+//! These tests verify that low-trust peers are NOT blocked from `send_request`
+//! (the lazy swap-out model only replaces them during routing table admission).
+//! Trust scores are still tracked and affect routing table swap-out decisions.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use saorsa_core::{AdaptiveDhtConfig, NodeConfig, P2PNode, PeerId, TrustEvent};
 use std::time::Duration;
 
-/// Default block threshold.
-const BLOCK_THRESHOLD: f64 = 0.15;
+/// Default swap threshold.
+const SWAP_THRESHOLD: f64 = 0.35;
 
 /// Helper: local test config.
 fn test_config() -> NodeConfig {
@@ -36,19 +36,20 @@ fn test_config() -> NodeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Trust-based blocking via send_request
+// send_request never blocks based on trust
 // ---------------------------------------------------------------------------
 
-/// `send_request` to a blocked peer returns a "PeerBlocked" error immediately
-/// without actually attempting to connect.
+/// `send_request` to a low-trust peer does NOT return a blocking error.
+/// It will fail for other reasons (not connected) but trust alone does not
+/// prevent communication.
 #[tokio::test]
-async fn send_request_blocked_for_low_trust_peer() {
+async fn send_request_not_blocked_for_low_trust_peer() {
     let node = P2PNode::new(test_config()).await.unwrap();
     node.start().await.unwrap();
 
     let bad_peer = PeerId::random();
 
-    // Tank the peer's trust below block threshold
+    // Tank the peer's trust below swap threshold
     for _ in 0..100 {
         node.report_trust_event(&bad_peer, TrustEvent::ConnectionFailed)
             .await;
@@ -56,11 +57,11 @@ async fn send_request_blocked_for_low_trust_peer() {
 
     let score = node.peer_trust(&bad_peer);
     assert!(
-        score < BLOCK_THRESHOLD,
-        "Peer score {score} should be below threshold {BLOCK_THRESHOLD}"
+        score < SWAP_THRESHOLD,
+        "Peer score {score} should be below threshold {SWAP_THRESHOLD}"
     );
 
-    // send_request should fail-fast with a blocking error
+    // send_request should NOT fail with a blocking error
     let result = node
         .send_request(
             &bad_peer,
@@ -70,19 +71,17 @@ async fn send_request_blocked_for_low_trust_peer() {
         )
         .await;
 
-    assert!(result.is_err(), "send_request to blocked peer should fail");
+    assert!(result.is_err(), "send_request to unknown peer should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("blocked") || err_msg.contains("Blocked"),
-        "Error should mention blocking, got: {err_msg}"
+        !err_msg.contains("blocked") && !err_msg.contains("Blocked"),
+        "Low-trust peer should not be blocked, got: {err_msg}"
     );
 
     node.stop().await.unwrap();
 }
 
-/// `send_request` to a peer with neutral trust should NOT be blocked
-/// (it will fail for other reasons since the peer doesn't exist, but the
-/// error should not be "blocked").
+/// `send_request` to a neutral-trust peer behaves normally.
 #[tokio::test]
 async fn send_request_not_blocked_for_neutral_peer() {
     let node = P2PNode::new(test_config()).await.unwrap();
@@ -110,16 +109,15 @@ async fn send_request_not_blocked_for_neutral_peer() {
     node.stop().await.unwrap();
 }
 
-/// A peer right at the block threshold (>= 0.15) is NOT blocked.
+/// A peer with score above the threshold is not affected.
 #[tokio::test]
-async fn peer_at_threshold_is_not_blocked() {
+async fn peer_above_threshold_not_affected() {
     let node = P2PNode::new(test_config()).await.unwrap();
     node.start().await.unwrap();
 
     let peer = PeerId::random();
 
     // Push score down partway but not below threshold
-    // From 0.5, 2 failures gives approximately 0.5 * 0.7^2 ≈ 0.245 (above 0.15)
     for _ in 0..2 {
         node.report_trust_event(&peer, TrustEvent::ConnectionFailed)
             .await;
@@ -127,15 +125,14 @@ async fn peer_at_threshold_is_not_blocked() {
 
     let score = node.peer_trust(&peer);
     assert!(
-        score >= BLOCK_THRESHOLD,
-        "Score {score} should still be above threshold {BLOCK_THRESHOLD}"
+        score >= SWAP_THRESHOLD,
+        "Score {score} should still be above threshold {SWAP_THRESHOLD}"
     );
 
     let result = node
         .send_request(&peer, "test/echo", vec![], Duration::from_secs(1))
         .await;
 
-    // Will fail (not connected) but should NOT mention "blocked"
     if let Err(e) = &result {
         let msg = e.to_string();
         assert!(
@@ -148,56 +145,59 @@ async fn peer_at_threshold_is_not_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// Custom threshold changes blocking boundary
+// Custom threshold configuration
 // ---------------------------------------------------------------------------
 
-/// With a higher threshold (e.g. 0.4), fewer failures are needed to block.
+/// Custom swap threshold is stored and accessible.
 #[tokio::test]
-async fn custom_high_threshold_blocks_sooner() {
+async fn custom_swap_threshold_accepted() {
     let custom_threshold = 0.4;
     let config = NodeConfig::builder()
         .local(true)
         .port(0)
         .ipv6(false)
         .adaptive_dht_config(AdaptiveDhtConfig {
-            block_threshold: custom_threshold,
+            swap_threshold: custom_threshold,
         })
         .build()
         .unwrap();
 
     let node = P2PNode::new(config).await.unwrap();
-    node.start().await.unwrap();
 
+    let threshold = node.adaptive_dht().config().swap_threshold;
+    assert!(
+        (threshold - custom_threshold).abs() < f64::EPSILON,
+        "Stored threshold {threshold} should match configured {custom_threshold}"
+    );
+
+    // Even with a custom threshold, send_request does not block
     let peer = PeerId::random();
-
-    // With threshold 0.4 and EMA weight 0.1, from neutral (0.5):
-    // After ~5 failures: 0.5 * 0.9^5 ≈ 0.295, below 0.4
     for _ in 0..10 {
         node.report_trust_event(&peer, TrustEvent::ConnectionFailed)
             .await;
     }
-
     let score = node.peer_trust(&peer);
     assert!(
         score < custom_threshold,
         "Score {score} should be below custom threshold {custom_threshold}"
     );
 
+    node.start().await.unwrap();
     let result = node
         .send_request(&peer, "test/echo", vec![], Duration::from_secs(1))
         .await;
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("blocked") || err_msg.contains("Blocked"),
-        "Should be blocked with custom threshold, got: {err_msg}"
+        !err_msg.contains("blocked") && !err_msg.contains("Blocked"),
+        "send_request should never mention blocking, got: {err_msg}"
     );
 
     node.stop().await.unwrap();
 }
 
-/// With trust enforcement disabled (threshold 0.0), even a zero-trust peer is
-/// not blocked.
+/// With trust enforcement disabled (threshold 0.0), peers are never
+/// swap-eligible and never blocked.
 #[tokio::test]
 async fn enforcement_disabled_never_blocks() {
     let config = NodeConfig::builder()
@@ -226,7 +226,6 @@ async fn enforcement_disabled_never_blocks() {
         .send_request(&peer, "test/echo", vec![], Duration::from_secs(1))
         .await;
 
-    // Should fail for "not connected" but NOT for "blocked"
     let err_msg = result.unwrap_err().to_string();
     assert!(
         !err_msg.contains("blocked") && !err_msg.contains("Blocked"),
@@ -237,98 +236,66 @@ async fn enforcement_disabled_never_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// Blocking is per-peer, not global
+// Trust is per-peer
 // ---------------------------------------------------------------------------
 
-/// Blocking one peer does not affect requests to other peers.
+/// Low trust for one peer does not affect requests to other peers.
 #[tokio::test]
-async fn blocking_is_per_peer() {
+async fn low_trust_does_not_affect_other_peers() {
     let node = P2PNode::new(test_config()).await.unwrap();
     node.start().await.unwrap();
 
-    let blocked_peer = PeerId::random();
+    let bad_peer = PeerId::random();
     let clean_peer = PeerId::random();
 
-    // Block one peer
+    // Tank one peer's trust
     for _ in 0..100 {
-        node.report_trust_event(&blocked_peer, TrustEvent::ConnectionFailed)
+        node.report_trust_event(&bad_peer, TrustEvent::ConnectionFailed)
             .await;
     }
 
-    assert!(node.peer_trust(&blocked_peer) < BLOCK_THRESHOLD);
+    assert!(node.peer_trust(&bad_peer) < SWAP_THRESHOLD);
     assert!((node.peer_trust(&clean_peer) - 0.5).abs() < f64::EPSILON);
 
-    // Blocked peer should be rejected
-    let blocked_result = node
-        .send_request(&blocked_peer, "test/echo", vec![], Duration::from_secs(1))
-        .await;
-    let err_msg = blocked_result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("blocked") || err_msg.contains("Blocked"),
-        "Blocked peer error should mention 'blocked', got: {err_msg}"
-    );
-
-    // Clean peer should NOT be blocked (will fail for not-connected, but
-    // the error should not mention blocking)
-    let clean_result = node
-        .send_request(&clean_peer, "test/echo", vec![], Duration::from_secs(1))
-        .await;
-    if let Err(e) = &clean_result {
-        let msg = e.to_string();
-        assert!(
-            !msg.contains("blocked") && !msg.contains("Blocked"),
-            "Clean peer should not be blocked, got: {msg}"
-        );
+    // Neither peer should get a blocking error
+    for peer in [&bad_peer, &clean_peer] {
+        let result = node
+            .send_request(peer, "test/echo", vec![], Duration::from_secs(1))
+            .await;
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("blocked") && !msg.contains("Blocked"),
+                "No peer should ever be blocked, got: {msg}"
+            );
+        }
     }
 
     node.stop().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Trust recovery unblocks send_request
+// Trust removal resets score
 // ---------------------------------------------------------------------------
 
-/// After removing a blocked peer from the trust engine, `send_request` no
-/// longer returns a "blocked" error.
+/// Removing a peer from the trust engine resets their score to neutral.
 #[tokio::test]
-async fn trust_removal_unblocks_peer() {
+async fn trust_removal_resets_peer_score() {
     let node = P2PNode::new(test_config()).await.unwrap();
-    node.start().await.unwrap();
 
     let peer = PeerId::random();
 
-    // Block the peer
+    // Tank trust
     for _ in 0..100 {
         node.report_trust_event(&peer, TrustEvent::ConnectionFailed)
             .await;
     }
-    assert!(node.peer_trust(&peer) < BLOCK_THRESHOLD);
+    assert!(node.peer_trust(&peer) < SWAP_THRESHOLD);
 
-    // Verify blocked
-    let blocked = node
-        .send_request(&peer, "test/echo", vec![], Duration::from_secs(1))
-        .await;
-    let err_msg = blocked.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("blocked") || err_msg.contains("Blocked"),
-        "Blocked peer error should mention 'blocked', got: {err_msg}"
-    );
-
-    // Remove from trust engine → reset to neutral
+    // Remove from trust engine -> reset to neutral
     node.trust_engine().remove_node(&peer);
-    assert!((node.peer_trust(&peer) - 0.5).abs() < f64::EPSILON);
-
-    // Should no longer be blocked
-    let unblocked = node
-        .send_request(&peer, "test/echo", vec![], Duration::from_secs(1))
-        .await;
-    if let Err(e) = &unblocked {
-        let msg = e.to_string();
-        assert!(
-            !msg.contains("blocked") && !msg.contains("Blocked"),
-            "After removal, peer should not be blocked: {msg}"
-        );
-    }
-
-    node.stop().await.unwrap();
+    assert!(
+        (node.peer_trust(&peer) - 0.5).abs() < f64::EPSILON,
+        "After removal, peer should return to neutral trust"
+    );
 }

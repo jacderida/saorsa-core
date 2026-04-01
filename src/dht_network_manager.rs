@@ -120,10 +120,10 @@ pub struct DhtNetworkConfig {
     pub max_concurrent_operations: usize,
     /// Enable enhanced security features
     pub enable_security: bool,
-    /// Trust score below which a peer is blocked from DHT operations.
-    /// Messages from blocked peers are silently dropped and they cannot
-    /// be added to the routing table. Default: 0.0 (disabled).
-    pub block_threshold: f64,
+    /// Trust score below which a peer is eligible for swap-out from the
+    /// routing table when a better candidate is available.
+    /// Default: 0.0 (disabled).
+    pub swap_threshold: f64,
 }
 
 /// DHT network operation types
@@ -159,7 +159,7 @@ pub enum DhtNetworkResult {
     },
     /// Leave confirmation
     LeaveSuccess,
-    /// The remote peer has blocked us — do not penalise their trust score
+    /// The remote peer has rejected us — do not penalise their trust score
     PeerRejected,
     /// Operation failed
     Error { operation: String, error: String },
@@ -303,7 +303,7 @@ pub enum DhtNetworkEvent {
     },
     /// New peer added to the routing table.
     PeerAdded { peer_id: PeerId },
-    /// Peer removed from the routing table (eviction, blocking, or departure).
+    /// Peer removed from the routing table (swap-out, eviction, or departure).
     PeerRemoved { peer_id: PeerId },
     /// Bootstrap process completed.
     BootstrapComplete { num_peers: usize },
@@ -367,7 +367,7 @@ impl DhtNetworkManager {
             config.peer_id,
             config.node_config.dht_config.k_value,
             config.node_config.allow_loopback,
-            config.block_threshold,
+            config.swap_threshold,
         )
         .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
 
@@ -960,7 +960,7 @@ impl DhtNetworkManager {
                 break;
             }
 
-            // Select up to ALPHA closest unqueried, non-blocked nodes to query.
+            // Select up to ALPHA closest unqueried nodes to query.
             // BTreeMap is sorted by (distance, peer_id), so first_entry()
             // always yields the closest candidate.
             let mut batch: Vec<DHTNode> = Vec::new();
@@ -970,14 +970,6 @@ impl DhtNetworkManager {
                 };
                 let node = entry.remove();
                 if queried_nodes.contains(&node.peer_id) {
-                    continue;
-                }
-                // Skip peers whose trust score is below the block threshold
-                if self.is_peer_blocked(&node.peer_id) {
-                    trace!(
-                        "[NETWORK] Skipping blocked peer {} in lookup",
-                        node.peer_id.to_hex()
-                    );
                     continue;
                 }
                 batch.push(node);
@@ -1067,11 +1059,12 @@ impl DhtNetworkManager {
                         }
                     }
                     Ok(DhtNetworkResult::PeerRejected) => {
-                        // Remote peer has us blocked — remove them from our routing
-                        // table (no point retrying) but do NOT penalise their trust
-                        // score; the rejection is an honest signal, not misbehaviour.
+                        // Remote peer rejected us (e.g. older node with blocking) —
+                        // remove them from our routing table (no point retrying) but
+                        // do NOT penalise their trust score; the rejection is an
+                        // honest signal, not misbehaviour.
                         info!(
-                            "[NETWORK] Peer {} rejected us (blocked) — removing from routing table",
+                            "[NETWORK] Peer {} rejected us — removing from routing table",
                             peer_id.to_hex()
                         );
                         let mut dht = self.dht.write().await;
@@ -1235,93 +1228,7 @@ impl DhtNetworkManager {
                 peer_id,
                 crate::adaptive::NodeStatisticsUpdate::FailedResponse,
             );
-
-            // Immediately evict and disconnect if trust has crossed the block threshold
-            if self.config.block_threshold > 0.0
-                && engine.score(peer_id) < self.config.block_threshold
-            {
-                let mut dht = self.dht.write().await;
-                let rt_events = dht.remove_node_by_id(peer_id).await;
-                drop(dht); // Release write lock before disconnect
-                self.broadcast_routing_events(&rt_events);
-                // Cancel in-flight RPCs — cancelled operations must not record
-                // trust events (Section 7.4 step 2a).
-                self.cancel_operations_for_peer(peer_id);
-                let _ = self.transport.disconnect_peer(peer_id).await;
-                tracing::info!(
-                    peer = peer_id.to_hex(),
-                    score = engine.score(peer_id),
-                    threshold = self.config.block_threshold,
-                    "Blocked peer — evicted from RT and disconnected"
-                );
-            }
         }
-    }
-
-    /// Evict a blocked peer from the routing table, cancel in-flight RPCs,
-    /// and disconnect at the transport layer.
-    ///
-    /// Unlike [`record_peer_failure`], this does NOT record a trust event —
-    /// the caller has already updated the trust score (e.g. via
-    /// `AdaptiveDHT::report_trust_event`). This avoids double-counting.
-    pub(crate) async fn evict_blocked_peer(&self, peer_id: &PeerId) {
-        let mut dht = self.dht.write().await;
-        let rt_events = dht.remove_node_by_id(peer_id).await;
-        drop(dht);
-        self.broadcast_routing_events(&rt_events);
-        self.cancel_operations_for_peer(peer_id);
-        let _ = self.transport.disconnect_peer(peer_id).await;
-        tracing::info!(
-            peer = peer_id.to_hex(),
-            "Evicted blocked peer (consumer trust event)"
-        );
-    }
-
-    /// Check if a peer's trust score is below the block threshold.
-    ///
-    /// Returns `true` if the peer should be blocked (trust too low).
-    /// Returns `false` if blocking is disabled (threshold == 0) or no trust engine.
-    fn is_peer_blocked(&self, peer_id: &PeerId) -> bool {
-        if self.config.block_threshold <= 0.0 {
-            return false;
-        }
-        if let Some(ref engine) = self.trust_engine {
-            engine.score(peer_id) < self.config.block_threshold
-        } else {
-            false
-        }
-    }
-
-    /// Cancel all in-flight operations targeting a blocked peer.
-    ///
-    /// Drops the oneshot senders so that the response waiters get a
-    /// `RecvError` and know the operation was cancelled. Cancelled
-    /// operations MUST NOT record trust events — the blocking decision
-    /// has already been made (Section 7.4 step 2a).
-    fn cancel_operations_for_peer(&self, peer_id: &PeerId) {
-        let mut ops = match self.active_operations.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                tracing::warn!(
-                    "active_operations mutex poisoned in cancel_operations_for_peer, recovering"
-                );
-                poisoned.into_inner()
-            }
-        };
-        ops.retain(|_id, ctx| {
-            if ctx.peer_id == *peer_id {
-                // Drop the oneshot sender — the waiter will get RecvError
-                // and should NOT record a trust event for this cancellation.
-                tracing::debug!(
-                    peer = peer_id.to_hex(),
-                    op = ?ctx.operation,
-                    "Cancelling in-flight operation for blocked peer"
-                );
-                false // remove from map
-            } else {
-                true // keep
-            }
-        });
     }
 
     /// Remove expired operations from `active_operations`.
@@ -1362,11 +1269,6 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
         address_hint: Option<&MultiAddr>,
     ) -> Result<DhtNetworkResult> {
-        // Fail fast for blocked peers — don't waste resources connecting/sending
-        if self.is_peer_blocked(peer_id) {
-            return Err(P2PError::Network(NetworkError::PeerBlocked(*peer_id)));
-        }
-
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
 
@@ -1553,15 +1455,7 @@ impl DhtNetworkManager {
 
         // Record trust failure at the RPC level so every failed request
         // (send error, response timeout, etc.) is counted exactly once.
-        // Exclude cancelled operations (the blocking decision already
-        // recorded trust — Section 7.4 step 2a).
-        if let Err(ref e) = result
-            && !matches!(
-                e,
-                P2PError::Network(NetworkError::OperationCancelled(_))
-                    | P2PError::Network(NetworkError::PeerBlocked(_))
-            )
-        {
+        if result.is_err() {
             self.record_peer_failure(peer_id).await;
         }
 
@@ -1604,10 +1498,6 @@ impl DhtNetworkManager {
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
     async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
-        if self.is_peer_blocked(peer_id) {
-            return None;
-        }
-
         let peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
@@ -1681,10 +1571,8 @@ impl DhtNetworkManager {
     /// operation context. When handle_dht_response receives a response, it sends
     /// through the channel. This function awaits on the receiver with timeout.
     ///
-    /// When the oneshot sender is dropped (e.g. by `cancel_operations_for_peer`),
-    /// the receiver gets a `RecvError`. If the peer is blocked at that point,
-    /// we return `OperationCancelled` so the caller knows not to record a trust
-    /// event (Section 7.4 step 2a).
+    /// When the oneshot sender is dropped, the receiver gets a `RecvError`
+    /// and we return a `ProtocolError`.
     ///
     /// Note: cleanup of `active_operations` is handled by explicit removal in the
     /// caller (`send_dht_request`), so this method does not remove entries itself.
@@ -1692,7 +1580,7 @@ impl DhtNetworkManager {
         &self,
         _message_id: &str,
         response_rx: oneshot::Receiver<(PeerId, DhtNetworkResult)>,
-        peer_id: &PeerId,
+        _peer_id: &PeerId,
     ) -> Result<DhtNetworkResult> {
         let response_timeout = self.config.request_timeout;
 
@@ -1701,18 +1589,9 @@ impl DhtNetworkManager {
             Ok(Ok((_source, result))) => Ok(result),
             Ok(Err(_recv_error)) => {
                 // Channel closed without response (sender dropped).
-                // If the peer was blocked (cancel_operations_for_peer dropped
-                // the sender), return OperationCancelled so callers skip trust
-                // event recording (Section 7.4 step 2a).
-                if self.is_peer_blocked(peer_id) {
-                    Err(P2PError::Network(NetworkError::OperationCancelled(
-                        *peer_id,
-                    )))
-                } else {
-                    Err(P2PError::Network(NetworkError::ProtocolError(
-                        "Response channel closed unexpectedly".into(),
-                    )))
-                }
+                Err(P2PError::Network(NetworkError::ProtocolError(
+                    "Response channel closed unexpectedly".into(),
+                )))
             }
             Err(_timeout) => Err(P2PError::Network(NetworkError::Timeout)),
         }
@@ -1739,23 +1618,9 @@ impl DhtNetworkManager {
             ));
         }
 
-        // Deserialize message (needed before block check so we can send a rejection response)
+        // Deserialize message
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
-
-        // SEC: Block peers whose trust score has fallen below threshold.
-        // Send an explicit rejection so the remote peer knows not to penalise
-        // our trust score (avoiding mutual-block loops from silent timeouts).
-        if self.is_peer_blocked(sender) {
-            info!("Rejecting message from blocked peer {}", sender.to_hex());
-            let _ = self.transport.disconnect_peer(sender).await;
-            let response =
-                self.create_response_message(&message, DhtNetworkResult::PeerRejected)?;
-            return Ok(Some(
-                postcard::to_stdvec(&response)
-                    .map_err(|e| P2PError::Serialization(e.to_string().into()))?,
-            ));
-        }
 
         debug!(
             "[STEP 3] {}: Received {:?} from {} (msg_id: {})",
@@ -2085,15 +1950,6 @@ impl DhtNetworkManager {
     async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
 
-        // Block peers whose trust score has fallen below threshold
-        if self.is_peer_blocked(&node_id) {
-            info!(
-                "Rejecting blocked peer {} from DHT (trust below threshold)",
-                app_peer_id_hex
-            );
-            return;
-        }
-
         info!(
             "DHT peer connected: app_id={}, user_agent={}",
             app_peer_id_hex, user_agent
@@ -2218,15 +2074,6 @@ impl DhtNetworkManager {
                         match recv {
                             Ok(event) => match event {
                                 crate::network::P2PEvent::PeerConnected(peer_id, ref user_agent) => {
-                                    // Disconnect blocked peers immediately
-                                    if self_arc.is_peer_blocked(&peer_id) {
-                                        info!(
-                                            "Disconnecting blocked peer {}",
-                                            peer_id.to_hex()
-                                        );
-                                        let _ = self_arc.transport.disconnect_peer(&peer_id).await;
-                                        continue;
-                                    }
                                     self_arc.handle_peer_connected(peer_id, user_agent).await;
                                 }
                                 crate::network::P2PEvent::PeerDisconnected(peer_id) => {
@@ -2587,7 +2434,7 @@ impl Default for DhtNetworkConfig {
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
             enable_security: true,
-            block_threshold: 0.0,
+            swap_threshold: 0.0,
         }
     }
 }

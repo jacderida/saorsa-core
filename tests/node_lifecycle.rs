@@ -192,7 +192,7 @@ async fn builder_client_mode() {
     assert_eq!(node.config().mode, NodeMode::Client);
 }
 
-/// Builder `.trust_enforcement(false)` sets block threshold to 0.0.
+/// Builder `.trust_enforcement(false)` sets swap threshold to 0.0.
 #[tokio::test]
 async fn builder_trust_enforcement_toggle() {
     let config_off = NodeConfig::builder()
@@ -205,7 +205,7 @@ async fn builder_trust_enforcement_toggle() {
 
     let node_off = P2PNode::new(config_off).await.unwrap();
     assert!(
-        (node_off.adaptive_dht().config().block_threshold - 0.0).abs() < f64::EPSILON,
+        (node_off.adaptive_dht().config().swap_threshold - 0.0).abs() < f64::EPSILON,
         "trust_enforcement(false) should set threshold to 0.0"
     );
 
@@ -219,8 +219,8 @@ async fn builder_trust_enforcement_toggle() {
 
     let node_on = P2PNode::new(config_on).await.unwrap();
     assert!(
-        (node_on.adaptive_dht().config().block_threshold
-            - AdaptiveDhtConfig::default().block_threshold)
+        (node_on.adaptive_dht().config().swap_threshold
+            - AdaptiveDhtConfig::default().swap_threshold)
             .abs()
             < f64::EPSILON,
         "trust_enforcement(true) should use default threshold"

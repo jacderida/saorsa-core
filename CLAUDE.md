@@ -135,13 +135,13 @@ Trust boundary and adaptive routing:
 - **AdaptiveDHT**: Sole owner of TrustEngine and DhtNetworkManager — all trust signals flow through here
 - **TrustEngine**: Response-rate scoring with time decay for decentralized reputation
 - **TrustEvent**: Unified enum for all trust-relevant outcomes (reported via `P2PNode::report_trust_event`)
-- **Binary blocking**: Peers below block threshold are evicted and rejected (no trust-weighted routing)
+- **Lazy swap-out**: Peers below swap threshold are replaced when better candidates arrive (no immediate blocking)
 
 #### 3. DHT Layer (`src/dht/`)
 Peer phonebook with geographic awareness (no data storage):
 - **Core Engine**: Kademlia-based routing table and peer discovery
 - **Geographic Routing**: Region-aware peer selection
-- **Trust-Weighted Eviction**: Peers below trust threshold are evicted (live TrustEngine queries)
+- **Trust-Based Swap-Out**: Peers below swap threshold are replaced by better candidates during admission
 
 ## External Crate Dependencies
 
@@ -170,7 +170,7 @@ cargo test --lib
 - **Bucket Size**: 20 nodes per k-bucket
 - **Concurrency**: Alpha=3 parallel lookups
 - **Geographic Awareness**: Region-aware peer selection
-- **Trust Integration**: Response-rate scoring with binary blocking
+- **Trust Integration**: Response-rate scoring with lazy swap-out (no blocking)
 
 ### Performance Optimizations
 - **Connection Pooling**: Max 100 connections with LRU eviction
