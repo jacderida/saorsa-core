@@ -724,10 +724,10 @@ impl DhtNetworkManager {
                             node.addresses.len(),
                             first.as_ref().map(|a| a.to_string())
                         );
-                        if seen.insert(node.peer_id) {
-                            if let Some(addr) = first {
-                                self.dial_candidate(&node.peer_id, &addr).await;
-                            }
+                        if seen.insert(node.peer_id)
+                            && let Some(addr) = first
+                        {
+                            self.dial_candidate(&node.peer_id, &addr).await;
                         }
                     }
                 }
