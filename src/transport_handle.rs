@@ -116,6 +116,11 @@ pub struct TransportHandle {
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
+    /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
+    peer_address_update_rx:
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+    /// Relay established events — received when this node sets up a MASQUE relay.
+    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SocketAddr>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
@@ -188,6 +193,13 @@ impl TransportHandle {
 
         let shutdown = CancellationToken::new();
 
+        // Subscribe to P2pEvent::PeerAddressUpdated from the transport layer.
+        // These are forwarded from ADD_ADDRESS frames when a peer advertises
+        // a new reachable address (e.g., relay). The P2PNode reads these and
+        // updates the DHT routing table.
+        let (peer_addr_update_rx, relay_established_rx) =
+            dual_node.spawn_peer_address_update_forwarder();
+
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
 
@@ -195,6 +207,7 @@ impl TransportHandle {
         let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
         let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        // (peer_addr_update_tx removed — dedicated forwarder creates its own)
 
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
@@ -239,6 +252,8 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider,
             shutdown,
+            peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
+            relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -300,6 +315,14 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
+            peer_address_update_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::sync::Mutex::new(rx)
+            },
+            relay_established_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::sync::Mutex::new(rx)
+            },
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -457,6 +480,45 @@ impl TransportHandle {
         self.peers.write().await.remove(channel_id);
     }
 
+    /// Look up the peer ID for a given connection address.
+    pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
+        let c2p = self.channel_to_peers.read().await;
+
+        // Try the exact stringified address first.
+        let channel_id = addr.to_string();
+        if let Some(peer_id) = c2p.get(&channel_id).and_then(|p| p.iter().next().copied()) {
+            return Some(peer_id);
+        }
+
+        // The channel key may be stored as IPv4-mapped IPv6 (e.g., "[::ffff:1.2.3.4]:PORT")
+        // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
+        let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
+        let alt_channel_id = alt_addr.to_string();
+        c2p.get(&alt_channel_id)
+            .and_then(|p| p.iter().next().copied())
+    }
+
+    /// Drain pending peer address updates from ADD_ADDRESS frames.
+    ///
+    /// Returns (peer_connection_addr, advertised_addr) pairs. The caller
+    /// should look up the peer ID and update the DHT routing table.
+    pub async fn drain_peer_address_updates(&self) -> Vec<(SocketAddr, SocketAddr)> {
+        let mut rx = self.peer_address_update_rx.lock().await;
+        let mut updates = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            updates.push(update);
+        }
+        updates
+    }
+
+    /// Drain any relay established events. Returns the relay address if this
+    /// node has just established a MASQUE relay.
+    pub async fn drain_relay_established(&self) -> Option<SocketAddr> {
+        let mut rx = self.relay_established_rx.lock().await;
+        // Only care about the first one (relay is established once)
+        rx.try_recv().ok()
+    }
+
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
@@ -515,6 +577,12 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
+    /// Set the target peer ID for the next hole-punch attempt.
+    /// See [`P2pEndpoint::set_hole_punch_target_peer_id`].
+    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
+        self.dual_node.set_hole_punch_target_peer_id(peer_id).await;
+    }
+
     /// Connect to a peer at the given address.
     ///
     /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
@@ -1310,6 +1378,7 @@ impl TransportHandle {
         let channel_to_peers = Arc::clone(&self.channel_to_peers);
         let peer_user_agents = Arc::clone(&self.peer_user_agents);
         let self_peer_id = *self.node_identity.peer_id();
+        let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
         handles.push(tokio::spawn(async move {
             info!("Message receive loop started");
             while let Some((from_addr, bytes)) = rx.recv().await {
@@ -1343,6 +1412,13 @@ impl TransportHandle {
                             }
                             // Drop the lock before emitting events.
                             drop(p2c);
+
+                            // Register peer ID at the low-level transport
+                            // endpoint so PUNCH_ME_NOW relay can find this
+                            // peer by identity instead of socket address.
+                            dual_node_for_peer_reg
+                                .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                                .await;
 
                             if is_new_peer {
                                 peer_user_agents
@@ -1580,6 +1656,9 @@ impl TransportHandle {
                                     &peer_user_agents,
                                     &event_tx,
                                 ).await;
+                            }
+                            ConnectionEvent::PeerAddressUpdated { .. } => {
+                                // Handled by dedicated forwarder, not here
                             }
                         },
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {

@@ -137,6 +137,10 @@ pub enum DhtNetworkOperation {
     Join,
     /// Leave the DHT network gracefully
     Leave,
+    /// Publish the sender's preferred routable addresses (e.g., relay address).
+    /// Receiving nodes update their routing table for the sender. Sent once
+    /// after relay setup to K closest peers, not on every message.
+    PublishAddress { addresses: Vec<crate::MultiAddr> },
 }
 
 /// DHT network operation result
@@ -161,6 +165,8 @@ pub enum DhtNetworkResult {
     LeaveSuccess,
     /// The remote peer has rejected us — do not penalise their trust score
     PeerRejected,
+    /// Acknowledgement of a PublishAddress request
+    PublishAddressAck,
     /// Operation failed
     Error { operation: String, error: String },
 }
@@ -407,7 +413,8 @@ impl DhtNetworkManager {
     }
 
     /// Kademlia K parameter — bucket size and lookup count.
-    fn k_value(&self) -> usize {
+    /// Get the configured Kademlia K value (bucket size / close group size).
+    pub fn k_value(&self) -> usize {
         self.config.node_config.dht_config.k_value
     }
 
@@ -424,6 +431,16 @@ impl DhtNetworkManager {
 
         let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
         let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
+
+        // Log addresses being returned in FIND_NODE response
+        for node in &closer_nodes {
+            let addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
+            debug!(
+                "FIND_NODE response: peer={} addresses={:?}",
+                node.peer_id.to_hex(),
+                addrs
+            );
+        }
 
         Ok(DhtNetworkResult::NodesFound {
             key: *key,
@@ -700,10 +717,17 @@ impl DhtNetworkManager {
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        if seen.insert(node.peer_id)
-                            && let Some(addr) = Self::first_dialable_address(&node.addresses)
-                        {
-                            self.dial_candidate(&node.peer_id, &addr).await;
+                        let first = Self::first_dialable_address(&node.addresses);
+                        debug!(
+                            "DHT bootstrap: peer={} num_addresses={} first_dialable={:?}",
+                            node.peer_id.to_hex(),
+                            node.addresses.len(),
+                            first.as_ref().map(|a| a.to_string())
+                        );
+                        if seen.insert(node.peer_id) {
+                            if let Some(addr) = first {
+                                self.dial_candidate(&node.peer_id, &addr).await;
+                            }
                         }
                     }
                 }
@@ -1513,6 +1537,13 @@ impl DhtNetworkManager {
             );
             return None;
         }
+        // Set the target peer ID so hole-punch PUNCH_ME_NOW uses it for
+        // routing. This is essential for symmetric NAT where the coordinator
+        // can't match the target by socket address.
+        self.transport
+            .set_hole_punch_target_peer_id(Some(*peer_id.to_bytes()))
+            .await;
+
         let dial_timeout = self
             .transport
             .connection_timeout()
@@ -1712,13 +1743,24 @@ impl DhtNetworkManager {
             }
             DhtNetworkOperation::Leave => {
                 debug!("Handling LEAVE request from: {}", authenticated_sender);
-                // Remove the leaving node from our routing table
-                // TODO: Implement node removal from DHT routing table
-                // let dht_guard = self.dht.write().await;
-                // if let Err(e) = dht_guard.remove_node(authenticated_sender).await {
-                //     warn!("Failed to remove leaving node from routing table: {}", e);
-                // }
                 Ok(DhtNetworkResult::LeaveSuccess)
+            }
+            DhtNetworkOperation::PublishAddress { addresses } => {
+                info!(
+                    "Handling PUBLISH_ADDRESS from {}: {} addresses",
+                    authenticated_sender,
+                    addresses.len()
+                );
+                let dht = self.dht.read().await;
+                for addr in addresses {
+                    dht.touch_node_typed(
+                        authenticated_sender,
+                        Some(addr),
+                        crate::dht::AddressType::Relay,
+                    )
+                    .await;
+                }
+                Ok(DhtNetworkResult::PublishAddressAck)
             }
         }
     }
@@ -1848,6 +1890,9 @@ impl DhtNetworkManager {
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
+            // Use Ping as a lightweight ack — avoids echoing the full
+            // PublishAddress payload (which contains the address list).
+            DhtNetworkResult::PublishAddressAck => DhtNetworkOperation::Ping,
             DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
@@ -1892,16 +1937,25 @@ impl DhtNetworkManager {
             return;
         };
 
-        // Resolve current address from the transport layer so the routing
-        // table stays up-to-date when a peer reconnects from a new endpoint.
-        let current_address = self
+        // Transport-layer address is tagged as Direct. The typed merge
+        // ensures it never displaces a Relay address at the front.
+        // NATted addresses (from NAT connections) are handled separately
+        // by the DHT bridge which tags them explicitly.
+        let transport_addr = self
             .transport
             .peer_info(&app_peer_id)
             .await
             .and_then(|info| Self::first_dialable_address(&info.addresses));
 
         let dht = self.dht.read().await;
-        if dht.touch_node(&app_peer_id, current_address.as_ref()).await {
+        if dht
+            .touch_node_typed(
+                &app_peer_id,
+                transport_addr.as_ref(),
+                crate::dht::AddressType::Direct,
+            )
+            .await
+        {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
         }
     }
@@ -1984,9 +2038,11 @@ impl DhtNetworkManager {
                 app_peer_id_hex, user_agent
             );
         } else {
+            let address_types = vec![crate::dht::AddressType::Direct; addresses.len()];
             let node_info = NodeInfo {
                 id: node_id,
                 addresses,
+                address_types,
                 last_seen: Instant::now(),
             };
 
@@ -2332,6 +2388,29 @@ impl DhtNetworkManager {
     }
 
     /// Get current statistics
+    /// Update a node's address in the DHT routing table.
+    ///
+    /// Called when a peer advertises a new reachable address (e.g., relay).
+    pub async fn touch_node(&self, peer_id: &PeerId, address: Option<&MultiAddr>) -> bool {
+        let dht = self.dht.read().await;
+        dht.touch_node(peer_id, address).await
+    }
+
+    /// Update a node's address with an explicit type tag.
+    ///
+    /// Prefer over [`Self::touch_node`] when the address class is known
+    /// (e.g., `AddressType::Relay` for relay addresses so they are stored
+    /// at the front of the address list).
+    pub async fn touch_node_typed(
+        &self,
+        peer_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: crate::dht::AddressType,
+    ) -> bool {
+        let dht = self.dht.read().await;
+        dht.touch_node_typed(peer_id, address, addr_type).await
+    }
+
     pub async fn get_stats(&self) -> DhtNetworkStats {
         self.stats.read().await.clone()
     }
@@ -2393,6 +2472,43 @@ impl DhtNetworkManager {
     /// Get this node's peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.config.peer_id
+    }
+
+    /// Send a PublishAddress request to a list of peers, telling them to
+    /// store the given addresses for this node in their routing tables.
+    /// Used after relay setup to propagate the relay address to K closest peers.
+    pub async fn publish_address_to_peers(
+        &self,
+        addresses: Vec<crate::MultiAddr>,
+        peers: &[DHTNode],
+    ) {
+        let op = DhtNetworkOperation::PublishAddress {
+            addresses: addresses.clone(),
+        };
+        for peer in peers {
+            if peer.peer_id == self.config.peer_id {
+                continue; // Skip self
+            }
+            match self
+                .send_dht_request(
+                    &peer.peer_id,
+                    op.clone(),
+                    Self::first_dialable_address(&peer.addresses).as_ref(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!("Published address to peer {}", peer.peer_id.to_hex());
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to publish address to peer {}: {}",
+                        peer.peer_id.to_hex(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Get the local listen address of this node's P2P network
