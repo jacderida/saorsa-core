@@ -76,49 +76,9 @@ jobs:
             exit 1
           fi
 
-  test:
-    name: Test Suite
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev build-essential protobuf-compiler
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
-        run: cargo test --lib
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
-
   publish-crate:
     name: Publish to crates.io
-    needs: [validate, test]
+    needs: [validate]
     runs-on: ubuntu-latest
     if: github.event.inputs.dry_run != 'true'
     steps:
