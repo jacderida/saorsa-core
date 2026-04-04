@@ -518,14 +518,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Wrap the entire send path in a 10-second timeout.
-        //
-        // For chunk storage, the client should already have the correct
-        // address (relay or direct) from the DHT. A 4MB chunk at 10 Mbps
-        // takes ~3.2s; 10s provides 3x margin for slow-start and jitter.
-        // Longer timeouts cause excessive delays per unreachable peer when
-        // the DHT has stale NATted addresses, dominating upload time.
-        const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+        // Budget must cover dial (up to ~20s for full NAT traversal cascade)
+        // plus the data transfer. Matches DIAL_TIMEOUT in connect_to_peer.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(25);
 
         tokio::time::timeout(SEND_TIMEOUT, async {
             let conn = self
