@@ -1537,12 +1537,14 @@ impl DhtNetworkManager {
             );
             return None;
         }
-        // Set the target peer ID so hole-punch PUNCH_ME_NOW uses it for
-        // routing. This is essential for symmetric NAT where the coordinator
-        // can't match the target by socket address.
-        self.transport
-            .set_hole_punch_target_peer_id(Some(*peer_id.to_bytes()))
-            .await;
+        // Set the target peer ID for this specific address so the hole-punch
+        // PUNCH_ME_NOW can route by peer identity. Keyed by address to avoid
+        // races when multiple concurrent dials share the same transport.
+        if let Some(socket_addr) = address.dialable_socket_addr() {
+            self.transport
+                .set_hole_punch_target_peer_id(socket_addr, *peer_id.to_bytes())
+                .await;
+        }
 
         let dial_timeout = self
             .transport

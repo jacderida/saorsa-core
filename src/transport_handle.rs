@@ -577,10 +577,10 @@ impl TransportHandle {
 // ============================================================================
 
 impl TransportHandle {
-    /// Set the target peer ID for the next hole-punch attempt.
+    /// Set the target peer ID for a hole-punch attempt to a specific address.
     /// See [`P2pEndpoint::set_hole_punch_target_peer_id`].
-    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
-        self.dual_node.set_hole_punch_target_peer_id(peer_id).await;
+    pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
+        self.dual_node.set_hole_punch_target_peer_id(target, peer_id).await;
     }
 
     /// Connect to a peer at the given address.

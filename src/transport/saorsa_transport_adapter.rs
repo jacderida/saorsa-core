@@ -793,14 +793,14 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
 
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
-    /// Set the target peer ID for the next hole-punch attempt. The P2pEndpoint
-    /// uses this in PUNCH_ME_NOW to let the coordinator match by peer identity
-    /// instead of socket address — essential for symmetric NAT.
-    pub async fn set_hole_punch_target_peer_id(&self, peer_id: Option<[u8; 32]>) {
+    /// Set the target peer ID for a hole-punch attempt to a specific address.
+    /// The P2pEndpoint uses this in PUNCH_ME_NOW to let the coordinator match
+    /// by peer identity. Keyed by address to avoid concurrent dial races.
+    pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             node.transport
                 .endpoint()
-                .set_hole_punch_target_peer_id(peer_id)
+                .set_hole_punch_target_peer_id(target, peer_id)
                 .await;
         }
     }
