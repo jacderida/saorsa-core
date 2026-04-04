@@ -437,11 +437,10 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // The full NAT traversal flow is: direct (5s) → hole-punch (15s) →
-        // relay (30s). The outer timeout must accommodate the entire flow,
-        // otherwise the connection attempt is killed mid-hole-punch and the
-        // NAT'd peer is never reached.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(90);
+        // The full NAT traversal flow is: direct (2s) + 2 × hole-punch
+        // rounds (3s + 1s retry each) + relay (10s) = ~20s. 25s provides
+        // margin for handshake jitter.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
@@ -519,14 +518,14 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Wrap the entire send path in a 15-second timeout.
+        // Wrap the entire send path in a 10-second timeout.
         //
         // For chunk storage, the client should already have the correct
-        // address (relay or direct) from the DHT. Direct connections
-        // complete in <5s, so 15s is generous. A longer timeout (e.g. 60s)
-        // causes ~60s delays per unreachable peer when the DHT has stale
-        // NATted addresses, dominating upload time.
-        const SEND_TIMEOUT: Duration = Duration::from_secs(15);
+        // address (relay or direct) from the DHT. A 4MB chunk at 10 Mbps
+        // takes ~3.2s; 10s provides 3x margin for slow-start and jitter.
+        // Longer timeouts cause excessive delays per unreachable peer when
+        // the DHT has stale NATted addresses, dominating upload time.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
         tokio::time::timeout(SEND_TIMEOUT, async {
             let conn = self

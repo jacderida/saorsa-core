@@ -51,10 +51,10 @@ const MAX_CANDIDATE_NODES: usize = 200;
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Request timeout for DHT message handlers (30 seconds)
+/// Request timeout for DHT message handlers (10 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reliability score assigned to the local node in K-closest results.
 /// The local node is always considered fully reliable for its own lookups.
@@ -62,7 +62,7 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
 /// Maximum time to wait for the identity-exchange handshake after dialling
 /// a peer. The actual timeout is `min(request_timeout, this)`.
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
