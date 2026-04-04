@@ -124,16 +124,16 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Default connection timeout in seconds.
 ///
-/// Must accommodate the full NAT traversal flow: direct (5s) → hole-punch
-/// (15s) → relay (30s) = ~50s. With 90s we have headroom for retries and
-/// slow handshakes.
-const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 90;
+/// Derived from the sum of connection strategy stages: direct (2s) +
+/// 2 × hole-punch rounds (3s + 1s retry each) + relay (10s) = ~20s.
+/// 25s provides margin for handshake jitter.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
 
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 5;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
@@ -2271,7 +2271,7 @@ mod tests {
 
         assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
         assert_eq!(config.max_connections, 10000);
-        assert_eq!(config.connection_timeout, Duration::from_secs(90));
+        assert_eq!(config.connection_timeout, Duration::from_secs(25));
     }
 
     #[tokio::test]
