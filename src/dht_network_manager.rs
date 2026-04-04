@@ -527,6 +527,9 @@ impl DhtNetworkManager {
                     warn!("Periodic self-lookup failed: {e}");
                 }
 
+                // Evict any stale K-closest peers that fail to respond.
+                this.revalidate_stale_k_closest().await;
+
                 // Check if routing table is depleted after the self-lookup.
                 this.maybe_rebootstrap().await;
             }
@@ -2358,6 +2361,64 @@ impl DhtNetworkManager {
             .await
             .map(|_| ())
             .context("ping failed")
+    }
+
+    /// Revalidate stale K-closest peers by pinging them and evicting non-responders.
+    ///
+    /// Piggybacked on the periodic self-lookup to avoid a dedicated background
+    /// worker. Ensures offline close-group members are evicted promptly rather
+    /// than lingering until admission contention triggers revalidation.
+    async fn revalidate_stale_k_closest(&self) {
+        let stale_peers = {
+            let dht = self.dht.read().await;
+            dht.stale_k_closest().await
+        };
+
+        if stale_peers.is_empty() {
+            return;
+        }
+
+        debug!("Revalidating {} stale K-closest peer(s)", stale_peers.len());
+
+        // Ping concurrently in chunks, reusing the same concurrency limit as
+        // admission-triggered revalidation.
+        let mut non_responders = Vec::new();
+
+        for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
+            let results = futures::future::join_all(chunk.iter().map(|peer_id| async {
+                let responded =
+                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                (*peer_id, responded)
+            }))
+            .await;
+
+            for (peer_id, responded) in results {
+                if !responded {
+                    non_responders.push(peer_id);
+                }
+            }
+        }
+
+        if non_responders.is_empty() {
+            debug!("All stale K-closest peers responded — no evictions");
+            return;
+        }
+
+        // Evict non-responders under the write lock, then broadcast events
+        // after releasing it.
+        let all_events = {
+            let mut dht = self.dht.write().await;
+            let mut events = Vec::new();
+            for peer_id in &non_responders {
+                events.extend(dht.remove_node_by_id(peer_id).await);
+            }
+            events
+        };
+
+        self.broadcast_routing_events(&all_events);
+        info!("Evicted {} offline K-closest peer(s)", non_responders.len());
     }
 
     /// Translate core engine routing table events into network events and broadcast them.
