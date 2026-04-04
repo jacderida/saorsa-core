@@ -2536,8 +2536,13 @@ impl DhtNetworkManager {
     }
 }
 
-/// Default request timeout for DHT operations (seconds)
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default request timeout for outbound DHT operations (seconds).
+///
+/// Governs `wait_for_response` and the upper bound of `dial_candidate`'s
+/// dial timeout (`min(connection_timeout, request_timeout)`). Must stay
+/// above the relay stage (~10s) so it never truncates the NAT traversal
+/// cascade.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
