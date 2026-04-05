@@ -583,6 +583,19 @@ impl TransportHandle {
         self.dual_node.set_hole_punch_target_peer_id(target, peer_id).await;
     }
 
+    /// Set a preferred coordinator for hole-punching to a specific target.
+    /// The preferred coordinator is a peer that referred us to the target
+    /// during a DHT lookup, so it has a connection to the target.
+    pub async fn set_hole_punch_preferred_coordinator(
+        &self,
+        target: SocketAddr,
+        coordinator: SocketAddr,
+    ) {
+        self.dual_node
+            .set_hole_punch_preferred_coordinator(target, coordinator)
+            .await;
+    }
+
     /// Connect to a peer at the given address.
     ///
     /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports

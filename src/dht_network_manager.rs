@@ -590,7 +590,7 @@ impl DhtNetworkManager {
                                 if let Some(addr) =
                                     Self::first_dialable_address(&dht_node.addresses)
                                 {
-                                    this.dial_candidate(&dht_node.peer_id, &addr).await;
+                                    this.dial_candidate(&dht_node.peer_id, &addr, None).await;
                                 }
                             }
                         }
@@ -625,7 +625,7 @@ impl DhtNetworkManager {
                     }
                     // Dial if not already connected
                     if let Some(addr) = Self::first_dialable_address(&dht_node.addresses) {
-                        self.dial_candidate(&dht_node.peer_id, &addr).await;
+                        self.dial_candidate(&dht_node.peer_id, &addr, None).await;
                     }
                 }
                 Ok(())
@@ -727,7 +727,7 @@ impl DhtNetworkManager {
                         if seen.insert(node.peer_id)
                             && let Some(addr) = first
                         {
-                            self.dial_candidate(&node.peer_id, &addr).await;
+                            self.dial_candidate(&node.peer_id, &addr, None).await;
                         }
                     }
                 }
@@ -948,6 +948,12 @@ impl DhtNetworkManager {
         let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
+        // Track which peer referred us to each discovered peer. When node A
+        // responds to FindNode with node B, node A has B in its routing table
+        // and has a connection to B. We use A as the preferred coordinator
+        // when hole-punching to B.
+        let mut referrers: std::collections::HashMap<PeerId, std::net::SocketAddr> =
+            std::collections::HashMap::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
@@ -1021,10 +1027,11 @@ impl DhtNetworkManager {
                 .map(|node| {
                     let peer_id = node.peer_id;
                     let address = Self::first_dialable_address(&node.addresses);
+                    let referrer = referrers.get(&peer_id).copied();
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         if let Some(ref addr) = address {
-                            self.dial_candidate(&peer_id, addr).await;
+                            self.dial_candidate(&peer_id, addr, referrer).await;
                         }
                         (
                             peer_id,
@@ -1045,6 +1052,14 @@ impl DhtNetworkManager {
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
+
+                        // Track this peer as the referrer for all nodes it returned.
+                        let referrer_addr = batch
+                            .iter()
+                            .find(|n| n.peer_id == peer_id)
+                            .and_then(|n| Self::first_dialable_address(&n.addresses))
+                            .and_then(|a| a.dialable_socket_addr());
+
                         // Truncate response to K closest to the lookup key to
                         // limit amplification from a single response and bound
                         // per-iteration memory growth.
@@ -1055,6 +1070,19 @@ impl DhtNetworkManager {
                                 || self.is_local_peer_id(&node.peer_id)
                             {
                                 continue;
+                            }
+                            // Record the referrer (first referrer wins)
+                            if let Some(ref_addr) = referrer_addr
+                                && let std::collections::hash_map::Entry::Vacant(e) =
+                                    referrers.entry(node.peer_id)
+                            {
+                                info!(
+                                    "find_closest_nodes_network: peer {} referred by {} ({})",
+                                    hex::encode(&node.peer_id.to_bytes()[..8]),
+                                    hex::encode(&peer_id.to_bytes()[..8]),
+                                    ref_addr
+                                );
+                                e.insert(ref_addr);
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
@@ -1372,7 +1400,7 @@ impl DhtNetworkManager {
                 "[STEP 1b] {} -> {}: No open channel, dialling {}",
                 local_hex, peer_hex, address
             );
-            if let Some(channel_id) = self.dial_candidate(peer_id, address).await {
+            if let Some(channel_id) = self.dial_candidate(peer_id, address, None).await {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
                 match self
                     .transport
@@ -1521,7 +1549,12 @@ impl DhtNetworkManager {
     /// [`TransportHandle::wait_for_peer_identity`] before sending, because
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
+    async fn dial_candidate(
+        &self,
+        peer_id: &PeerId,
+        address: &MultiAddr,
+        referrer: Option<std::net::SocketAddr>,
+    ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
@@ -1548,6 +1581,21 @@ impl DhtNetworkManager {
             );
             self.transport
                 .set_hole_punch_target_peer_id(socket_addr, pid_bytes)
+                .await;
+        }
+
+        // If we know which peer referred us to this target (from a DHT
+        // FindNode response), set it as the preferred coordinator for
+        // hole-punching. That peer has a connection to the target.
+        if let Some(coordinator_addr) = referrer
+            && let Some(socket_addr) = address.dialable_socket_addr()
+        {
+            info!(
+                "dial_candidate: setting preferred coordinator for {} = {} (DHT referrer)",
+                socket_addr, coordinator_addr
+            );
+            self.transport
+                .set_hole_punch_preferred_coordinator(socket_addr, coordinator_addr)
                 .await;
         }
 

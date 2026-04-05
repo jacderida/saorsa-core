@@ -805,6 +805,22 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
+    /// Set a preferred coordinator for hole-punching to a specific target.
+    /// The preferred coordinator is a peer that referred us to the target
+    /// during a DHT lookup, so it has a connection to the target.
+    pub async fn set_hole_punch_preferred_coordinator(
+        &self,
+        target: SocketAddr,
+        coordinator: SocketAddr,
+    ) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            node.transport
+                .endpoint()
+                .set_hole_punch_preferred_coordinator(target, coordinator)
+                .await;
+        }
+    }
+
     /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
     /// relay routing. Called when identity exchange completes on a connection.
     pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
