@@ -1541,8 +1541,13 @@ impl DhtNetworkManager {
         // PUNCH_ME_NOW can route by peer identity. Keyed by address to avoid
         // races when multiple concurrent dials share the same transport.
         if let Some(socket_addr) = address.dialable_socket_addr() {
+            let pid_bytes = *peer_id.to_bytes();
+            info!(
+                "dial_candidate: setting hole_punch_target_peer_id for {} = {}",
+                socket_addr, hex::encode(&pid_bytes[..8])
+            );
             self.transport
-                .set_hole_punch_target_peer_id(socket_addr, *peer_id.to_bytes())
+                .set_hole_punch_target_peer_id(socket_addr, pid_bytes)
                 .await;
         }
 
