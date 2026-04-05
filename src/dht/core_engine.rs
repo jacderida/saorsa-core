@@ -646,6 +646,20 @@ impl DhtCoreEngine {
         &self.node_id
     }
 
+    /// Return K-closest peer IDs whose `last_seen` exceeds the live threshold.
+    ///
+    /// Used by the self-lookup task to revalidate stale close-group members
+    /// and evict offline peers promptly.
+    pub(crate) async fn stale_k_closest(&self) -> Vec<PeerId> {
+        let routing = self.routing_table.read().await;
+        routing
+            .find_closest_nodes(&self.node_id, self.k_value)
+            .into_iter()
+            .filter(|n| n.last_seen.elapsed() > self.live_threshold)
+            .map(|n| n.id)
+            .collect()
+    }
+
     /// Return bucket indices that haven't been refreshed within the given threshold.
     pub(crate) async fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
         self.routing_table
