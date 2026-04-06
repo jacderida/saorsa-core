@@ -716,6 +716,15 @@ impl DhtNetworkManager {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
         for peer_id in peers {
+            // Resolve the bootstrap peer's socket address so we can set it as
+            // the preferred coordinator for any peers it returns. The bootstrap
+            // peer has connections to those peers, making it a good relay.
+            let bootstrap_addr = self
+                .peer_addresses_for_dial(peer_id)
+                .await
+                .first()
+                .and_then(|a| a.dialable_socket_addr());
+
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
@@ -730,7 +739,8 @@ impl DhtNetworkManager {
                         if seen.insert(node.peer_id)
                             && let Some(addr) = first
                         {
-                            self.dial_candidate(&node.peer_id, &addr, None).await;
+                            self.dial_candidate(&node.peer_id, &addr, bootstrap_addr)
+                                .await;
                         }
                     }
                 }
