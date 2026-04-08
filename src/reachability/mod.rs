@@ -50,8 +50,13 @@
 
 #![allow(unused_imports)]
 
+pub(crate) mod acquisition;
 pub(crate) mod classifier;
 pub(crate) mod probe;
 
+pub(crate) use acquisition::{
+    AcquiredRelay, RelayAcquisition, RelayAcquisitionError, RelayCandidate,
+    RelaySessionEstablishError, RelaySessionEstablisher,
+};
 pub(crate) use classifier::{AddressClassification, Classifier};
 pub(crate) use probe::{DIAL_BACK_PROBE_TIMEOUT, DialBackOutcome, DialBackProber};
