@@ -235,7 +235,7 @@ pub struct NodeConfig {
     ///
     /// Controls whether peers with low trust scores are eligible for
     /// swap-out from the routing table when better candidates arrive. Use
-    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
+    /// `NodeConfigBuilder::trust_enforcement` for a simple on/off toggle.
     ///
     /// Default: enabled with a swap threshold of 0.35.
     #[serde(default)]
@@ -741,7 +741,7 @@ const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 /// - Handle network events and peer lifecycle
 ///
 /// Transport concerns (connections, messaging, events) are delegated to
-/// [`TransportHandle`](crate::transport_handle::TransportHandle).
+/// `TransportHandle`.
 pub struct P2PNode {
     /// Node configuration
     config: NodeConfig,
@@ -978,7 +978,7 @@ impl P2PNode {
     ///
     /// # Returns
     ///
-    /// A [`PeerResponse`] on success, or an error on timeout / connection failure.
+    /// A `PeerResponse` on success, or an error on timeout / connection failure.
     ///
     /// # Example
     ///
@@ -1613,13 +1613,20 @@ impl P2PNode {
 /// can pass it directly to `send_message()`. This eliminates a spoofing
 /// vector where a peer could claim an arbitrary identity via the payload.
 ///
-/// Maximum allowed clock skew for message timestamps (5 minutes).
-/// This is intentionally lenient for initial deployment to accommodate nodes with
-/// misconfigured clocks or high-latency network conditions. Can be tightened (e.g., to 60s)
-/// once the network stabilizes and node clock synchronization improves.
+/// Maximum allowed clock skew for message timestamps.
+///
+/// A decentralized network cannot assume participants have accurate clocks.
+/// Consumer devices commonly have clocks that drift by minutes (no NTP, wrong
+/// timezone offset applied to UTC, suspended laptops, VMs without guest
+/// additions, etc.). Both past and future windows must be symmetric and
+/// generous enough that normal clock drift does not partition the network.
+///
+/// 5 minutes in both directions provides replay protection while tolerating
+/// the clock skew observed in real-world deployments (31-42 seconds was
+/// measured between a macOS client and NTP-synced VPS nodes).
 const MAX_MESSAGE_AGE_SECS: u64 = 300;
-/// Maximum allowed future timestamp (30 seconds to account for clock drift)
-const MAX_FUTURE_SECS: u64 = 30;
+/// Maximum allowed future timestamp — symmetric with the past window.
+const MAX_FUTURE_SECS: u64 = 300;
 
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
