@@ -150,6 +150,14 @@ pub enum DhtNetworkOperation {
     /// Receiving nodes update their routing table for the sender. Sent once
     /// after relay setup to K closest peers, not on every message.
     PublishAddress { addresses: Vec<crate::MultiAddr> },
+    /// Ask the receiver to attempt a one-shot QUIC dial against each of the
+    /// supplied candidate addresses and report per-address success/failure.
+    /// Used by the ADR-014 reachability classifier to decide whether the
+    /// sender is publicly reachable.
+    DialBackRequest {
+        /// Candidate listen addresses the sender wants verified.
+        addresses: Vec<crate::MultiAddr>,
+    },
 }
 
 /// DHT network operation result
@@ -176,6 +184,12 @@ pub enum DhtNetworkResult {
     PeerRejected,
     /// Acknowledgement of a PublishAddress request
     PublishAddressAck,
+    /// Reply to a [`DhtNetworkOperation::DialBackRequest`]. One outcome per
+    /// requested address. The ADR-014 reachability classifier aggregates
+    /// outcomes from multiple probers and applies the 2/3 quorum rule.
+    DialBackReply {
+        outcomes: Vec<crate::reachability::DialBackOutcome>,
+    },
     /// Operation failed
     Error { operation: String, error: String },
 }
@@ -1947,6 +1961,52 @@ impl DhtNetworkManager {
                 }
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
+            DhtNetworkOperation::DialBackRequest { addresses } => {
+                info!(
+                    "Handling DIAL_BACK_REQUEST from {}: {} addresses (ADR-014 probe)",
+                    authenticated_sender,
+                    addresses.len()
+                );
+                let mut outcomes = Vec::with_capacity(addresses.len());
+                for address in addresses {
+                    // Attempt a one-shot QUIC dial with a short, hard-capped
+                    // budget. Any failure (timeout, refused, protocol error,
+                    // invalid address) maps to `reachable = false`. The probe
+                    // must never propagate errors upward — it is a boolean
+                    // question, and the classifier at the requester side
+                    // interprets "no outcome" differently from "failed
+                    // outcome", so we must always emit exactly one record per
+                    // requested address.
+                    let reachable = match tokio::time::timeout(
+                        crate::reachability::DIAL_BACK_PROBE_TIMEOUT,
+                        self.transport.connect_peer(address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_channel)) => true,
+                        Ok(Err(e)) => {
+                            debug!(
+                                address = %address,
+                                error = %e,
+                                "dial-back probe failed: connect_peer error"
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            debug!(
+                                address = %address,
+                                "dial-back probe failed: timed out"
+                            );
+                            false
+                        }
+                    };
+                    outcomes.push(crate::reachability::DialBackOutcome::new(
+                        address.clone(),
+                        reachable,
+                    ));
+                }
+                Ok(DhtNetworkResult::DialBackReply { outcomes })
+            }
         }
     }
 
@@ -2078,6 +2138,9 @@ impl DhtNetworkManager {
             // Use Ping as a lightweight ack — avoids echoing the full
             // PublishAddress payload (which contains the address list).
             DhtNetworkResult::PublishAddressAck => DhtNetworkOperation::Ping,
+            // Echo the original request so the correlation envelope stays
+            // intact. The caller reads `result` for the probe outcomes.
+            DhtNetworkResult::DialBackReply { .. } => request.payload.clone(),
             DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
@@ -2750,6 +2813,54 @@ impl DhtNetworkManager {
                         e
                     );
                 }
+            }
+        }
+    }
+
+    /// Send a [`DhtNetworkOperation::DialBackRequest`] to `prober` asking it
+    /// to attempt a one-shot QUIC dial against each of `addresses` and report
+    /// per-address success.
+    ///
+    /// Returns the prober's replies on success. Errors from the underlying
+    /// `send_dht_request` (timeout, transport failure, protocol mismatch) are
+    /// propagated as `Ok(Vec::new())` — an empty reply from a prober is
+    /// semantically equivalent to "contributes no successes to the quorum"
+    /// from the classifier's perspective, so callers should not treat a
+    /// failed request as fatal: a single unresponsive prober is absorbed
+    /// naturally by the 2/3 quorum rule across the other probers.
+    ///
+    /// Use [`crate::reachability::Classifier::classify`] to aggregate the
+    /// results from multiple probers and produce per-address classifications.
+    pub async fn send_dial_back_request(
+        &self,
+        prober: &PeerId,
+        addresses: Vec<crate::MultiAddr>,
+    ) -> Vec<crate::reachability::DialBackOutcome> {
+        let op = DhtNetworkOperation::DialBackRequest { addresses };
+        match self.send_dht_request(prober, op, None).await {
+            Ok(DhtNetworkResult::DialBackReply { outcomes }) => {
+                debug!(
+                    prober = %prober.to_hex(),
+                    outcomes = outcomes.len(),
+                    "received dial-back reply"
+                );
+                outcomes
+            }
+            Ok(other) => {
+                warn!(
+                    prober = %prober.to_hex(),
+                    response = ?other,
+                    "unexpected response type for dial-back request; treating as empty reply"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                debug!(
+                    prober = %prober.to_hex(),
+                    error = %e,
+                    "dial-back request failed; treating as empty reply"
+                );
+                Vec::new()
             }
         }
     }

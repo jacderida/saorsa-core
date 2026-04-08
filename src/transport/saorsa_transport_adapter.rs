@@ -918,6 +918,45 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         false
     }
 
+    /// Establish a proactive MASQUE relay session with the relay reachable at
+    /// `relay_addr`, rebinding the matching stack's Quinn endpoint onto the
+    /// resulting tunnel.
+    ///
+    /// Used by the ADR-014 relay acquisition coordinator (see
+    /// `src/reachability/acquisition.rs`). Dispatches to the stack that
+    /// matches the relay's address family: IPv4 relays go through `self.v4`
+    /// (falling back to `self.v6` if v4 is absent); IPv6 relays the
+    /// reverse. If neither stack is available, returns a
+    /// [`saorsa_transport::p2p_endpoint::EndpointError::Config`] describing
+    /// the mismatch.
+    ///
+    /// On success, returns the relay-allocated public socket address the
+    /// caller should publish in its DHT self-record. A
+    /// `P2pEvent::RelayEstablished` is emitted on the event broadcaster so
+    /// the saorsa-core DHT bridge can propagate the address to peers without
+    /// needing this return value.
+    pub async fn setup_proactive_relay(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> std::result::Result<SocketAddr, saorsa_transport::p2p_endpoint::EndpointError> {
+        let node = if relay_addr.is_ipv4() {
+            self.v4.as_ref().or(self.v6.as_ref())
+        } else {
+            self.v6.as_ref().or(self.v4.as_ref())
+        }
+        .ok_or_else(|| {
+            saorsa_transport::p2p_endpoint::EndpointError::Config(format!(
+                "no transport stack available for relay address family {}",
+                relay_addr
+            ))
+        })?;
+
+        node.transport
+            .endpoint()
+            .setup_proactive_relay(relay_addr)
+            .await
+    }
+
     /// Shut down the underlying QUIC endpoints on both stacks.
     ///
     /// This cancels each endpoint's internal `CancellationToken`, which

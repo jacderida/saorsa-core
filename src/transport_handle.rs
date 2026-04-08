@@ -28,6 +28,7 @@ use crate::network::{
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
+use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::observed_address_cache::ObservedAddressCache;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
@@ -820,6 +821,61 @@ impl TransportHandle {
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
         Ok(peer_id)
+    }
+
+    /// Establish a proactive MASQUE relay session with the peer reachable at
+    /// `relay_addr`, returning the relay-allocated public socket address on
+    /// success.
+    ///
+    /// This is the caller-driven entry point for ADR-014 relay acquisition.
+    /// It delegates through [`DualStackNetworkNode::setup_proactive_relay`]
+    /// to saorsa-transport's `NatTraversalEndpoint::setup_proactive_relay`,
+    /// which establishes the MASQUE `CONNECT-UDP` session and rebinds the
+    /// local Quinn endpoint onto the tunnel.
+    ///
+    /// Error conversion: saorsa-transport's `RelayAtCapacity` variant is
+    /// mapped to [`RelaySessionEstablishError::AtCapacity`] so the acquisition
+    /// coordinator can walk to the next candidate; all other failure modes
+    /// (network errors, config errors, protocol errors) become
+    /// [`RelaySessionEstablishError::Unreachable`].
+    pub async fn setup_proactive_relay_session(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+        use saorsa_transport::nat_traversal_api::NatTraversalError;
+        use saorsa_transport::p2p_endpoint::EndpointError;
+
+        debug!(
+            relay = %relay_addr,
+            "requesting proactive MASQUE relay session from transport layer"
+        );
+
+        match self.dual_node.setup_proactive_relay(relay_addr).await {
+            Ok(allocated) => {
+                info!(
+                    relay = %relay_addr,
+                    allocated = %allocated,
+                    "proactive relay established"
+                );
+                Ok(allocated)
+            }
+            Err(EndpointError::NatTraversal(NatTraversalError::RelayAtCapacity { reason })) => {
+                debug!(
+                    relay = %relay_addr,
+                    reason = %reason,
+                    "relay rejected request: at client capacity"
+                );
+                Err(RelaySessionEstablishError::AtCapacity(reason))
+            }
+            Err(other) => {
+                debug!(
+                    relay = %relay_addr,
+                    error = %other,
+                    "relay session establishment failed"
+                );
+                Err(RelaySessionEstablishError::Unreachable(other.to_string()))
+            }
+        }
     }
 
     /// Disconnect from a peer, closing the underlying QUIC connection only
@@ -2084,5 +2140,19 @@ impl TransportHandle {
             .entry(channel_id)
             .or_default()
             .insert(peer_id);
+    }
+}
+
+/// Wire `TransportHandle` into the reachability subsystem's
+/// [`RelaySessionEstablisher`] abstraction so the ADR-014 relay acquisition
+/// coordinator can drive it directly. The trait impl is a thin delegate to
+/// [`TransportHandle::setup_proactive_relay_session`].
+#[async_trait::async_trait]
+impl RelaySessionEstablisher for TransportHandle {
+    async fn establish(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+        self.setup_proactive_relay_session(relay_addr).await
     }
 }

@@ -55,8 +55,13 @@ pub const DIAL_BACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// One of these is produced per address per prober. The requester collects
 /// outcomes from multiple probers and feeds them to the
 /// [`Classifier`](super::classifier::Classifier) for quorum evaluation.
+///
+/// Marked `pub` (rather than `pub(crate)`) because it appears as a field of
+/// [`crate::dht_network_manager::DhtNetworkResult::DialBackReply`], which is
+/// itself `pub` within a `pub(crate)` module. The effective external
+/// visibility is still crate-private.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DialBackOutcome {
+pub struct DialBackOutcome {
     /// The address the prober was asked to dial.
     pub address: MultiAddr,
     /// `true` if the prober successfully established a QUIC handshake to
