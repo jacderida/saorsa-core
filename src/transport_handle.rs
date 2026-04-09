@@ -500,13 +500,11 @@ impl TransportHandle {
             if result.len() >= limit {
                 break;
             }
-            // Channel IDs are stringified MultiAddrs — parse back to get socket addr
+            // Channel IDs are stringified SocketAddrs (e.g., "45.32.243.72:10012")
             for channel_id in channels {
-                if let Ok(addr) = channel_id.parse::<MultiAddr>() {
-                    if let Some(sa) = addr.dialable_socket_addr() {
-                        result.push((sa, *peer_id));
-                        break; // One address per peer is enough
-                    }
+                if let Ok(sa) = channel_id.parse::<SocketAddr>() {
+                    result.push((sa, *peer_id));
+                    break; // One address per peer is enough
                 }
             }
         }

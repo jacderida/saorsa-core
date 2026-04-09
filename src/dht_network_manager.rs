@@ -1320,12 +1320,12 @@ impl DhtNetworkManager {
             }
         }
 
-        // 3. Coordinator hints — connected peers that can relay PUNCH_ME_NOW to us.
-        //    Only included when we have few direct addresses (≤2), suggesting
-        //    we're behind NAT. Public nodes with many observed addresses don't
-        //    need hints. Encoded as MultiAddr with the coordinator's PeerId suffix
-        //    so consumers can distinguish hints from direct addresses.
-        if addresses.len() <= 2 {
+        // 3. Coordinator hints — connected peers that can relay PUNCH_ME_NOW
+        //    to us. Every node includes hints so that any peer discovering us
+        //    via DHT can find a working coordinator for hole-punching.
+        //    Encoded as MultiAddr with the coordinator's PeerId suffix so
+        //    consumers can distinguish hints from direct addresses.
+        {
             let connected = self.transport.connected_peer_addresses(5).await;
             if !connected.is_empty() {
                 let hint_addrs: Vec<String> = connected
