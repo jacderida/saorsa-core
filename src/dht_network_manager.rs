@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::{AtomicInstant, NodeInfo},
+    dht::core_engine::{AddressType, AtomicInstant, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -109,6 +109,17 @@ const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 pub struct DHTNode {
     pub peer_id: PeerId,
     pub addresses: Vec<MultiAddr>,
+    /// Type tag for each address, parallel to `addresses` by index.
+    ///
+    /// Defaults to empty on deserialization (legacy records or wire data from
+    /// nodes that predate ADR-014). When empty, callers treat all addresses
+    /// as [`AddressType::Direct`] — the conservative assumption.
+    ///
+    /// Populated when constructing from DHT routing-table entries so
+    /// consumers (e.g., saorsa-node) can inspect the address types of
+    /// peers returned by `find_closest_nodes_local()`.
+    #[serde(default)]
+    pub address_types: Vec<AddressType>,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
 }
@@ -933,6 +944,7 @@ impl DhtNetworkManager {
                 .filter(|node| !self.is_local_peer_id(&node.id))
                 .map(|node| DHTNode {
                     peer_id: node.id,
+                    address_types: node.address_types,
                     addresses: node.addresses,
                     distance: None,
                     reliability: SELF_RELIABILITY_SCORE,
@@ -1333,6 +1345,7 @@ impl DhtNetworkManager {
         DHTNode {
             peer_id: self.config.peer_id,
             addresses,
+            address_types: Vec::new(), // Self-addresses are untagged; the classifier decides.
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
@@ -1344,11 +1357,61 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Return all dialable addresses from a list of [`MultiAddr`] values.
+    /// Return all dialable addresses from a [`DHTNode`], sorted by
+    /// [`AddressType`] priority.
+    ///
+    /// ADR-014: relay-allocated addresses (known-reachable via MASQUE tunnel)
+    /// are tried first, then verified Direct addresses, then untagged/NATted
+    /// addresses. This ensures that the dialer hits the fastest path first
+    /// and avoids wasting time on stale Direct addresses for peers that have
+    /// since transitioned to private.
     ///
     /// Only QUIC addresses are considered dialable. Unspecified (`0.0.0.0`)
     /// addresses are rejected. Loopback addresses are accepted for local/test
     /// use.
+    pub(crate) fn dialable_addresses_from_node(node: &DHTNode) -> Vec<MultiAddr> {
+        let mut candidates: Vec<(MultiAddr, AddressType)> = node
+            .addresses
+            .iter()
+            .enumerate()
+            .filter(|(_, addr)| {
+                let Some(sa) = addr.dialable_socket_addr() else {
+                    trace!("Skipping non-dialable address: {addr}");
+                    return false;
+                };
+                if sa.ip().is_unspecified() {
+                    warn!("Rejecting unspecified address: {addr}");
+                    return false;
+                }
+                if sa.ip().is_loopback() {
+                    trace!("Accepting loopback address (local/test): {addr}");
+                }
+                true
+            })
+            .map(|(i, addr)| {
+                let addr_type = node
+                    .address_types
+                    .get(i)
+                    .copied()
+                    .unwrap_or(AddressType::Direct);
+                (addr.clone(), addr_type)
+            })
+            .collect();
+
+        // Relay first (known-good relay endpoint), Direct second, NATted last.
+        candidates.sort_by_key(|(_, t)| match t {
+            AddressType::Relay => 0,
+            AddressType::Direct => 1,
+            AddressType::NATted => 2,
+        });
+
+        candidates.into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    /// Return all dialable addresses from a bare address list (no type info).
+    ///
+    /// Used when the caller only has `&[MultiAddr]` without accompanying
+    /// `AddressType` tags. Addresses are returned in their original order.
     fn dialable_addresses(addresses: &[MultiAddr]) -> Vec<MultiAddr> {
         addresses
             .iter()
@@ -1794,21 +1857,59 @@ impl DhtNetworkManager {
     /// Checks the DHT routing table first (source of truth for DHT peer
     /// addresses), then falls back to the transport layer for connected peers.
     /// Returns an empty vec when the peer is unknown or has no addresses.
+    ///
+    /// ADR-014: addresses are sorted by [`AddressType`] priority — Relay
+    /// first (known-good relay endpoint), then Direct, then NATted — so
+    /// the dialer tries the fastest path first.
     pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
-        // 1. Routing table — filter to dialable QUIC addresses (the table
-        //    can hold unspecified or non-QUIC entries from peer announcements).
-        let addrs = self.dht.read().await.get_node_addresses(peer_id).await;
-        let filtered = Self::dialable_addresses(&addrs);
-        if !filtered.is_empty() {
-            return filtered;
+        // 1. Routing table — filter to dialable QUIC addresses and sort by
+        //    AddressType priority (Relay first).
+        let typed = self
+            .dht
+            .read()
+            .await
+            .get_node_addresses_typed(peer_id)
+            .await;
+        if !typed.is_empty() {
+            return Self::dialable_addresses_typed(&typed);
         }
 
-        // 2. Transport layer — for connected peers not yet in the routing table
+        // 2. Transport layer — for connected peers not yet in the routing table.
+        //    No type info available; return in original order.
         if let Some(info) = self.transport.peer_info(peer_id).await {
             return Self::dialable_addresses(&info.addresses);
         }
 
         Vec::new()
+    }
+
+    /// Filter and sort addresses by type priority. Relay first, Direct
+    /// second, NATted last.
+    fn dialable_addresses_typed(typed: &[(MultiAddr, AddressType)]) -> Vec<MultiAddr> {
+        let mut candidates: Vec<(MultiAddr, AddressType)> = typed
+            .iter()
+            .filter(|pair| {
+                let addr = &pair.0;
+                let Some(sa) = addr.dialable_socket_addr() else {
+                    trace!("Skipping non-dialable address: {addr}");
+                    return false;
+                };
+                if sa.ip().is_unspecified() {
+                    warn!("Rejecting unspecified address: {addr}");
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        candidates.sort_by_key(|pair| match pair.1 {
+            AddressType::Relay => 0,
+            AddressType::Direct => 1,
+            AddressType::NATted => 2,
+        });
+
+        candidates.into_iter().map(|pair| pair.0).collect()
     }
 
     /// Wait for DHT network response via oneshot channel with timeout
@@ -2796,6 +2897,7 @@ impl DhtNetworkManager {
                     .unwrap_or(DEFAULT_NEUTRAL_TRUST);
                 DHTNode {
                     peer_id: node.id,
+                    address_types: node.address_types,
                     addresses: node.addresses,
                     distance: None,
                     reliability,

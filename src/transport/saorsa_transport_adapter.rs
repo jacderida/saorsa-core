@@ -488,18 +488,19 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // ADR-014: with proactive relay acquisition, the common path is
-        // either direct (peer has verified Direct address, ~3s) or via
-        // relay (peer published a relay-allocated address, 1-hop ~2s).
-        // The cascade (direct → hole-punch → relay) is now a deep fallback
-        // rather than the primary path, so the budget no longer needs to
-        // accommodate the full ~29 s worst case.
+        // ADR-014: with proactive relay acquisition, every published address
+        // in the DHT is either a verified-Direct socket (dial-back probe
+        // confirmed it publicly reachable) or a relay-allocated port
+        // (MASQUE tunnel terminates at a public relay server). In both cases
+        // the dialer is connecting to a publicly-reachable socket — no hole
+        // punching, no on-the-fly relay negotiation.
         //
-        // 10 s covers: direct Happy Eyeballs (~3 s) + one hole-punch round
-        // (~8 s). Losing the relay stage of the cascade is acceptable because
-        // both ends have already classified and published relay-fronted
-        // addresses if they are private.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+        // 5 s covers a QUIC handshake (1 RTT) + ML-DSA verification + margin
+        // for network jitter. The cascade (direct → hole-punch → relay) is
+        // still present in saorsa-transport as a deep fallback but the 5 s
+        // budget means only the direct stage runs; that's all we need when
+        // addresses are pre-classified.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,

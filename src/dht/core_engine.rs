@@ -937,11 +937,45 @@ impl DhtCoreEngine {
     ///
     /// Returns the stored addresses if the peer is in the routing table,
     /// an empty vec otherwise. O(K) scan of the target k-bucket.
+    ///
+    /// Production code paths now use [`Self::get_node_addresses_typed`]
+    /// for address-type-aware priority sorting (ADR-014). This untyped
+    /// variant is retained as a public API for external consumers and is
+    /// exercised by in-crate tests.
+    #[allow(dead_code)]
     pub async fn get_node_addresses(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
         let routing = self.routing_table.read().await;
         routing
             .find_node_by_id(peer_id)
             .map(|n| n.addresses.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get a peer's addresses paired with their [`AddressType`] tags.
+    ///
+    /// Used by [`crate::dht_network_manager::DhtNetworkManager::peer_addresses_for_dial`]
+    /// to sort candidates by type priority (Relay first) per ADR-014.
+    pub async fn get_node_addresses_typed(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let routing = self.routing_table.read().await;
+        routing
+            .find_node_by_id(peer_id)
+            .map(|n| {
+                n.addresses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, addr)| {
+                        let addr_type = n
+                            .address_types
+                            .get(i)
+                            .copied()
+                            .unwrap_or(AddressType::Direct);
+                        (addr.clone(), addr_type)
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

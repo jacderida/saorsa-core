@@ -121,15 +121,16 @@ pub(crate) async fn run_classification(
     // Step 5: Build relay candidates from XOR-closest peers.
     // Per the user's design: we try everyone and private peers reject the
     // reservation request themselves (via relay_serving_enabled gate).
+    //
+    // Use dialable_addresses_from_node to get type-prioritised addresses
+    // (Relay first, then Direct) so the first dialable address per
+    // candidate is the best available.
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
     let candidates: Vec<RelayCandidate> = closest
-        .into_iter()
+        .iter()
         .filter_map(|node| {
-            let addr = node
-                .addresses
-                .iter()
-                .find(|a| a.dialable_socket_addr().is_some())?
-                .clone();
+            let sorted = DhtNetworkManager::dialable_addresses_from_node(node);
+            let addr = sorted.into_iter().next()?;
             Some(RelayCandidate::new(node.peer_id, addr))
         })
         .collect();
