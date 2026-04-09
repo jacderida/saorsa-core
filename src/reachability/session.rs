@@ -77,9 +77,31 @@ pub(crate) async fn run_classification(
 ) -> ReachabilityOutcome {
     if !assume_private {
         // Step 1: Gather candidate listen addresses.
-        let listen_addrs = transport.listen_addrs().await;
+        //
+        // Use the observed external addresses (from QUIC OBSERVED_ADDRESS
+        // frames) rather than raw listen_addrs — the latter may contain
+        // wildcard bind addresses (0.0.0.0) that probers cannot dial.
+        // This mirrors the fix in local_dht_node() (PR #70).
+        //
+        // Fall back to listen_addrs filtered to non-wildcard if no
+        // observations are available yet (cold start before any peer
+        // connected).
+        let observed = transport.observed_external_addresses();
+        let listen_addrs: Vec<MultiAddr> = if observed.is_empty() {
+            transport
+                .listen_addrs()
+                .await
+                .into_iter()
+                .filter(|a| {
+                    a.dialable_socket_addr()
+                        .is_some_and(|sa| !sa.ip().is_unspecified())
+                })
+                .collect()
+        } else {
+            observed.into_iter().map(MultiAddr::quic).collect()
+        };
         if listen_addrs.is_empty() {
-            warn!("ADR-014: no listen addresses available — cannot classify reachability");
+            warn!("ADR-014: no routable listen addresses available — cannot classify reachability");
             return ReachabilityOutcome::NoProbers;
         }
         info!(
