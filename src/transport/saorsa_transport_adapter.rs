@@ -488,10 +488,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // The full NAT traversal flow is: direct (2s) + 2 × hole-punch
-        // rounds (3s + 1s retry each) + relay (10s) = ~20s. 25s provides
-        // margin for handshake jitter.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
+        // The full NAT traversal flow is: direct (3s) + 2 × hole-punch
+        // rounds (3s each) + relay (5s) = ~17s. 15s hard cap ensures
+        // we fail fast if the cascade stalls — any legitimate connection
+        // completes well within this window.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
@@ -499,6 +500,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         )
         .await
         .map_err(|_| {
+            tracing::warn!(
+                "DIAL_TIMEOUT expired: connect_to_peer({}) exceeded {}s hard cap \
+                 — the inner connection cascade (direct+holepunch+relay) did not \
+                 complete or fail within the expected window",
+                peer_addr,
+                DIAL_TIMEOUT.as_secs(),
+            );
             anyhow::anyhow!(
                 "Connection timeout after {:?} to {}",
                 DIAL_TIMEOUT,

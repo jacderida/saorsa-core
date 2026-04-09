@@ -124,10 +124,11 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Default connection timeout in seconds.
 ///
-/// Derived from the sum of connection strategy stages: direct (2s) +
-/// 2 × hole-punch rounds (3s + 1s retry each) + relay (10s) = ~20s.
-/// 25s provides margin for handshake jitter.
-const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
+/// Derived from the sum of connection strategy stages: direct (3s) +
+/// 2 × hole-punch rounds (3s each) + relay (5s) = ~17s. 15s is
+/// tighter than the cascade sum to ensure any stalled stage is caught
+/// quickly rather than silently consuming the full budget.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 15;
 
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
