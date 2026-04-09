@@ -1112,6 +1112,27 @@ impl DhtNetworkManager {
                                 );
                                 e.insert(ref_addr);
                             }
+                            // Extract coordinator hints from DHT record and set them
+                            // as preferred coordinators for hole-punching.
+                            let hints = Self::extract_coordinator_hints(&node);
+                            if !hints.is_empty() {
+                                let direct = Self::direct_addresses_only(&node);
+                                if let Some(target_addr) =
+                                    Self::first_dialable_address(&direct)
+                                        .and_then(|a| a.dialable_socket_addr())
+                                {
+                                    info!(
+                                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
+                                        hints.len(),
+                                        hex::encode(&node.peer_id.to_bytes()[..8])
+                                    );
+                                    self.transport
+                                        .set_hole_punch_preferred_coordinators(
+                                            target_addr, hints,
+                                        )
+                                        .await;
+                                }
+                            }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
                             if candidates.contains_key(&cand_key) {
@@ -1299,12 +1320,66 @@ impl DhtNetworkManager {
             }
         }
 
+        // 3. Coordinator hints — connected peers that can relay PUNCH_ME_NOW to us.
+        //    Only included when we have few direct addresses (≤2), suggesting
+        //    we're behind NAT. Public nodes with many observed addresses don't
+        //    need hints. Encoded as MultiAddr with the coordinator's PeerId suffix
+        //    so consumers can distinguish hints from direct addresses.
+        if addresses.len() <= 2 {
+            let connected = self.transport.connected_peer_addresses(5).await;
+            if !connected.is_empty() {
+                let hint_addrs: Vec<String> = connected
+                    .iter()
+                    .map(|(sa, _)| sa.to_string())
+                    .collect();
+                info!(
+                    "local_dht_node: including {} coordinator hint(s): {:?}",
+                    connected.len(),
+                    hint_addrs
+                );
+                for (socket_addr, peer_id) in connected {
+                    let hint = MultiAddr::quic(socket_addr).with_peer_id(peer_id);
+                    if !addresses.contains(&hint) {
+                        addresses.push(hint);
+                    }
+                }
+            }
+        }
+
         DHTNode {
             peer_id: self.config.peer_id,
             addresses,
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
+    }
+
+    /// Extract coordinator hints from a DHTNode's addresses.
+    /// Hints are addresses whose peer_id suffix differs from the node's peer_id —
+    /// they are addresses of OTHER peers that can coordinate for this node.
+    fn extract_coordinator_hints(node: &DHTNode) -> Vec<SocketAddr> {
+        node.addresses
+            .iter()
+            .filter_map(|addr| {
+                let hint_peer_id = addr.peer_id()?;
+                if *hint_peer_id == node.peer_id {
+                    return None; // Same peer_id = direct address, not a hint
+                }
+                addr.dialable_socket_addr()
+            })
+            .collect()
+    }
+
+    /// Filter a node's addresses to only direct addresses (excluding coordinator hints).
+    fn direct_addresses_only(node: &DHTNode) -> Vec<MultiAddr> {
+        node.addresses
+            .iter()
+            .filter(|addr| match addr.peer_id() {
+                None => true, // No peer_id suffix = direct address
+                Some(pid) => *pid == node.peer_id, // Same peer_id = direct address
+            })
+            .cloned()
+            .collect()
     }
 
     /// Add the local app-level peer ID to `queried` so that iterative lookups
@@ -1360,7 +1435,17 @@ impl DhtNetworkManager {
         addresses: &[MultiAddr],
         referrer: Option<SocketAddr>,
     ) -> Option<String> {
-        let dialable = Self::dialable_addresses(addresses);
+        // Filter out coordinator hints (addresses of OTHER peers, not the target).
+        // Dialing a hint would connect to the coordinator, not the target.
+        let direct_only: Vec<MultiAddr> = addresses
+            .iter()
+            .filter(|addr| match addr.peer_id() {
+                None => true, // No peer_id suffix = direct address
+                Some(pid) => *pid == *peer_id, // Same peer_id = direct address
+            })
+            .cloned()
+            .collect();
+        let dialable = Self::dialable_addresses(&direct_only);
         if dialable.is_empty() {
             debug!(
                 "dial_addresses: no dialable addresses for {}",
