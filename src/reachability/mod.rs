@@ -52,6 +52,7 @@
 
 pub(crate) mod acquisition;
 pub(crate) mod classifier;
+pub(crate) mod monitor;
 pub(crate) mod probe;
 pub(crate) mod session;
 

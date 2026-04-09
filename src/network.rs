@@ -21,8 +21,9 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
-use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
+use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
+use crate::reachability::session::{ReachabilityOutcome, run_classification};
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
@@ -775,6 +776,16 @@ pub struct P2PNode {
     /// to the same stale peer don't race to dial.  Entries accumulate over
     /// the node's lifetime; each is a lightweight `Arc<TokioMutex<()>>`.
     reconnect_locks: ParkingMutex<HashMap<PeerId, Arc<TokioMutex<()>>>>,
+
+    /// The peer ID of the node currently relaying traffic for us (ADR-014).
+    ///
+    /// Set after the reachability classifier acquires a relay in `start()`.
+    /// The relayer monitor watches this against the K-closest set: if the
+    /// relayer drops out, it triggers rebinding.
+    ///
+    /// `None` when the node is publicly reachable (no relay needed) or
+    /// before classification has run.
+    relayer_peer_id: Arc<RwLock<Option<PeerId>>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -876,6 +887,7 @@ impl P2PNode {
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
             reconnect_locks: ParkingMutex::new(HashMap::new()),
+            relayer_peer_id: Arc::new(RwLock::new(None)),
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -1141,8 +1153,6 @@ impl P2PNode {
         // addresses or a relay-allocated address. The cost is ~2-4 s (probe
         // timeout × 1 round-trip + relay handshake).
         {
-            use crate::reachability::session::{ReachabilityOutcome, run_classification};
-
             let dht = self.adaptive_dht.dht_manager();
             let outcome = run_classification(dht.as_ref(), &self.transport).await;
 
@@ -1159,6 +1169,8 @@ impl P2PNode {
                         "ADR-014: node is PRIVATE — relay via {:?} at {}",
                         relay.relayer, relay.allocated_public_addr
                     );
+                    // Store relayer for the K-closest monitor.
+                    *self.relayer_peer_id.write().await = Some(relay.relayer);
                     // Private → disable relay serving so we reject reservation
                     // requests we can't honour.
                     self.transport.set_relay_serving_enabled(false);
@@ -1182,12 +1194,22 @@ impl P2PNode {
             // addressable. Consumers waiting on this event can start issuing
             // DHT queries knowing the self-record is accurate.
             let rt_size = dht.get_routing_table_size().await;
-            dht.emit_event(
-                crate::dht_network_manager::DhtNetworkEvent::BootstrapComplete {
-                    num_peers: rt_size,
-                },
-            );
+            dht.emit_event(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
         }
+
+        // ADR-014 item 6: spawn the relayer monitor.
+        //
+        // Watches for the relayer dropping out of the K-closest set or the
+        // MASQUE session dying. On either trigger, re-runs the classification
+        // session to acquire a new relay. Only meaningful when we have a
+        // relayer (private nodes); for public nodes the monitor is a no-op
+        // because relayer_peer_id is None.
+        crate::reachability::monitor::spawn_relayer_monitor(
+            self.adaptive_dht.dht_manager().clone(),
+            Arc::clone(&self.transport),
+            Arc::clone(&self.relayer_peer_id),
+            self.shutdown.clone(),
+        );
 
         // Spawn background task to forward peer address updates to the DHT.
         //

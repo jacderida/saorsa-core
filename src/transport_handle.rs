@@ -823,6 +823,15 @@ impl TransportHandle {
         Ok(peer_id)
     }
 
+    /// Check if the proactive relay session is still alive.
+    ///
+    /// Returns `true` if no relay was established or the relay is healthy.
+    /// Returns `false` if a relay was established but the QUIC connection
+    /// has closed. Used by the relayer monitor (ADR-014 item 6).
+    pub fn is_relay_healthy(&self) -> bool {
+        self.dual_node.is_relay_healthy()
+    }
+
     /// Enable or disable relay serving on this node's MASQUE relay servers.
     ///
     /// Delegates to [`DualStackNetworkNode::set_relay_serving_enabled`].

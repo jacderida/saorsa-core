@@ -488,10 +488,18 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // The full NAT traversal flow is: direct (2s) + 2 × hole-punch
-        // rounds (3s + 1s retry each) + relay (10s) = ~20s. 25s provides
-        // margin for handshake jitter.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
+        // ADR-014: with proactive relay acquisition, the common path is
+        // either direct (peer has verified Direct address, ~3s) or via
+        // relay (peer published a relay-allocated address, 1-hop ~2s).
+        // The cascade (direct → hole-punch → relay) is now a deep fallback
+        // rather than the primary path, so the budget no longer needs to
+        // accommodate the full ~29 s worst case.
+        //
+        // 10 s covers: direct Happy Eyeballs (~3 s) + one hole-punch round
+        // (~8 s). Losing the relay stage of the cascade is acceptable because
+        // both ends have already classified and published relay-fronted
+        // addresses if they are private.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
@@ -916,6 +924,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             }
         }
         false
+    }
+
+    /// Check if the proactive relay session is still alive on any stack.
+    ///
+    /// Returns `true` if no relay was established or the relay is healthy.
+    /// Returns `false` if a relay was established but the QUIC connection
+    /// has closed — the relayer monitor should trigger rebinding.
+    pub fn is_relay_healthy(&self) -> bool {
+        // If ANY stack reports an unhealthy relay, the relay is dead.
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            if !node.transport.endpoint().is_relay_healthy() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Enable or disable relay serving on both stacks' MASQUE relay servers.
