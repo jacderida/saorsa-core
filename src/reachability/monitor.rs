@@ -35,19 +35,20 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::PeerId;
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
 use crate::reachability::session::{ReachabilityOutcome, run_classification};
 use crate::transport_handle::TransportHandle;
 
-/// How often to poll `is_relay_healthy()` when we have an active relay.
+/// How often to send a heartbeat Ping to the relay peer.
 ///
 /// 5 seconds is responsive enough for the ADR-014 "must be reachable at all
 /// times" constraint (the accepted failover window is 10–30 s) while being
-/// light on CPU — the health check is a single DashMap lookup + one
-/// `close_reason()` poll on the QUIC connection, both lock-free.
+/// light on bandwidth — a DHT Ping/Pong is ~100 bytes round-trip. The Ping
+/// doubles as a keepalive: it flows through the MASQUE tunnel, refreshing
+/// NAT bindings and confirming the relay peer is responsive.
 const RELAY_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawn the relayer monitor as a background task.
@@ -88,7 +89,7 @@ pub(crate) fn spawn_relayer_monitor(
                     }
                 }
                 _ = health_interval.tick() => {
-                    check_relay_health(&relayer_peer_id, &transport).await
+                    heartbeat_relayer(&relayer_peer_id, &dht).await
                 }
             };
 
@@ -118,20 +119,49 @@ async fn check_relayer_in_k_closest(
     true
 }
 
-/// Returns `true` if we have a relayer but its MASQUE session is dead.
-async fn check_relay_health(
+/// Heartbeat the relayer with a DHT Ping. Returns `true` if the relay
+/// appears dead and we should rebind.
+///
+/// The Ping flows through the MASQUE tunnel, so a successful round-trip
+/// confirms:
+/// 1. The QUIC connection to the relay is alive (NAT binding refreshed).
+/// 2. The relay peer itself is responsive.
+///
+/// This replaces QUIC-level keepalive configuration — we don't need to
+/// modify transport configs because the Ping IS the keepalive. If the app
+/// disables QUIC keepalives for normal connections, the relay still stays
+/// alive because this function sends real data on every health-check tick.
+async fn heartbeat_relayer(
     relayer_peer_id: &RwLock<Option<PeerId>>,
-    transport: &TransportHandle,
+    dht: &DhtNetworkManager,
 ) -> bool {
     let guard = relayer_peer_id.read().await;
-    if guard.is_none() {
-        return false; // No relayer — nothing to monitor.
+    let Some(relayer) = guard.as_ref() else {
+        return false; // No relayer — nothing to heartbeat.
+    };
+    let relayer = *relayer;
+    // Drop the lock before the async Ping to avoid holding it across .await.
+    drop(guard);
+
+    match dht
+        .send_request(
+            &relayer,
+            crate::dht_network_manager::DhtNetworkOperation::Ping,
+        )
+        .await
+    {
+        Ok(_) => {
+            trace!("ADR-014 monitor: relay heartbeat OK");
+            false
+        }
+        Err(e) => {
+            info!(
+                "ADR-014 monitor: relay heartbeat failed ({}) — triggering rebind",
+                e
+            );
+            true
+        }
     }
-    if transport.is_relay_healthy() {
-        return false; // Relay session is alive — all good.
-    }
-    info!("ADR-014 monitor: relay session unhealthy — triggering rebind");
-    true
 }
 
 /// Re-run the classification session and update the relayer peer ID.
