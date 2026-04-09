@@ -254,6 +254,20 @@ pub struct NodeConfig {
     /// When `None`, no close group cache is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_group_cache_dir: Option<PathBuf>,
+
+    /// Force the node to skip reachability classification and assume it is
+    /// behind NAT (private).
+    ///
+    /// When `true`, the ADR-014 dial-back probes are skipped entirely and
+    /// the node proceeds directly to MASQUE relay acquisition. The node
+    /// will not advertise any contact address until a relay is established.
+    ///
+    /// Useful for devnets and test scenarios where you want to exercise
+    /// the relay path without relying on actual NAT detection.
+    ///
+    /// Default: `false`
+    #[serde(default)]
+    pub assume_private: bool,
 }
 
 /// DHT-specific configuration
@@ -384,6 +398,7 @@ pub struct NodeConfigBuilder {
     allow_loopback: Option<bool>,
     adaptive_dht_config: Option<AdaptiveDhtConfig>,
     close_group_cache_dir: Option<PathBuf>,
+    assume_private: bool,
 }
 
 impl Default for NodeConfigBuilder {
@@ -402,6 +417,7 @@ impl Default for NodeConfigBuilder {
             allow_loopback: None,
             adaptive_dht_config: None,
             close_group_cache_dir: None,
+            assume_private: false,
         }
     }
 }
@@ -523,6 +539,15 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Force the node to assume it is behind NAT (private).
+    ///
+    /// When `true`, skips ADR-014 dial-back probes and proceeds directly
+    /// to MASQUE relay acquisition. See [`NodeConfig::assume_private`].
+    pub fn assume_private(mut self, assume: bool) -> Self {
+        self.assume_private = assume;
+        self
+    }
+
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -551,6 +576,7 @@ impl NodeConfigBuilder {
             allow_loopback,
             adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
             close_group_cache_dir: self.close_group_cache_dir,
+            assume_private: self.assume_private,
         })
     }
 }
@@ -574,6 +600,7 @@ impl Default for NodeConfig {
             allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
+            assume_private: false,
         }
     }
 }
@@ -1154,7 +1181,8 @@ impl P2PNode {
         // timeout × 1 round-trip + relay handshake).
         {
             let dht = self.adaptive_dht.dht_manager();
-            let outcome = run_classification(dht.as_ref(), &self.transport).await;
+            let outcome =
+                run_classification(dht.as_ref(), &self.transport, self.config.assume_private).await;
 
             match &outcome {
                 ReachabilityOutcome::Public { direct_addresses } => {
@@ -1209,6 +1237,7 @@ impl P2PNode {
             Arc::clone(&self.transport),
             Arc::clone(&self.relayer_peer_id),
             self.shutdown.clone(),
+            self.config.assume_private,
         );
 
         // Spawn background task to forward peer address updates to the DHT.
@@ -2367,6 +2396,7 @@ mod tests {
             allow_loopback: true,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
+            assume_private: false,
         }
     }
 

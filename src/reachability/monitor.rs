@@ -64,6 +64,7 @@ pub(crate) fn spawn_relayer_monitor(
     transport: Arc<TransportHandle>,
     relayer_peer_id: Arc<RwLock<Option<PeerId>>>,
     shutdown: CancellationToken,
+    assume_private: bool,
 ) {
     tokio::spawn(async move {
         let mut events_rx = dht.subscribe_events();
@@ -94,7 +95,7 @@ pub(crate) fn spawn_relayer_monitor(
             };
 
             if should_rebind {
-                rebind(&dht, &transport, &relayer_peer_id).await;
+                rebind(&dht, &transport, &relayer_peer_id, assume_private).await;
             }
         }
     });
@@ -169,10 +170,11 @@ async fn rebind(
     dht: &DhtNetworkManager,
     transport: &Arc<TransportHandle>,
     relayer_peer_id: &RwLock<Option<PeerId>>,
+    assume_private: bool,
 ) {
     info!("ADR-014 monitor: starting rebind — re-running classification");
 
-    let outcome = run_classification(dht, transport).await;
+    let outcome = run_classification(dht, transport, assume_private).await;
 
     match outcome {
         ReachabilityOutcome::Public { direct_addresses } => {

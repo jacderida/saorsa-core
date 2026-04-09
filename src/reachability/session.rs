@@ -65,58 +65,70 @@ pub(crate) enum ReachabilityOutcome {
 ///   reservations they can't honour).
 /// - Emitting [`DhtNetworkEvent::BootstrapComplete`] after the session
 ///   returns (the "fully addressable" signal).
+///
+/// When `assume_private` is `true`, the dial-back probes are skipped
+/// entirely and the node proceeds directly to relay acquisition. This is
+/// useful for devnets and test scenarios where you want to force nodes
+/// onto the relay path without relying on actual NAT detection.
 pub(crate) async fn run_classification(
     dht: &DhtNetworkManager,
     transport: &Arc<TransportHandle>,
+    assume_private: bool,
 ) -> ReachabilityOutcome {
-    // Step 1: Gather candidate listen addresses.
-    let listen_addrs = transport.listen_addrs().await;
-    if listen_addrs.is_empty() {
-        warn!("ADR-014: no listen addresses available — cannot classify reachability");
-        return ReachabilityOutcome::NoProbers;
-    }
-    info!(
-        "ADR-014: starting reachability classification for {} candidate address(es)",
-        listen_addrs.len()
-    );
-
-    // Step 2: Pick up to MAX_PROBERS close-group peers.
-    let own_key = *dht.peer_id().to_bytes();
-    let probers = dht.find_closest_nodes_local(&own_key, MAX_PROBERS).await;
-    if probers.is_empty() {
-        warn!("ADR-014: no close-group peers available as probers — routing table may be empty");
-        return ReachabilityOutcome::NoProbers;
-    }
-    let prober_count = probers.len();
-    info!("ADR-014: selected {} prober(s) for dial-back", prober_count);
-
-    // Step 3: Send DialBackRequest to each prober concurrently.
-    let mut probe_futures = Vec::with_capacity(prober_count);
-    for prober in &probers {
-        let addrs = listen_addrs.clone();
-        probe_futures.push(dht.send_dial_back_request(&prober.peer_id, addrs));
-    }
-    let replies: Vec<Vec<DialBackOutcome>> = futures::future::join_all(probe_futures).await;
-
-    // Step 4: Run the classifier.
-    let classifier = Classifier::new();
-    let classifications = classifier.classify(prober_count, replies);
-
-    let direct_addresses: Vec<MultiAddr> = classifications
-        .into_iter()
-        .filter(|(_, class)| *class == AddressClassification::Direct)
-        .map(|(addr, _)| addr)
-        .collect();
-
-    if !direct_addresses.is_empty() {
+    if !assume_private {
+        // Step 1: Gather candidate listen addresses.
+        let listen_addrs = transport.listen_addrs().await;
+        if listen_addrs.is_empty() {
+            warn!("ADR-014: no listen addresses available — cannot classify reachability");
+            return ReachabilityOutcome::NoProbers;
+        }
         info!(
-            "ADR-014: classified as PUBLIC — {} Direct address(es)",
-            direct_addresses.len()
+            "ADR-014: starting reachability classification for {} candidate address(es)",
+            listen_addrs.len()
         );
-        return ReachabilityOutcome::Public { direct_addresses };
-    }
 
-    info!("ADR-014: no Direct addresses — classified as PRIVATE, acquiring relay");
+        // Step 2: Pick up to MAX_PROBERS close-group peers.
+        let own_key = *dht.peer_id().to_bytes();
+        let probers = dht.find_closest_nodes_local(&own_key, MAX_PROBERS).await;
+        if probers.is_empty() {
+            warn!(
+                "ADR-014: no close-group peers available as probers — routing table may be empty"
+            );
+            return ReachabilityOutcome::NoProbers;
+        }
+        let prober_count = probers.len();
+        info!("ADR-014: selected {} prober(s) for dial-back", prober_count);
+
+        // Step 3: Send DialBackRequest to each prober concurrently.
+        let mut probe_futures = Vec::with_capacity(prober_count);
+        for prober in &probers {
+            let addrs = listen_addrs.clone();
+            probe_futures.push(dht.send_dial_back_request(&prober.peer_id, addrs));
+        }
+        let replies: Vec<Vec<DialBackOutcome>> = futures::future::join_all(probe_futures).await;
+
+        // Step 4: Run the classifier.
+        let classifier = Classifier::new();
+        let classifications = classifier.classify(prober_count, replies);
+
+        let direct_addresses: Vec<MultiAddr> = classifications
+            .into_iter()
+            .filter(|(_, class)| *class == AddressClassification::Direct)
+            .map(|(addr, _)| addr)
+            .collect();
+
+        if !direct_addresses.is_empty() {
+            info!(
+                "ADR-014: classified as PUBLIC — {} Direct address(es)",
+                direct_addresses.len()
+            );
+            return ReachabilityOutcome::Public { direct_addresses };
+        }
+
+        info!("ADR-014: no Direct addresses — classified as PRIVATE, acquiring relay");
+    } else {
+        info!("ADR-014: assume_private is set — skipping classification, acquiring relay");
+    }
 
     // Step 5: Build relay candidates from XOR-closest peers.
     // Per the user's design: we try everyone and private peers reject the
@@ -125,6 +137,7 @@ pub(crate) async fn run_classification(
     // Use dialable_addresses_from_node to get type-prioritised addresses
     // (Relay first, then Direct) so the first dialable address per
     // candidate is the best available.
+    let own_key = *dht.peer_id().to_bytes();
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
     let candidates: Vec<RelayCandidate> = closest
         .iter()
