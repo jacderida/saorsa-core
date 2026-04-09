@@ -31,6 +31,7 @@ use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaS
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -813,6 +814,14 @@ pub struct P2PNode {
     /// `None` when the node is publicly reachable (no relay needed) or
     /// before classification has run.
     relayer_peer_id: Arc<RwLock<Option<PeerId>>>,
+
+    /// The relay-allocated public address (ADR-014).
+    ///
+    /// Set after a proactive MASQUE relay is acquired in `start()`. This is
+    /// the address that external peers must dial to reach this node through
+    /// the relay. `None` when the node is publicly reachable (no relay) or
+    /// before classification has run.
+    relay_address: Arc<RwLock<Option<SocketAddr>>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -915,6 +924,7 @@ impl P2PNode {
             is_started: Arc::new(AtomicBool::new(false)),
             reconnect_locks: ParkingMutex::new(HashMap::new()),
             relayer_peer_id: Arc::new(RwLock::new(None)),
+            relay_address: Arc::new(RwLock::new(None)),
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -932,6 +942,16 @@ impl P2PNode {
     /// Get the transport handle for sharing with other components.
     pub fn transport(&self) -> &Arc<crate::transport_handle::TransportHandle> {
         &self.transport
+    }
+
+    /// The relay-allocated public address, if this node acquired a MASQUE relay.
+    ///
+    /// Returns `Some(addr)` when the node is behind NAT and successfully
+    /// acquired a proactive relay during `start()`. External peers must dial
+    /// this address to reach the node through the relay. Returns `None` when
+    /// the node is publicly reachable or no relay was established.
+    pub async fn relay_address(&self) -> Option<SocketAddr> {
+        *self.relay_address.read().await
     }
 
     pub fn local_addr(&self) -> Option<MultiAddr> {
@@ -1197,8 +1217,10 @@ impl P2PNode {
                         "ADR-014: node is PRIVATE — relay via {:?} at {}",
                         relay.relayer, relay.allocated_public_addr
                     );
-                    // Store relayer for the K-closest monitor.
+                    // Store relayer and allocated address for the K-closest monitor
+                    // and for consumers that need the relay address.
                     *self.relayer_peer_id.write().await = Some(relay.relayer);
+                    *self.relay_address.write().await = Some(relay.allocated_public_addr);
                     // Private → disable relay serving so we reject reservation
                     // requests we can't honour.
                     self.transport.set_relay_serving_enabled(false);
