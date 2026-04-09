@@ -1129,6 +1129,66 @@ impl P2PNode {
         self.connect_bootstrap_peers(close_group_cache.as_ref())
             .await?;
 
+        // ADR-014: classify reachability and acquire a relay if private.
+        //
+        // The dial-back probe asks close-group peers to connect back to our
+        // listen addresses; the classifier applies the 2/3 quorum rule; if
+        // no address is Direct the acquisition coordinator walks XOR-closest
+        // public peers until one accepts a relay reservation.
+        //
+        // Runs synchronously (blocking start()) so by the time we return the
+        // node's DHT self-record is accurate: either verified Direct
+        // addresses or a relay-allocated address. The cost is ~2-4 s (probe
+        // timeout × 1 round-trip + relay handshake).
+        {
+            use crate::reachability::session::{ReachabilityOutcome, run_classification};
+
+            let dht = self.adaptive_dht.dht_manager();
+            let outcome = run_classification(dht.as_ref(), &self.transport).await;
+
+            match &outcome {
+                ReachabilityOutcome::Public { direct_addresses } => {
+                    info!(
+                        "ADR-014: node is PUBLIC with {} Direct address(es)",
+                        direct_addresses.len()
+                    );
+                    // Public → keep relay serving enabled (default).
+                }
+                ReachabilityOutcome::PrivateWithRelay { relay } => {
+                    info!(
+                        "ADR-014: node is PRIVATE — relay via {:?} at {}",
+                        relay.relayer, relay.allocated_public_addr
+                    );
+                    // Private → disable relay serving so we reject reservation
+                    // requests we can't honour.
+                    self.transport.set_relay_serving_enabled(false);
+                }
+                ReachabilityOutcome::PrivateNoRelay { reason } => {
+                    warn!(
+                        "ADR-014: node is PRIVATE but relay acquisition failed: {}",
+                        reason
+                    );
+                    self.transport.set_relay_serving_enabled(false);
+                }
+                ReachabilityOutcome::NoProbers => {
+                    info!(
+                        "ADR-014: no probers available — skipping classification \
+                         (will re-classify on next probe cycle)"
+                    );
+                }
+            }
+
+            // Emit BootstrapComplete — the node is now fully classified and
+            // addressable. Consumers waiting on this event can start issuing
+            // DHT queries knowing the self-record is accurate.
+            let rt_size = dht.get_routing_table_size().await;
+            dht.emit_event(
+                crate::dht_network_manager::DhtNetworkEvent::BootstrapComplete {
+                    num_peers: rt_size,
+                },
+            );
+        }
+
         // Spawn background task to forward peer address updates to the DHT.
         //
         // Two event streams are bridged from the transport layer onto DHT

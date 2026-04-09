@@ -918,6 +918,17 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         false
     }
 
+    /// Enable or disable relay serving on both stacks' MASQUE relay servers.
+    ///
+    /// Called by the ADR-014 reachability classifier: public nodes leave it
+    /// enabled, private nodes disable it so they reject incoming relay
+    /// reservation requests.
+    pub fn set_relay_serving_enabled(&self, enabled: bool) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            node.transport.endpoint().set_relay_serving_enabled(enabled);
+        }
+    }
+
     /// Establish a proactive MASQUE relay session with the relay reachable at
     /// `relay_addr`, rebinding the matching stack's Quinn endpoint onto the
     /// resulting tunnel.

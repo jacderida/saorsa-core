@@ -53,6 +53,7 @@
 pub(crate) mod acquisition;
 pub(crate) mod classifier;
 pub(crate) mod probe;
+pub(crate) mod session;
 
 pub(crate) use acquisition::{
     AcquiredRelay, RelayAcquisition, RelayAcquisitionError, RelayCandidate,

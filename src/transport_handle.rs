@@ -823,6 +823,15 @@ impl TransportHandle {
         Ok(peer_id)
     }
 
+    /// Enable or disable relay serving on this node's MASQUE relay servers.
+    ///
+    /// Delegates to [`DualStackNetworkNode::set_relay_serving_enabled`].
+    /// Called by the ADR-014 reachability classifier after classification
+    /// completes: public nodes leave it enabled, private nodes disable it.
+    pub fn set_relay_serving_enabled(&self, enabled: bool) {
+        self.dual_node.set_relay_serving_enabled(enabled);
+    }
+
     /// Establish a proactive MASQUE relay session with the peer reachable at
     /// `relay_addr`, returning the relay-allocated public socket address on
     /// success.
@@ -2147,8 +2156,22 @@ impl TransportHandle {
 /// [`RelaySessionEstablisher`] abstraction so the ADR-014 relay acquisition
 /// coordinator can drive it directly. The trait impl is a thin delegate to
 /// [`TransportHandle::setup_proactive_relay_session`].
+///
+/// Both `TransportHandle` and `Arc<TransportHandle>` implement the trait so
+/// callers can pass either an owned handle or a shared reference without
+/// wrapping.
 #[async_trait::async_trait]
 impl RelaySessionEstablisher for TransportHandle {
+    async fn establish(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+        self.setup_proactive_relay_session(relay_addr).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RelaySessionEstablisher for Arc<TransportHandle> {
     async fn establish(
         &self,
         relay_addr: SocketAddr,

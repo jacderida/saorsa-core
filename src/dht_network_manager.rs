@@ -334,7 +334,21 @@ pub enum DhtNetworkEvent {
     PeerAdded { peer_id: PeerId },
     /// Peer removed from the routing table (swap-out, eviction, or departure).
     PeerRemoved { peer_id: PeerId },
-    /// Bootstrap process completed.
+    /// Routing table populated after bootstrap peer discovery.
+    ///
+    /// Emitted when the DHT routing table is populated with peers from the
+    /// bootstrap process. This is an intermediate milestone — the node has
+    /// outbound connectivity and can issue DHT queries, but it has **not**
+    /// yet classified its own reachability or acquired a relay if private.
+    ///
+    /// For the "fully addressable" signal, wait for [`Self::BootstrapComplete`].
+    RoutingTableReady { num_peers: usize },
+    /// Bootstrap fully complete: node is classified and addressable.
+    ///
+    /// Emitted after the ADR-014 reachability classifier has run and, if
+    /// needed, a relay has been acquired. When a consumer sees this event
+    /// the node's published DHT self-record is accurate (either a verified
+    /// Direct address or a relay-allocated address).
     BootstrapComplete { num_peers: usize },
     /// DHT operation completed
     OperationCompleted {
@@ -775,14 +789,17 @@ impl DhtNetworkManager {
             }
         }
 
-        // Emit BootstrapComplete event with the current routing table size.
+        // Emit RoutingTableReady — routing table is populated but the node has
+        // not yet classified its reachability (ADR-014). The full
+        // BootstrapComplete event is emitted later by P2PNode::start() after
+        // the classifier run.
         let rt_size = self.get_routing_table_size().await;
         if self.event_tx.receiver_count() > 0 {
             let _ = self
                 .event_tx
-                .send(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
+                .send(DhtNetworkEvent::RoutingTableReady { num_peers: rt_size });
         }
-        info!("Bootstrap complete: routing table has {rt_size} peers");
+        info!("Routing table ready: {rt_size} peers (reachability classification pending)");
 
         Ok(seen.len())
     }
@@ -2722,6 +2739,18 @@ impl DhtNetworkManager {
     }
 
     /// Subscribe to DHT network events
+    /// Emit a [`DhtNetworkEvent`] on the event broadcaster.
+    ///
+    /// Primarily used by `P2PNode` to emit
+    /// [`DhtNetworkEvent::BootstrapComplete`] after the ADR-014 reachability
+    /// classifier has run. Internal DHT operations emit their own events
+    /// directly.
+    pub fn emit_event(&self, event: DhtNetworkEvent) {
+        if self.event_tx.receiver_count() > 0 {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<DhtNetworkEvent> {
         self.event_tx.subscribe()
     }
@@ -2983,6 +3012,15 @@ mod tests {
         assert!(
             matches!(deserialized, DhtNetworkResult::PeerRejected),
             "round-tripped result should be PeerRejected, got: {deserialized:?}"
+        );
+    }
+
+    #[test]
+    fn test_routing_table_ready_event_construction() {
+        let event = DhtNetworkEvent::RoutingTableReady { num_peers: 42 };
+        assert!(
+            matches!(event, DhtNetworkEvent::RoutingTableReady { num_peers: 42 }),
+            "RoutingTableReady event should carry the peer count"
         );
     }
 
