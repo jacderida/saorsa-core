@@ -90,7 +90,7 @@ pub(crate) fn spawn_relayer_monitor(
                     }
                 }
                 _ = health_interval.tick() => {
-                    heartbeat_relayer(&relayer_peer_id, &dht).await
+                    heartbeat_relayer(&relayer_peer_id, &dht, &transport).await
                 }
             };
 
@@ -120,30 +120,41 @@ async fn check_relayer_in_k_closest(
     true
 }
 
-/// Heartbeat the relayer with a DHT Ping. Returns `true` if the relay
-/// appears dead and we should rebind.
+/// Check whether the relay tunnel is still alive. Returns `true` if
+/// the tunnel is dead and we should rebind.
 ///
-/// The Ping flows through the MASQUE tunnel, so a successful round-trip
-/// confirms:
-/// 1. The QUIC connection to the relay is alive (NAT binding refreshed).
-/// 2. The relay peer itself is responsive.
+/// Uses the transport-level `is_relay_healthy()` check (QUIC connection
+/// state) rather than an application-level DHT Ping. A busy relay server
+/// may be slow to respond to Pings while the tunnel itself is perfectly
+/// functional — treating a Ping timeout as "relay dead" caused spurious
+/// rebinds that killed the relay unnecessarily.
 ///
-/// This replaces QUIC-level keepalive configuration — we don't need to
-/// modify transport configs because the Ping IS the keepalive. If the app
-/// disables QUIC keepalives for normal connections, the relay still stays
-/// alive because this function sends real data on every health-check tick.
+/// A DHT Ping is still sent as a keepalive (refreshes NAT bindings and
+/// confirms the relay peer is in the routing table), but its failure
+/// does NOT trigger a rebind.
 async fn heartbeat_relayer(
     relayer_peer_id: &RwLock<Option<PeerId>>,
     dht: &DhtNetworkManager,
+    transport: &TransportHandle,
 ) -> bool {
     let guard = relayer_peer_id.read().await;
     let Some(relayer) = guard.as_ref() else {
         return false; // No relayer — nothing to heartbeat.
     };
     let relayer = *relayer;
-    // Drop the lock before the async Ping to avoid holding it across .await.
     drop(guard);
 
+    // Primary check: is the relay tunnel's QUIC connection alive?
+    // This is authoritative — if the connection is dead, the tunnel
+    // cannot forward traffic and we must rebind.
+    if !transport.is_relay_healthy() {
+        info!("ADR-014 monitor: relay tunnel unhealthy — triggering rebind");
+        return true;
+    }
+
+    // Secondary: send a DHT Ping as a keepalive. Its success/failure
+    // is logged but does NOT trigger rebind — a slow response from a
+    // busy relay server is not a reason to tear down a working tunnel.
     match dht
         .send_request(
             &relayer,
@@ -153,16 +164,15 @@ async fn heartbeat_relayer(
     {
         Ok(_) => {
             trace!("ADR-014 monitor: relay heartbeat OK");
-            false
         }
         Err(e) => {
-            info!(
-                "ADR-014 monitor: relay heartbeat failed ({}) — triggering rebind",
+            debug!(
+                "ADR-014 monitor: relay keepalive Ping failed ({}), tunnel still healthy",
                 e
             );
-            true
         }
     }
+    false
 }
 
 /// Re-run the classification session and update the relayer peer ID.
