@@ -1190,10 +1190,15 @@ impl P2PNode {
 
         // ADR-014: classify reachability and acquire a relay if private.
         //
-        // The dial-back probe asks close-group peers to connect back to our
-        // listen addresses; the classifier applies the 2/3 quorum rule; if
-        // no address is Direct the acquisition coordinator walks XOR-closest
-        // public peers until one accepts a relay reservation.
+        // Clients only initiate outgoing connections — they don't need to be
+        // reachable by other peers, so skip the entire classification /
+        // relay-acquisition flow and go straight to BootstrapComplete.
+        //
+        // For Node mode: the dial-back probe asks close-group peers to
+        // connect back to our listen addresses; the classifier applies the
+        // 2/3 quorum rule; if no address is Direct the acquisition
+        // coordinator walks XOR-closest public peers until one accepts a
+        // relay reservation.
         //
         // Runs synchronously (blocking start()) so by the time we return the
         // node's DHT self-record is accurate: either verified Direct
@@ -1201,48 +1206,56 @@ impl P2PNode {
         // timeout × 1 round-trip + relay handshake).
         {
             let dht = self.adaptive_dht.dht_manager();
-            let outcome =
-                run_classification(dht.as_ref(), &self.transport, self.config.assume_private).await;
 
-            match &outcome {
-                ReachabilityOutcome::Public { direct_addresses } => {
-                    info!(
-                        "ADR-014: node is PUBLIC with {} Direct address(es)",
-                        direct_addresses.len()
-                    );
-                    // Public → keep relay serving enabled (default).
-                }
-                ReachabilityOutcome::PrivateWithRelay { relay } => {
-                    info!(
-                        "ADR-014: node is PRIVATE — relay via {:?} at {}",
-                        relay.relayer, relay.allocated_public_addr
-                    );
-                    // Store relayer and allocated address for the K-closest monitor
-                    // and for consumers that need the relay address.
-                    *self.relayer_peer_id.write().await = Some(relay.relayer);
-                    *self.relay_address.write().await = Some(relay.allocated_public_addr);
-                    // Private → disable relay serving so we reject reservation
-                    // requests we can't honour.
-                    self.transport.set_relay_serving_enabled(false);
-                }
-                ReachabilityOutcome::PrivateNoRelay { reason } => {
-                    warn!(
-                        "ADR-014: node is PRIVATE but relay acquisition failed: {}",
-                        reason
-                    );
-                    self.transport.set_relay_serving_enabled(false);
-                }
-                ReachabilityOutcome::NoProbers => {
-                    info!(
-                        "ADR-014: no probers available — skipping classification \
-                         (will re-classify on next probe cycle)"
-                    );
+            if self.config.mode == NodeMode::Client {
+                info!(
+                    "ADR-014: client mode — skipping reachability classification and relay setup"
+                );
+            } else {
+                let outcome =
+                    run_classification(dht.as_ref(), &self.transport, self.config.assume_private)
+                        .await;
+
+                match &outcome {
+                    ReachabilityOutcome::Public { direct_addresses } => {
+                        info!(
+                            "ADR-014: node is PUBLIC with {} Direct address(es)",
+                            direct_addresses.len()
+                        );
+                        // Public → keep relay serving enabled (default).
+                    }
+                    ReachabilityOutcome::PrivateWithRelay { relay } => {
+                        info!(
+                            "ADR-014: node is PRIVATE — relay via {:?} at {}",
+                            relay.relayer, relay.allocated_public_addr
+                        );
+                        // Store relayer and allocated address for the K-closest monitor
+                        // and for consumers that need the relay address.
+                        *self.relayer_peer_id.write().await = Some(relay.relayer);
+                        *self.relay_address.write().await = Some(relay.allocated_public_addr);
+                        // Private → disable relay serving so we reject reservation
+                        // requests we can't honour.
+                        self.transport.set_relay_serving_enabled(false);
+                    }
+                    ReachabilityOutcome::PrivateNoRelay { reason } => {
+                        warn!(
+                            "ADR-014: node is PRIVATE but relay acquisition failed: {}",
+                            reason
+                        );
+                        self.transport.set_relay_serving_enabled(false);
+                    }
+                    ReachabilityOutcome::NoProbers => {
+                        info!(
+                            "ADR-014: no probers available — skipping classification \
+                             (will re-classify on next probe cycle)"
+                        );
+                    }
                 }
             }
 
             // Emit BootstrapComplete — the node is now fully classified and
-            // addressable. Consumers waiting on this event can start issuing
-            // DHT queries knowing the self-record is accurate.
+            // addressable (or, for clients, simply connected to peers).
+            // Consumers waiting on this event can start issuing DHT queries.
             let rt_size = dht.get_routing_table_size().await;
             dht.emit_event(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
         }
@@ -1251,16 +1264,18 @@ impl P2PNode {
         //
         // Watches for the relayer dropping out of the K-closest set or the
         // MASQUE session dying. On either trigger, re-runs the classification
-        // session to acquire a new relay. Only meaningful when we have a
-        // relayer (private nodes); for public nodes the monitor is a no-op
-        // because relayer_peer_id is None.
-        crate::reachability::monitor::spawn_relayer_monitor(
-            self.adaptive_dht.dht_manager().clone(),
-            Arc::clone(&self.transport),
-            Arc::clone(&self.relayer_peer_id),
-            self.shutdown.clone(),
-            self.config.assume_private,
-        );
+        // session to acquire a new relay. Only meaningful for Node mode when
+        // the node is private; clients never acquire relays, and public nodes
+        // have no relayer_peer_id so the monitor is a no-op.
+        if self.config.mode != NodeMode::Client {
+            crate::reachability::monitor::spawn_relayer_monitor(
+                self.adaptive_dht.dht_manager().clone(),
+                Arc::clone(&self.transport),
+                Arc::clone(&self.relayer_peer_id),
+                self.shutdown.clone(),
+                self.config.assume_private,
+            );
+        }
 
         // Spawn background task to forward peer address updates to the DHT.
         //
