@@ -895,11 +895,20 @@ impl DhtNetworkManager {
             }
         }
 
-        // Phase 3: Dial all discovered nodes now that hints are in place.
-        for entry in &discovered {
-            self.dial_addresses(&entry.node.peer_id, &entry.node.addresses, entry.referrer)
-                .await;
-        }
+        // Phase 3: Dial all discovered nodes concurrently now that hints
+        // are in place. Sequential dialing would serialize every DIAL_TIMEOUT
+        // (15s each), making bootstrap take minutes when NAT nodes are slow.
+        info!(
+            "Bootstrap dialing {} peers concurrently (hints pre-loaded)",
+            discovered.len()
+        );
+        let dial_futures: Vec<_> = discovered
+            .iter()
+            .map(|entry| {
+                self.dial_addresses(&entry.node.peer_id, &entry.node.addresses, entry.referrer)
+            })
+            .collect();
+        futures::future::join_all(dial_futures).await;
 
         // Emit BootstrapComplete event with the current routing table size.
         let rt_size = self.get_routing_table_size().await;
