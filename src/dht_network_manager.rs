@@ -798,25 +798,29 @@ impl DhtNetworkManager {
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
+
+        // Phase 1: Collect all FindNode responses from bootstrap peers.
+        // We gather all discovered nodes BEFORE dialing any of them so that
+        // coordinator hints from all responses can be merged first. Without
+        // this, a NAT node discovered from boot-1 might start dialing before
+        // boot-3's response provides the hints needed for hole-punching.
+        struct DiscoveredNode {
+            node: DHTNode,
+            referrer: Option<std::net::SocketAddr>,
+        }
+        let mut discovered: Vec<DiscoveredNode> = Vec::new();
+
         for peer_id in peers {
-            // Resolve the bootstrap peer's socket address so we can set it as
-            // the preferred coordinator for any peers it returns. The bootstrap
-            // peer has connections to those peers, making it a good relay.
             let bootstrap_addr = self
                 .peer_addresses_for_dial(peer_id)
                 .await
                 .first()
                 .and_then(|a| a.dialable_socket_addr());
 
-            // The bootstrap peer is the natural NAT-traversal referrer for
-            // every node it returns: it has a live connection to us (we just
-            // queried it) and presumably also to the nodes it tells us about.
-            // Passing its socket address as the preferred coordinator lets
-            // hole-punch PUNCH_ME_NOW be relayed through it.
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
-                    for node in &nodes {
+                    for node in nodes {
                         let dialable = Self::dialable_addresses(&node.addresses);
                         debug!(
                             "DHT bootstrap: peer={} num_addresses={} dialable={}",
@@ -825,55 +829,10 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            // Extract coordinator hints from the node's DHT record,
-                            // set them as preferred coordinators for hole-punching,
-                            // and merge them into the routing table for propagation.
-                            let hint_addrs = Self::extract_coordinator_hints(node);
-                            if !hint_addrs.is_empty() {
-                                let direct = Self::direct_addresses_only(node);
-                                if let Some(target_addr) =
-                                    Self::first_dialable_address(&direct)
-                                        .and_then(|a| a.dialable_socket_addr())
-                                {
-                                    info!(
-                                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
-                                        hint_addrs.len(),
-                                        hex::encode(&node.peer_id.to_bytes()[..8])
-                                    );
-                                    self.transport
-                                        .set_hole_punch_preferred_coordinators(
-                                            target_addr, hint_addrs.clone(),
-                                        )
-                                        .await;
-                                }
-                                // Merge hints into routing table for propagation
-                                let hint_multiaddrs: Vec<crate::MultiAddr> = node
-                                    .addresses
-                                    .iter()
-                                    .filter(|addr| {
-                                        addr.peer_id()
-                                            .map_or(false, |pid| *pid != node.peer_id)
-                                    })
-                                    .cloned()
-                                    .collect();
-                                let stored = {
-                                    let dht = self.dht.read().await;
-                                    dht.merge_coordinator_hints(
-                                        &node.peer_id,
-                                        hint_multiaddrs,
-                                    )
-                                    .await
-                                };
-                                if stored > 0 {
-                                    info!(
-                                        "Merged {} coordinator hint(s) into routing table for peer {}",
-                                        stored,
-                                        hex::encode(&node.peer_id.to_bytes()[..8])
-                                    );
-                                }
-                            }
-                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
-                                .await;
+                            discovered.push(DiscoveredNode {
+                                node,
+                                referrer: bootstrap_addr,
+                            });
                         }
                     }
                 }
@@ -882,6 +841,64 @@ impl DhtNetworkManager {
                     warn!("Bootstrap FIND_NODE to {} failed: {}", peer_id.to_hex(), e);
                 }
             }
+        }
+
+        info!(
+            "Bootstrap collected {} unique peers from {} bootstrap nodes, extracting hints before dialing",
+            discovered.len(),
+            peers.len()
+        );
+
+        // Phase 2: Extract and merge all coordinator hints across ALL
+        // discovered nodes before any dialing begins. This ensures every
+        // NAT node has the best available coordinator set from all responses.
+        for entry in &discovered {
+            let hint_addrs = Self::extract_coordinator_hints(&entry.node);
+            if !hint_addrs.is_empty() {
+                let direct = Self::direct_addresses_only(&entry.node);
+                if let Some(target_addr) = Self::first_dialable_address(&direct)
+                    .and_then(|a| a.dialable_socket_addr())
+                {
+                    info!(
+                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
+                        hint_addrs.len(),
+                        hex::encode(&entry.node.peer_id.to_bytes()[..8])
+                    );
+                    self.transport
+                        .set_hole_punch_preferred_coordinators(
+                            target_addr, hint_addrs,
+                        )
+                        .await;
+                }
+                let hint_multiaddrs: Vec<crate::MultiAddr> = entry
+                    .node
+                    .addresses
+                    .iter()
+                    .filter(|addr| {
+                        addr.peer_id()
+                            .map_or(false, |pid| *pid != entry.node.peer_id)
+                    })
+                    .cloned()
+                    .collect();
+                let stored = {
+                    let dht = self.dht.read().await;
+                    dht.merge_coordinator_hints(&entry.node.peer_id, hint_multiaddrs)
+                        .await
+                };
+                if stored > 0 {
+                    info!(
+                        "Merged {} coordinator hint(s) into routing table for peer {}",
+                        stored,
+                        hex::encode(&entry.node.peer_id.to_bytes()[..8])
+                    );
+                }
+            }
+        }
+
+        // Phase 3: Dial all discovered nodes now that hints are in place.
+        for entry in &discovered {
+            self.dial_addresses(&entry.node.peer_id, &entry.node.addresses, entry.referrer)
+                .await;
         }
 
         // Emit BootstrapComplete event with the current routing table size.
