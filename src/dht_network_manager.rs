@@ -1776,7 +1776,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         address: &MultiAddr,
-        referrer: Option<std::net::SocketAddr>,
+        _referrer: Option<std::net::SocketAddr>,
     ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
@@ -1792,35 +1792,6 @@ impl DhtNetworkManager {
                 peer_hex, address
             );
             return None;
-        }
-        // Set the target peer ID for this specific address so the hole-punch
-        // PUNCH_ME_NOW can route by peer identity. Keyed by address to avoid
-        // races when multiple concurrent dials share the same transport.
-        if let Some(socket_addr) = address.dialable_socket_addr() {
-            let pid_bytes = *peer_id.to_bytes();
-            info!(
-                "dial_candidate: setting hole_punch_target_peer_id for {} = {}",
-                socket_addr,
-                hex::encode(&pid_bytes[..8])
-            );
-            self.transport
-                .set_hole_punch_target_peer_id(socket_addr, pid_bytes)
-                .await;
-        }
-
-        // If we know which peer referred us to this target (from a DHT
-        // FindNode response), set it as the preferred coordinator for
-        // hole-punching. That peer has a connection to the target.
-        if let Some(coordinator_addr) = referrer
-            && let Some(socket_addr) = address.dialable_socket_addr()
-        {
-            info!(
-                "dial_candidate: setting preferred coordinator for {} = {} (DHT referrer)",
-                socket_addr, coordinator_addr
-            );
-            self.transport
-                .set_hole_punch_preferred_coordinator(socket_addr, coordinator_addr)
-                .await;
         }
 
         let dial_timeout = self

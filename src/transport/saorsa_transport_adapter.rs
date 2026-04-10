@@ -54,6 +54,7 @@ use tracing::{debug, info, trace, warn};
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
     LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId,
+    StrategyConfig,
 };
 
 // Import saorsa-transport types for SharedTransport integration
@@ -219,7 +220,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
 
         let transport = P2pLinkTransport::new(config)
             .await
-            .context("Failed to create transport")?;
+            .context("Failed to create transport")?
+            .with_default_strategy(StrategyConfig::direct_only());
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
         let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
@@ -235,7 +237,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
     pub async fn new_with_config(_bind_addr: SocketAddr, config: P2pConfig) -> Result<Self> {
         let transport = P2pLinkTransport::new(config)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?
+            .with_default_strategy(StrategyConfig::direct_only());
 
         // Get the actual bound address from the endpoint
         let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
@@ -488,18 +491,12 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // ADR-014: with proactive relay acquisition, every published address
-        // in the DHT is either a verified-Direct socket (dial-back probe
-        // confirmed it publicly reachable) or a relay-allocated port
-        // (MASQUE tunnel terminates at a public relay server). In both cases
-        // the dialer is connecting to a publicly-reachable socket — no hole
-        // punching, no on-the-fly relay negotiation.
-        //
-        // 5 s covers a QUIC handshake (1 RTT) + ML-DSA verification + margin
-        // for network jitter. The cascade (direct → hole-punch → relay) is
-        // still present in saorsa-transport as a deep fallback but the 5 s
-        // budget means only the direct stage runs; that's all we need when
-        // addresses are pre-classified.
+        // ADR-014: every published address in the DHT is pre-classified as
+        // verified-direct or relay-allocated. Both are publicly reachable
+        // sockets, so hole-punching and relay fallback are disabled via
+        // StrategyConfig::direct_only() on the transport. Only the direct
+        // stage runs. 5 s covers a QUIC handshake (1 RTT) + ML-DSA
+        // verification + margin for network jitter.
         const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
         let conn = tokio::time::timeout(
