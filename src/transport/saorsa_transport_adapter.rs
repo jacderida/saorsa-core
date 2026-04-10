@@ -1230,14 +1230,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
     /// expected by the v6 transport before sending.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Preserve the underlying error(s) from the v6 and v4 stacks so the
-        // caller can surface them at WARN level. The previous implementation
-        // dropped both errors and returned a hardcoded
-        // "send_to_peer_optimized failed on both stacks" which made every
-        // transport failure look identical in the logs.
-        let mut v6_err: Option<anyhow::Error> = None;
+        // Try IPv4 first — the vast majority of peer addresses are IPv4 and
+        // trying IPv6 first on an IPv4 address produces noisy "Peer not
+        // found" warnings on every send.
         let mut v4_err: Option<anyhow::Error> = None;
+        let mut v6_err: Option<anyhow::Error> = None;
 
+        if let Some(v4) = &self.v4 {
+            match v4.send_to_peer_optimized(addr, data).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
+                    v4_err = Some(e);
+                }
+            }
+        }
         if let Some(v6) = &self.v6 {
             let wire_addr = self.to_mapped_if_needed(addr);
             match v6.send_to_peer_optimized(&wire_addr, data).await {
@@ -1245,15 +1252,6 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 Err(e) => {
                     warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
                     v6_err = Some(e);
-                }
-            }
-        }
-        if let Some(v4) = &self.v4 {
-            match v4.send_to_peer_optimized(addr, data).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
-                    v4_err = Some(e);
                 }
             }
         }
