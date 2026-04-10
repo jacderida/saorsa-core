@@ -114,8 +114,9 @@ const MAX_NATTED_ADDRESSES: usize = 1;
 /// Address classification for priority ordering and staleness eviction.
 ///
 /// Relay addresses are always preferred over Direct, which are preferred over
-/// NATted. The `merge_typed_address` method uses this for insertion ordering
-/// and the eviction of excess NATted entries.
+/// NATted. Coordinator hints are stored after NATted addresses and have their
+/// own eviction cap. The `merge_typed_address` method uses this for insertion
+/// ordering and the eviction of excess entries per type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressType {
     /// Address through a MASQUE relay server (always reachable)
@@ -124,7 +125,14 @@ pub enum AddressType {
     Direct,
     /// NATted address (ephemeral, typically unreachable from outside)
     NATted,
+    /// Coordinator hint — address of a DIFFERENT peer that can relay
+    /// PUNCH_ME_NOW to this node for hole-punching. The MultiAddr carries
+    /// the coordinator's PeerId suffix (different from this node's PeerId).
+    CoordinatorHint,
 }
+
+/// Maximum coordinator hints stored per node in the routing table.
+const MAX_COORDINATOR_HINTS: usize = 5;
 
 /// Duration of no contact after which a peer is considered stale.
 /// Stale peers lose trust protection and become eligible for revalidation-based eviction.
@@ -175,11 +183,50 @@ impl NodeInfo {
     /// Return all distinct, canonicalized IP addresses across every address in
     /// this node's address list. Useful for IP diversity checks that must
     /// consider all addresses, not just the primary one.
+    ///
+    /// Coordinator hints are excluded — their IPs belong to the coordinator
+    /// peer, not this node, and would cause false diversity violations.
     fn all_ips(&self) -> HashSet<IpAddr> {
         self.addresses
             .iter()
-            .filter_map(|a| a.ip().map(canonicalize_ip))
+            .enumerate()
+            .filter(|(i, _)| self.address_type_at(*i) != AddressType::CoordinatorHint)
+            .filter_map(|(_, a)| a.ip().map(canonicalize_ip))
             .collect()
+    }
+
+    /// Replace all coordinator hints with a fresh set.
+    ///
+    /// Removes all existing `CoordinatorHint` entries and inserts the new
+    /// ones. Returns the number of hints stored (may be less than provided
+    /// if capped by [`MAX_COORDINATOR_HINTS`]).
+    pub fn replace_coordinator_hints(&mut self, hints: Vec<MultiAddr>) -> usize {
+        // Remove all existing hints
+        let mut i = 0;
+        while i < self.address_types.len() {
+            if self.address_types[i] == AddressType::CoordinatorHint {
+                self.addresses.remove(i);
+                self.address_types.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // Insert fresh hints (capped)
+        let mut stored = 0;
+        for hint in hints.into_iter().take(MAX_COORDINATOR_HINTS) {
+            // Skip duplicates
+            if !self.addresses.contains(&hint) {
+                self.addresses.push(hint);
+                self.address_types.push(AddressType::CoordinatorHint);
+                stored += 1;
+            }
+        }
+
+        // Cap total addresses
+        self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
+        self.address_types.truncate(MAX_ADDRESSES_PER_NODE);
+        stored
     }
 
     /// Merge a new address with default type `Direct`.
@@ -225,9 +272,14 @@ impl NodeInfo {
                 self.address_types.insert(pos, AddressType::Direct);
             }
             AddressType::NATted => {
-                // At the back
-                self.addresses.push(addr);
-                self.address_types.push(AddressType::NATted);
+                // At the back (before any CoordinatorHint entries)
+                let pos = self
+                    .address_types
+                    .iter()
+                    .position(|t| *t == AddressType::CoordinatorHint)
+                    .unwrap_or(self.addresses.len());
+                self.addresses.insert(pos, addr);
+                self.address_types.insert(pos, AddressType::NATted);
 
                 // Evict excess NATted addresses (keep only MAX_NATTED_ADDRESSES)
                 let natted_count = self
@@ -241,6 +293,31 @@ impl NodeInfo {
                     let mut i = 0;
                     while i < self.address_types.len() && to_remove > 0 {
                         if self.address_types[i] == AddressType::NATted {
+                            self.addresses.remove(i);
+                            self.address_types.remove(i);
+                            to_remove -= 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            AddressType::CoordinatorHint => {
+                // Always at the back, after NATted
+                self.addresses.push(addr);
+                self.address_types.push(AddressType::CoordinatorHint);
+
+                // Evict excess hints (keep only MAX_COORDINATOR_HINTS)
+                let hint_count = self
+                    .address_types
+                    .iter()
+                    .filter(|t| **t == AddressType::CoordinatorHint)
+                    .count();
+                if hint_count > MAX_COORDINATOR_HINTS {
+                    let mut to_remove = hint_count - MAX_COORDINATOR_HINTS;
+                    let mut i = 0;
+                    while i < self.address_types.len() && to_remove > 0 {
+                        if self.address_types[i] == AddressType::CoordinatorHint {
                             self.addresses.remove(i);
                             self.address_types.remove(i);
                             to_remove -= 1;
@@ -485,6 +562,23 @@ impl KademliaRoutingTable {
             }
             None => false,
         }
+    }
+
+    /// Replace all coordinator hints for a node in the routing table.
+    /// Returns the number of hints stored, or 0 if the node is not present.
+    fn merge_coordinator_hints(
+        &mut self,
+        node_id: &PeerId,
+        hints: Vec<MultiAddr>,
+    ) -> usize {
+        let Some(bucket_index) = self.get_bucket_index(node_id) else {
+            return 0;
+        };
+        let bucket = &mut self.buckets[bucket_index];
+        let Some(node) = bucket.nodes.iter_mut().find(|n| n.id == *node_id) else {
+            return 0;
+        };
+        node.replace_coordinator_hints(hints)
     }
 
     /// Fast path for the touch operation.
@@ -1036,6 +1130,19 @@ impl DhtCoreEngine {
         // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
+    }
+
+    /// Replace all coordinator hints for a peer in the routing table.
+    ///
+    /// Takes a write lock. Returns the number of hints stored (0 if the
+    /// peer is not in the routing table).
+    pub async fn merge_coordinator_hints(
+        &self,
+        node_id: &PeerId,
+        hints: Vec<MultiAddr>,
+    ) -> usize {
+        let mut routing = self.routing_table.write().await;
+        routing.merge_coordinator_hints(node_id, hints)
     }
 
     /// Add a node to the DHT with security checks.
