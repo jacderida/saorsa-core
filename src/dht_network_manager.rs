@@ -749,6 +749,28 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
+                            // Extract coordinator hints from the node's DHT record
+                            // and set them as preferred coordinators BEFORE dialing,
+                            // so hole-punching can use them immediately.
+                            let hints = Self::extract_coordinator_hints(node);
+                            if !hints.is_empty() {
+                                let direct = Self::direct_addresses_only(node);
+                                if let Some(target_addr) =
+                                    Self::first_dialable_address(&direct)
+                                        .and_then(|a| a.dialable_socket_addr())
+                                {
+                                    info!(
+                                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
+                                        hints.len(),
+                                        hex::encode(&node.peer_id.to_bytes()[..8])
+                                    );
+                                    self.transport
+                                        .set_hole_punch_preferred_coordinators(
+                                            target_addr, hints,
+                                        )
+                                        .await;
+                                }
+                            }
                             self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
                                 .await;
                         }
