@@ -455,7 +455,7 @@ impl DhtNetworkManager {
             let hint_count = Self::extract_coordinator_hints(node).len();
             let addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
             if hint_count > 0 {
-                info!(
+                debug!(
                     "FindNode response includes {} coordinator hint(s) for peer {}",
                     hint_count,
                     hex::encode(&node.peer_id.to_bytes()[..8])
@@ -810,7 +810,8 @@ impl DhtNetworkManager {
         }
         let mut discovered: Vec<DiscoveredNode> = Vec::new();
 
-        for peer_id in peers {
+        // Send FindNode to all bootstrap peers concurrently.
+        let find_node_futures = peers.iter().map(|peer_id| async {
             let bootstrap_addr = self
                 .peer_addresses_for_dial(peer_id)
                 .await
@@ -818,7 +819,13 @@ impl DhtNetworkManager {
                 .and_then(|a| a.dialable_socket_addr());
 
             let op = DhtNetworkOperation::FindNode { key };
-            match self.send_dht_request(peer_id, op, None).await {
+            let result = self.send_dht_request(peer_id, op, None).await;
+            (*peer_id, bootstrap_addr, result)
+        });
+        let responses = futures::future::join_all(find_node_futures).await;
+
+        for (peer_id, bootstrap_addr, result) in responses {
+            match result {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in nodes {
                         let dialable = Self::dialable_addresses(&node.addresses);
@@ -1510,7 +1517,7 @@ impl DhtNetworkManager {
                     .iter()
                     .map(|(sa, _)| sa.to_string())
                     .collect();
-                info!(
+                debug!(
                     "local_dht_node: including {} coordinator hint(s): {:?}",
                     connected.len(),
                     hint_addrs
