@@ -1206,25 +1206,20 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             }
         }
 
-        // Produce a single error that preserves the full cause chain from
-        // whichever stack(s) were actually tried. In dual-stack-over-v6 mode
-        // (v4 is None) we don't lie about having tried v4.
+        // Inline the actual error cause so callers using `{}` (not `{:#}`)
+        // see the real failure reason, not just which IP stack was tried.
         let err = match (v6_err, v4_err) {
-            (Some(v6), Some(v4)) => v6.context(format!(
-                "send_to_peer_optimized to {} failed on both stacks (v4 cause: {:#})",
-                addr, v4
-            )),
-            (Some(v6), None) => v6.context(format!(
-                "send_to_peer_optimized to {} failed (v6-only: no v4 stack bound)",
-                addr
-            )),
-            (None, Some(v4)) => v4.context(format!(
-                "send_to_peer_optimized to {} failed (v4-only: no v6 stack bound)",
-                addr
-            )),
+            (Some(v6), Some(v4)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed on both stacks — v6: {v6}, v4: {v4}"
+            ),
+            (Some(v6), None) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed: {v6}"
+            ),
+            (None, Some(v4)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed: {v4}"
+            ),
             (None, None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {}: neither v6 nor v4 stack available",
-                addr
+                "send_to_peer_optimized to {addr}: neither v6 nor v4 stack available"
             ),
         };
         Err(err)
