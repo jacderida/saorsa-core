@@ -49,7 +49,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
@@ -1238,60 +1238,52 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Send to peer using P2pEndpoint's optimized send method.
     ///
-    /// Uses P2pEndpoint::send() which corresponds with recv() for proper
-    /// bidirectional communication. Tries IPv6 first, then IPv4.
+    /// Routes the send to the appropriate stack based on the target's
+    /// address family. In dual-stack mode, converts plain IPv4 to the
+    /// IPv4-mapped form expected by the v6 transport before sending.
     ///
-    /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
-    /// expected by the v6 transport before sending.
+    /// **Fallback is NOT attempted across address families.** When the
+    /// target is IPv4 and v4 is bound, we never fall back to v6 — the
+    /// v6 stack has no record of an IPv4-only peer, so the attempt is
+    /// guaranteed to fail with `Peer not found` and just produces log
+    /// noise plus wasted latency. The fallback only makes sense for:
+    ///
+    /// - IPv6 targets when v6 is bound (direct path)
+    /// - IPv4 targets on nodes that only bound v6 (dual-stack-over-v6)
+    /// - v4-only nodes that need to reach v6 targets — not supported
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Try IPv4 first — the vast majority of peer addresses are IPv4 and
-        // trying IPv6 first on an IPv4 address produces noisy "Peer not
-        // found" warnings on every send.
-        let mut v4_err: Option<anyhow::Error> = None;
-        let mut v6_err: Option<anyhow::Error> = None;
-
-        if let Some(v4) = &self.v4 {
-            match v4.send_to_peer_optimized(addr, data).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
-                    v4_err = Some(e);
-                }
-            }
+        // v4 target + v4 stack bound → send via v4 only. A v6 fallback
+        // would hit "Peer not found" (v6 has no record) and contribute
+        // 1 s of useless ACK-timeout latency on failure.
+        if addr.is_ipv4()
+            && let Some(v4) = &self.v4
+        {
+            return v4
+                .send_to_peer_optimized(addr, data)
+                .await
+                .map_err(|e| e.context(format!("IPv4 send to {} failed", addr)));
         }
+
+        // v6 target, or IPv4 target on a v6-only (dual-stack-over-v6)
+        // node: route through v6, converting IPv4 → v4-mapped form.
         if let Some(v6) = &self.v6 {
             let wire_addr = self.to_mapped_if_needed(addr);
-            match v6.send_to_peer_optimized(&wire_addr, data).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
-                    v6_err = Some(e);
-                }
-            }
+            return v6
+                .send_to_peer_optimized(&wire_addr, data)
+                .await
+                .map_err(|e| {
+                    e.context(format!("IPv6 send to {} (wire {}) failed", addr, wire_addr))
+                });
         }
 
-        // Produce a single error that preserves the full cause chain from
-        // whichever stack(s) were actually tried. In dual-stack-over-v6 mode
-        // (v4 is None) we don't lie about having tried v4.
-        let err = match (v6_err, v4_err) {
-            (Some(v6), Some(v4)) => v6.context(format!(
-                "send_to_peer_optimized to {} failed on both stacks (v4 cause: {:#})",
-                addr, v4
-            )),
-            (Some(v6), None) => v6.context(format!(
-                "send_to_peer_optimized to {} failed (v6-only: no v4 stack bound)",
-                addr
-            )),
-            (None, Some(v4)) => v4.context(format!(
-                "send_to_peer_optimized to {} failed (v4-only: no v6 stack bound)",
-                addr
-            )),
-            (None, None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {}: neither v6 nor v4 stack available",
-                addr
-            ),
-        };
-        Err(err)
+        // Neither stack can take this target. This is unreachable on a
+        // correctly-configured dual-stack node but guarded for safety.
+        Err(anyhow::anyhow!(
+            "send_to_peer_optimized to {}: no compatible stack bound (v4={}, v6={})",
+            addr,
+            self.v4.is_some(),
+            self.v6.is_some()
+        ))
     }
 
     /// Disconnect a peer, closing the underlying QUIC connection.

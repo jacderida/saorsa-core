@@ -1180,6 +1180,22 @@ impl TransportHandle {
     /// signed identity-announce message. This helper polls the
     /// `channel_to_peers` index until the channel has an associated peer,
     /// or the timeout expires.
+    ///
+    /// **Channel-death short-circuit.** If the underlying QUIC connection is
+    /// torn down while we are waiting (the connection-lifecycle monitor
+    /// removes the channel from `active_connections` on Lost/Failed events),
+    /// the identity exchange can never complete on this channel — we fail
+    /// fast instead of blocking for the remaining timeout. Without this,
+    /// a dead channel holds bootstrap convergence up for the entire
+    /// `IDENTITY_EXCHANGE_TIMEOUT` budget, which cascades into serialised
+    /// startup delays on the rest of the network.
+    ///
+    /// The short-circuit checks `is_connection_active` on every poll tick
+    /// *after* the initial check, so it doesn't race the brief window
+    /// between `connect_peer` returning and the channel being observed in
+    /// `active_connections`: `connect_peer` inserts the channel into that
+    /// set before returning, so the first tick always sees it present and
+    /// a later transition to absent is the death signal.
     pub async fn wait_for_peer_identity(
         &self,
         channel_id: &str,
@@ -1194,6 +1210,20 @@ impl TransportHandle {
             if let Some(peer_id) = peers.into_iter().next() {
                 return Ok(peer_id);
             }
+
+            // Channel-death short-circuit. If the channel is no longer
+            // active, the connection has been torn down and the identity
+            // exchange can never complete — bail immediately with a
+            // dedicated error so the caller stops waiting.
+            if !self.is_connection_active(channel_id).await {
+                return Err(P2PError::Transport(
+                    crate::error::TransportError::StreamError(
+                        format!("channel {channel_id} closed before identity exchange completed")
+                            .into(),
+                    ),
+                ));
+            }
+
             if Instant::now() >= deadline {
                 return Err(P2PError::Timeout(timeout));
             }

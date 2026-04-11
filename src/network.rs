@@ -137,14 +137,16 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
 /// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. On a LAN this completes in
-/// well under a second; on congested cellular or cross-region links it can
-/// blow past 5s with retransmits. The previous 5s default fired
-/// spuriously on slow networks during testnet validation, forcing
-/// reconnect loops that masqueraded as NAT traversal failures, so we
-/// budget enough headroom for two QUIC handshake retries on a high-latency
-/// link.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 15;
+/// plus an ML-DSA-65 signature verification. 5 s covers loopback (<100 ms
+/// in practice) and reasonable WAN paths (~2 s with one handshake retry),
+/// while keeping dead-channel detection fast enough that bootstrap
+/// convergence does not serialise on a single stuck peer. Kept in lockstep
+/// with `IDENTITY_EXCHANGE_TIMEOUT` in `dht_network_manager.rs`, which
+/// covers the same exchange for every subsequent dial.
+///
+/// `wait_for_peer_identity` short-circuits on channel close, so most dead
+/// channels surface in microseconds regardless of this budget.
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 5;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {

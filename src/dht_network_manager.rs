@@ -64,14 +64,21 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 /// a peer. The actual timeout is `min(request_timeout, this)`.
 ///
 /// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. On a LAN this completes in
-/// well under a second; on congested cellular or cross-region links it can
-/// blow past 5s with retransmits. Kept in lockstep with
-/// `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both budgets exist
-/// to absorb the same slow-link failure mode (the bootstrap variant covers
-/// the initial join, this one covers every subsequent peer dial via
-/// `send_dht_request`).
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// plus an ML-DSA-65 signature verification. Covers a reasonable range of
+/// loopback and WAN links — LAN completes in <1 s, a congested
+/// cross-region link fits in the 5 s budget with retransmits. Kept in
+/// lockstep with `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both
+/// budgets exist to absorb the same slow-link failure mode (the bootstrap
+/// variant covers the initial join, this one covers every subsequent peer
+/// dial via `send_dht_request`).
+///
+/// Tightened from 15 s to 5 s: the old budget let dead channels hold
+/// up bootstrap convergence for 15 s each. On a devnet with serialised
+/// bootstraps this turned a ~6 s startup into ~40 s for the last node.
+/// `wait_for_peer_identity` additionally short-circuits on channel
+/// close so most failures surface in microseconds regardless of the
+/// timeout.
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
