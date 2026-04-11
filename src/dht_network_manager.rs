@@ -31,7 +31,7 @@ use crate::{
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -122,6 +122,33 @@ pub struct DHTNode {
     pub address_types: Vec<AddressType>,
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
+}
+
+impl DHTNode {
+    /// Pair each address with its type tag.
+    ///
+    /// Untagged entries (legacy records that predate ADR-014, or any
+    /// position past the end of `address_types`) default to
+    /// [`AddressType::Direct`] — the conservative assumption that
+    /// matches `address_type_at` on `NodeInfo`.
+    ///
+    /// The returned vec preserves the storage order from `addresses`;
+    /// callers that need Relay-first ordering should pass the result to
+    /// [`DhtNetworkManager::dialable_addresses_typed`].
+    pub fn typed_addresses(&self) -> Vec<(MultiAddr, AddressType)> {
+        self.addresses
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let ty = self
+                    .address_types
+                    .get(i)
+                    .copied()
+                    .unwrap_or(AddressType::Direct);
+                (addr.clone(), ty)
+            })
+            .collect()
+    }
 }
 
 /// Alias for serialization compatibility
@@ -633,7 +660,7 @@ impl DhtNetworkManager {
                                 if dht_node.peer_id == this.config.peer_id {
                                     continue;
                                 }
-                                this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                                this.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
                                     .await;
                             }
                         }
@@ -669,7 +696,7 @@ impl DhtNetworkManager {
                     // Dial if not already connected — try every advertised
                     // address, not just the first, so a stale NAT binding on
                     // one entry doesn't kill the dial.
-                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                    self.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
                         .await;
                 }
                 Ok(())
@@ -757,34 +784,21 @@ impl DhtNetworkManager {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
         for peer_id in peers {
-            // Resolve the bootstrap peer's socket address so we can set it as
-            // the preferred coordinator for any peers it returns. The bootstrap
-            // peer has connections to those peers, making it a good relay.
-            let bootstrap_addr = self
-                .peer_addresses_for_dial(peer_id)
-                .await
-                .first()
-                .and_then(|a| a.dialable_socket_addr());
-
-            // The bootstrap peer is the natural NAT-traversal referrer for
-            // every node it returns: it has a live connection to us (we just
-            // queried it) and presumably also to the nodes it tells us about.
-            // Passing its socket address as the preferred coordinator lets
-            // hole-punch PUNCH_ME_NOW be relayed through it.
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        let dialable = Self::dialable_addresses(&node.addresses);
+                        let typed = node.typed_addresses();
+                        let dialable_count =
+                            typed.iter().filter(|(a, _)| Self::is_dialable(a)).count();
                         debug!(
                             "DHT bootstrap: peer={} num_addresses={} dialable={}",
                             node.peer_id.to_hex(),
                             node.addresses.len(),
-                            dialable.len()
+                            dialable_count
                         );
-                        if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
-                                .await;
+                        if seen.insert(node.peer_id) && dialable_count > 0 {
+                            self.dial_addresses(&node.peer_id, &typed).await;
                         }
                     }
                 }
@@ -1009,12 +1023,6 @@ impl DhtNetworkManager {
         let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
-        // Track which peer referred us to each discovered peer. When node A
-        // responds to FindNode with node B, node A has B in its routing table
-        // and has a connection to B. We use A as the preferred coordinator
-        // when hole-punching to B.
-        let mut referrers: std::collections::HashMap<PeerId, std::net::SocketAddr> =
-            std::collections::HashMap::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
@@ -1087,21 +1095,21 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let addresses = node.addresses.clone();
-                    let referrer = referrers.get(&peer_id).copied();
+                    let typed = node.typed_addresses();
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
-                        // Try every dialable address, not just the first.
-                        // If at least one succeeds the peer is connected and
-                        // `send_dht_request` will reuse that channel; if all
-                        // fail, `send_dht_request`'s own fallback will retry
-                        // with the routing-table addresses.
-                        self.dial_addresses(&peer_id, &addresses, referrer).await;
-                        let address_hint = Self::first_dialable_address(&addresses);
+                        // Pass the same typed candidate list to both
+                        // dial_addresses and send_dht_request so the
+                        // request path doesn't pay a redundant routing-
+                        // table read. Trying every dialable address —
+                        // instead of stopping at the first — protects
+                        // against stale NAT bindings, single-IP-family
+                        // failures, and recently-relayed peers whose
+                        // direct address is no longer reachable.
+                        self.dial_addresses(&peer_id, &typed).await;
                         (
                             peer_id,
-                            self.send_dht_request(&peer_id, op, address_hint.as_ref())
-                                .await,
+                            self.send_dht_request(&peer_id, op, Some(&typed)).await,
                         )
                     }
                 })
@@ -1119,13 +1127,6 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
 
-                        // Track this peer as the referrer for all nodes it returned.
-                        let referrer_addr = batch
-                            .iter()
-                            .find(|n| n.peer_id == peer_id)
-                            .and_then(|n| Self::first_dialable_address(&n.addresses))
-                            .and_then(|a| a.dialable_socket_addr());
-
                         // Truncate response to K closest to the lookup key to
                         // limit amplification from a single response and bound
                         // per-iteration memory growth.
@@ -1136,19 +1137,6 @@ impl DhtNetworkManager {
                                 || self.is_local_peer_id(&node.peer_id)
                             {
                                 continue;
-                            }
-                            // Record the referrer (first referrer wins)
-                            if let Some(ref_addr) = referrer_addr
-                                && let std::collections::hash_map::Entry::Vacant(e) =
-                                    referrers.entry(node.peer_id)
-                            {
-                                info!(
-                                    "find_closest_nodes_network: peer {} referred by {} ({})",
-                                    hex::encode(&node.peer_id.to_bytes()[..8]),
-                                    hex::encode(&peer_id.to_bytes()[..8]),
-                                    ref_addr
-                                );
-                                e.insert(ref_addr);
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
@@ -1387,53 +1375,56 @@ impl DhtNetworkManager {
         None
     }
 
-    /// Return all dialable addresses from a bare address list (no type info).
+    /// Predicate: is this address dialable (QUIC, non-unspecified)?
     ///
-    /// Used when the caller only has `&[MultiAddr]` without accompanying
-    /// `AddressType` tags. Addresses are returned in their original order.
-    fn dialable_addresses(addresses: &[MultiAddr]) -> Vec<MultiAddr> {
-        addresses
-            .iter()
-            .filter(|addr| {
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    trace!("Skipping non-dialable address: {addr}");
-                    return false;
-                };
-                if sa.ip().is_unspecified() {
-                    warn!("Rejecting unspecified address: {addr}");
-                    return false;
-                }
-                if sa.ip().is_loopback() {
-                    trace!("Accepting loopback address (local/test): {addr}");
-                }
-                true
-            })
-            .cloned()
-            .collect()
+    /// Centralised so the typed dial path and the transport-bridge sites
+    /// (which only have bare `MultiAddr` lists from the transport layer's
+    /// peer info) emit the same trace/warn output for rejected addresses.
+    /// Loopback is accepted — the actual loopback gate lives in
+    /// [`crate::dht::core_engine::DhtCoreEngine::replace_node_addresses`]
+    /// and the per-node `allow_loopback` config.
+    fn is_dialable(addr: &MultiAddr) -> bool {
+        let Some(sa) = addr.dialable_socket_addr() else {
+            trace!("Skipping non-dialable address: {addr}");
+            return false;
+        };
+        if sa.ip().is_unspecified() {
+            warn!("Rejecting unspecified address: {addr}");
+            return false;
+        }
+        if sa.ip().is_loopback() {
+            trace!("Accepting loopback address (local/test): {addr}");
+        }
+        true
     }
 
-    /// Return the first dialable address from a list of [`MultiAddr`] values.
-    fn first_dialable_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
-        Self::dialable_addresses(addresses).into_iter().next()
-    }
-
-    /// Try dialing each dialable address in `addresses` in order until one
-    /// succeeds. Returns the channel ID of the first successful dial, or
-    /// `None` if every address was rejected, failed, or timed out.
+    /// Try dialing each address in `typed_addresses` in priority order
+    /// (Relay → Direct → NATted) until one succeeds. Returns the transport
+    /// channel ID on the first success, `None` if every dial failed.
     ///
-    /// This is the multi-address counterpart of [`Self::dial_candidate`]
-    /// and is the right entry point for any code path that has been handed
-    /// a `DHTNode` (or any peer entry that exposes multiple addresses) —
-    /// using only the first dialable address means a stale NAT binding,
-    /// failed relay, or unreachable family kills the connection attempt
-    /// even when other published addresses would have worked.
+    /// The caller hands in typed pairs from a `DHTNode` (via
+    /// [`DHTNode::typed_addresses`]) or a candidate list returned by
+    /// [`Self::peer_addresses_for_dial_typed`]. Internal call to
+    /// [`Self::dialable_addresses_typed`] sorts by priority so the order
+    /// of the input slice does not matter for correctness — the dialer
+    /// always tries the highest-priority address first.
+    ///
+    /// Bails out early when the peer is already connected — the caller
+    /// would otherwise be paying N redundant `is_peer_connected` reads
+    /// (one per address) only to learn the dial is unnecessary.
     async fn dial_addresses(
         &self,
         peer_id: &PeerId,
-        addresses: &[MultiAddr],
-        referrer: Option<SocketAddr>,
+        typed_addresses: &[(MultiAddr, AddressType)],
     ) -> Option<String> {
-        let dialable = Self::dialable_addresses(addresses);
+        if self.transport.is_peer_connected(peer_id).await {
+            trace!(
+                "dial_addresses: peer {} already connected, skipping dial",
+                peer_id.to_hex()
+            );
+            return None;
+        }
+        let dialable = Self::dialable_addresses_typed(typed_addresses);
         if dialable.is_empty() {
             debug!(
                 "dial_addresses: no dialable addresses for {}",
@@ -1441,8 +1432,8 @@ impl DhtNetworkManager {
             );
             return None;
         }
-        for addr in &dialable {
-            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrer).await {
+        for (addr, _ty) in &dialable {
+            if let Some(channel_id) = self.dial_candidate(peer_id, addr).await {
                 return Some(channel_id);
             }
         }
@@ -1493,13 +1484,16 @@ impl DhtNetworkManager {
 
     /// Send a DHT request to a specific peer.
     ///
-    /// When `address_hint` is provided (e.g. from a `DHTNode` in an iterative
-    /// lookup), it is used directly for dialling without a routing-table lookup.
+    /// When `candidates` is `Some(...)`, those typed addresses are used
+    /// for the pre-send dial — typically passed through from an iterative
+    /// lookup batch so we don't pay a second routing-table read inside
+    /// this function. When `None`, [`Self::peer_addresses_for_dial_typed`]
+    /// is consulted (the routing table is the authoritative source).
     async fn send_dht_request(
         &self,
         peer_id: &PeerId,
         operation: DhtNetworkOperation,
-        address_hint: Option<&MultiAddr>,
+        candidates: Option<&[(MultiAddr, AddressType)]>,
     ) -> Result<DhtNetworkResult> {
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
@@ -1565,26 +1559,23 @@ impl DhtNetworkManager {
         // identity-exchange handshake completes. Without waiting, the
         // subsequent `send_message` would fail with `PeerNotFound`.
         //
-        // Build the candidate address list: caller's hint first (if any),
-        // then the peer's addresses from the routing table. Trying every
-        // candidate — instead of stopping at the first — protects against
-        // stale NAT bindings, single-IP-family failures, and recently-relayed
+        // Build the candidate address list. When the caller already has
+        // typed addresses for this peer (e.g., the iterative lookup batch
+        // passes the same `node.typed_addresses()` it just read), use
+        // those directly to avoid a redundant routing-table read.
+        // Otherwise, consult the routing table via
+        // `peer_addresses_for_dial_typed`. Trying every candidate —
+        // instead of stopping at the first — protects against stale NAT
+        // bindings, single-IP-family failures, and recently-relayed
         // peers whose direct address is no longer reachable.
-        let candidate_addresses: Vec<MultiAddr> = if self.transport.is_peer_connected(peer_id).await
-        {
-            Vec::new()
-        } else {
-            let mut addrs = Vec::new();
-            if let Some(hint) = address_hint {
-                addrs.push(hint.clone());
-            }
-            for addr in self.peer_addresses_for_dial(peer_id).await {
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
-                }
-            }
-            addrs
-        };
+        let candidate_addresses: Vec<(MultiAddr, AddressType)> =
+            if self.transport.is_peer_connected(peer_id).await {
+                Vec::new()
+            } else if let Some(provided) = candidates {
+                provided.to_vec()
+            } else {
+                self.peer_addresses_for_dial_typed(peer_id).await
+            };
 
         if !candidate_addresses.is_empty() {
             info!(
@@ -1593,10 +1584,7 @@ impl DhtNetworkManager {
                 peer_hex,
                 candidate_addresses.len()
             );
-            if let Some(channel_id) = self
-                .dial_addresses(peer_id, &candidate_addresses, None)
-                .await
-            {
+            if let Some(channel_id) = self.dial_addresses(peer_id, &candidate_addresses).await {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
                 match self
                     .transport
@@ -1751,18 +1739,8 @@ impl DhtNetworkManager {
     /// [`TransportHandle::wait_for_peer_identity`] before sending, because
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
-    async fn dial_candidate(
-        &self,
-        peer_id: &PeerId,
-        address: &MultiAddr,
-        _referrer: Option<std::net::SocketAddr>,
-    ) -> Option<String> {
+    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
         let peer_hex = peer_id.to_hex();
-
-        if self.transport.is_peer_connected(peer_id).await {
-            debug!("dial_candidate: peer {} already connected", peer_hex);
-            return None;
-        }
 
         // Reject unspecified addresses before attempting the connection.
         if address.ip().is_some_and(|ip| ip.is_unspecified()) {
@@ -1802,18 +1780,37 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Look up connectable addresses for `peer_id`.
+    /// Look up connectable addresses for `peer_id` as bare `MultiAddr`s.
+    ///
+    /// Thin wrapper over [`Self::peer_addresses_for_dial_typed`] for
+    /// callers that don't need the per-address type tag (e.g.,
+    /// `network.rs::first_dialable_peer_address`). Internally always
+    /// goes through the typed path so the Relay-first sort invariant
+    /// holds for both consumer styles.
+    pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+        self.peer_addresses_for_dial_typed(peer_id)
+            .await
+            .into_iter()
+            .map(|(addr, _ty)| addr)
+            .collect()
+    }
+
+    /// Look up connectable typed addresses for `peer_id`.
     ///
     /// Checks the DHT routing table first (source of truth for DHT peer
-    /// addresses), then falls back to the transport layer for connected peers.
-    /// Returns an empty vec when the peer is unknown or has no addresses.
+    /// addresses), then falls back to the transport layer for connected
+    /// peers. Returns an empty vec when the peer is unknown or has no
+    /// dialable addresses.
     ///
-    /// ADR-014: addresses are sorted by [`AddressType`] priority — Relay
-    /// first (known-good relay endpoint), then Direct, then NATted — so
-    /// the dialer tries the fastest path first.
-    pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
-        // 1. Routing table — filter to dialable QUIC addresses and sort by
-        //    AddressType priority (Relay first).
+    /// Result is sorted by [`AddressType`] priority — Relay first
+    /// (known-good relay endpoint), then Direct, then NATted — so the
+    /// dialer tries the fastest path first.
+    pub(crate) async fn peer_addresses_for_dial_typed(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        // 1. Routing table — filter to dialable QUIC addresses and sort
+        //    by AddressType priority (Relay first).
         let typed = self
             .dht
             .read()
@@ -1824,32 +1821,33 @@ impl DhtNetworkManager {
             return Self::dialable_addresses_typed(&typed);
         }
 
-        // 2. Transport layer — for connected peers not yet in the routing table.
-        //    No type info available; return in original order.
+        // 2. Transport layer — for connected peers not yet in the
+        //    routing table. No type info available, so each address is
+        //    tagged Direct (the conservative assumption).
         if let Some(info) = self.transport.peer_info(peer_id).await {
-            return Self::dialable_addresses(&info.addresses);
+            return info
+                .addresses
+                .into_iter()
+                .filter(Self::is_dialable)
+                .map(|a| (a, AddressType::Direct))
+                .collect();
         }
 
         Vec::new()
     }
 
-    /// Filter and sort addresses by type priority. Relay first, Direct
-    /// second, NATted last.
-    fn dialable_addresses_typed(typed: &[(MultiAddr, AddressType)]) -> Vec<MultiAddr> {
+    /// Filter and sort typed addresses by [`type_priority`].
+    ///
+    /// Relay first, Direct second, NATted last. Stable sort within each
+    /// tier preserves the input order, so callers that hand in addresses
+    /// in a meaningful sub-order (e.g., IPv6 before IPv4) keep that
+    /// order within the type tier.
+    fn dialable_addresses_typed(
+        typed: &[(MultiAddr, AddressType)],
+    ) -> Vec<(MultiAddr, AddressType)> {
         let mut candidates: Vec<(MultiAddr, AddressType)> = typed
             .iter()
-            .filter(|pair| {
-                let addr = &pair.0;
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    trace!("Skipping non-dialable address: {addr}");
-                    return false;
-                };
-                if sa.ip().is_unspecified() {
-                    warn!("Rejecting unspecified address: {addr}");
-                    return false;
-                }
-                true
-            })
+            .filter(|pair| Self::is_dialable(&pair.0))
             .cloned()
             .collect();
 
@@ -1859,7 +1857,7 @@ impl DhtNetworkManager {
             AddressType::NATted => 2,
         });
 
-        candidates.into_iter().map(|pair| pair.0).collect()
+        candidates
     }
 
     /// Wait for DHT network response via oneshot channel with timeout
@@ -2202,12 +2200,14 @@ impl DhtNetworkManager {
         // Transport-layer address is tagged as Direct. The typed merge
         // ensures it never displaces a Relay address at the front.
         // NATted addresses (from NAT connections) are handled separately
-        // by the DHT bridge which tags them explicitly.
+        // by the DHT bridge which tags them explicitly. Transport
+        // peer_info has no AddressType info, so we just pick the first
+        // dialable entry to refresh the routing-table record.
         let transport_addr = self
             .transport
             .peer_info(&app_peer_id)
             .await
-            .and_then(|info| Self::first_dialable_address(&info.addresses));
+            .and_then(|info| info.addresses.into_iter().find(Self::is_dialable));
 
         let dht = self.dht.read().await;
         if dht
@@ -2275,8 +2275,12 @@ impl DhtNetworkManager {
         // peer_info() resolves app-level IDs internally via peer_to_channel.
         // Collect all dialable addresses — peers may be multi-homed or
         // reachable via multiple NAT traversal endpoints.
-        let addresses = if let Some(info) = self.transport.peer_info(&node_id).await {
-            Self::dialable_addresses(&info.addresses)
+        let addresses: Vec<MultiAddr> = if let Some(info) = self.transport.peer_info(&node_id).await
+        {
+            info.addresses
+                .into_iter()
+                .filter(Self::is_dialable)
+                .collect()
         } else {
             warn!("peer_info unavailable for app_peer_id {}", app_peer_id_hex);
             Vec::new()
@@ -2831,12 +2835,12 @@ impl DhtNetworkManager {
             if peer.peer_id == self.config.peer_id {
                 continue; // Skip self
             }
+            // Pass the peer's typed addresses through directly so
+            // send_dht_request avoids a redundant routing-table read for
+            // a peer we already have in hand.
+            let peer_typed = peer.typed_addresses();
             match self
-                .send_dht_request(
-                    &peer.peer_id,
-                    op.clone(),
-                    Self::first_dialable_address(&peer.addresses).as_ref(),
-                )
+                .send_dht_request(&peer.peer_id, op.clone(), Some(&peer_typed))
                 .await
             {
                 Ok(_) => {
@@ -2934,59 +2938,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_first_dialable_address_skips_non_ip_when_ip_address_exists() {
-        let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
-            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
-            psm: 0x0025,
-        });
-        let quic = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
-
-        let selected = DhtNetworkManager::first_dialable_address(&[ble, quic.clone()]);
-
-        assert_eq!(
-            selected,
-            Some(quic),
-            "address selection should prefer a dialable IP transport over a preceding non-IP entry"
-        );
+    fn is_dialable_accepts_quic_with_routable_ip() {
+        let quic = MultiAddr::quic("203.0.113.7:9000".parse().unwrap());
+        assert!(DhtNetworkManager::is_dialable(&quic));
     }
 
     #[test]
-    fn test_first_dialable_address_returns_none_for_all_non_dialable() {
+    fn is_dialable_rejects_non_quic_transports() {
         let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
-            mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
-            psm: 128,
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
         });
         let tcp = MultiAddr::tcp("10.0.0.1:80".parse().unwrap());
         let lora = MultiAddr::new(crate::address::TransportAddr::LoRa {
             dev_addr: [0xDE, 0xAD, 0xBE, 0xEF],
             freq_hz: 868_000_000,
         });
-
-        assert_eq!(
-            DhtNetworkManager::first_dialable_address(&[ble, tcp, lora]),
-            None,
-            "should return None when no QUIC address is present"
-        );
+        assert!(!DhtNetworkManager::is_dialable(&ble));
+        assert!(!DhtNetworkManager::is_dialable(&tcp));
+        assert!(!DhtNetworkManager::is_dialable(&lora));
     }
 
     #[test]
-    fn test_first_dialable_address_rejects_unspecified_ip() {
+    fn is_dialable_rejects_unspecified_ip() {
         let unspecified = MultiAddr::quic("0.0.0.0:9000".parse().unwrap());
-
-        assert_eq!(
-            DhtNetworkManager::first_dialable_address(&[unspecified]),
-            None,
-            "should reject unspecified (0.0.0.0) addresses"
-        );
+        assert!(!DhtNetworkManager::is_dialable(&unspecified));
     }
 
     #[test]
-    fn test_first_dialable_address_returns_none_for_empty_slice() {
-        assert_eq!(
-            DhtNetworkManager::first_dialable_address(&[]),
-            None,
-            "should return None for empty address list"
-        );
+    fn is_dialable_accepts_loopback() {
+        let loopback = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
+        assert!(DhtNetworkManager::is_dialable(&loopback));
     }
 
     fn dht_node(seed: u8, entries: Vec<(&str, AddressType)>) -> DHTNode {

@@ -144,6 +144,14 @@ pub const ADDRESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// coalesce to one warning per `ADDRESS_EVENT_DROP_LOG_INTERVAL` drops.
 const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
 
+/// Resolution-delay budget for the IPv4 attempt in
+/// [`DualStackNetworkNode::connect_happy_eyeballs`]'s race.
+///
+/// Per RFC 8305 §8 ("Connection Attempt Delay"), 50 ms is a sensible
+/// default that prefers IPv6 when both stacks are reachable but lets
+/// IPv4 take over quickly when the v6 attempt is failing or stalled.
+const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
+
 /// Increment the drop counter and log periodically when the address-event
 /// forwarder fails to push into a bounded channel.
 ///
@@ -491,11 +499,16 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // ADR-014: every published address in the DHT is pre-classified as
-        // verified-direct or relay-allocated. Both are publicly reachable
-        // sockets, so hole-punching and relay fallback are disabled via
-        // StrategyConfig::direct_only() on the transport. Only the direct
-        // stage runs. 5 s covers a QUIC handshake (1 RTT) + ML-DSA
+        // saorsa-core publishes typed addresses (Direct or Relay-allocated)
+        // and is responsible for picking the right one before reaching the
+        // transport. Direct addresses are self-asserted by the publisher,
+        // not externally verified — actual reachability is discovered at
+        // dial time, and failures cascade back to the relay-acquisition
+        // driver which may pick a different peer or rebind.
+        //
+        // The transport's default StrategyConfig::direct_only() disables
+        // hole-punching and the in-cascade relay fallback, so this dial
+        // is single-shot. 5 s covers a QUIC handshake (1 RTT) + ML-DSA
         // verification + margin for network jitter.
         const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -575,9 +588,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Dials the peer by address, opens a typed unidirectional stream,
     /// writes the data, and finishes the stream.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Budget must cover dial (up to ~25s for full NAT traversal cascade)
-        // plus the data transfer (4MB chunk at 10Mbps ≈ 3s).
-        const SEND_TIMEOUT: Duration = Duration::from_secs(35);
+        // Budget covers a single direct dial (~5 s with the
+        // direct_only strategy) plus a small-payload write (typically
+        // sub-second; oversized payloads are rejected upstream by the
+        // protocol-level message-size cap). The legacy ~25 s cascade
+        // budget no longer applies — hole-punching and in-cascade
+        // relay fallback are disabled at the transport layer.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
         tokio::time::timeout(SEND_TIMEOUT, async {
             let conn = self
@@ -1422,7 +1439,7 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         };
 
         let v4_fut = async {
-            sleep(Duration::from_millis(50)).await; // Slight delay per Happy Eyeballs
+            sleep(HAPPY_EYEBALLS_V4_STAGGER).await;
             for addr in v4_targets_clone {
                 if let Ok(connected_addr) = v4_node.connect_to_peer(addr).await {
                     return Ok(connected_addr);
