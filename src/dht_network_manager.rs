@@ -94,11 +94,14 @@ const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minut
 /// Periodic refresh cadence for stale k-buckets.
 const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
 
-/// How often NAT nodes republish their coordinator hints to connected peers.
-/// Keeps hints fresh so stale coordinator addresses get replaced before they
-/// accumulate NACK failures. Short enough to track coordinator churn, long
-/// enough to avoid flooding.
-const HINT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(120); // 2 minutes
+/// Minimum interval for NAT coordinator hint republishing (randomized between
+/// min and max). Keeps hints fresh so stale coordinator addresses get replaced
+/// before they accumulate NACK failures. Randomized to prevent thundering-herd
+/// spikes when many nodes republish simultaneously.
+const HINT_REPUBLISH_INTERVAL_MIN: Duration = Duration::from_secs(90); // 1.5 minutes
+
+/// Maximum interval for NAT coordinator hint republishing.
+const HINT_REPUBLISH_INTERVAL_MAX: Duration = Duration::from_secs(150); // 2.5 minutes
 
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
@@ -636,7 +639,7 @@ impl DhtNetworkManager {
 
     /// Spawn the periodic coordinator hint republish task.
     ///
-    /// Every [`HINT_REPUBLISH_INTERVAL`], builds the local node's DHT record
+    /// Every [`HINT_REPUBLISH_INTERVAL_MIN`]–[`HINT_REPUBLISH_INTERVAL_MAX`], builds the local node's DHT record
     /// (including coordinator hints), then sends a `PublishAddress` with those
     /// addresses to the K closest peers. Receiving nodes merge the hints into
     /// their routing table so they can propagate them in FindNode responses.
@@ -647,8 +650,13 @@ impl DhtNetworkManager {
 
         let handle = tokio::spawn(async move {
             loop {
+                let interval = Self::randomised_interval(
+                    HINT_REPUBLISH_INTERVAL_MIN,
+                    HINT_REPUBLISH_INTERVAL_MAX,
+                );
+
                 tokio::select! {
-                    () = tokio::time::sleep(HINT_REPUBLISH_INTERVAL) => {}
+                    () = tokio::time::sleep(interval) => {}
                     () = shutdown.cancelled() => break,
                 }
 
@@ -866,7 +874,7 @@ impl DhtNetworkManager {
                 if let Some(target_addr) = Self::first_dialable_address(&direct)
                     .and_then(|a| a.dialable_socket_addr())
                 {
-                    info!(
+                    debug!(
                         "Setting {} coordinator hint(s) for NAT node {} from DHT record",
                         hint_addrs.len(),
                         hex::encode(&entry.node.peer_id.to_bytes()[..8])
@@ -893,7 +901,7 @@ impl DhtNetworkManager {
                         .await
                 };
                 if stored > 0 {
-                    info!(
+                    debug!(
                         "Merged {} coordinator hint(s) into routing table for peer {}",
                         stored,
                         hex::encode(&entry.node.peer_id.to_bytes()[..8])
@@ -1280,7 +1288,7 @@ impl DhtNetworkManager {
                                     Self::first_dialable_address(&direct)
                                         .and_then(|a| a.dialable_socket_addr())
                                 {
-                                    info!(
+                                    debug!(
                                         "Setting {} coordinator hint(s) for NAT node {} from DHT record",
                                         hint_addrs.len(),
                                         hex::encode(&node.peer_id.to_bytes()[..8])
@@ -1311,7 +1319,7 @@ impl DhtNetworkManager {
                                     .await
                                 };
                                 if stored > 0 {
-                                    info!(
+                                    debug!(
                                         "Merged {} coordinator hint(s) into routing table for peer {}",
                                         stored,
                                         hex::encode(&node.peer_id.to_bytes()[..8])
@@ -1751,7 +1759,7 @@ impl DhtNetworkManager {
         // Send message via network layer, reconnecting on demand if needed.
         let peer_hex = peer_id.to_hex();
         let local_hex = self.config.peer_id.to_hex();
-        info!(
+        debug!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
             local_hex, peer_hex, message.payload, message_id
         );
@@ -1867,7 +1875,7 @@ impl DhtNetworkManager {
             .await
         {
             Ok(_) => {
-                info!(
+                debug!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
                     local_hex, peer_hex
                 );
@@ -1877,7 +1885,7 @@ impl DhtNetworkManager {
                     .wait_for_response(&message_id, response_rx, peer_id)
                     .await;
                 match &result {
-                    Ok(r) => info!(
+                    Ok(r) => debug!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
                         local_hex,
                         peer_hex,
@@ -2234,7 +2242,7 @@ impl DhtNetworkManager {
                 }
 
                 if !hints.is_empty() {
-                    info!(
+                    debug!(
                         "Received {} coordinator hint(s) for peer {} via publish",
                         hints.len(),
                         authenticated_sender
@@ -2244,7 +2252,7 @@ impl DhtNetworkManager {
                         .merge_coordinator_hints(authenticated_sender, hints)
                         .await;
                     if stored > 0 {
-                        info!(
+                        debug!(
                             "Merged {} coordinator hint(s) into routing table for peer {}",
                             stored,
                             authenticated_sender
