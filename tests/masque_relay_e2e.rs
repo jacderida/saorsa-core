@@ -39,6 +39,14 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Timeout for waiting for bilateral peer visibility.
 const BILATERAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait for the acquisition driver to establish a relay
+/// after `start()` returns. Covers the driver's 0–2 s startup jitter plus
+/// the XOR-closest walk and MASQUE CONNECT-UDP exchange.
+const RELAY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for the relay acquisition driver.
+const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Helper: local loopback, ephemeral port, IPv4-only config.
 fn test_config() -> NodeConfig {
     NodeConfig::builder()
@@ -74,9 +82,11 @@ async fn ipv4_addr(node: &P2PNode) -> MultiAddr {
 
 /// Start the relay node (R) and return it along with its listen address.
 ///
-/// R uses default config — relay_serving_enabled stays `true` because the
-/// loopback environment produces a `NoProbers` reachability outcome, which
-/// does not disable relay serving.
+/// R uses default config. R also runs the relay acquisition driver but
+/// its local routing table is empty (no bootstrap peer), so the driver
+/// cannot find any candidates and enters backoff; R's published self
+/// record stays direct-only, which is correct for a relay-serving node
+/// that is itself reachable.
 async fn start_relay_node() -> (P2PNode, MultiAddr) {
     let node_r = P2PNode::new(test_config()).await.unwrap();
     node_r.start().await.unwrap();
@@ -84,26 +94,43 @@ async fn start_relay_node() -> (P2PNode, MultiAddr) {
     (node_r, addr)
 }
 
-/// Start a private node that acquires a MASQUE relay through R.
+/// Poll `node.relay_address()` until it becomes `Some`, up to
+/// [`RELAY_ACQUIRE_TIMEOUT`].
 ///
-/// Returns the node and its relay-allocated address. Panics if the relay
-/// was not established.
+/// Needed because the acquisition driver is spawned as a background task
+/// by `node.start()` and runs after a 0–2 s jitter; callers that need the
+/// relay address must wait for the driver to complete one cycle.
+async fn await_relay_address(node: &P2PNode) -> std::net::SocketAddr {
+    let deadline = tokio::time::Instant::now() + RELAY_ACQUIRE_TIMEOUT;
+    loop {
+        if let Some(sock) = node.relay_address().await {
+            return sock;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("relay address was not acquired within {RELAY_ACQUIRE_TIMEOUT:?}");
+        }
+        sleep(RELAY_POLL_INTERVAL).await;
+    }
+}
+
+/// Start a node that acquires a MASQUE relay through R.
+///
+/// In the unconditional-relay design, every non-client node tries to
+/// acquire a relay from an XOR-closest peer after bootstrap. Here, R is
+/// the only close peer reachable to the new node, so the acquisition
+/// walker picks R. Returns the node and its relay-allocated address.
 async fn start_private_node(relay_node_addr: &MultiAddr) -> (P2PNode, MultiAddr) {
     let config = NodeConfig::builder()
         .local(true)
         .port(0)
         .ipv6(false)
-        .assume_private(true)
         .bootstrap_peer(relay_node_addr.clone())
         .build()
         .unwrap();
     let node = P2PNode::new(config).await.unwrap();
     node.start().await.unwrap();
 
-    let relay_sock = node
-        .relay_address()
-        .await
-        .expect("private node should have acquired a MASQUE relay during start()");
+    let relay_sock = await_relay_address(&node).await;
     let relay_multi = MultiAddr::quic(relay_sock);
     (node, relay_multi)
 }
@@ -112,8 +139,8 @@ async fn start_private_node(relay_node_addr: &MultiAddr) -> (P2PNode, MultiAddr)
 // Relay establishment (works on loopback)
 // ---------------------------------------------------------------------------
 
-/// A private node with `assume_private` successfully acquires a MASQUE relay
-/// through a reachable bootstrap peer.
+/// A non-client node unconditionally acquires a MASQUE relay through a
+/// reachable bootstrap peer.
 ///
 /// Verifies:
 /// - The relay session is established (relay address allocated)
@@ -121,7 +148,7 @@ async fn start_private_node(relay_node_addr: &MultiAddr) -> (P2PNode, MultiAddr)
 /// - P's direct listen address becomes unreachable after endpoint rebind
 /// - P is connected to R after bootstrap
 #[tokio::test]
-async fn assume_private_node_acquires_relay_through_bootstrap_peer() {
+async fn node_acquires_relay_through_bootstrap_peer() {
     init_tracing();
 
     let (node_r, node_r_addr) = start_relay_node().await;

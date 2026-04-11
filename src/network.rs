@@ -23,7 +23,7 @@ use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
-use crate::reachability::session::{ReachabilityOutcome, run_classification};
+use crate::reachability::spawn_acquisition_driver;
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
@@ -255,20 +255,6 @@ pub struct NodeConfig {
     /// When `None`, no close group cache is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_group_cache_dir: Option<PathBuf>,
-
-    /// Force the node to skip reachability classification and assume it is
-    /// behind NAT (private).
-    ///
-    /// When `true`, the ADR-014 dial-back probes are skipped entirely and
-    /// the node proceeds directly to MASQUE relay acquisition. The node
-    /// will not advertise any contact address until a relay is established.
-    ///
-    /// Useful for devnets and test scenarios where you want to exercise
-    /// the relay path without relying on actual NAT detection.
-    ///
-    /// Default: `false`
-    #[serde(default)]
-    pub assume_private: bool,
 }
 
 /// DHT-specific configuration
@@ -399,7 +385,6 @@ pub struct NodeConfigBuilder {
     allow_loopback: Option<bool>,
     adaptive_dht_config: Option<AdaptiveDhtConfig>,
     close_group_cache_dir: Option<PathBuf>,
-    assume_private: bool,
 }
 
 impl Default for NodeConfigBuilder {
@@ -418,7 +403,6 @@ impl Default for NodeConfigBuilder {
             allow_loopback: None,
             adaptive_dht_config: None,
             close_group_cache_dir: None,
-            assume_private: false,
         }
     }
 }
@@ -540,15 +524,6 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Force the node to assume it is behind NAT (private).
-    ///
-    /// When `true`, skips ADR-014 dial-back probes and proceeds directly
-    /// to MASQUE relay acquisition. See [`NodeConfig::assume_private`].
-    pub fn assume_private(mut self, assume: bool) -> Self {
-        self.assume_private = assume;
-        self
-    }
-
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -577,7 +552,6 @@ impl NodeConfigBuilder {
             allow_loopback,
             adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
             close_group_cache_dir: self.close_group_cache_dir,
-            assume_private: self.assume_private,
         })
     }
 }
@@ -601,7 +575,6 @@ impl Default for NodeConfig {
             allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
-            assume_private: false,
         }
     }
 }
@@ -1188,93 +1161,41 @@ impl P2PNode {
         self.connect_bootstrap_peers(close_group_cache.as_ref())
             .await?;
 
-        // ADR-014: classify reachability and acquire a relay if private.
-        //
-        // Clients only initiate outgoing connections — they don't need to be
-        // reachable by other peers, so skip the entire classification /
-        // relay-acquisition flow and go straight to BootstrapComplete.
-        //
-        // For Node mode: the dial-back probe asks close-group peers to
-        // connect back to our listen addresses; the classifier applies the
-        // 2/3 quorum rule; if no address is Direct the acquisition
-        // coordinator walks XOR-closest public peers until one accepts a
-        // relay reservation.
-        //
-        // Runs synchronously (blocking start()) so by the time we return the
-        // node's DHT self-record is accurate: either verified Direct
-        // addresses or a relay-allocated address. The cost is ~2-4 s (probe
-        // timeout × 1 round-trip + relay handshake).
+        // Emit BootstrapComplete — the node is connected to the network and
+        // the DHT routing table is populated; consumers waiting on this
+        // event can start issuing queries. The relay-acquisition driver
+        // runs asynchronously after this point, so the node's published
+        // self-record may be direct-only for a brief window until the
+        // driver's first acquisition attempt finishes.
         {
             let dht = self.adaptive_dht.dht_manager();
-
-            if self.config.mode == NodeMode::Client {
-                info!(
-                    "ADR-014: client mode — skipping reachability classification and relay setup"
-                );
-            } else {
-                let outcome =
-                    run_classification(dht.as_ref(), &self.transport, self.config.assume_private)
-                        .await;
-
-                match &outcome {
-                    ReachabilityOutcome::Public { direct_addresses } => {
-                        info!(
-                            "ADR-014: node is PUBLIC with {} Direct address(es)",
-                            direct_addresses.len()
-                        );
-                        // Public → keep relay serving enabled (default).
-                    }
-                    ReachabilityOutcome::PrivateWithRelay { relay } => {
-                        info!(
-                            "ADR-014: node is PRIVATE — relay via {:?} at {}",
-                            relay.relayer, relay.allocated_public_addr
-                        );
-                        // Store relayer and allocated address for the K-closest monitor
-                        // and for consumers that need the relay address.
-                        *self.relayer_peer_id.write().await = Some(relay.relayer);
-                        *self.relay_address.write().await = Some(relay.allocated_public_addr);
-                        // Private → disable relay serving so we reject reservation
-                        // requests we can't honour.
-                        self.transport.set_relay_serving_enabled(false);
-                    }
-                    ReachabilityOutcome::PrivateNoRelay { reason } => {
-                        warn!(
-                            "ADR-014: node is PRIVATE but relay acquisition failed: {}",
-                            reason
-                        );
-                        self.transport.set_relay_serving_enabled(false);
-                    }
-                    ReachabilityOutcome::NoProbers => {
-                        info!(
-                            "ADR-014: no probers available — skipping classification \
-                             (will re-classify on next probe cycle)"
-                        );
-                    }
-                }
-            }
-
-            // Emit BootstrapComplete — the node is now fully classified and
-            // addressable (or, for clients, simply connected to peers).
-            // Consumers waiting on this event can start issuing DHT queries.
             let rt_size = dht.get_routing_table_size().await;
             dht.emit_event(DhtNetworkEvent::BootstrapComplete { num_peers: rt_size });
         }
 
-        // ADR-014 item 6: spawn the relayer monitor.
+        // Spawn the relay-acquisition driver for Node mode.
         //
-        // Watches for the relayer dropping out of the K-closest set or the
-        // MASQUE session dying. On either trigger, re-runs the classification
-        // session to acquire a new relay. Only meaningful for Node mode when
-        // the node is private; clients never acquire relays, and public nodes
-        // have no relayer_peer_id so the monitor is a no-op.
+        // The driver unconditionally tries to acquire a MASQUE relay from
+        // an XOR-closest peer right after bootstrap — there is no public/
+        // private classification. Private candidates are filtered out
+        // ambiently: their Direct addresses are unreachable from outside
+        // their NAT, so the QUIC dial fails and the walker advances to
+        // the next-closest peer.
+        //
+        // The driver also owns the relay-lost → republish → reacquire
+        // state machine (see `reachability::driver` for the full flow).
+        // Clients (`NodeMode::Client`) do not run the driver at all: they
+        // are outbound-only and do not need to be reachable.
         if self.config.mode != NodeMode::Client {
-            crate::reachability::monitor::spawn_relayer_monitor(
+            spawn_acquisition_driver(
                 self.adaptive_dht.dht_manager().clone(),
                 Arc::clone(&self.transport),
                 Arc::clone(&self.relayer_peer_id),
+                Arc::clone(&self.relay_address),
                 self.shutdown.clone(),
-                self.config.assume_private,
             );
+        } else {
+            info!("client mode — skipping relay acquisition driver");
         }
 
         // Spawn background task to forward peer address updates to the DHT.
@@ -1306,6 +1227,17 @@ impl P2PNode {
         // forwarder mpsc into drop territory. Instead, the lookup +
         // publish is detached into its own task per relay event, so the
         // select loop keeps polling both branches.
+        // DHT_BRIDGE: forward peer-advertised address updates from the
+        // transport layer onto DHT routing table mutations. When a connected
+        // peer's ADD_ADDRESS notification carries a different IP than the
+        // connection's source (i.e., the peer is behind a relay or has
+        // migrated), merge the advertised address into the peer's DHT entry.
+        //
+        // This node's OWN relay state changes are NOT handled here — the
+        // relay acquisition driver (see `reachability::driver`) owns them
+        // directly, so the "relay established" branch no longer belongs to
+        // the bridge. The driver knows the full typed address set for the
+        // self-record; the bridge did not.
         {
             let transport = Arc::clone(&self.transport);
             let dht = self.adaptive_dht.dht_manager().clone();
@@ -1315,43 +1247,6 @@ impl P2PNode {
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
-                        relay = transport.recv_relay_established() => {
-                            let Some(relay_addr) = relay else { break };
-                            // Normalize IPv6-mapped addresses to IPv4 so the
-                            // published address is dialable by IPv4-only clients.
-                            let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
-                            let relay_multi = crate::MultiAddr::quic(normalized);
-                            info!(
-                                "DHT_BRIDGE: relay established at {} — spawning self-lookup + PublishAddress",
-                                relay_addr
-                            );
-                            // Detach the slow work so the select loop is
-                            // free to keep polling peer-address updates.
-                            let dht_for_propagation = dht.clone();
-                            tokio::spawn(async move {
-                                let own_key = *dht_for_propagation.peer_id().to_bytes();
-                                match dht_for_propagation
-                                    .find_closest_nodes_network(&own_key, dht_for_propagation.k_value())
-                                    .await
-                                {
-                                    Ok(nodes) => {
-                                        info!(
-                                            "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
-                                            nodes.len()
-                                        );
-                                        dht_for_propagation
-                                            .publish_address_to_peers(vec![relay_multi], &nodes)
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "DHT_BRIDGE: self-lookup for relay propagation failed: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            });
-                        }
                         update = transport.recv_peer_address_update() => {
                             let Some((peer_addr, advertised_addr)) = update else { break };
                             info!(
@@ -2433,7 +2328,6 @@ mod tests {
             allow_loopback: true,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
-            assume_private: false,
         }
     }
 

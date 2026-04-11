@@ -9,7 +9,7 @@ use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_sub
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -124,6 +124,19 @@ pub enum AddressType {
     Direct,
     /// NATted address (ephemeral, typically unreachable from outside)
     NATted,
+}
+
+/// Priority index for ordering addresses by type. Lower is preferred.
+///
+/// Shared between [`NodeInfo::merge_typed_address`] insertion logic and the
+/// full-replace path in [`KBucket::replace_node_addresses`] so both maintain
+/// the same ordering invariant.
+const fn type_priority(t: AddressType) -> u8 {
+    match t {
+        AddressType::Relay => 0,
+        AddressType::Direct => 1,
+        AddressType::NATted => 2,
+    }
 }
 
 /// Duration of no contact after which a peer is considered stale.
@@ -440,12 +453,61 @@ impl KBucket {
     fn find_node(&self, node_id: &PeerId) -> Option<&NodeInfo> {
         self.nodes.iter().find(|n| &n.id == node_id)
     }
+
+    /// Overwrite a peer's address list with `typed_addresses`.
+    ///
+    /// Full-replace semantics for the `PublishAddressSet` wire op: the sender
+    /// is authoritative about its own reachable addresses and the receiver
+    /// drops any state the sender omits (e.g., a stale relay address after
+    /// the relay session closes).
+    ///
+    /// The new list is sorted by [`type_priority`] (Relay → Direct → NATted)
+    /// to preserve the same ordering invariant that [`NodeInfo::merge_typed_address`]
+    /// maintains, then truncated to [`MAX_ADDRESSES_PER_NODE`].
+    ///
+    /// Returns `true` when the peer was found and its addresses replaced,
+    /// `false` when the peer is not in this bucket.
+    fn replace_node_addresses(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+    ) -> bool {
+        let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
+            return false;
+        };
+
+        let mut typed = typed_addresses;
+        typed.sort_by_key(|(_, t)| type_priority(*t));
+        typed.truncate(MAX_ADDRESSES_PER_NODE);
+
+        let (addresses, address_types): (Vec<_>, Vec<_>) = typed.into_iter().unzip();
+
+        {
+            let node = &mut self.nodes[pos];
+            node.addresses = addresses;
+            node.address_types = address_types;
+            node.last_seen.store_now();
+        }
+
+        // Move to tail (most recently seen).
+        let node = self.nodes.remove(pos);
+        self.nodes.push(node);
+        self.last_refreshed = Instant::now();
+        true
+    }
 }
 
 /// Kademlia routing table
 pub struct KademliaRoutingTable {
     buckets: Vec<KBucket>,
     node_id: PeerId,
+    /// Highest `PublishAddressSet` sequence number received from each peer.
+    ///
+    /// Republishes with a lower-or-equal sequence than the stored value are
+    /// discarded to close the "relay-lost → relay-acquired" reorder race.
+    /// Stored alongside the routing table so the sequence check and the
+    /// address replacement are atomic under the same write lock.
+    last_publish_seqs: HashMap<PeerId, u64>,
 }
 
 impl KademliaRoutingTable {
@@ -455,7 +517,11 @@ impl KademliaRoutingTable {
             buckets.push(KBucket::new(k_value));
         }
 
-        Self { buckets, node_id }
+        Self {
+            buckets,
+            node_id,
+            last_publish_seqs: HashMap::new(),
+        }
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
@@ -469,6 +535,43 @@ impl KademliaRoutingTable {
         if let Some(bucket_index) = self.get_bucket_index(node_id) {
             self.buckets[bucket_index].remove_node(node_id);
         }
+        self.last_publish_seqs.remove(node_id);
+    }
+
+    /// Replace a peer's advertised address list under a monotonic sender
+    /// sequence check.
+    ///
+    /// Stale republishes (`seq <= stored seq for this peer`) are discarded.
+    /// When `seq` is strictly greater than any previously observed sequence
+    /// from `node_id`, the peer's bucket entry is rewritten via
+    /// [`KBucket::replace_node_addresses`] and the stored sequence is
+    /// advanced. The whole check-and-apply runs under the caller's write
+    /// lock on the routing table, so concurrent republishes from the same
+    /// sender are serialised.
+    ///
+    /// Returns `true` when addresses were replaced; `false` when the peer
+    /// is absent from the routing table or the message was stale.
+    fn replace_node_addresses(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+    ) -> bool {
+        if let Some(&stored) = self.last_publish_seqs.get(node_id)
+            && seq <= stored
+        {
+            return false;
+        }
+
+        let Some(bucket_index) = self.get_bucket_index(node_id) else {
+            return false;
+        };
+
+        let applied = self.buckets[bucket_index].replace_node_addresses(node_id, typed_addresses);
+        if applied {
+            self.last_publish_seqs.insert(*node_id, seq);
+        }
+        applied
     }
 
     /// Update `last_seen` (and optionally merge a typed address) for a node and
@@ -1070,6 +1173,57 @@ impl DhtCoreEngine {
         // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
+    }
+
+    /// Replace a peer's advertised address list with `typed_addresses`, under
+    /// a monotonic-sequence guard.
+    ///
+    /// Implements the receive side of the `PublishAddressSet` wire op: the
+    /// sender is authoritative about its own reachable addresses and the
+    /// receiver drops any address the sender omits. This is the only path
+    /// by which a stale relay entry can be removed from a peer's routing
+    /// record when the relay session dies.
+    ///
+    /// - Loopback entries are filtered out unless [`Self::allow_loopback`]
+    ///   is set (devnets/tests), matching the loopback-injection guard in
+    ///   [`KBucket::touch_node_typed`].
+    /// - Empty address lists (after filtering) are rejected — the sender
+    ///   must have at least one valid address or the receiver would be
+    ///   left with an unreachable entry.
+    /// - `seq` must strictly exceed the last sequence observed from
+    ///   `node_id`; older or duplicate sequences are ignored.
+    ///
+    /// Returns `true` when the peer's addresses were replaced, `false`
+    /// otherwise (peer absent, stale sequence, or empty filtered list).
+    pub async fn replace_node_addresses(
+        &self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+    ) -> bool {
+        if typed_addresses.is_empty() {
+            return false;
+        }
+
+        let allow_loopback = self.allow_loopback;
+        let filtered: Vec<(MultiAddr, AddressType)> = typed_addresses
+            .into_iter()
+            .filter(|(addr, _)| {
+                if allow_loopback {
+                    return true;
+                }
+                !addr
+                    .ip()
+                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback())
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return false;
+        }
+
+        let mut routing = self.routing_table.write().await;
+        routing.replace_node_addresses(node_id, filtered, seq)
     }
 
     /// Add a node to the DHT with security checks.
@@ -1837,6 +1991,151 @@ mod tests {
             AddressType::Direct,
         );
         assert!(!found);
+    }
+
+    // -----------------------------------------------------------------------
+    // KBucket::replace_node_addresses tests (full-replace semantics)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replace_addresses_overwrites_existing_list() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+
+        let new_direct: MultiAddr = "/ip4/2.2.2.2/udp/9001/quic".parse().unwrap();
+        let new_relay: MultiAddr = "/ip4/3.3.3.3/udp/9002/quic".parse().unwrap();
+        let typed = vec![
+            (new_direct.clone(), AddressType::Direct),
+            (new_relay.clone(), AddressType::Relay),
+        ];
+        let replaced = bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed);
+        assert!(replaced);
+        let node = bucket.find_node(&PeerId::from_bytes([1u8; 32])).unwrap();
+        // Relay is first, Direct second — matches NodeInfo::merge_typed_address ordering.
+        assert_eq!(node.addresses, vec![new_relay, new_direct]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Relay, AddressType::Direct]
+        );
+    }
+
+    #[test]
+    fn replace_addresses_missing_peer_returns_false() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+
+        let typed = vec![(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        let replaced = bucket.replace_node_addresses(&PeerId::from_bytes([42u8; 32]), typed);
+        assert!(!replaced);
+    }
+
+    #[test]
+    fn replace_addresses_truncates_to_max() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+
+        let typed: Vec<(MultiAddr, AddressType)> = (0..12)
+            .map(|i| {
+                (
+                    format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap(),
+                    AddressType::Direct,
+                )
+            })
+            .collect();
+        assert!(bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed));
+        let node = bucket.find_node(&PeerId::from_bytes([1u8; 32])).unwrap();
+        assert_eq!(node.addresses.len(), MAX_ADDRESSES_PER_NODE);
+        assert_eq!(node.address_types.len(), MAX_ADDRESSES_PER_NODE);
+    }
+
+    // -----------------------------------------------------------------------
+    // KademliaRoutingTable::replace_node_addresses — sequence monotonicity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replace_addresses_seq_monotonic() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let first: Vec<(MultiAddr, AddressType)> = vec![(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        let second: Vec<(MultiAddr, AddressType)> = vec![(
+            "/ip4/3.3.3.3/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+
+        assert!(table.replace_node_addresses(&peer, first.clone(), 10));
+        // Same seq → rejected
+        assert!(!table.replace_node_addresses(&peer, second.clone(), 10));
+        // Lower seq → rejected
+        assert!(!table.replace_node_addresses(&peer, second.clone(), 5));
+        // Higher seq → accepted, addresses replaced
+        assert!(table.replace_node_addresses(&peer, second.clone(), 20));
+
+        let bucket_index = table.get_bucket_index(&peer).unwrap();
+        let node = table.buckets[bucket_index].find_node(&peer).unwrap();
+        assert_eq!(
+            node.addresses,
+            vec!["/ip4/3.3.3.3/udp/9000/quic".parse::<MultiAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn remove_node_clears_publish_seq() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let typed = vec![(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        assert!(table.replace_node_addresses(&peer, typed.clone(), 100));
+
+        table.remove_node(&peer);
+        assert!(!table.last_publish_seqs.contains_key(&peer));
+
+        // Re-add and verify the seq counter was cleared (lower seq now accepted).
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+        assert!(table.replace_node_addresses(&peer, typed, 50));
     }
 
     // -----------------------------------------------------------------------

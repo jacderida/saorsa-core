@@ -27,10 +27,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
 
-use crate::MultiAddr;
 use crate::dht::core_engine::DhtCoreEngine;
 use crate::dht::network_integration::{DhtMessage, DhtResponse, ErrorCode};
-use crate::reachability::{DIAL_BACK_PROBE_TIMEOUT, DialBackOutcome, DialBackProber};
 
 #[allow(dead_code)]
 /// DHT stream types handled by this handler.
@@ -42,30 +40,19 @@ const DHT_STREAM_TYPES: &[StreamType] = &[StreamType::DhtQuery];
 /// DHT protocol handler for SharedTransport.
 ///
 /// Routes incoming DHT streams to the appropriate handlers based on stream type:
-/// - DhtQuery: Handles FIND_NODE, Ping, and DialBackRequest messages (peer phonebook
-///   plus reachability probing per ADR-014)
+/// - DhtQuery: Handles FIND_NODE, Ping, Join, and Leave messages (peer phonebook
+///   operations).
 #[allow(dead_code)]
 pub struct DhtStreamHandler {
     /// Reference to the DHT engine for processing requests.
     dht_engine: Arc<RwLock<DhtCoreEngine>>,
-    /// Optional dial-back prober used to service incoming
-    /// [`DhtMessage::DialBackRequest`] messages. When absent, the handler
-    /// replies with an empty outcome list — a node that cannot act as a
-    /// prober (e.g., because it has no outbound transport handle yet) is
-    /// still a valid participant in the DHT, it just cannot vouch for
-    /// other peers' reachability.
-    prober: Option<Arc<dyn DialBackProber>>,
     /// Handler name for logging.
     name: String,
 }
 
 #[allow(dead_code)]
 impl DhtStreamHandler {
-    /// Create a new DHT stream handler without a dial-back prober.
-    ///
-    /// The handler will still process all other DHT queries normally;
-    /// incoming [`DhtMessage::DialBackRequest`] messages will be answered
-    /// with an empty outcome list.
+    /// Create a new DHT stream handler.
     ///
     /// # Arguments
     ///
@@ -73,7 +60,6 @@ impl DhtStreamHandler {
     pub fn new(dht_engine: Arc<RwLock<DhtCoreEngine>>) -> Self {
         Self {
             dht_engine,
-            prober: None,
             name: "DhtStreamHandler".to_string(),
         }
     }
@@ -82,17 +68,8 @@ impl DhtStreamHandler {
     pub fn with_name(dht_engine: Arc<RwLock<DhtCoreEngine>>, name: impl Into<String>) -> Self {
         Self {
             dht_engine,
-            prober: None,
             name: name.into(),
         }
-    }
-
-    /// Attach a dial-back prober so this handler can service
-    /// [`DhtMessage::DialBackRequest`] messages by actually dialing the
-    /// requested addresses. Builder-style; returns `self` for chaining.
-    pub fn with_prober(mut self, prober: Arc<dyn DialBackProber>) -> Self {
-        self.prober = Some(prober);
-        self
     }
 
     /// Handle a DHT query request.
@@ -160,40 +137,7 @@ impl DhtStreamHandler {
                 debug!(node = ?node_id, "DHT leave notification");
                 Ok(DhtResponse::LeaveAck { confirmed: true })
             }
-
-            DhtMessage::DialBackRequest { addresses } => {
-                debug!(
-                    count = addresses.len(),
-                    "DHT dial-back request received (ADR-014 reachability probe)"
-                );
-                let outcomes = self.run_dial_back_probe(addresses).await;
-                Ok(DhtResponse::DialBackReply { outcomes })
-            }
         }
-    }
-
-    /// Execute a dial-back probe for each requested address using the
-    /// attached prober, or return an empty outcome list when no prober is
-    /// attached.
-    ///
-    /// Returns one [`DialBackOutcome`] per input address, preserving the
-    /// order of the input. A missing prober yields an empty `Vec` rather
-    /// than a list of failures so the classifier at the requester side can
-    /// distinguish "this peer cannot probe" from "this peer tried and
-    /// failed." In both cases the effective behaviour (no success
-    /// contribution for this prober) is the same, but the empty reply keeps
-    /// the wire record honest.
-    async fn run_dial_back_probe(&self, addresses: Vec<MultiAddr>) -> Vec<DialBackOutcome> {
-        let Some(prober) = self.prober.as_ref() else {
-            trace!("dial-back request but no prober attached — returning empty reply");
-            return Vec::new();
-        };
-        let mut outcomes = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            let reachable = prober.probe(&address, DIAL_BACK_PROBE_TIMEOUT).await;
-            outcomes.push(DialBackOutcome::new(address, reachable));
-        }
-        outcomes
     }
 }
 

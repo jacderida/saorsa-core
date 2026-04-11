@@ -157,17 +157,18 @@ pub enum DhtNetworkOperation {
     Join,
     /// Leave the DHT network gracefully
     Leave,
-    /// Publish the sender's preferred routable addresses (e.g., relay address).
-    /// Receiving nodes update their routing table for the sender. Sent once
-    /// after relay setup to K closest peers, not on every message.
-    PublishAddress { addresses: Vec<crate::MultiAddr> },
-    /// Ask the receiver to attempt a one-shot QUIC dial against each of the
-    /// supplied candidate addresses and report per-address success/failure.
-    /// Used by the ADR-014 reachability classifier to decide whether the
-    /// sender is publicly reachable.
-    DialBackRequest {
-        /// Candidate listen addresses the sender wants verified.
-        addresses: Vec<crate::MultiAddr>,
+    /// Publish the sender's complete, typed address set. Full-replace
+    /// semantics: the sender is authoritative about its own reachable
+    /// addresses, and the receiver drops any address the sender omits.
+    ///
+    /// `seq` is a per-sender monotonic Unix-nanosecond timestamp; receivers
+    /// discard messages whose `seq` is lower than the last seen from this
+    /// sender. This closes the "relay-lost → relay-acquired" reorder race
+    /// without a dedicated counter, and recovers across sender restarts
+    /// because wall-clock time advances across reboots.
+    PublishAddressSet {
+        seq: u64,
+        addresses: Vec<(crate::MultiAddr, AddressType)>,
     },
 }
 
@@ -193,14 +194,8 @@ pub enum DhtNetworkResult {
     LeaveSuccess,
     /// The remote peer has rejected us — do not penalise their trust score
     PeerRejected,
-    /// Acknowledgement of a PublishAddress request
+    /// Acknowledgement of a `PublishAddressSet` request
     PublishAddressAck,
-    /// Reply to a [`DhtNetworkOperation::DialBackRequest`]. One outcome per
-    /// requested address. The ADR-014 reachability classifier aggregates
-    /// outcomes from multiple probers and applies the 2/3 quorum rule.
-    DialBackReply {
-        outcomes: Vec<crate::reachability::DialBackOutcome>,
-    },
     /// Operation failed
     Error { operation: String, error: String },
 }
@@ -1357,55 +1352,39 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Return all dialable addresses from a [`DHTNode`], sorted by
-    /// [`AddressType`] priority.
+    /// Return the first dialable `Direct`-tagged address from a [`DHTNode`].
     ///
-    /// ADR-014: relay-allocated addresses (known-reachable via MASQUE tunnel)
-    /// are tried first, then verified Direct addresses, then untagged/NATted
-    /// addresses. This ensures that the dialer hits the fastest path first
-    /// and avoids wasting time on stale Direct addresses for peers that have
-    /// since transitioned to private.
+    /// Used by the relay-acquisition walker: to set up a new MASQUE relay
+    /// session against a candidate, we must dial the candidate's actual
+    /// listening socket (its Direct address). A `Relay`-tagged address is a
+    /// tunnel-allocated socket that already fronts its own target; using it
+    /// to request a new relay reservation would be a "relay through a
+    /// relay" which MASQUE CONNECT-UDP does not support.
     ///
-    /// Only QUIC addresses are considered dialable. Unspecified (`0.0.0.0`)
-    /// addresses are rejected. Loopback addresses are accepted for local/test
-    /// use.
-    pub(crate) fn dialable_addresses_from_node(node: &DHTNode) -> Vec<MultiAddr> {
-        let mut candidates: Vec<(MultiAddr, AddressType)> = node
-            .addresses
-            .iter()
-            .enumerate()
-            .filter(|(_, addr)| {
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    trace!("Skipping non-dialable address: {addr}");
-                    return false;
-                };
-                if sa.ip().is_unspecified() {
-                    warn!("Rejecting unspecified address: {addr}");
-                    return false;
-                }
-                if sa.ip().is_loopback() {
-                    trace!("Accepting loopback address (local/test): {addr}");
-                }
-                true
-            })
-            .map(|(i, addr)| {
-                let addr_type = node
-                    .address_types
-                    .get(i)
-                    .copied()
-                    .unwrap_or(AddressType::Direct);
-                (addr.clone(), addr_type)
-            })
-            .collect();
-
-        // Relay first (known-good relay endpoint), Direct second, NATted last.
-        candidates.sort_by_key(|(_, t)| match t {
-            AddressType::Relay => 0,
-            AddressType::Direct => 1,
-            AddressType::NATted => 2,
-        });
-
-        candidates.into_iter().map(|(addr, _)| addr).collect()
+    /// Walks the parallel `addresses` / `address_types` vecs, returning
+    /// the first address whose type is [`AddressType::Direct`] and whose
+    /// socket is dialable (QUIC, non-unspecified, not port zero). Returns
+    /// `None` when no such address exists — the caller should skip this
+    /// candidate and walk to the next-closest peer.
+    pub(crate) fn first_direct_dialable(node: &DHTNode) -> Option<MultiAddr> {
+        for (i, addr) in node.addresses.iter().enumerate() {
+            let addr_type = node
+                .address_types
+                .get(i)
+                .copied()
+                .unwrap_or(AddressType::Direct);
+            if addr_type != AddressType::Direct {
+                continue;
+            }
+            let Some(sa) = addr.dialable_socket_addr() else {
+                continue;
+            };
+            if sa.ip().is_unspecified() {
+                continue;
+            }
+            return Some(addr.clone());
+        }
+        None
     }
 
     /// Return all dialable addresses from a bare address list (no type info).
@@ -2033,68 +2012,17 @@ impl DhtNetworkManager {
                 debug!("Handling LEAVE request from: {}", authenticated_sender);
                 Ok(DhtNetworkResult::LeaveSuccess)
             }
-            DhtNetworkOperation::PublishAddress { addresses } => {
+            DhtNetworkOperation::PublishAddressSet { seq, addresses } => {
                 info!(
-                    "Handling PUBLISH_ADDRESS from {}: {} addresses",
+                    "Handling PUBLISH_ADDRESS_SET from {}: seq={} addrs={}",
                     authenticated_sender,
+                    seq,
                     addresses.len()
                 );
                 let dht = self.dht.read().await;
-                for addr in addresses {
-                    dht.touch_node_typed(
-                        authenticated_sender,
-                        Some(addr),
-                        crate::dht::AddressType::Relay,
-                    )
+                dht.replace_node_addresses(authenticated_sender, addresses.clone(), *seq)
                     .await;
-                }
                 Ok(DhtNetworkResult::PublishAddressAck)
-            }
-            DhtNetworkOperation::DialBackRequest { addresses } => {
-                info!(
-                    "Handling DIAL_BACK_REQUEST from {}: {} addresses (ADR-014 probe)",
-                    authenticated_sender,
-                    addresses.len()
-                );
-                let mut outcomes = Vec::with_capacity(addresses.len());
-                for address in addresses {
-                    // Attempt a one-shot QUIC dial with a short, hard-capped
-                    // budget. Any failure (timeout, refused, protocol error,
-                    // invalid address) maps to `reachable = false`. The probe
-                    // must never propagate errors upward — it is a boolean
-                    // question, and the classifier at the requester side
-                    // interprets "no outcome" differently from "failed
-                    // outcome", so we must always emit exactly one record per
-                    // requested address.
-                    let reachable = match tokio::time::timeout(
-                        crate::reachability::DIAL_BACK_PROBE_TIMEOUT,
-                        self.transport.connect_peer(address),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_channel)) => true,
-                        Ok(Err(e)) => {
-                            debug!(
-                                address = %address,
-                                error = %e,
-                                "dial-back probe failed: connect_peer error"
-                            );
-                            false
-                        }
-                        Err(_) => {
-                            debug!(
-                                address = %address,
-                                "dial-back probe failed: timed out"
-                            );
-                            false
-                        }
-                    };
-                    outcomes.push(crate::reachability::DialBackOutcome::new(
-                        address.clone(),
-                        reachable,
-                    ));
-                }
-                Ok(DhtNetworkResult::DialBackReply { outcomes })
             }
         }
     }
@@ -2225,11 +2153,8 @@ impl DhtNetworkManager {
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
             // Use Ping as a lightweight ack — avoids echoing the full
-            // PublishAddress payload (which contains the address list).
+            // PublishAddressSet payload (which contains the address list).
             DhtNetworkResult::PublishAddressAck => DhtNetworkOperation::Ping,
-            // Echo the original request so the correlation envelope stays
-            // intact. The caller reads `result` for the probe outcomes.
-            DhtNetworkResult::DialBackReply { .. } => request.payload.clone(),
             DhtNetworkResult::PeerRejected => request.payload.clone(),
             DhtNetworkResult::Error { .. } => {
                 return Err(P2PError::Dht(crate::error::DhtError::RoutingError(
@@ -2882,16 +2807,25 @@ impl DhtNetworkManager {
         &self.config.peer_id
     }
 
-    /// Send a PublishAddress request to a list of peers, telling them to
-    /// store the given addresses for this node in their routing tables.
-    /// Used after relay setup to propagate the relay address to K closest peers.
-    pub async fn publish_address_to_peers(
+    /// Publish this node's complete typed address set to a list of peers.
+    ///
+    /// Used by the relay-acquisition driver: on initial acquisition, on
+    /// relay-lost (before rebinding), and on successful rebind. The sender
+    /// is authoritative — the receiver replaces any prior record wholesale,
+    /// which is how stale relay addresses get dropped when a session closes.
+    ///
+    /// `seq` is a per-call Unix-nanosecond timestamp from
+    /// [`Self::next_publish_seq`], guaranteeing monotonicity across sends
+    /// from the same node.
+    pub async fn publish_address_set_to_peers(
         &self,
-        addresses: Vec<crate::MultiAddr>,
+        typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
         peers: &[DHTNode],
     ) {
-        let op = DhtNetworkOperation::PublishAddress {
-            addresses: addresses.clone(),
+        let seq = Self::next_publish_seq();
+        let op = DhtNetworkOperation::PublishAddressSet {
+            seq,
+            addresses: typed_addresses.clone(),
         };
         for peer in peers {
             if peer.peer_id == self.config.peer_id {
@@ -2906,11 +2840,16 @@ impl DhtNetworkManager {
                 .await
             {
                 Ok(_) => {
-                    info!("Published address to peer {}", peer.peer_id.to_hex());
+                    debug!(
+                        peer = %peer.peer_id.to_hex(),
+                        addrs = typed_addresses.len(),
+                        seq,
+                        "published address set to peer",
+                    );
                 }
                 Err(e) => {
                     debug!(
-                        "Failed to publish address to peer {}: {}",
+                        "Failed to publish address set to peer {}: {}",
                         peer.peer_id.to_hex(),
                         e
                     );
@@ -2919,52 +2858,26 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Send a [`DhtNetworkOperation::DialBackRequest`] to `prober` asking it
-    /// to attempt a one-shot QUIC dial against each of `addresses` and report
-    /// per-address success.
+    /// Generate the next monotonic publish sequence number.
     ///
-    /// Returns the prober's replies on success. Errors from the underlying
-    /// `send_dht_request` (timeout, transport failure, protocol mismatch) are
-    /// propagated as `Ok(Vec::new())` — an empty reply from a prober is
-    /// semantically equivalent to "contributes no successes to the quorum"
-    /// from the classifier's perspective, so callers should not treat a
-    /// failed request as fatal: a single unresponsive prober is absorbed
-    /// naturally by the 2/3 quorum rule across the other probers.
+    /// Uses wall-clock Unix nanoseconds so the counter:
     ///
-    /// Use [`crate::reachability::Classifier::classify`] to aggregate the
-    /// results from multiple probers and produce per-address classifications.
-    pub async fn send_dial_back_request(
-        &self,
-        prober: &PeerId,
-        addresses: Vec<crate::MultiAddr>,
-    ) -> Vec<crate::reachability::DialBackOutcome> {
-        let op = DhtNetworkOperation::DialBackRequest { addresses };
-        match self.send_dht_request(prober, op, None).await {
-            Ok(DhtNetworkResult::DialBackReply { outcomes }) => {
-                debug!(
-                    prober = %prober.to_hex(),
-                    outcomes = outcomes.len(),
-                    "received dial-back reply"
-                );
-                outcomes
-            }
-            Ok(other) => {
-                warn!(
-                    prober = %prober.to_hex(),
-                    response = ?other,
-                    "unexpected response type for dial-back request; treating as empty reply"
-                );
-                Vec::new()
-            }
-            Err(e) => {
-                debug!(
-                    prober = %prober.to_hex(),
-                    error = %e,
-                    "dial-back request failed; treating as empty reply"
-                );
-                Vec::new()
-            }
-        }
+    /// - Is naturally monotonic within a single process under normal clock
+    ///   conditions (nanosecond resolution, much higher than the republish
+    ///   frequency, which is at most once per relay state change).
+    /// - Survives process restarts because wall-clock time advances across
+    ///   reboots, so a restarted sender's first republish will always have
+    ///   a higher sequence than any pre-restart value stored on receivers.
+    /// - Requires no per-sender persistence.
+    ///
+    /// NTP slews of a few seconds are harmless: the worst case is briefly
+    /// rejecting a valid republish, which the driver's reactive triggers
+    /// will retry in short order.
+    fn next_publish_seq() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
 
     /// Get the local listen address of this node's P2P network
@@ -3073,6 +2986,92 @@ mod tests {
             DhtNetworkManager::first_dialable_address(&[]),
             None,
             "should return None for empty address list"
+        );
+    }
+
+    fn dht_node(seed: u8, entries: Vec<(&str, AddressType)>) -> DHTNode {
+        let (addresses, address_types): (Vec<MultiAddr>, Vec<AddressType>) = entries
+            .into_iter()
+            .map(|(s, t)| (s.parse().unwrap(), t))
+            .unzip();
+        DHTNode {
+            peer_id: PeerId::from_bytes([seed; 32]),
+            addresses,
+            address_types,
+            distance: None,
+            reliability: 1.0,
+        }
+    }
+
+    #[test]
+    fn first_direct_dialable_picks_direct_over_relay() {
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        let picked = DhtNetworkManager::first_direct_dialable(&node).unwrap();
+        assert_eq!(
+            picked,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn first_direct_dialable_returns_none_when_only_relay() {
+        let node = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    #[test]
+    fn first_direct_dialable_skips_wildcard_direct() {
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/0.0.0.0/udp/9000/quic", AddressType::Direct),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        let picked = DhtNetworkManager::first_direct_dialable(&node).unwrap();
+        assert_eq!(
+            picked,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn first_direct_dialable_returns_none_for_empty_node() {
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            distance: None,
+            reliability: 1.0,
+        };
+        assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    #[test]
+    fn first_direct_dialable_skips_natted() {
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::NATted),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        let picked = DhtNetworkManager::first_direct_dialable(&node).unwrap();
+        assert_eq!(
+            picked,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
         );
     }
 

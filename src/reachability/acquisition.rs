@@ -13,40 +13,33 @@
 
 //! Proactive MASQUE relay acquisition coordinator.
 //!
-//! When the classifier reports that none of the node's candidate addresses are
-//! [`AddressClassification::Direct`](super::classifier::AddressClassification::Direct),
-//! the node proceeds to acquire a relay from a close-group public peer. This
-//! module implements the XOR-closest walk described in ADR-014:
+//! Every non-client node calls [`RelayAcquisition::acquire`] after bootstrap
+//! to establish a relay from a close-group peer. The walker is unaware of
+//! whether the local node is public or private — if a candidate's Direct
+//! address is unreachable (private peer), the QUIC dial fails and the walk
+//! advances to the next-closest peer. "Is this candidate public?" is
+//! inferred ambiently from the dial attempt.
 //!
 //! 1. The caller supplies a pre-filtered list of [`RelayCandidate`]s sorted
-//!    by XOR distance (closest first). Filtering — selecting peers whose own
-//!    DHT record contains at least one `Direct` address — is the caller's
-//!    responsibility, not the coordinator's.
+//!    by XOR distance (closest first). Filtering — selecting peers whose
+//!    own DHT record contains at least one `Direct` address — is the
+//!    caller's responsibility, not the coordinator's. See
+//!    [`DhtNetworkManager::first_direct_dialable`](crate::dht_network_manager::DhtNetworkManager::first_direct_dialable)
+//!    for the canonical filter.
 //! 2. [`RelayAcquisition::acquire`] tries each candidate in order. On
 //!    `AtCapacity` or `Unreachable` it walks to the next candidate. On the
 //!    first success it returns.
 //! 3. If every candidate fails, the coordinator returns
-//!    [`RelayAcquisitionError::AllCandidatesExhausted`]; the caller can then
-//!    retry after a routing-table refresh or a re-probe.
+//!    [`RelayAcquisitionError::AllCandidatesExhausted`]; the caller can
+//!    then publish direct-only addresses and retry after a backoff.
 //!
 //! ## Separation of concerns
 //!
 //! The coordinator depends on a [`RelaySessionEstablisher`] trait rather than
 //! a concrete transport type. This keeps the XOR-walk logic testable with a
-//! mock establisher and decouples the reachability subsystem from the
+//! mock establisher and decouples the relay-acquisition subsystem from the
 //! saorsa-transport API surface. A production implementation of the trait
-//! wraps saorsa-transport's `NatTraversalEndpoint::setup_proactive_relay()`
-//! (see ADR-014 implementation scope item 4 for the wiring work).
-//!
-//! ## `dead_code` allow
-//!
-//! Like the classifier, the coordinator and its supporting types are exercised
-//! by the in-file unit tests but not yet consumed by production code. The
-//! consumer — the P2PNode startup sequence that calls the coordinator after
-//! classification — lands in a follow-up ADR-014 work item. Dead code is
-//! locally allowed so the foundation can land ahead of its consumer.
-
-#![allow(dead_code)]
+//! wraps saorsa-transport's `NatTraversalEndpoint::setup_proactive_relay()`.
 
 use std::net::SocketAddr;
 

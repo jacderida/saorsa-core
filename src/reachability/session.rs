@@ -11,192 +11,123 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! End-to-end reachability classification session.
+//! Unconditional MASQUE relay acquisition.
 //!
-//! Orchestrates the ADR-014 flow: after bootstrap, gather own listen
-//! addresses, ask close-group peers to dial them back, classify the results
-//! with the 2/3 quorum rule, and — if no address is Direct — acquire a
-//! proactive MASQUE relay from the closest public peer.
+//! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
+//! peer after bootstrap. There is no dial-back probe and no public/private
+//! classification: the "is this candidate public?" question is answered
+//! ambiently by the dial attempt itself. A candidate whose Direct address is
+//! unreachable will simply fail to accept the CONNECT-UDP request, and the
+//! walker moves to the next-closest peer.
 //!
-//! The session is a one-shot invocation driven by [`P2PNode::start()`].
-//! Periodic re-classification is handled by the re-probe scheduler (item 7,
-//! separate follow-up).
+//! The acquisition walk is a thin wrapper around the reusable
+//! [`RelayAcquisition`] coordinator: build a filtered candidate list from
+//! the routing table, hand it off, and return the outcome.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use rand::Rng;
 use tracing::{debug, info, warn};
 
-use crate::MultiAddr;
 use crate::dht_network_manager::DhtNetworkManager;
 use crate::reachability::acquisition::{AcquiredRelay, RelayAcquisition, RelayCandidate};
-use crate::reachability::classifier::{AddressClassification, Classifier};
-use crate::reachability::probe::DialBackOutcome;
 use crate::transport_handle::TransportHandle;
 
-/// Maximum number of close-group peers to ask for dial-back probes.
-/// Per ADR-014: aim for 3, accept fewer if the network is small.
-const MAX_PROBERS: usize = 3;
+/// Upper bound on the random startup jitter applied before the first
+/// acquisition attempt.
+///
+/// Decorrelates bootstrap-time acquisition stampedes: when many private
+/// nodes come online simultaneously, this prevents them all from hammering
+/// the same 2–3 close public peers in lock-step and tripping per-relay
+/// capacity limits. 2 seconds is short enough to be imperceptible to users
+/// but wide enough to spread load at the tens-of-milliseconds resolution
+/// that matters for QUIC dial handling.
+const STARTUP_JITTER_UPPER_MS: u64 = 2000;
 
-/// Result of a classification session.
+/// Outcome of a single relay acquisition attempt.
 #[derive(Debug, Clone)]
-pub(crate) enum ReachabilityOutcome {
-    /// At least one listen address was classified as Direct.
-    /// The node is publicly reachable and should publish these addresses.
-    Public { direct_addresses: Vec<MultiAddr> },
-    /// No Direct addresses; a relay was acquired successfully.
-    /// The relay-allocated address will be published by the existing DHT
-    /// bridge (via the `RelayEstablished` event from saorsa-transport).
-    PrivateWithRelay { relay: AcquiredRelay },
-    /// No Direct addresses and relay acquisition failed.
-    PrivateNoRelay { reason: String },
-    /// No probers were available to classify (empty routing table after
-    /// bootstrap). Cannot determine reachability — caller should retry after
-    /// the routing table is further populated.
-    NoProbers,
+pub(crate) enum RelayAcquisitionOutcome {
+    /// A MASQUE relay session was successfully established.
+    ///
+    /// The caller (acquisition driver) is responsible for:
+    ///
+    /// 1. Storing the relayer peer ID for the K-closest eviction monitor.
+    /// 2. Publishing the full typed self-record (direct addresses +
+    ///    relay-allocated address tagged [`AddressType::Relay`]) to K
+    ///    closest peers.
+    /// 3. Disabling local relay serving so this node does not form a
+    ///    relay loop by accepting reservations while its own traffic
+    ///    tunnels through someone else.
+    Acquired(AcquiredRelay),
+    /// Acquisition did not succeed. The driver should publish the
+    /// direct-only address set (so the network still has some way to
+    /// reach this node) and arm a backoff retry.
+    ///
+    /// `reason` is a human-readable diagnostic for logs / metrics — no
+    /// programmatic consumer switches on its contents.
+    Failed(String),
 }
 
-/// Run a full reachability classification session.
+/// Run a single unconditional relay-acquisition attempt.
 ///
-/// This is the ADR-014 orchestrator: it probes, classifies, and acquires a
-/// relay if needed. The caller (`P2PNode::start()`) is responsible for:
+/// Walks the XOR-closest peers in the local routing table, filters to
+/// those advertising at least one `Direct` address, and tries each in
+/// order via the [`RelayAcquisition`] coordinator until one accepts a
+/// MASQUE CONNECT-UDP reservation.
 ///
-/// - Calling [`TransportHandle::set_relay_serving_enabled`] based on the
-///   outcome (disable for private nodes so they don't accept relay
-///   reservations they can't honour).
-/// - Emitting [`DhtNetworkEvent::BootstrapComplete`] after the session
-///   returns (the "fully addressable" signal).
+/// The "is this candidate public?" check is implicit: a private candidate's
+/// Direct address is unreachable from outside its NAT, so the QUIC dial
+/// fails and the walker advances to the next candidate.
 ///
-/// When `assume_private` is `true`, the dial-back probes are skipped
-/// entirely and the node proceeds directly to relay acquisition. This is
-/// useful for devnets and test scenarios where you want to force nodes
-/// onto the relay path without relying on actual NAT detection.
-pub(crate) async fn run_classification(
+/// A small randomized startup jitter is applied before the first dial to
+/// prevent correlated bootstrap-time stampedes against the same close-group
+/// peers.
+pub(crate) async fn run_relay_acquisition(
     dht: &DhtNetworkManager,
     transport: &Arc<TransportHandle>,
-    assume_private: bool,
-) -> ReachabilityOutcome {
-    if !assume_private {
-        // Step 1: Gather candidate listen addresses.
-        //
-        // Use the observed external addresses (from QUIC OBSERVED_ADDRESS
-        // frames) rather than raw listen_addrs — the latter may contain
-        // wildcard bind addresses (0.0.0.0) that probers cannot dial.
-        // This mirrors the fix in local_dht_node() (PR #70).
-        //
-        // Fall back to listen_addrs filtered to non-wildcard if no
-        // observations are available yet (cold start before any peer
-        // connected).
-        let observed = transport.observed_external_addresses();
-        let listen_addrs: Vec<MultiAddr> = if observed.is_empty() {
-            transport
-                .listen_addrs()
-                .await
-                .into_iter()
-                .filter(|a| {
-                    a.dialable_socket_addr()
-                        .is_some_and(|sa| !sa.ip().is_unspecified())
-                })
-                .collect()
-        } else {
-            observed.into_iter().map(MultiAddr::quic).collect()
-        };
-        if listen_addrs.is_empty() {
-            warn!("ADR-014: no routable listen addresses available — cannot classify reachability");
-            return ReachabilityOutcome::NoProbers;
-        }
-        info!(
-            "ADR-014: starting reachability classification for {} candidate address(es)",
-            listen_addrs.len()
-        );
-
-        // Step 2: Pick up to MAX_PROBERS close-group peers.
-        let own_key = *dht.peer_id().to_bytes();
-        let probers = dht.find_closest_nodes_local(&own_key, MAX_PROBERS).await;
-        if probers.is_empty() {
-            warn!(
-                "ADR-014: no close-group peers available as probers — routing table may be empty"
-            );
-            return ReachabilityOutcome::NoProbers;
-        }
-        let prober_count = probers.len();
-        info!("ADR-014: selected {} prober(s) for dial-back", prober_count);
-
-        // Step 3: Send DialBackRequest to each prober concurrently.
-        let mut probe_futures = Vec::with_capacity(prober_count);
-        for prober in &probers {
-            let addrs = listen_addrs.clone();
-            probe_futures.push(dht.send_dial_back_request(&prober.peer_id, addrs));
-        }
-        let replies: Vec<Vec<DialBackOutcome>> = futures::future::join_all(probe_futures).await;
-
-        // Step 4: Run the classifier.
-        let classifier = Classifier::new();
-        let classifications = classifier.classify(prober_count, replies);
-
-        let direct_addresses: Vec<MultiAddr> = classifications
-            .into_iter()
-            .filter(|(_, class)| *class == AddressClassification::Direct)
-            .map(|(addr, _)| addr)
-            .collect();
-
-        if !direct_addresses.is_empty() {
-            info!(
-                "ADR-014: classified as PUBLIC — {} Direct address(es)",
-                direct_addresses.len()
-            );
-            return ReachabilityOutcome::Public { direct_addresses };
-        }
-
-        info!("ADR-014: no Direct addresses — classified as PRIVATE, acquiring relay");
-    } else {
-        info!("ADR-014: assume_private is set — skipping classification, acquiring relay");
+) -> RelayAcquisitionOutcome {
+    let jitter_ms = rand::thread_rng().gen_range(0..STARTUP_JITTER_UPPER_MS);
+    if jitter_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
     }
 
-    // Step 5: Build relay candidates from XOR-closest peers.
-    // Per the user's design: we try everyone and private peers reject the
-    // reservation request themselves (via relay_serving_enabled gate).
-    //
-    // Use dialable_addresses_from_node to get type-prioritised addresses
-    // (Relay first, then Direct) so the first dialable address per
-    // candidate is the best available.
     let own_key = *dht.peer_id().to_bytes();
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
+
     let candidates: Vec<RelayCandidate> = closest
         .iter()
         .filter_map(|node| {
-            let sorted = DhtNetworkManager::dialable_addresses_from_node(node);
-            let addr = sorted.into_iter().next()?;
-            Some(RelayCandidate::new(node.peer_id, addr))
+            let direct = DhtNetworkManager::first_direct_dialable(node)?;
+            Some(RelayCandidate::new(node.peer_id, direct))
         })
         .collect();
 
     if candidates.is_empty() {
-        warn!("ADR-014: no dialable relay candidates in routing table");
-        return ReachabilityOutcome::PrivateNoRelay {
-            reason: "no dialable relay candidates available".to_string(),
-        };
+        warn!("relay acquisition: no direct-addressable candidates in routing table");
+        return RelayAcquisitionOutcome::Failed(
+            "no direct-addressable candidates in routing table".to_string(),
+        );
     }
 
     debug!(
-        "ADR-014: trying {} relay candidate(s) in XOR order",
-        candidates.len()
+        candidate_count = candidates.len(),
+        "relay acquisition: starting XOR-closest walk"
     );
 
-    // Step 6: Walk candidates using the acquisition coordinator.
     let coordinator = RelayAcquisition::new(Arc::clone(transport));
     match coordinator.acquire(candidates).await {
         Ok(relay) => {
             info!(
-                "ADR-014: relay acquired — relayer={:?} allocated={}",
-                relay.relayer, relay.allocated_public_addr
+                relayer = ?relay.relayer,
+                allocated = %relay.allocated_public_addr,
+                "relay acquisition: session established"
             );
-            ReachabilityOutcome::PrivateWithRelay { relay }
+            RelayAcquisitionOutcome::Acquired(relay)
         }
         Err(e) => {
-            warn!("ADR-014: relay acquisition failed: {}", e);
-            ReachabilityOutcome::PrivateNoRelay {
-                reason: e.to_string(),
-            }
+            warn!(error = %e, "relay acquisition: all candidates failed");
+            RelayAcquisitionOutcome::Failed(e.to_string())
         }
     }
 }

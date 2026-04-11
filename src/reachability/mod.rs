@@ -11,54 +11,31 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! # Reachability classification
+//! # Unconditional relay acquisition
 //!
-//! Implements the proactive dial-back probe and per-address classifier
-//! described in [ADR-014](../../docs/adr/ADR-014-proactive-relay-first-nat-traversal.md).
+//! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
+//! peer after bootstrap. There is no dial-back probe, no `Public`/`Private`
+//! classification, and no `AssumePrivate` flag: the "is this candidate
+//! public?" question is inferred ambiently from the dial attempt itself.
+//! A private candidate's Direct address is unreachable from outside its NAT,
+//! so the QUIC dial fails and the walker advances to the next close peer.
 //!
-//! ## Overview
+//! ## Module layout
 //!
-//! After bootstrap, a node classifies each of its candidate listen addresses by
-//! asking close-group peers to dial the address back to it. If ≥ 2/3 of probers
-//! succeed (or all probers, for small networks), the address is marked
-//! [`AddressClassification::Direct`]; otherwise the node treats itself as
-//! private and proceeds to acquire a MASQUE relay from a public close-group
-//! peer.
-//!
-//! The module is organised into two concerns:
-//!
-//! - [`probe`]: the [`DialBackProber`] trait and per-address [`DialBackOutcome`]
-//!   record. Anything that can attempt a one-shot outbound dial implements the
-//!   trait; the DHT stream handler holds an `Arc<dyn DialBackProber>` and uses
-//!   it to service incoming `DialBackRequest` messages.
-//! - [`classifier`]: the pure aggregation logic. Given a set of probe replies
-//!   and the number of probers originally queried, [`Classifier`] applies the
-//!   quorum rule and returns a per-address [`AddressClassification`] map. It
-//!   has no I/O, no async, and is unit-tested in isolation.
-//!
-//! The wire-level request/response types that carry the protocol over the DHT
-//! stream live in [`crate::dht::network_integration`] alongside the other DHT
-//! message variants (`DhtMessage::DialBackRequest` / `DhtResponse::DialBackReply`).
-//!
-//! ## Incremental landing
-//!
-//! The `Classifier` and `AddressClassification` re-exports appear unused to
-//! the compiler today — their direct consumer (the relay acquisition
-//! coordinator) is a subsequent ADR-014 work item. The re-exports are kept at
-//! the module root so the consumer can land without restructuring the module
-//! layout. `unused_imports` is allowed locally for that reason.
-
-#![allow(unused_imports)]
+//! - [`acquisition`]: the reusable XOR-closest [`RelayAcquisition`]
+//!   coordinator. Pure logic — wraps a [`RelaySessionEstablisher`] trait so
+//!   the walk can be unit-tested with mock establishers.
+//! - [`session`]: the [`run_relay_acquisition`] entry point. Builds the
+//!   filtered candidate list from the routing table and hands it to the
+//!   coordinator.
+//! - [`driver`]: the [`spawn_acquisition_driver`] background task. Owns
+//!   every state transition for this node's relay: initial acquisition,
+//!   backoff retry, K-closest-eviction watch, tunnel-health poll, and
+//!   the republish-then-reacquire sequence on loss.
 
 pub(crate) mod acquisition;
-pub(crate) mod classifier;
-pub(crate) mod monitor;
-pub(crate) mod probe;
+pub(crate) mod driver;
 pub(crate) mod session;
 
-pub(crate) use acquisition::{
-    AcquiredRelay, RelayAcquisition, RelayAcquisitionError, RelayCandidate,
-    RelaySessionEstablishError, RelaySessionEstablisher,
-};
-pub(crate) use classifier::{AddressClassification, Classifier};
-pub(crate) use probe::{DIAL_BACK_PROBE_TIMEOUT, DialBackOutcome, DialBackProber};
+pub(crate) use acquisition::{RelaySessionEstablishError, RelaySessionEstablisher};
+pub(crate) use driver::spawn_acquisition_driver;
