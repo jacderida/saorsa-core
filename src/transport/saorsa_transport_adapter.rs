@@ -488,10 +488,11 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
-        // The full NAT traversal flow is: direct (2s) + 2 × hole-punch
-        // rounds (3s + 1s retry each) + relay (10s) = ~20s. 25s provides
-        // margin for handshake jitter.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(25);
+        // The full NAT traversal flow is: direct (3s) + 2 × hole-punch
+        // rounds (3s each) + relay (5s) = ~17s. 15s hard cap ensures
+        // we fail fast if the cascade stalls — any legitimate connection
+        // completes well within this window.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
@@ -499,6 +500,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         )
         .await
         .map_err(|_| {
+            tracing::warn!(
+                "DIAL_TIMEOUT expired: connect_to_peer({}) exceeded {}s hard cap \
+                 — the inner connection cascade (direct+holepunch+relay) did not \
+                 complete or fail within the expected window",
+                peer_addr,
+                DIAL_TIMEOUT.as_secs(),
+            );
             anyhow::anyhow!(
                 "Connection timeout after {:?} to {}",
                 DIAL_TIMEOUT,
@@ -872,6 +880,20 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
+    /// Set multiple preferred coordinators for hole-punching to a specific target.
+    pub async fn set_hole_punch_preferred_coordinators(
+        &self,
+        target: SocketAddr,
+        coordinators: Vec<SocketAddr>,
+    ) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            node.transport
+                .endpoint()
+                .set_hole_punch_preferred_coordinators(target, coordinators.clone())
+                .await;
+        }
+    }
+
     /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
     /// relay routing. Called when identity exchange completes on a connection.
     pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
@@ -1184,25 +1206,20 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             }
         }
 
-        // Produce a single error that preserves the full cause chain from
-        // whichever stack(s) were actually tried. In dual-stack-over-v6 mode
-        // (v4 is None) we don't lie about having tried v4.
+        // Inline the actual error cause so callers using `{}` (not `{:#}`)
+        // see the real failure reason, not just which IP stack was tried.
         let err = match (v6_err, v4_err) {
-            (Some(v6), Some(v4)) => v6.context(format!(
-                "send_to_peer_optimized to {} failed on both stacks (v4 cause: {:#})",
-                addr, v4
-            )),
-            (Some(v6), None) => v6.context(format!(
-                "send_to_peer_optimized to {} failed (v6-only: no v4 stack bound)",
-                addr
-            )),
-            (None, Some(v4)) => v4.context(format!(
-                "send_to_peer_optimized to {} failed (v4-only: no v6 stack bound)",
-                addr
-            )),
+            (Some(v6), Some(v4)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed on both stacks — v6: {v6}, v4: {v4}"
+            ),
+            (Some(v6), None) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed: {v6}"
+            ),
+            (None, Some(v4)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed: {v4}"
+            ),
             (None, None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {}: neither v6 nor v4 stack available",
-                addr
+                "send_to_peer_optimized to {addr}: neither v6 nor v4 stack available"
             ),
         };
         Err(err)

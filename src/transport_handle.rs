@@ -491,6 +491,26 @@ impl TransportHandle {
         self.peer_to_channel.read().await.keys().cloned().collect()
     }
 
+    /// Get socket addresses of connected peers (for coordinator hints).
+    /// Returns up to `limit` addresses of currently connected peers.
+    pub async fn connected_peer_addresses(&self, limit: usize) -> Vec<(SocketAddr, PeerId)> {
+        let p2c = self.peer_to_channel.read().await;
+        let mut result = Vec::new();
+        for (peer_id, channels) in p2c.iter() {
+            if result.len() >= limit {
+                break;
+            }
+            // Channel IDs are stringified SocketAddrs (e.g., "45.32.243.72:10012")
+            for channel_id in channels {
+                if let Ok(sa) = channel_id.parse::<SocketAddr>() {
+                    result.push((sa, *peer_id));
+                    break; // One address per peer is enough
+                }
+            }
+        }
+        result
+    }
+
     /// Get count of authenticated app-level peers.
     pub async fn peer_count(&self) -> usize {
         self.peer_to_channel.read().await.len()
@@ -731,6 +751,18 @@ impl TransportHandle {
     ) {
         self.dual_node
             .set_hole_punch_preferred_coordinator(target, coordinator)
+            .await;
+    }
+
+    /// Set multiple preferred coordinators for hole-punching to a specific target.
+    /// Used when coordinator hints are extracted from DHT records.
+    pub async fn set_hole_punch_preferred_coordinators(
+        &self,
+        target: SocketAddr,
+        coordinators: Vec<SocketAddr>,
+    ) {
+        self.dual_node
+            .set_hole_punch_preferred_coordinators(target, coordinators)
             .await;
     }
 
