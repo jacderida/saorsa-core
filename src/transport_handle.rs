@@ -81,6 +81,9 @@ pub struct TransportConfig {
     pub user_agent: String,
     /// Allow loopback addresses in the transport layer.
     pub allow_loopback: bool,
+    /// Enable MASQUE relay service for other peers.
+    /// False for client-mode nodes that are outbound-only.
+    pub enable_relay_service: bool,
 }
 
 impl TransportConfig {
@@ -99,6 +102,7 @@ impl TransportConfig {
             node_identity,
             user_agent: config.user_agent(),
             allow_loopback: config.allow_loopback,
+            enable_relay_service: config.mode != crate::network::NodeMode::Client,
         }
     }
 }
@@ -196,6 +200,7 @@ impl TransportHandle {
                 config.max_connections,
                 config.max_message_size,
                 config.allow_loopback,
+                config.enable_relay_service,
             )
             .await
             .map_err(|e| {

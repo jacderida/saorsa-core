@@ -197,30 +197,30 @@ impl P2PNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        Self::new_with_options(bind_addr, max_connections, max_msg_size, false).await
+        Self::new_with_options(bind_addr, max_connections, max_msg_size, false, true).await
     }
 
     /// Create a new P2P network node with full control over connection
-    /// limits, message size, and loopback address acceptance.
+    /// limits, message size, loopback address acceptance, and relay service.
     pub async fn new_with_options(
         bind_addr: SocketAddr,
         max_connections: usize,
         max_msg_size: Option<usize>,
         allow_loopback: bool,
+        enable_relay_service: bool,
     ) -> Result<Self> {
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
             .max_connections(max_connections)
             .conservative_timeouts()
-            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY);
-        if let Some(max_msg_size) = max_msg_size {
-            builder = builder.max_message_size(max_msg_size);
-        }
-        if allow_loopback {
-            builder = builder.nat(NatConfig {
-                allow_loopback: true,
+            .data_channel_capacity(P2pConfig::DEFAULT_DATA_CHANNEL_CAPACITY)
+            .nat(NatConfig {
+                allow_loopback,
+                enable_relay_service,
                 ..NatConfig::default()
             });
+        if let Some(max_msg_size) = max_msg_size {
+            builder = builder.max_message_size(max_msg_size);
         }
         let config = builder
             .build()
@@ -1151,17 +1151,18 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false).await
+        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false, true).await
     }
 
     /// Create dual nodes with full control over connection limits, message
-    /// size, and loopback address acceptance.
+    /// size, loopback address acceptance, and relay service.
     pub async fn new_with_options(
         v6_addr: Option<SocketAddr>,
         v4_addr: Option<SocketAddr>,
         max_connections: usize,
         max_msg_size: Option<usize>,
         allow_loopback: bool,
+        enable_relay_service: bool,
     ) -> Result<Self> {
         let v6 = if let Some(addr) = v6_addr {
             Some(
@@ -1170,6 +1171,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                     max_connections,
                     max_msg_size,
                     allow_loopback,
+                    enable_relay_service,
                 )
                 .await?,
             )
@@ -1182,6 +1184,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 max_connections,
                 max_msg_size,
                 allow_loopback,
+                enable_relay_service,
             )
             .await
             {
