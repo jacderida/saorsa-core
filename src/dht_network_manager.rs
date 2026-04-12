@@ -141,7 +141,8 @@ impl DHTNode {
     ///
     /// The returned vec preserves the storage order from `addresses`;
     /// callers that need Relay-first ordering should pass the result to
-    /// [`DhtNetworkManager::dialable_addresses_typed`].
+    /// [`DhtNetworkManager::dialable_addresses_typed`] or use
+    /// [`Self::addresses_by_priority`] for a pre-sorted `Vec<MultiAddr>`.
     pub fn typed_addresses(&self) -> Vec<(MultiAddr, AddressType)> {
         self.addresses
             .iter()
@@ -155,6 +156,19 @@ impl DHTNode {
                 (addr.clone(), ty)
             })
             .collect()
+    }
+
+    /// Addresses sorted by [`AddressType`] priority: Relay first, then
+    /// Direct, then NATted.  Within each tier the original insertion
+    /// order is preserved (stable sort).
+    ///
+    /// Use this instead of raw `addresses` whenever the caller needs to
+    /// dial or pass addresses to a consumer that will try them in order
+    /// (e.g., `send_message`, `reconnect_and_send`).
+    pub fn addresses_by_priority(&self) -> Vec<MultiAddr> {
+        let mut typed = self.typed_addresses();
+        typed.sort_by_key(|(_, ty)| ty.priority());
+        typed.into_iter().map(|(addr, _)| addr).collect()
     }
 }
 
@@ -1843,7 +1857,7 @@ impl DhtNetworkManager {
         Vec::new()
     }
 
-    /// Filter and sort typed addresses by [`type_priority`].
+    /// Filter and sort typed addresses by [`AddressType::priority`].
     ///
     /// Relay first, Direct second, NATted last. Stable sort within each
     /// tier preserves the input order, so callers that hand in addresses
@@ -1858,11 +1872,7 @@ impl DhtNetworkManager {
             .cloned()
             .collect();
 
-        candidates.sort_by_key(|pair| match pair.1 {
-            AddressType::Relay => 0,
-            AddressType::Direct => 1,
-            AddressType::NATted => 2,
-        });
+        candidates.sort_by_key(|pair| pair.1.priority());
 
         candidates
     }

@@ -126,17 +126,26 @@ pub enum AddressType {
     NATted,
 }
 
-/// Priority index for ordering addresses by type. Lower is preferred.
-///
-/// Shared between [`NodeInfo::merge_typed_address`] insertion logic and the
-/// full-replace path in [`KBucket::replace_node_addresses`] so both maintain
-/// the same ordering invariant.
-const fn type_priority(t: AddressType) -> u8 {
-    match t {
-        AddressType::Relay => 0,
-        AddressType::Direct => 1,
-        AddressType::NATted => 2,
+impl AddressType {
+    /// Priority index for ordering addresses by type. Lower is preferred.
+    ///
+    /// Relay (0) → Direct (1) → NATted (2).
+    ///
+    /// Used by [`NodeInfo::merge_typed_address`], [`KBucket::replace_node_addresses`],
+    /// [`DHTNode::addresses_by_priority`], and [`DhtNetworkManager::dialable_addresses_typed`]
+    /// to maintain a consistent ordering invariant.
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Relay => 0,
+            Self::Direct => 1,
+            Self::NATted => 2,
+        }
     }
+}
+
+/// Convenience alias for the internal callers that predate the method form.
+const fn type_priority(t: AddressType) -> u8 {
+    t.priority()
 }
 
 /// Duration of no contact after which a peer is considered stale.
