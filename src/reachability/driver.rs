@@ -26,10 +26,10 @@
 //! 1. **Acquiring**: call [`run_relay_acquisition`]. On success, publish
 //!    the full typed self-record (direct addresses + relay-allocated
 //!    address tagged [`AddressType::Relay`]) to K-closest peers, store
-//!    the relayer peer ID, disable local relay serving, and enter the
-//!    **Holding** state. On failure, publish the direct-only address set
-//!    so the node remains as reachable as possible, enable local relay
-//!    serving, arm the exponential backoff timer, and enter the
+//!    the relayer peer ID, and enter the **Holding** state. Relay
+//!    serving stays permanently enabled. On failure, publish the
+//!    direct-only address set so the node remains as reachable as
+//!    possible, arm the exponential backoff timer, and enter the
 //!    **Backoff** state.
 //! 2. **Holding**: subscribe to `KClosestPeersChanged` events and poll
 //!    [`TransportHandle::is_relay_healthy`] every
@@ -138,7 +138,6 @@ impl AcquisitionDriver {
                     self.current_backoff = BACKOFF_INITIAL;
                     *self.relayer_peer_id.write().await = Some(relay.relayer);
                     *self.relay_address.write().await = Some(relay.allocated_public_addr);
-                    self.transport.set_relay_serving_enabled(false);
                     self.publish_typed_set(Some(relay.allocated_public_addr))
                         .await;
                     info!(
@@ -161,7 +160,6 @@ impl AcquisitionDriver {
                     warn!(reason, "driver: acquisition failed, entering backoff");
                     *self.relayer_peer_id.write().await = None;
                     *self.relay_address.write().await = None;
-                    self.transport.set_relay_serving_enabled(true);
                     self.publish_typed_set(None).await;
                     if self.wait_backoff_or_event().await {
                         return; // shutdown
@@ -225,24 +223,19 @@ impl AcquisitionDriver {
         }
 
         let own_key = *self.dht.peer_id().to_bytes();
-        match self
+        let all_peers = self
             .dht
-            .find_closest_nodes_network(&own_key, self.dht.k_value())
-            .await
-        {
-            Ok(nodes) => {
-                trace!(
-                    peers = nodes.len(),
-                    addrs = typed.len(),
-                    relay = ?relay,
-                    "driver: publishing typed address set"
-                );
-                self.dht.publish_address_set_to_peers(typed, &nodes).await;
-            }
-            Err(e) => {
-                warn!(error = %e, "driver: self-lookup for publish failed");
-            }
-        }
+            .find_closest_nodes_local(&own_key, self.dht.k_value())
+            .await;
+        trace!(
+            peers = all_peers.len(),
+            addrs = typed.len(),
+            relay = ?relay,
+            "driver: publishing typed address set to all routing table peers"
+        );
+        self.dht
+            .publish_address_set_to_peers(typed, &all_peers)
+            .await;
     }
 
     /// Hold the acquired relay until an eviction or death event forces a
@@ -306,7 +299,6 @@ impl AcquisitionDriver {
     async fn lose_relay_and_republish(&self) {
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
-        self.transport.set_relay_serving_enabled(true);
         self.publish_typed_set(None).await;
     }
 
