@@ -188,6 +188,10 @@ impl AcquisitionDriver {
         let observed = self.transport.direct_external_addresses();
 
         let mut typed: Vec<(MultiAddr, AddressType)> = Vec::new();
+        // Normalize addresses before dedup so IPv4-mapped IPv6
+        // (::ffff:a.b.c.d) and plain IPv4 (a.b.c.d) are treated as
+        // equal, preventing the same address from appearing twice with
+        // different representations.
         let mut seen: HashSet<SocketAddr> = HashSet::new();
 
         // Prefer observed (post-NAT) addresses for the direct tier since
@@ -198,8 +202,9 @@ impl AcquisitionDriver {
                 if sa.ip().is_unspecified() {
                     continue;
                 }
-                if seen.insert(sa) {
-                    typed.push((MultiAddr::quic(sa), AddressType::Direct));
+                let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+                if seen.insert(normalized) {
+                    typed.push((MultiAddr::quic(normalized), AddressType::Direct));
                 }
             }
         }
@@ -210,8 +215,9 @@ impl AcquisitionDriver {
             if sa.ip().is_unspecified() {
                 continue;
             }
-            if seen.insert(sa) {
-                typed.push((addr, AddressType::Direct));
+            let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+            if seen.insert(normalized) {
+                typed.push((MultiAddr::quic(normalized), AddressType::Direct));
             }
         }
 

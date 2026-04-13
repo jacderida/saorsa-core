@@ -35,14 +35,26 @@
 
 use std::net::SocketAddr;
 
+/// Maximum number of pinned direct addresses retained.
+///
+/// Caps growth from mobile network handoffs, CGN pool rotation, or other
+/// NAT-rebinding events. When the cap is reached, the oldest (first)
+/// address is evicted on the assumption that newer observations better
+/// reflect the current NAT mapping. 16 is generous enough to cover
+/// dual-stack + multi-homed hosts while bounding the self-record size
+/// published to K-closest peers.
+const MAX_DIRECT_ADDRESSES: usize = 16;
+
 /// Pinned external addresses observed from QUIC peers and the relay layer.
 ///
-/// Direct addresses are pinned on first observation and never evicted.
+/// Direct addresses are pinned on first observation and evicted
+/// oldest-first when [`MAX_DIRECT_ADDRESSES`] is reached.
 /// The relay address is set/cleared by the relay acquisition driver.
 #[derive(Debug, Default)]
 pub(crate) struct ExternalAddresses {
     /// Direct external addresses pinned from QUIC `OBSERVED_ADDRESS` frames
-    /// received during bootstrap. Insertion-ordered, deduplicated.
+    /// received during bootstrap. Insertion-ordered, deduplicated, capped
+    /// at [`MAX_DIRECT_ADDRESSES`].
     direct: Vec<SocketAddr>,
     /// Relay-allocated address. `Some` when a MASQUE relay is held, `None`
     /// otherwise.
@@ -57,11 +69,16 @@ impl ExternalAddresses {
 
     /// Pin a direct external address observed from a QUIC peer.
     ///
-    /// Inserts `addr` if it is not already present. No eviction, no expiry.
+    /// Inserts `addr` if it is not already present. When the list is at
+    /// capacity, the oldest entry is evicted first.
     pub(crate) fn pin_direct(&mut self, addr: SocketAddr) {
-        if !self.direct.contains(&addr) {
-            self.direct.push(addr);
+        if self.direct.contains(&addr) {
+            return;
         }
+        if self.direct.len() >= MAX_DIRECT_ADDRESSES {
+            self.direct.remove(0);
+        }
+        self.direct.push(addr);
     }
 
     /// Set the relay-allocated address.
@@ -182,5 +199,21 @@ mod tests {
         ext.pin_direct(direct);
         ext.set_relay(relay);
         assert_eq!(ext.direct_addresses(), vec![direct]);
+    }
+
+    #[test]
+    fn pin_direct_evicts_oldest_at_capacity() {
+        let mut ext = ExternalAddresses::new();
+        for i in 0..MAX_DIRECT_ADDRESSES as u8 {
+            ext.pin_direct(addr(i, 9000));
+        }
+        assert_eq!(ext.direct_addresses().len(), MAX_DIRECT_ADDRESSES);
+
+        // Adding one more should evict the oldest (octet 0).
+        let new = addr(MAX_DIRECT_ADDRESSES as u8, 9000);
+        ext.pin_direct(new);
+        assert_eq!(ext.direct_addresses().len(), MAX_DIRECT_ADDRESSES);
+        assert!(!ext.direct_addresses().contains(&addr(0, 9000)));
+        assert_eq!(*ext.direct_addresses().last().unwrap(), new);
     }
 }
