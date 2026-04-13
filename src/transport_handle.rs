@@ -84,6 +84,9 @@ pub struct TransportConfig {
     /// Enable MASQUE relay service for other peers.
     /// False for client-mode nodes that are outbound-only.
     pub enable_relay_service: bool,
+    /// Advertise discovered external addresses to connected peers.
+    /// False for client-mode nodes that are outbound-only.
+    pub advertise_external_addresses: bool,
 }
 
 impl TransportConfig {
@@ -103,6 +106,7 @@ impl TransportConfig {
             user_agent: config.user_agent(),
             allow_loopback: config.allow_loopback,
             enable_relay_service: config.mode != crate::network::NodeMode::Client,
+            advertise_external_addresses: config.mode != crate::network::NodeMode::Client,
         }
     }
 }
@@ -200,6 +204,7 @@ impl TransportHandle {
                 config.max_message_size,
                 config.allow_loopback,
                 config.enable_relay_service,
+                config.advertise_external_addresses,
             )
             .await
             .map_err(|e| {
