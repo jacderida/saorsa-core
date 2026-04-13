@@ -39,7 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
-use crate::transport::observed_address_cache::ObservedAddressCache;
+use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
@@ -1034,17 +1034,15 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     ///   needs to publish the relay address to the K closest peers.
     ///   Returned via the second mpsc receiver.
     /// - **`ExternalAddressDiscovered`**: a peer reported the address it
-    ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Recorded
-    ///   directly into the supplied [`ObservedAddressCache`] so the
-    ///   transport layer can fall back to it when no live connection has an
-    ///   observation. See the cache module for the frequency- and
-    ///   recency-aware selection algorithm.
+    ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Pinned
+    ///   directly into the supplied [`ExternalAddresses`] store. Once
+    ///   pinned, the address is retained for the process lifetime.
     ///
     /// Other `P2pEvent` variants are not consumed by saorsa-core and are
     /// silently ignored.
     pub fn spawn_peer_address_update_forwarder(
         &self,
-        observed_cache: Arc<parking_lot::Mutex<ObservedAddressCache>>,
+        external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
     ) -> (
         tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
@@ -1056,10 +1054,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
-            let cache_clone = Arc::clone(&observed_cache);
+            let ext_clone = Arc::clone(&external_addresses);
             let drops = Arc::clone(&drop_counter);
-            // Capture which local bind owns this forwarder so the cache can
-            // partition observations by interface (multi-homed correctness).
             let local_bind = node.local_address();
             tokio::spawn(async move {
                 tracing::debug!(
@@ -1097,17 +1093,17 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                         Ok(saorsa_transport::P2pEvent::ExternalAddressDiscovered { addr }) => {
                             // Convert TransportAddr → SocketAddr for QUIC.
                             // Non-UDP transports (BLE, LoRa) yield None and
-                            // are skipped — the cache only models routable
-                            // IP addresses.
+                            // are skipped — only routable IP addresses are
+                            // pinned.
                             if let Some(socket_addr) = addr.as_socket_addr() {
                                 let normalized =
                                     saorsa_transport::shared::normalize_socket_addr(socket_addr);
                                 tracing::debug!(
                                     local_bind = %local_bind,
-                                    "ADDR_FWD: caching observed external address {}",
+                                    "ADDR_FWD: pinning observed external address {}",
                                     normalized
                                 );
-                                cache_clone.lock().record(local_bind, normalized);
+                                ext_clone.lock().pin_direct(normalized);
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {

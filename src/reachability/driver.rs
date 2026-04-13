@@ -138,6 +138,8 @@ impl AcquisitionDriver {
                     self.current_backoff = BACKOFF_INITIAL;
                     *self.relayer_peer_id.write().await = Some(relay.relayer);
                     *self.relay_address.write().await = Some(relay.allocated_public_addr);
+                    self.transport
+                        .set_relay_address(relay.allocated_public_addr);
                     self.publish_typed_set(Some(relay.allocated_public_addr))
                         .await;
                     info!(
@@ -160,6 +162,7 @@ impl AcquisitionDriver {
                     warn!(reason, "driver: acquisition failed, entering backoff");
                     *self.relayer_peer_id.write().await = None;
                     *self.relay_address.write().await = None;
+                    self.transport.clear_relay_address();
                     self.publish_typed_set(None).await;
                     if self.wait_backoff_or_event().await {
                         return; // shutdown
@@ -182,7 +185,7 @@ impl AcquisitionDriver {
     /// peers how to reach it.
     async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
         let listen = self.transport.listen_addrs().await;
-        let observed = self.transport.observed_external_addresses();
+        let observed = self.transport.direct_external_addresses();
 
         let mut typed: Vec<(MultiAddr, AddressType)> = Vec::new();
         let mut seen: HashSet<SocketAddr> = HashSet::new();
@@ -299,6 +302,7 @@ impl AcquisitionDriver {
     async fn lose_relay_and_republish(&self) {
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
+        self.transport.clear_relay_address();
         self.publish_typed_set(None).await;
     }
 
