@@ -108,7 +108,7 @@ pub fn is_dht_participant(user_agent: &str) -> bool {
 }
 
 /// Capacity of the internal channel used by the message receiving system.
-pub(crate) const MESSAGE_RECV_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const MESSAGE_RECV_CHANNEL_CAPACITY: usize = 2048;
 
 /// Maximum number of concurrent in-flight request/response operations.
 pub(crate) const MAX_ACTIVE_REQUESTS: usize = 256;
