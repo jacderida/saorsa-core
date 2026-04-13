@@ -146,7 +146,7 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 ///
 /// `wait_for_peer_identity` short-circuits on channel close, so most dead
 /// channels surface in microseconds regardless of this budget.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 5;
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
@@ -727,7 +727,7 @@ pub(crate) struct PendingRequest {
 }
 
 /// Maximum time to wait for identity exchange during a reconnect-on-send dial.
-const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Short grace period after closing stale QUIC connections before re-dialing.
 ///
