@@ -1212,12 +1212,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             (Some(v6), Some(v4)) => anyhow::anyhow!(
                 "send_to_peer_optimized to {addr} failed on both stacks — v6: {v6}, v4: {v4}"
             ),
-            (Some(v6), None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr} failed: {v6}"
-            ),
-            (None, Some(v4)) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr} failed: {v4}"
-            ),
+            (Some(v6), None) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v6}"),
+            (None, Some(v4)) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v4}"),
             (None, None) => anyhow::anyhow!(
                 "send_to_peer_optimized to {addr}: neither v6 nor v4 stack available"
             ),

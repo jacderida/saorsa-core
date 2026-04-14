@@ -566,11 +566,7 @@ impl KademliaRoutingTable {
 
     /// Replace all coordinator hints for a node in the routing table.
     /// Returns the number of hints stored, or 0 if the node is not present.
-    fn merge_coordinator_hints(
-        &mut self,
-        node_id: &PeerId,
-        hints: Vec<MultiAddr>,
-    ) -> usize {
+    fn merge_coordinator_hints(&mut self, node_id: &PeerId, hints: Vec<MultiAddr>) -> usize {
         let Some(bucket_index) = self.get_bucket_index(node_id) else {
             return 0;
         };
@@ -1136,11 +1132,7 @@ impl DhtCoreEngine {
     ///
     /// Takes a write lock. Returns the number of hints stored (0 if the
     /// peer is not in the routing table).
-    pub async fn merge_coordinator_hints(
-        &self,
-        node_id: &PeerId,
-        hints: Vec<MultiAddr>,
-    ) -> usize {
+    pub async fn merge_coordinator_hints(&self, node_id: &PeerId, hints: Vec<MultiAddr>) -> usize {
         let mut routing = self.routing_table.write().await;
         routing.merge_coordinator_hints(node_id, hints)
     }

@@ -704,7 +704,7 @@ impl DhtNetworkManager {
                             .iter()
                             .filter(|a| {
                                 a.peer_id()
-                                    .map_or(false, |pid| *pid != local_node.peer_id)
+                                    .is_some_and(|pid| *pid != local_node.peer_id)
                             })
                             .map(|a| format!("{}", a))
                             .collect();
@@ -893,8 +893,8 @@ impl DhtNetworkManager {
             let hint_addrs = Self::extract_coordinator_hints(&entry.node);
             if !hint_addrs.is_empty() {
                 let direct = Self::direct_addresses_only(&entry.node);
-                if let Some(target_addr) = Self::first_dialable_address(&direct)
-                    .and_then(|a| a.dialable_socket_addr())
+                if let Some(target_addr) =
+                    Self::first_dialable_address(&direct).and_then(|a| a.dialable_socket_addr())
                 {
                     debug!(
                         "Setting {} coordinator hint(s) for NAT node {} from DHT record",
@@ -902,19 +902,14 @@ impl DhtNetworkManager {
                         hex::encode(&entry.node.peer_id.to_bytes()[..8])
                     );
                     self.transport
-                        .set_hole_punch_preferred_coordinators(
-                            target_addr, hint_addrs,
-                        )
+                        .set_hole_punch_preferred_coordinators(target_addr, hint_addrs)
                         .await;
                 }
                 let hint_multiaddrs: Vec<crate::MultiAddr> = entry
                     .node
                     .addresses
                     .iter()
-                    .filter(|addr| {
-                        addr.peer_id()
-                            .map_or(false, |pid| *pid != entry.node.peer_id)
-                    })
+                    .filter(|addr| addr.peer_id().is_some_and(|pid| *pid != entry.node.peer_id))
                     .cloned()
                     .collect();
                 let stored = {
@@ -1314,9 +1309,8 @@ impl DhtNetworkManager {
                             let hint_addrs = Self::extract_coordinator_hints(&node);
                             if !hint_addrs.is_empty() {
                                 let direct = Self::direct_addresses_only(&node);
-                                if let Some(target_addr) =
-                                    Self::first_dialable_address(&direct)
-                                        .and_then(|a| a.dialable_socket_addr())
+                                if let Some(target_addr) = Self::first_dialable_address(&direct)
+                                    .and_then(|a| a.dialable_socket_addr())
                                 {
                                     debug!(
                                         "Setting {} coordinator hint(s) for NAT node {} from DHT record",
@@ -1325,7 +1319,8 @@ impl DhtNetworkManager {
                                     );
                                     self.transport
                                         .set_hole_punch_preferred_coordinators(
-                                            target_addr, hint_addrs.clone(),
+                                            target_addr,
+                                            hint_addrs.clone(),
                                         )
                                         .await;
                                 }
@@ -1335,18 +1330,14 @@ impl DhtNetworkManager {
                                     .iter()
                                     .enumerate()
                                     .filter(|(_, addr)| {
-                                        addr.peer_id()
-                                            .map_or(false, |pid| *pid != node.peer_id)
+                                        addr.peer_id().is_some_and(|pid| *pid != node.peer_id)
                                     })
                                     .map(|(_, addr)| addr.clone())
                                     .collect();
                                 let stored = {
                                     let dht = self.dht.read().await;
-                                    dht.merge_coordinator_hints(
-                                        &node.peer_id,
-                                        hint_multiaddrs,
-                                    )
-                                    .await
+                                    dht.merge_coordinator_hints(&node.peer_id, hint_multiaddrs)
+                                        .await
                                 };
                                 if stored > 0 {
                                     debug!(
@@ -1551,10 +1542,8 @@ impl DhtNetworkManager {
         {
             let connected = self.transport.connected_peer_addresses(5).await;
             if !connected.is_empty() {
-                let hint_addrs: Vec<String> = connected
-                    .iter()
-                    .map(|(sa, _)| sa.to_string())
-                    .collect();
+                let hint_addrs: Vec<String> =
+                    connected.iter().map(|(sa, _)| sa.to_string()).collect();
                 debug!(
                     "local_dht_node: including {} coordinator hint(s): {:?}",
                     connected.len(),
@@ -1598,7 +1587,7 @@ impl DhtNetworkManager {
         node.addresses
             .iter()
             .filter(|addr| match addr.peer_id() {
-                None => true, // No peer_id suffix = direct address
+                None => true,                      // No peer_id suffix = direct address
                 Some(pid) => *pid == node.peer_id, // Same peer_id = direct address
             })
             .cloned()
@@ -1663,7 +1652,7 @@ impl DhtNetworkManager {
         let direct_only: Vec<MultiAddr> = addresses
             .iter()
             .filter(|addr| match addr.peer_id() {
-                None => true, // No peer_id suffix = direct address
+                None => true,                  // No peer_id suffix = direct address
                 Some(pid) => *pid == *peer_id, // Same peer_id = direct address
             })
             .cloned()
@@ -2246,7 +2235,7 @@ impl DhtNetworkManager {
                 for addr in addresses {
                     if addr
                         .peer_id()
-                        .map_or(false, |pid| *pid != *authenticated_sender)
+                        .is_some_and(|pid| *pid != *authenticated_sender)
                     {
                         hints.push(addr.clone());
                     } else {
@@ -2284,8 +2273,7 @@ impl DhtNetworkManager {
                     if stored > 0 {
                         debug!(
                             "Merged {} coordinator hint(s) into routing table for peer {}",
-                            stored,
-                            authenticated_sender
+                            stored, authenticated_sender
                         );
                     }
                 }
