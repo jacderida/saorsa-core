@@ -33,6 +33,7 @@ use crate::transport::external_addresses::ExternalAddresses;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use dashmap::{DashMap, DashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -119,8 +120,14 @@ impl TransportConfig {
 /// hold `Arc<TransportHandle>` so they share the same transport state.
 pub struct TransportHandle {
     dual_node: Arc<DualStackNetworkNode>,
-    peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-    active_connections: Arc<RwLock<HashSet<String>>>,
+    /// Channel-level peer registry. Sharded internally — concurrent
+    /// reads/writes on different keys never serialise. Replaces the previous
+    /// `Arc<RwLock<HashMap>>`, which serialised the inbound accept loop and
+    /// every per-peer event handler behind a single writer.
+    peers: Arc<DashMap<String, PeerInfo>>,
+    /// Active transport-level channels. Sharded internally; same rationale
+    /// as `peers`.
+    active_connections: Arc<DashSet<String>>,
     event_tx: broadcast::Sender<P2PEvent>,
     listen_addrs: RwLock<Vec<MultiAddr>>,
     rate_limiter: Arc<RateLimiter>,
@@ -215,9 +222,9 @@ impl TransportHandle {
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
-        let active_connections = Arc::new(RwLock::new(HashSet::new()));
+        let active_connections: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let geo_provider = Arc::new(BgpGeoProvider::new());
-        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let peers: Arc<DashMap<String, PeerInfo>> = Arc::new(DashMap::new());
 
         let shutdown = CancellationToken::new();
 
@@ -336,8 +343,8 @@ impl TransportHandle {
 
         Ok(Self {
             dual_node,
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            active_connections: Arc::new(RwLock::new(HashSet::new())),
+            peers: Arc::new(DashMap::new()),
+            active_connections: Arc::new(DashSet::new()),
             event_tx,
             listen_addrs: RwLock::new(Vec::new()),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
@@ -497,10 +504,8 @@ impl TransportHandle {
     #[allow(dead_code)]
     pub(crate) async fn active_channels(&self) -> Vec<String> {
         self.active_connections
-            .read()
-            .await
             .iter()
-            .cloned()
+            .map(|e| e.key().clone())
             .collect()
     }
 
@@ -509,29 +514,36 @@ impl TransportHandle {
     /// Resolves the app-level [`PeerId`] to a channel ID via the
     /// `peer_to_channel` mapping, then looks up the channel's [`PeerInfo`].
     pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
-        let p2c = self.peer_to_channel.read().await;
-        let channel = p2c.get(peer_id).and_then(|chs| chs.iter().next())?;
-        let peers = self.peers.read().await;
-        peers.get(channel).cloned()
+        let channel = {
+            let p2c = self.peer_to_channel.read().await;
+            p2c.get(peer_id)
+                .and_then(|chs| chs.iter().next().cloned())?
+        };
+        self.peers.get(&channel).map(|e| e.value().clone())
     }
 
     /// Get info for a transport-level channel by its channel ID (internal only).
     #[allow(dead_code)]
     pub(crate) async fn peer_info_by_channel(&self, channel_id: &str) -> Option<PeerInfo> {
-        self.peers.read().await.get(channel_id).cloned()
+        self.peers.get(channel_id).map(|e| e.value().clone())
     }
 
     /// Get the channel ID for a given address, if connected (internal only).
+    ///
+    /// Iteration over the sharded map is not a consistent snapshot — a
+    /// concurrently-removed entry may be missed — but for "find any
+    /// matching peer" semantics that's the correct behaviour.
     #[allow(dead_code)]
     pub(crate) async fn get_channel_id_by_address(&self, addr: &MultiAddr) -> Option<String> {
         let target = addr.socket_addr()?;
-        let peers = self.peers.read().await;
-
-        for (channel_id, peer_info) in peers.iter() {
-            for peer_addr in &peer_info.addresses {
-                if peer_addr.socket_addr() == Some(target) {
-                    return Some(channel_id.clone());
-                }
+        for entry in self.peers.iter() {
+            if entry
+                .value()
+                .addresses
+                .iter()
+                .any(|peer_addr| peer_addr.socket_addr() == Some(target))
+            {
+                return Some(entry.key().clone());
             }
         }
         None
@@ -540,26 +552,25 @@ impl TransportHandle {
     /// List all active connections with peer IDs and addresses (internal only).
     #[allow(dead_code)]
     pub(crate) async fn list_active_connections(&self) -> Vec<(String, Vec<MultiAddr>)> {
-        let active = self.active_connections.read().await;
-        let peers = self.peers.read().await;
-
-        active
+        self.active_connections
             .iter()
-            .map(|peer_id| {
-                let addresses = peers
-                    .get(peer_id)
-                    .map(|info| info.addresses.clone())
+            .map(|entry| {
+                let key = entry.key().clone();
+                let addresses = self
+                    .peers
+                    .get(&key)
+                    .map(|info| info.value().addresses.clone())
                     .unwrap_or_default();
-                (peer_id.clone(), addresses)
+                (key, addresses)
             })
             .collect()
     }
 
     /// Remove a channel from the tracking maps (internal only).
     pub(crate) async fn remove_channel(&self, channel_id: &str) -> bool {
-        self.active_connections.write().await.remove(channel_id);
+        self.active_connections.remove(channel_id);
         self.remove_channel_mappings(channel_id).await;
-        self.peers.write().await.remove(channel_id).is_some()
+        self.peers.remove(channel_id).is_some()
     }
 
     /// Close a channel's QUIC connection and remove it from all tracking maps.
@@ -578,9 +589,9 @@ impl TransportHandle {
                 );
             }
         }
-        self.active_connections.write().await.remove(channel_id);
+        self.active_connections.remove(channel_id);
         self.remove_channel_mappings(channel_id).await;
-        self.peers.write().await.remove(channel_id);
+        self.peers.remove(channel_id);
     }
 
     /// Look up the peer ID for a given connection address.
@@ -655,7 +666,7 @@ impl TransportHandle {
 
     /// Check if a connection to a peer is active at the transport layer (internal only).
     pub(crate) async fn is_connection_active(&self, channel_id: &str) -> bool {
-        self.active_connections.read().await.contains(channel_id)
+        self.active_connections.contains(channel_id)
     }
 
     /// Remove channel mappings for a disconnected channel.
@@ -803,11 +814,8 @@ impl TransportHandle {
             heartbeat_count: 0,
         };
 
-        self.peers.write().await.insert(peer_id.clone(), peer_info);
-        self.active_connections
-            .write()
-            .await
-            .insert(peer_id.clone());
+        self.peers.insert(peer_id.clone(), peer_info);
+        self.active_connections.insert(peer_id.clone());
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
@@ -943,8 +951,8 @@ impl TransportHandle {
                     );
                 }
             }
-            self.active_connections.write().await.remove(channel_id);
-            self.peers.write().await.remove(channel_id);
+            self.active_connections.remove(channel_id);
+            self.peers.remove(channel_id);
         }
 
         info!("Disconnected from peer: {}", peer_id);
@@ -1038,40 +1046,28 @@ impl TransportHandle {
         // registered in P2pEndpoint::connected_peers, but the event chain
         // to populate TransportHandle::peers may not have completed yet.
         //
-        // Uses a single write lock with entry() to avoid a TOCTOU race
-        // where a concurrent event handler could insert a fully-populated
-        // PeerInfo between a read-check and our write.
-        // Double-checked locking: only take a write lock when the channel
-        // is not yet registered, avoiding write-lock contention on every send.
-        {
-            let needs_insert = {
-                let peers = self.peers.read().await;
-                !peers.contains_key(channel_id)
-            };
-
-            if needs_insert {
-                let mut peers = self.peers.write().await;
-                peers.entry(channel_id.to_string()).or_insert_with(|| {
-                    info!(
-                        "send_on_channel: registering new channel {} on the fly",
-                        channel_id
-                    );
-                    let addresses = channel_id
-                        .parse::<std::net::SocketAddr>()
-                        .map(|addr| vec![MultiAddr::quic(addr)])
-                        .unwrap_or_default();
-                    PeerInfo {
-                        channel_id: channel_id.to_string(),
-                        addresses,
-                        status: ConnectionStatus::Connected,
-                        last_seen: Instant::now(),
-                        connected_at: Instant::now(),
-                        protocols: Vec::new(),
-                        heartbeat_count: 0,
-                    }
-                });
+        // DashMap's `entry().or_insert_with()` is atomic on the relevant
+        // shard, so two concurrent senders will not produce duplicate
+        // PeerInfo entries.
+        self.peers.entry(channel_id.to_string()).or_insert_with(|| {
+            info!(
+                "send_on_channel: registering new channel {} on the fly",
+                channel_id
+            );
+            let addresses = channel_id
+                .parse::<std::net::SocketAddr>()
+                .map(|addr| vec![MultiAddr::quic(addr)])
+                .unwrap_or_default();
+            PeerInfo {
+                channel_id: channel_id.to_string(),
+                addresses,
+                status: ConnectionStatus::Connected,
+                last_seen: Instant::now(),
+                connected_at: Instant::now(),
+                protocols: Vec::new(),
+                heartbeat_count: 0,
             }
-        }
+        });
 
         // NOTE: We no longer *reject* sends based on is_connection_active().
         //
@@ -1087,10 +1083,7 @@ impl TransportHandle {
         // is used only to opportunistically populate active_connections,
         // not to decide whether we send.
         if !self.is_connection_active(channel_id).await {
-            self.active_connections
-                .write()
-                .await
-                .insert(channel_id.to_string());
+            self.active_connections.insert(channel_id.to_string());
         }
 
         let raw_data_len = data.len();
@@ -1132,7 +1125,7 @@ impl TransportHandle {
             warn!("Failed to send message to channel {}", channel_id);
             // Clean up the optimistic active_connections entry so stale
             // entries don't accumulate for unknown channels.
-            self.active_connections.write().await.remove(channel_id);
+            self.active_connections.remove(channel_id);
         }
 
         result
@@ -1481,12 +1474,12 @@ impl TransportHandle {
         }
 
         // Include unauthenticated channels (single-channel groups, no fallback).
-        {
-            let peers_guard = self.peers.read().await;
-            for channel_id in peers_guard.keys() {
-                if !mapped_channels.contains(channel_id) {
-                    peer_channel_groups.push(vec![channel_id.clone()]);
-                }
+        // DashMap iteration is not a consistent snapshot, but a missed
+        // freshly-inserted/removed channel here is not a correctness issue —
+        // the next publish picks it up.
+        for entry in self.peers.iter() {
+            if !mapped_channels.contains(entry.key()) {
+                peer_channel_groups.push(vec![entry.key().clone()]);
             }
         }
 
@@ -1595,8 +1588,13 @@ impl TransportHandle {
                 let remote_addr = MultiAddr::quic(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
-                register_new_channel(&peers, &channel_id, &remote_addr).await;
-                active_connections.write().await.insert(channel_id);
+                //
+                // Both register_new_channel and active_connections.insert are
+                // sync DashMap operations — the loop never awaits any lock,
+                // so it cannot stall and back-pressure the upstream
+                // handshake channel under high accept rates.
+                register_new_channel(&peers, &channel_id, &remote_addr);
+                active_connections.insert(channel_id);
             }
         });
         *self.listener_handle.write().await = Some(handle);
@@ -2010,8 +2008,8 @@ impl TransportHandle {
         mut event_rx: broadcast::Receiver<
             crate::transport::saorsa_transport_adapter::ConnectionEvent,
         >,
-        active_connections: Arc<RwLock<HashSet<String>>>,
-        peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
+        active_connections: Arc<DashSet<String>>,
+        peers: Arc<DashMap<String, PeerInfo>>,
         event_tx: broadcast::Sender<P2PEvent>,
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
@@ -2041,16 +2039,16 @@ impl TransportHandle {
                                     channel_id, remote_address
                                 );
 
-                                active_connections.write().await.insert(channel_id.clone());
+                                active_connections.insert(channel_id.clone());
 
-                                let mut peers_lock = peers.write().await;
-                                if let Some(peer_info) = peers_lock.get_mut(&channel_id) {
-                                    peer_info.status = ConnectionStatus::Connected;
-                                    peer_info.connected_at = Instant::now();
-                                } else {
-                                    debug!("Registering new incoming channel: {}", channel_id);
-                                    peers_lock.insert(
-                                        channel_id.clone(),
+                                peers
+                                    .entry(channel_id.clone())
+                                    .and_modify(|peer_info| {
+                                        peer_info.status = ConnectionStatus::Connected;
+                                        peer_info.connected_at = Instant::now();
+                                    })
+                                    .or_insert_with(|| {
+                                        debug!("Registering new incoming channel: {}", channel_id);
                                         PeerInfo {
                                             channel_id: channel_id.clone(),
                                             addresses: vec![MultiAddr::quic(remote_address)],
@@ -2059,19 +2057,35 @@ impl TransportHandle {
                                             connected_at: Instant::now(),
                                             protocols: Vec::new(),
                                             heartbeat_count: 0,
-                                        },
-                                    );
-                                }
+                                        }
+                                    });
 
                                 // Send identity announce so the remote peer can authenticate us.
+                                //
+                                // Build the bytes inline (cheap, infallible
+                                // for valid identities) but spawn the actual
+                                // QUIC send so a stalled peer's 1s ACK
+                                // timeout doesn't block the lifecycle
+                                // monitor and back up identity announces for
+                                // every other peer that just (re)connected.
                                 match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
                                     Ok(announce_bytes) => {
-                                        if let Err(e) = dual_node
-                                            .send_to_peer_optimized(&remote_address, &announce_bytes)
-                                            .await
-                                        {
-                                            warn!("Failed to send identity announce to {channel_id}: {e}");
-                                        }
+                                        let dual_node = Arc::clone(&dual_node);
+                                        let channel_id_for_send = channel_id.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = dual_node
+                                                .send_to_peer_optimized(&remote_address, &announce_bytes)
+                                                .await
+                                            {
+                                                // {e:#} prints the full anyhow cause chain so we
+                                                // can see the underlying reason (e.g. "peer did
+                                                // not acknowledge stream data within 1s",
+                                                // "open_uni failed", "PeerNotFound").
+                                                warn!(
+                                                    "Failed to send identity announce to {channel_id_for_send}: {e:#}"
+                                                );
+                                            }
+                                        });
                                     }
                                     Err(e) => {
                                         warn!("Failed to create identity announce: {e}");
@@ -2086,8 +2100,8 @@ impl TransportHandle {
                                 let channel_id = remote_address.to_string();
                                 debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
 
-                                active_connections.write().await.remove(&channel_id);
-                                peers.write().await.remove(&channel_id);
+                                active_connections.remove(&channel_id);
+                                peers.remove(&channel_id);
                                 // Remove channel mappings and emit PeerDisconnected
                                 // when the peer's last channel is closed.
                                 Self::remove_channel_mappings_static(
@@ -2155,12 +2169,12 @@ impl NetworkSender for TransportHandle {
 impl TransportHandle {
     /// Insert a peer into the peers map (test helper)
     pub(crate) async fn inject_peer(&self, peer_id: String, info: PeerInfo) {
-        self.peers.write().await.insert(peer_id, info);
+        self.peers.insert(peer_id, info);
     }
 
     /// Insert a channel ID into the active_connections set (test helper)
     pub(crate) async fn inject_active_connection(&self, channel_id: String) {
-        self.active_connections.write().await.insert(channel_id);
+        self.active_connections.insert(channel_id);
     }
 
     /// Map an app-level PeerId to a channel ID in both `peer_to_channel` and

@@ -28,6 +28,7 @@ use crate::reachability::spawn_acquisition_driver;
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
+use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2278,13 +2279,17 @@ mod diversity_tests {
     }
 }
 
-/// Helper function to register a new channel
-pub(crate) async fn register_new_channel(
-    peers: &Arc<RwLock<HashMap<String, PeerInfo>>>,
+/// Helper function to register a new channel.
+///
+/// Sync because the underlying map is a sharded `DashMap` — no `.await` is
+/// needed to take a write lock. Keeping this sync is what lets the inbound
+/// accept loop in `TransportHandle` insert without yielding, so it cannot
+/// stall and back-pressure the upstream handshake channel.
+pub(crate) fn register_new_channel(
+    peers: &DashMap<String, PeerInfo>,
     channel_id: &str,
     remote_addr: &MultiAddr,
 ) {
-    let mut peers_guard = peers.write().await;
     let peer_info = PeerInfo {
         channel_id: channel_id.to_owned(),
         addresses: vec![remote_addr.clone()],
@@ -2294,7 +2299,7 @@ pub(crate) async fn register_new_channel(
         protocols: vec!["p2p-core/1.0.0".to_string()],
         heartbeat_count: 0,
     };
-    peers_guard.insert(channel_id.to_owned(), peer_info);
+    peers.insert(channel_id.to_owned(), peer_info);
 }
 
 #[cfg(test)]
