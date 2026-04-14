@@ -1027,7 +1027,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Spawn background tasks that forward address-related `P2pEvent`s from
     /// each stack's `P2pEndpoint` to the upper layers.
     ///
-    /// Three event flavours are bridged:
+    /// Four event flavours are bridged:
     ///
     /// - **`PeerAddressUpdated`**: a connected peer advertised a new
     ///   reachable address via an ADD_ADDRESS frame (typically a relay).
@@ -1036,6 +1036,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// - **`RelayEstablished`**: this node set up a MASQUE relay and now
     ///   needs to publish the relay address to the K closest peers.
     ///   Returned via the second mpsc receiver.
+    /// - **`RelayLost`**: a previously-advertised MASQUE relay address is
+    ///   no longer reachable. The reachability driver republishes the
+    ///   address set without the relay entry on receipt.  Returned via
+    ///   the third mpsc receiver.
     /// - **`ExternalAddressDiscovered`**: a peer reported the address it
     ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Pinned
     ///   directly into the supplied [`ExternalAddresses`] store. Once
@@ -1049,14 +1053,18 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     ) -> (
         tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
+        tokio::sync::mpsc::Receiver<SocketAddr>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
         let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
+        let (relay_lost_tx, relay_lost_rx) =
+            tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
         let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
+            let relay_lost_tx_clone = relay_lost_tx.clone();
             let ext_clone = Arc::clone(&external_addresses);
             let drops = Arc::clone(&drop_counter);
             let local_bind = node.local_address();
@@ -1091,6 +1099,15 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                             );
                             if let Err(err) = relay_tx_clone.try_send(relay_addr) {
                                 handle_address_event_drop(&drops, "RelayEstablished", &err);
+                            }
+                        }
+                        Ok(saorsa_transport::P2pEvent::RelayLost { relay_addr }) => {
+                            tracing::info!(
+                                "ADDR_FWD: received RelayLost relay_addr={}",
+                                relay_addr
+                            );
+                            if let Err(err) = relay_lost_tx_clone.try_send(relay_addr) {
+                                handle_address_event_drop(&drops, "RelayLost", &err);
                             }
                         }
                         Ok(saorsa_transport::P2pEvent::ExternalAddressDiscovered { addr }) => {
@@ -1130,7 +1147,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 }
             });
         }
-        (rx, relay_rx)
+        (rx, relay_rx, relay_lost_rx)
     }
 
     /// Create dual nodes bound to IPv6 and IPv4 addresses with default

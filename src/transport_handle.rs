@@ -149,6 +149,16 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Relay lost events — received when a previously-advertised MASQUE
+    /// relay address is no longer reachable (tunnel died, health check
+    /// failed, accept loop exited).  Drained by the reachability driver
+    /// to trigger an immediate DHT republish with the stale relay
+    /// address removed — without this, peers keep dialing the dead
+    /// relay for the full health-poll cycle (5 s) or longer.
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    relay_lost_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Pinned external addresses: direct addresses observed from QUIC
     /// `OBSERVED_ADDRESS` frames during bootstrap, plus the relay-allocated
     /// address when a MASQUE relay is held. Populated by the address-update
@@ -236,8 +246,9 @@ impl TransportHandle {
         // Subscribe to address-related P2pEvents from the transport layer:
         //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
         //   - RelayEstablished → mpsc, drained by the DHT bridge
+        //   - RelayLost → mpsc, drained by the reachability driver
         //   - ExternalAddressDiscovered → pinned into external_addresses
-        let (peer_addr_update_rx, relay_established_rx) =
+        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) =
             dual_node.spawn_peer_address_update_forwarder(Arc::clone(&external_addresses));
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -294,6 +305,7 @@ impl TransportHandle {
             shutdown,
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
+            relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
             external_addresses,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
@@ -363,6 +375,12 @@ impl TransportHandle {
                 tokio::sync::Mutex::new(rx)
             },
             relay_established_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
+                tokio::sync::Mutex::new(rx)
+            },
+            relay_lost_rx: {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
@@ -655,6 +673,29 @@ impl TransportHandle {
     /// relay establishment immediately instead of polling.
     pub async fn recv_relay_established(&self) -> Option<SocketAddr> {
         let mut rx = self.relay_established_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Drain any relay-lost events. Returns the relay address that
+    /// became unreachable, if one is queued.
+    pub async fn drain_relay_lost(&self) -> Option<SocketAddr> {
+        let mut rx = self.relay_lost_rx.lock().await;
+        rx.try_recv().ok()
+    }
+
+    /// Wait for the next relay-lost event.
+    ///
+    /// Resolves when a previously-advertised MASQUE relay address has
+    /// become unreachable (yielding the dead relay address), or `None`
+    /// if the underlying channel has closed (transport shut down).
+    ///
+    /// Use this in a `tokio::select!` against a shutdown token to react
+    /// to relay failures immediately instead of polling — without this,
+    /// the reachability driver waits for its 5 s health tick before
+    /// republishing, leaving a window where peers continue to dial the
+    /// dead relay address.
+    pub async fn recv_relay_lost(&self) -> Option<SocketAddr> {
+        let mut rx = self.relay_lost_rx.lock().await;
         rx.recv().await
     }
 

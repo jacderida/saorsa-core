@@ -262,6 +262,30 @@ impl AcquisitionDriver {
                 _ = self.shutdown.cancelled() => {
                     return true;
                 }
+                // Event-driven relay-death signal: the transport layer
+                // emits `RelayLost` the moment its health monitor (or the
+                // MASQUE tunnel reader task, via the graceful-close
+                // watcher) observes the tunnel is gone.  Acting on it
+                // immediately closes the staleness window that the 5 s
+                // `health.tick()` path would otherwise leave open — the
+                // window during which peers continue to dial the dead
+                // relay address returned by DHT lookups.
+                lost = self.transport.recv_relay_lost() => {
+                    match lost {
+                        Some(addr) => {
+                            info!(
+                                relay = %addr,
+                                "driver: RelayLost event received, rebinding"
+                            );
+                            return false;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting
+                            // down. Treat as shutdown.
+                            return true;
+                        }
+                    }
+                }
                 event = events.recv() => {
                     match event {
                         Ok(DhtNetworkEvent::KClosestPeersChanged { ref new, .. }) => {
