@@ -154,11 +154,11 @@ pub struct JoinRateLimiterConfig {
 impl Default for JoinRateLimiterConfig {
     fn default() -> Self {
         Self {
-            max_joins_per_64_per_hour: 10_000,
-            max_joins_per_48_per_hour: 10_000,
-            max_joins_per_24_per_hour: 10_000,
-            max_global_joins_per_minute: 10_000,
-            global_burst_size: 10_000,
+            max_joins_per_64_per_hour: 1,
+            max_joins_per_48_per_hour: 5,
+            max_joins_per_24_per_hour: 3,
+            max_global_joins_per_minute: 100,
+            global_burst_size: 10,
         }
     }
 }
