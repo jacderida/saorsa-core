@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::NodeInfo,
+    dht::core_engine::{AtomicInstant, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -31,7 +31,7 @@ use crate::{
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -51,10 +51,10 @@ const MAX_CANDIDATE_NODES: usize = 200;
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Request timeout for DHT message handlers (30 seconds)
+/// Request timeout for DHT message handlers (10 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reliability score assigned to the local node in K-closest results.
 /// The local node is always considered fully reliable for its own lookups.
@@ -62,7 +62,16 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
 /// Maximum time to wait for the identity-exchange handshake after dialling
 /// a peer. The actual timeout is `min(request_timeout, this)`.
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
+/// plus an ML-DSA-65 signature verification. On a LAN this completes in
+/// well under a second; on congested cellular or cross-region links it can
+/// blow past 5s with retransmits. Kept in lockstep with
+/// `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both budgets exist
+/// to absorb the same slow-link failure mode (the bootstrap variant covers
+/// the initial join, this one covers every subsequent peer dial via
+/// `send_dht_request`).
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -84,6 +93,15 @@ const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minut
 
 /// Periodic refresh cadence for stale k-buckets.
 const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Minimum interval for NAT coordinator hint republishing (randomized between
+/// min and max). Keeps hints fresh so stale coordinator addresses get replaced
+/// before they accumulate NACK failures. Randomized to prevent thundering-herd
+/// spikes when many nodes republish simultaneously.
+const HINT_REPUBLISH_INTERVAL_MIN: Duration = Duration::from_secs(90); // 1.5 minutes
+
+/// Maximum interval for NAT coordinator hint republishing.
+const HINT_REPUBLISH_INTERVAL_MAX: Duration = Duration::from_secs(150); // 2.5 minutes
 
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
@@ -249,6 +267,8 @@ pub struct DhtNetworkManager {
     self_lookup_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Handle for the periodic bucket refresh background task
     bucket_refresh_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Handle for the periodic coordinator hint republish task
+    hint_republish_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
@@ -408,6 +428,7 @@ impl DhtNetworkManager {
             event_handler_handle: Arc::new(RwLock::new(None)),
             self_lookup_handle: Arc::new(RwLock::new(None)),
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
+            hint_republish_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
         })
     }
@@ -434,7 +455,15 @@ impl DhtNetworkManager {
 
         // Log addresses being returned in FIND_NODE response
         for node in &closer_nodes {
+            let hint_count = Self::extract_coordinator_hints(node).len();
             let addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
+            if hint_count > 0 {
+                debug!(
+                    "FindNode response includes {} coordinator hint(s) for peer {}",
+                    hint_count,
+                    hex::encode(&node.peer_id.to_bytes()[..8])
+                );
+            }
             debug!(
                 "FIND_NODE response: peer={} addresses={:?}",
                 node.peer_id.to_hex(),
@@ -498,6 +527,7 @@ impl DhtNetworkManager {
         // Spawn periodic maintenance background tasks.
         self.spawn_self_lookup_task().await;
         self.spawn_bucket_refresh_task().await;
+        self.spawn_hint_republish_task().await;
 
         info!("DHT Network Manager started successfully");
         Ok(())
@@ -523,12 +553,20 @@ impl DhtNetworkManager {
                     () = shutdown.cancelled() => break,
                 }
 
-                if let Err(e) = this.trigger_self_lookup().await {
-                    warn!("Periodic self-lookup failed: {e}");
+                // Wrap the work in a select so shutdown cancels in-progress
+                // operations rather than waiting for them to complete. Without
+                // this, iterative DHT lookups under active traffic can block
+                // for minutes, preventing the task from noticing shutdown.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = async {
+                        if let Err(e) = this.trigger_self_lookup().await {
+                            warn!("Periodic self-lookup failed: {e}");
+                        }
+                        this.revalidate_stale_k_closest().await;
+                        this.maybe_rebootstrap().await;
+                    } => {}
                 }
-
-                // Check if routing table is depleted after the self-lookup.
-                this.maybe_rebootstrap().await;
             }
         });
         *handle_slot.write().await = Some(handle);
@@ -552,56 +590,133 @@ impl DhtNetworkManager {
                     () = shutdown.cancelled() => break,
                 }
 
-                let stale_indices = this
-                    .dht
-                    .read()
-                    .await
-                    .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
-                    .await;
+                // Wrap the work in a select so shutdown cancels in-progress
+                // lookups rather than waiting for all buckets to be refreshed.
+                let shutdown_ref = &shutdown;
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = async {
+                        let stale_indices = this
+                            .dht
+                            .read()
+                            .await
+                            .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
+                            .await;
 
-                if stale_indices.is_empty() {
-                    trace!("Bucket refresh: no stale buckets");
-                    continue;
-                }
+                        if stale_indices.is_empty() {
+                            trace!("Bucket refresh: no stale buckets");
+                            return;
+                        }
 
-                debug!("Bucket refresh: {} stale buckets", stale_indices.len());
-                let k = this.k_value();
+                        debug!("Bucket refresh: {} stale buckets", stale_indices.len());
+                        let k = this.k_value();
 
-                for bucket_idx in stale_indices {
-                    let random_key = {
-                        let dht = this.dht.read().await;
-                        dht.generate_random_key_for_bucket(bucket_idx)
-                    };
-                    let Some(key) = random_key else {
-                        continue;
-                    };
+                        for bucket_idx in stale_indices {
+                            if shutdown_ref.is_cancelled() {
+                                break;
+                            }
+                            let random_key = {
+                                let dht = this.dht.read().await;
+                                dht.generate_random_key_for_bucket(bucket_idx)
+                            };
+                            let Some(key) = random_key else {
+                                continue;
+                            };
 
-                    let key_bytes: Key = *key.as_bytes();
-                    match this.find_closest_nodes_network(&key_bytes, k).await {
-                        Ok(nodes) => {
-                            trace!(
-                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
-                                nodes.len()
-                            );
-                            for dht_node in nodes {
-                                if dht_node.peer_id == this.config.peer_id {
-                                    continue;
+                            let key_bytes: Key = *key.as_bytes();
+                            match this.find_closest_nodes_network(&key_bytes, k).await {
+                                Ok(nodes) => {
+                                    trace!(
+                                        "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                        nodes.len()
+                                    );
+                                    for dht_node in nodes {
+                                        if dht_node.peer_id == this.config.peer_id {
+                                            continue;
+                                        }
+                                        this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                                            .await;
+                                    }
                                 }
-                                if let Some(addr) =
-                                    Self::first_dialable_address(&dht_node.addresses)
-                                {
-                                    this.dial_candidate(&dht_node.peer_id, &addr).await;
+                                Err(e) => {
+                                    debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
-                        }
-                    }
+
+                        this.maybe_rebootstrap().await;
+                    } => {}
+                }
+            }
+        });
+        *handle_slot.write().await = Some(handle);
+    }
+
+    /// Spawn the periodic coordinator hint republish task.
+    ///
+    /// Every [`HINT_REPUBLISH_INTERVAL_MIN`]–[`HINT_REPUBLISH_INTERVAL_MAX`], builds the local node's DHT record
+    /// (including coordinator hints), then sends a `PublishAddress` with those
+    /// addresses to the K closest peers. Receiving nodes merge the hints into
+    /// their routing table so they can propagate them in FindNode responses.
+    async fn spawn_hint_republish_task(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let handle_slot = Arc::clone(&self.hint_republish_handle);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let interval = Self::randomised_interval(
+                    HINT_REPUBLISH_INTERVAL_MIN,
+                    HINT_REPUBLISH_INTERVAL_MAX,
+                );
+
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = shutdown.cancelled() => break,
                 }
 
-                // Check if routing table is depleted after refresh.
-                this.maybe_rebootstrap().await;
+                // Wrap the work in a select so shutdown cancels in-progress
+                // publish operations.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = async {
+                        // Build current local DHT node record (includes coordinator hints)
+                        let local_node = this.local_dht_node().await;
+                        if local_node.addresses.is_empty() {
+                            return;
+                        }
+
+                        // Only republish if we have coordinator hints
+                        let hint_count = Self::extract_coordinator_hints(&local_node).len();
+                        if hint_count == 0 {
+                            trace!("Hint republish: no coordinator hints to publish");
+                            return;
+                        }
+
+                        // Send to K closest peers
+                        let k = this.k_value();
+                        let self_key: Key = *this.config.peer_id.as_bytes();
+                        let closest = this.find_closest_nodes_local(&self_key, k).await;
+
+                        let peer_count = closest.len();
+                        let hint_addrs: Vec<String> = local_node
+                            .addresses
+                            .iter()
+                            .filter(|a| {
+                                a.peer_id()
+                                    .is_some_and(|pid| *pid != local_node.peer_id)
+                            })
+                            .map(|a| format!("{}", a))
+                            .collect();
+                        info!(
+                            "Publishing {} coordinator hint(s) to {} connected peers: {:?}",
+                            hint_count, peer_count, hint_addrs
+                        );
+
+                        this.publish_address_to_peers(local_node.addresses, &closest)
+                            .await;
+                    } => {}
+                }
             }
         });
         *handle_slot.write().await = Some(handle);
@@ -623,10 +738,11 @@ impl DhtNetworkManager {
                     if dht_node.peer_id == self_id {
                         continue;
                     }
-                    // Dial if not already connected
-                    if let Some(addr) = Self::first_dialable_address(&dht_node.addresses) {
-                        self.dial_candidate(&dht_node.peer_id, &addr).await;
-                    }
+                    // Dial if not already connected — try every advertised
+                    // address, not just the first, so a stale NAT binding on
+                    // one entry doesn't kill the dial.
+                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                        .await;
                 }
                 Ok(())
             }
@@ -712,22 +828,48 @@ impl DhtNetworkManager {
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
-        for peer_id in peers {
+
+        // Phase 1: Collect all FindNode responses from bootstrap peers.
+        // We gather all discovered nodes BEFORE dialing any of them so that
+        // coordinator hints from all responses can be merged first. Without
+        // this, a NAT node discovered from boot-1 might start dialing before
+        // boot-3's response provides the hints needed for hole-punching.
+        struct DiscoveredNode {
+            node: DHTNode,
+            referrer: Option<std::net::SocketAddr>,
+        }
+        let mut discovered: Vec<DiscoveredNode> = Vec::new();
+
+        // Send FindNode to all bootstrap peers concurrently.
+        let find_node_futures = peers.iter().map(|peer_id| async {
+            let bootstrap_addr = self
+                .peer_addresses_for_dial(peer_id)
+                .await
+                .first()
+                .and_then(|a| a.dialable_socket_addr());
+
             let op = DhtNetworkOperation::FindNode { key };
-            match self.send_dht_request(peer_id, op, None).await {
+            let result = self.send_dht_request(peer_id, op, None).await;
+            (*peer_id, bootstrap_addr, result)
+        });
+        let responses = futures::future::join_all(find_node_futures).await;
+
+        for (peer_id, bootstrap_addr, result) in responses {
+            match result {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
-                    for node in &nodes {
-                        let first = Self::first_dialable_address(&node.addresses);
+                    for node in nodes {
+                        let dialable = Self::dialable_addresses(&node.addresses);
                         debug!(
-                            "DHT bootstrap: peer={} num_addresses={} first_dialable={:?}",
+                            "DHT bootstrap: peer={} num_addresses={} dialable={}",
                             node.peer_id.to_hex(),
                             node.addresses.len(),
-                            first.as_ref().map(|a| a.to_string())
+                            dialable.len()
                         );
-                        if seen.insert(node.peer_id)
-                            && let Some(addr) = first
-                        {
-                            self.dial_candidate(&node.peer_id, &addr).await;
+                        if seen.insert(node.peer_id) && !dialable.is_empty() {
+                            discovered.push(DiscoveredNode {
+                                node,
+                                referrer: bootstrap_addr,
+                            });
                         }
                     }
                 }
@@ -737,6 +879,68 @@ impl DhtNetworkManager {
                 }
             }
         }
+
+        info!(
+            "Bootstrap collected {} unique peers from {} bootstrap nodes, extracting hints before dialing",
+            discovered.len(),
+            peers.len()
+        );
+
+        // Phase 2: Extract and merge all coordinator hints across ALL
+        // discovered nodes before any dialing begins. This ensures every
+        // NAT node has the best available coordinator set from all responses.
+        for entry in &discovered {
+            let hint_addrs = Self::extract_coordinator_hints(&entry.node);
+            if !hint_addrs.is_empty() {
+                let direct = Self::direct_addresses_only(&entry.node);
+                if let Some(target_addr) =
+                    Self::first_dialable_address(&direct).and_then(|a| a.dialable_socket_addr())
+                {
+                    debug!(
+                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
+                        hint_addrs.len(),
+                        hex::encode(&entry.node.peer_id.to_bytes()[..8])
+                    );
+                    self.transport
+                        .set_hole_punch_preferred_coordinators(target_addr, hint_addrs)
+                        .await;
+                }
+                let hint_multiaddrs: Vec<crate::MultiAddr> = entry
+                    .node
+                    .addresses
+                    .iter()
+                    .filter(|addr| addr.peer_id().is_some_and(|pid| *pid != entry.node.peer_id))
+                    .cloned()
+                    .collect();
+                let stored = {
+                    let dht = self.dht.read().await;
+                    dht.merge_coordinator_hints(&entry.node.peer_id, hint_multiaddrs)
+                        .await
+                };
+                if stored > 0 {
+                    debug!(
+                        "Merged {} coordinator hint(s) into routing table for peer {}",
+                        stored,
+                        hex::encode(&entry.node.peer_id.to_bytes()[..8])
+                    );
+                }
+            }
+        }
+
+        // Phase 3: Dial all discovered nodes concurrently now that hints
+        // are in place. Sequential dialing would serialize every DIAL_TIMEOUT
+        // (15s each), making bootstrap take minutes when NAT nodes are slow.
+        info!(
+            "Bootstrap dialing {} peers concurrently (hints pre-loaded)",
+            discovered.len()
+        );
+        let dial_futures: Vec<_> = discovered
+            .iter()
+            .map(|entry| {
+                self.dial_addresses(&entry.node.peer_id, &entry.node.addresses, entry.referrer)
+            })
+            .collect();
+        futures::future::join_all(dial_futures).await;
 
         // Emit BootstrapComplete event with the current routing table size.
         let rt_size = self.get_routing_table_size().await;
@@ -766,19 +970,28 @@ impl DhtNetworkManager {
         // Signal background tasks to stop
         self.dht.read().await.signal_shutdown();
 
-        // Join all background tasks
+        // Join all background tasks with a timeout. The tasks check
+        // `shutdown.cancelled()` but may be mid-operation when cancel fires.
+        // The select-wrapped work blocks (added to fix shutdown hangs under
+        // active traffic) should make tasks exit promptly, but as defense in
+        // depth we abort any task that doesn't stop within 10 seconds.
         async fn join_task(name: &str, slot: &RwLock<Option<tokio::task::JoinHandle<()>>>) {
-            if let Some(handle) = slot.write().await.take() {
-                match handle.await {
-                    Ok(()) => debug!("{name} task stopped cleanly"),
-                    Err(e) if e.is_cancelled() => debug!("{name} task was cancelled"),
-                    Err(e) => warn!("{name} task panicked: {e}"),
+            if let Some(mut handle) = slot.write().await.take() {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+                    Ok(Ok(())) => debug!("{name} task stopped cleanly"),
+                    Ok(Err(e)) if e.is_cancelled() => debug!("{name} task was cancelled"),
+                    Ok(Err(e)) => warn!("{name} task panicked: {e}"),
+                    Err(_) => {
+                        warn!("{name} task did not stop within 10s, aborting");
+                        handle.abort();
+                    }
                 }
             }
         }
         join_task("event handler", &self.event_handler_handle).await;
         join_task("self-lookup", &self.self_lookup_handle).await;
         join_task("bucket refresh", &self.bucket_refresh_handle).await;
+        join_task("hint republish", &self.hint_republish_handle).await;
 
         info!("DHT Network Manager stopped");
         Ok(())
@@ -910,7 +1123,7 @@ impl DhtNetworkManager {
         // back to `count`. Self may displace the farthest peer.
         let mut nodes = self.find_closest_nodes_local(key, count).await;
 
-        nodes.push(self.local_dht_node());
+        nodes.push(self.local_dht_node().await);
 
         let key_peer = PeerId::from_bytes(*key);
         nodes.sort_by(|a, b| {
@@ -948,12 +1161,18 @@ impl DhtNetworkManager {
         let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
+        // Track which peer referred us to each discovered peer. When node A
+        // responds to FindNode with node B, node A has B in its routing table
+        // and has a connection to B. We use A as the preferred coordinator
+        // when hole-punching to B.
+        let mut referrers: std::collections::HashMap<PeerId, std::net::SocketAddr> =
+            std::collections::HashMap::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
         // Seed best_nodes with self and mark self as "queried" so the iterative
         // loop never tries to contact us.
-        best_nodes.push(self.local_dht_node());
+        best_nodes.push(self.local_dht_node().await);
         self.mark_self_queried(&mut queried_nodes);
 
         // Candidates sorted by XOR distance to target (closest first).
@@ -1020,15 +1239,21 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let address = Self::first_dialable_address(&node.addresses);
+                    let addresses = node.addresses.clone();
+                    let referrer = referrers.get(&peer_id).copied();
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
-                        if let Some(ref addr) = address {
-                            self.dial_candidate(&peer_id, addr).await;
-                        }
+                        // Try every dialable address, not just the first.
+                        // If at least one succeeds the peer is connected and
+                        // `send_dht_request` will reuse that channel; if all
+                        // fail, `send_dht_request`'s own fallback will retry
+                        // with the routing-table addresses.
+                        self.dial_addresses(&peer_id, &addresses, referrer).await;
+                        let address_hint = Self::first_dialable_address(&addresses);
                         (
                             peer_id,
-                            self.send_dht_request(&peer_id, op, address.as_ref()).await,
+                            self.send_dht_request(&peer_id, op, address_hint.as_ref())
+                                .await,
                         )
                     }
                 })
@@ -1045,6 +1270,14 @@ impl DhtNetworkManager {
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
+
+                        // Track this peer as the referrer for all nodes it returned.
+                        let referrer_addr = batch
+                            .iter()
+                            .find(|n| n.peer_id == peer_id)
+                            .and_then(|n| Self::first_dialable_address(&n.addresses))
+                            .and_then(|a| a.dialable_socket_addr());
+
                         // Truncate response to K closest to the lookup key to
                         // limit amplification from a single response and bound
                         // per-iteration memory growth.
@@ -1055,6 +1288,64 @@ impl DhtNetworkManager {
                                 || self.is_local_peer_id(&node.peer_id)
                             {
                                 continue;
+                            }
+                            // Record the referrer (first referrer wins)
+                            if let Some(ref_addr) = referrer_addr
+                                && let std::collections::hash_map::Entry::Vacant(e) =
+                                    referrers.entry(node.peer_id)
+                            {
+                                info!(
+                                    "find_closest_nodes_network: peer {} referred by {} ({})",
+                                    hex::encode(&node.peer_id.to_bytes()[..8]),
+                                    hex::encode(&peer_id.to_bytes()[..8]),
+                                    ref_addr
+                                );
+                                e.insert(ref_addr);
+                            }
+                            // Extract coordinator hints from DHT record, set them
+                            // as preferred coordinators for hole-punching, AND
+                            // merge them into the routing table so they propagate
+                            // when we return this node in our own FindNode responses.
+                            let hint_addrs = Self::extract_coordinator_hints(&node);
+                            if !hint_addrs.is_empty() {
+                                let direct = Self::direct_addresses_only(&node);
+                                if let Some(target_addr) = Self::first_dialable_address(&direct)
+                                    .and_then(|a| a.dialable_socket_addr())
+                                {
+                                    debug!(
+                                        "Setting {} coordinator hint(s) for NAT node {} from DHT record",
+                                        hint_addrs.len(),
+                                        hex::encode(&node.peer_id.to_bytes()[..8])
+                                    );
+                                    self.transport
+                                        .set_hole_punch_preferred_coordinators(
+                                            target_addr,
+                                            hint_addrs.clone(),
+                                        )
+                                        .await;
+                                }
+                                // Merge hints into routing table for propagation
+                                let hint_multiaddrs: Vec<crate::MultiAddr> = node
+                                    .addresses
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, addr)| {
+                                        addr.peer_id().is_some_and(|pid| *pid != node.peer_id)
+                                    })
+                                    .map(|(_, addr)| addr.clone())
+                                    .collect();
+                                let stored = {
+                                    let dht = self.dht.read().await;
+                                    dht.merge_coordinator_hints(&node.peer_id, hint_multiaddrs)
+                                        .await
+                                };
+                                if stored > 0 {
+                                    debug!(
+                                        "Merged {} coordinator hint(s) into routing table for peer {}",
+                                        stored,
+                                        hex::encode(&node.peer_id.to_bytes()[..8])
+                                    );
+                                }
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
@@ -1193,20 +1484,114 @@ impl DhtNetworkManager {
     /// Build a `DHTNode` representing the local node for inclusion in
     /// K-closest results. The local node always participates in distance
     /// ranking but is never queried over the network.
-    fn local_dht_node(&self) -> DHTNode {
-        let mut addresses: Vec<MultiAddr> = self.config.node_config.listen_addrs().to_vec();
-        if addresses.is_empty() {
-            addresses.push(MultiAddr::quic(std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                0,
-            )));
+    ///
+    /// The published address list is sourced from:
+    ///
+    /// 1. The transport's externally-observed reflexive address (set by
+    ///    OBSERVED_ADDRESS frames received from peers). This is the only
+    ///    authoritative source for a NAT'd node — it is the actual post-NAT
+    ///    address that remote peers see the connection arrive from.
+    /// 2. The transport's runtime-bound `listen_addrs`, but **only when the
+    ///    bind address has a specific (non-wildcard) IP**. Wildcard binds
+    ///    (`0.0.0.0` / `[::]`) are bind-side concepts meaning "any interface"
+    ///    and are not dialable, so we skip them entirely and rely on (1).
+    ///
+    /// If neither source produces an address, the returned `DHTNode` has an
+    /// empty `addresses` vec. This is the right answer at the publish layer:
+    /// it tells consumers "I don't know how to be reached yet" rather than
+    /// lying with a bind-side wildcard or a guessed LAN IP that won't work
+    /// from the public internet. The empty window closes naturally once the
+    /// first peer connects to us and OBSERVED_ADDRESS flows.
+    async fn local_dht_node(&self) -> DHTNode {
+        let mut addresses: Vec<MultiAddr> = Vec::new();
+
+        // 1. Observed external addresses — the post-NAT addresses peers
+        //    actually see, learned from QUIC OBSERVED_ADDRESS frames.
+        //    Empty until at least one peer has observed us. On a
+        //    multi-homed host this can return multiple addresses (one per
+        //    local interface that has an observation), and we publish all
+        //    of them so peers reaching us via any interface can dial back.
+        for observed in self.transport.observed_external_addresses() {
+            let resolved = MultiAddr::quic(observed);
+            if !addresses.contains(&resolved) {
+                addresses.push(resolved);
+            }
         }
+
+        // 2. Runtime-bound listen addresses with specific IPs only. Wildcards
+        //    and zero ports are pre-bind placeholders or all-interface
+        //    bindings — neither is dialable.
+        for la in self.transport.listen_addrs().await {
+            let Some(sa) = la.dialable_socket_addr() else {
+                continue;
+            };
+            if sa.port() == 0 || sa.ip().is_unspecified() {
+                continue;
+            }
+            let resolved = MultiAddr::quic(sa);
+            if !addresses.contains(&resolved) {
+                addresses.push(resolved);
+            }
+        }
+
+        // 3. Coordinator hints — connected peers that can relay PUNCH_ME_NOW
+        //    to us. Every node includes hints so that any peer discovering us
+        //    via DHT can find a working coordinator for hole-punching.
+        //    Encoded as MultiAddr with the coordinator's PeerId suffix so
+        //    consumers can distinguish hints from direct addresses.
+        {
+            let connected = self.transport.connected_peer_addresses(5).await;
+            if !connected.is_empty() {
+                let hint_addrs: Vec<String> =
+                    connected.iter().map(|(sa, _)| sa.to_string()).collect();
+                debug!(
+                    "local_dht_node: including {} coordinator hint(s): {:?}",
+                    connected.len(),
+                    hint_addrs
+                );
+                for (socket_addr, peer_id) in connected {
+                    let hint = MultiAddr::quic(socket_addr).with_peer_id(peer_id);
+                    if !addresses.contains(&hint) {
+                        addresses.push(hint);
+                    }
+                }
+            }
+        }
+
         DHTNode {
             peer_id: self.config.peer_id,
             addresses,
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
+    }
+
+    /// Extract coordinator hints from a DHTNode's addresses.
+    /// Hints are addresses whose peer_id suffix differs from the node's peer_id —
+    /// they are addresses of OTHER peers that can coordinate for this node.
+    fn extract_coordinator_hints(node: &DHTNode) -> Vec<SocketAddr> {
+        node.addresses
+            .iter()
+            .filter_map(|addr| {
+                let hint_peer_id = addr.peer_id()?;
+                if *hint_peer_id == node.peer_id {
+                    return None; // Same peer_id = direct address, not a hint
+                }
+                addr.dialable_socket_addr()
+            })
+            .collect()
+    }
+
+    /// Filter a node's addresses to only direct addresses (excluding coordinator hints).
+    fn direct_addresses_only(node: &DHTNode) -> Vec<MultiAddr> {
+        node.addresses
+            .iter()
+            .filter(|addr| match addr.peer_id() {
+                None => true,                      // No peer_id suffix = direct address
+                Some(pid) => *pid == node.peer_id, // Same peer_id = direct address
+            })
+            .cloned()
+            .collect()
     }
 
     /// Add the local app-level peer ID to `queried` so that iterative lookups
@@ -1244,6 +1629,53 @@ impl DhtNetworkManager {
     /// Return the first dialable address from a list of [`MultiAddr`] values.
     fn first_dialable_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
         Self::dialable_addresses(addresses).into_iter().next()
+    }
+
+    /// Try dialing each dialable address in `addresses` in order until one
+    /// succeeds. Returns the channel ID of the first successful dial, or
+    /// `None` if every address was rejected, failed, or timed out.
+    ///
+    /// This is the multi-address counterpart of [`Self::dial_candidate`]
+    /// and is the right entry point for any code path that has been handed
+    /// a `DHTNode` (or any peer entry that exposes multiple addresses) —
+    /// using only the first dialable address means a stale NAT binding,
+    /// failed relay, or unreachable family kills the connection attempt
+    /// even when other published addresses would have worked.
+    async fn dial_addresses(
+        &self,
+        peer_id: &PeerId,
+        addresses: &[MultiAddr],
+        referrer: Option<SocketAddr>,
+    ) -> Option<String> {
+        // Filter out coordinator hints (addresses of OTHER peers, not the target).
+        // Dialing a hint would connect to the coordinator, not the target.
+        let direct_only: Vec<MultiAddr> = addresses
+            .iter()
+            .filter(|addr| match addr.peer_id() {
+                None => true,                  // No peer_id suffix = direct address
+                Some(pid) => *pid == *peer_id, // Same peer_id = direct address
+            })
+            .cloned()
+            .collect();
+        let dialable = Self::dialable_addresses(&direct_only);
+        if dialable.is_empty() {
+            debug!(
+                "dial_addresses: no dialable addresses for {}",
+                peer_id.to_hex()
+            );
+            return None;
+        }
+        for addr in &dialable {
+            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrer).await {
+                return Some(channel_id);
+            }
+        }
+        debug!(
+            "dial_addresses: all {} address(es) failed for {}",
+            dialable.len(),
+            peer_id.to_hex()
+        );
+        None
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
@@ -1346,7 +1778,7 @@ impl DhtNetworkManager {
         // Send message via network layer, reconnecting on demand if needed.
         let peer_hex = peer_id.to_hex();
         let local_hex = self.config.peer_id.to_hex();
-        info!(
+        debug!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
             local_hex, peer_hex, message.payload, message_id
         );
@@ -1356,23 +1788,39 @@ impl DhtNetworkManager {
         // `peer_to_channel` mapping is only populated after the asynchronous
         // identity-exchange handshake completes. Without waiting, the
         // subsequent `send_message` would fail with `PeerNotFound`.
-        let resolved_address: Option<MultiAddr> = if self.transport.is_peer_connected(peer_id).await
+        //
+        // Build the candidate address list: caller's hint first (if any),
+        // then the peer's addresses from the routing table. Trying every
+        // candidate — instead of stopping at the first — protects against
+        // stale NAT bindings, single-IP-family failures, and recently-relayed
+        // peers whose direct address is no longer reachable.
+        let candidate_addresses: Vec<MultiAddr> = if self.transport.is_peer_connected(peer_id).await
         {
-            None
-        } else if let Some(hint) = address_hint {
-            Some(hint.clone())
+            Vec::new()
         } else {
-            self.peer_addresses_for_dial(peer_id)
-                .await
-                .into_iter()
-                .next()
+            let mut addrs = Vec::new();
+            if let Some(hint) = address_hint {
+                addrs.push(hint.clone());
+            }
+            for addr in self.peer_addresses_for_dial(peer_id).await {
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+            addrs
         };
-        if let Some(ref address) = resolved_address {
+
+        if !candidate_addresses.is_empty() {
             info!(
-                "[STEP 1b] {} -> {}: No open channel, dialling {}",
-                local_hex, peer_hex, address
+                "[STEP 1b] {} -> {}: No open channel, trying {} dialable address(es)",
+                local_hex,
+                peer_hex,
+                candidate_addresses.len()
             );
-            if let Some(channel_id) = self.dial_candidate(peer_id, address).await {
+            if let Some(channel_id) = self
+                .dial_addresses(peer_id, &candidate_addresses, None)
+                .await
+            {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
                 match self
                     .transport
@@ -1382,11 +1830,10 @@ impl DhtNetworkManager {
                     Ok(authenticated) => {
                         if &authenticated != peer_id {
                             warn!(
-                                "[STEP 1b] {} -> {}: identity MISMATCH — dialled {} but authenticated as {}. \
+                                "[STEP 1b] {} -> {}: identity MISMATCH — authenticated as {}. \
                                  Routing table entry may be stale.",
                                 local_hex,
                                 peer_hex,
-                                address,
                                 authenticated.to_hex()
                             );
                             if let Ok(mut ops) = self.active_operations.lock() {
@@ -1421,15 +1868,22 @@ impl DhtNetworkManager {
                 }
             } else {
                 warn!(
-                    "[STEP 1b] {} -> {}: dial failed to {}",
-                    local_hex, peer_hex, address
+                    "[STEP 1b] {} -> {}: dial failed for all {} candidate address(es)",
+                    local_hex,
+                    peer_hex,
+                    candidate_addresses.len()
                 );
                 if let Ok(mut ops) = self.active_operations.lock() {
                     ops.remove(&message_id);
                 }
                 self.record_peer_failure(peer_id).await;
                 return Err(P2PError::Network(NetworkError::PeerNotFound(
-                    format!("failed to dial {} at {}", peer_hex, address).into(),
+                    format!(
+                        "failed to dial {} at any of {} candidate address(es)",
+                        peer_hex,
+                        candidate_addresses.len()
+                    )
+                    .into(),
                 )));
             }
         }
@@ -1440,7 +1894,7 @@ impl DhtNetworkManager {
             .await
         {
             Ok(_) => {
-                info!(
+                debug!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
                     local_hex, peer_hex
                 );
@@ -1450,7 +1904,7 @@ impl DhtNetworkManager {
                     .wait_for_response(&message_id, response_rx, peer_id)
                     .await;
                 match &result {
-                    Ok(r) => info!(
+                    Ok(r) => debug!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
                         local_hex,
                         peer_hex,
@@ -1521,7 +1975,12 @@ impl DhtNetworkManager {
     /// [`TransportHandle::wait_for_peer_identity`] before sending, because
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
+    async fn dial_candidate(
+        &self,
+        peer_id: &PeerId,
+        address: &MultiAddr,
+        referrer: Option<std::net::SocketAddr>,
+    ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
         if self.transport.is_peer_connected(peer_id).await {
@@ -1537,12 +1996,35 @@ impl DhtNetworkManager {
             );
             return None;
         }
-        // Set the target peer ID so hole-punch PUNCH_ME_NOW uses it for
-        // routing. This is essential for symmetric NAT where the coordinator
-        // can't match the target by socket address.
-        self.transport
-            .set_hole_punch_target_peer_id(Some(*peer_id.to_bytes()))
-            .await;
+        // Set the target peer ID for this specific address so the hole-punch
+        // PUNCH_ME_NOW can route by peer identity. Keyed by address to avoid
+        // races when multiple concurrent dials share the same transport.
+        if let Some(socket_addr) = address.dialable_socket_addr() {
+            let pid_bytes = *peer_id.to_bytes();
+            info!(
+                "dial_candidate: setting hole_punch_target_peer_id for {} = {}",
+                socket_addr,
+                hex::encode(&pid_bytes[..8])
+            );
+            self.transport
+                .set_hole_punch_target_peer_id(socket_addr, pid_bytes)
+                .await;
+        }
+
+        // If we know which peer referred us to this target (from a DHT
+        // FindNode response), set it as the preferred coordinator for
+        // hole-punching. That peer has a connection to the target.
+        if let Some(coordinator_addr) = referrer
+            && let Some(socket_addr) = address.dialable_socket_addr()
+        {
+            info!(
+                "dial_candidate: setting preferred coordinator for {} = {} (DHT referrer)",
+                socket_addr, coordinator_addr
+            );
+            self.transport
+                .set_hole_punch_preferred_coordinator(socket_addr, coordinator_addr)
+                .await;
+        }
 
         let dial_timeout = self
             .transport
@@ -1746,20 +2228,56 @@ impl DhtNetworkManager {
                 Ok(DhtNetworkResult::LeaveSuccess)
             }
             DhtNetworkOperation::PublishAddress { addresses } => {
-                info!(
-                    "Handling PUBLISH_ADDRESS from {}: {} addresses",
-                    authenticated_sender,
-                    addresses.len()
-                );
-                let dht = self.dht.read().await;
+                // Separate coordinator hints (peer_id suffix ≠ sender) from
+                // relay/direct addresses (peer_id suffix == sender or absent).
+                let mut hints = Vec::new();
+                let mut relay_addrs = Vec::new();
                 for addr in addresses {
-                    dht.touch_node_typed(
-                        authenticated_sender,
-                        Some(addr),
-                        crate::dht::AddressType::Relay,
-                    )
-                    .await;
+                    if addr
+                        .peer_id()
+                        .is_some_and(|pid| *pid != *authenticated_sender)
+                    {
+                        hints.push(addr.clone());
+                    } else {
+                        relay_addrs.push(addr);
+                    }
                 }
+
+                if !relay_addrs.is_empty() {
+                    info!(
+                        "Handling PUBLISH_ADDRESS from {}: {} relay/direct addresses",
+                        authenticated_sender,
+                        relay_addrs.len()
+                    );
+                    let dht = self.dht.read().await;
+                    for addr in &relay_addrs {
+                        dht.touch_node_typed(
+                            authenticated_sender,
+                            Some(addr),
+                            crate::dht::AddressType::Relay,
+                        )
+                        .await;
+                    }
+                }
+
+                if !hints.is_empty() {
+                    debug!(
+                        "Received {} coordinator hint(s) for peer {} via publish",
+                        hints.len(),
+                        authenticated_sender
+                    );
+                    let dht = self.dht.read().await;
+                    let stored = dht
+                        .merge_coordinator_hints(authenticated_sender, hints)
+                        .await;
+                    if stored > 0 {
+                        debug!(
+                            "Merged {} coordinator hint(s) into routing table for peer {}",
+                            stored, authenticated_sender
+                        );
+                    }
+                }
+
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
         }
@@ -2043,7 +2561,7 @@ impl DhtNetworkManager {
                 id: node_id,
                 addresses,
                 address_types,
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
             };
 
             let trust_fn = |peer_id: &PeerId| -> f64 {
@@ -2360,6 +2878,64 @@ impl DhtNetworkManager {
             .context("ping failed")
     }
 
+    /// Revalidate stale K-closest peers by pinging them and evicting non-responders.
+    ///
+    /// Piggybacked on the periodic self-lookup to avoid a dedicated background
+    /// worker. Ensures offline close-group members are evicted promptly rather
+    /// than lingering until admission contention triggers revalidation.
+    async fn revalidate_stale_k_closest(&self) {
+        let stale_peers = {
+            let dht = self.dht.read().await;
+            dht.stale_k_closest().await
+        };
+
+        if stale_peers.is_empty() {
+            return;
+        }
+
+        debug!("Revalidating {} stale K-closest peer(s)", stale_peers.len());
+
+        // Ping concurrently in chunks, reusing the same concurrency limit as
+        // admission-triggered revalidation.
+        let mut non_responders = Vec::new();
+
+        for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
+            let results = futures::future::join_all(chunk.iter().map(|peer_id| async {
+                let responded =
+                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                (*peer_id, responded)
+            }))
+            .await;
+
+            for (peer_id, responded) in results {
+                if !responded {
+                    non_responders.push(peer_id);
+                }
+            }
+        }
+
+        if non_responders.is_empty() {
+            debug!("All stale K-closest peers responded — no evictions");
+            return;
+        }
+
+        // Evict non-responders under the write lock, then broadcast events
+        // after releasing it.
+        let all_events = {
+            let mut dht = self.dht.write().await;
+            let mut events = Vec::new();
+            for peer_id in &non_responders {
+                events.extend(dht.remove_node_by_id(peer_id).await);
+            }
+            events
+        };
+
+        self.broadcast_routing_events(&all_events);
+        info!("Evicted {} offline K-closest peer(s)", non_responders.len());
+    }
+
     /// Translate core engine routing table events into network events and broadcast them.
     fn broadcast_routing_events(&self, events: &[RoutingTableEvent]) {
         if self.event_tx.receiver_count() == 0 {
@@ -2536,8 +3112,13 @@ impl DhtNetworkManager {
     }
 }
 
-/// Default request timeout for DHT operations (seconds)
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default request timeout for outbound DHT operations (seconds).
+///
+/// Governs `wait_for_response` and the upper bound of `dial_candidate`'s
+/// dial timeout (`min(connection_timeout, request_timeout)`). Must stay
+/// above the relay stage (~10s) so it never truncates the NAT traversal
+/// cascade.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;

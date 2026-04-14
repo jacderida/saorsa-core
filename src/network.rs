@@ -108,7 +108,7 @@ pub fn is_dht_participant(user_agent: &str) -> bool {
 }
 
 /// Capacity of the internal channel used by the message receiving system.
-pub(crate) const MESSAGE_RECV_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const MESSAGE_RECV_CHANNEL_CAPACITY: usize = 2048;
 
 /// Maximum number of concurrent in-flight request/response operations.
 pub(crate) const MAX_ACTIVE_REQUESTS: usize = 256;
@@ -124,16 +124,26 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Default connection timeout in seconds.
 ///
-/// Must accommodate the full NAT traversal flow: direct (5s) → hole-punch
-/// (15s) → relay (30s) = ~50s. With 90s we have headroom for retries and
-/// slow handshakes.
-const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 90;
+/// Derived from the sum of connection strategy stages: direct (3s) +
+/// 2 × hole-punch rounds (3s each) + relay (5s) = ~17s. 15s is
+/// tighter than the cascade sum to ensure any stalled stage is caught
+/// quickly rather than silently consuming the full budget.
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 15;
 
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+///
+/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
+/// plus an ML-DSA-65 signature verification. On a LAN this completes in
+/// well under a second; on congested cellular or cross-region links it can
+/// blow past 5s with retransmits. The previous 5s default fired
+/// spuriously on slow networks during testnet validation, forcing
+/// reconnect loops that masqueraded as NAT traversal failures, so we
+/// budget enough headroom for two QUIC handshake retries on a high-latency
+/// link.
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 15;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
@@ -226,7 +236,7 @@ pub struct NodeConfig {
     ///
     /// Controls whether peers with low trust scores are eligible for
     /// swap-out from the routing table when better candidates arrive. Use
-    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
+    /// `NodeConfigBuilder::trust_enforcement` for a simple on/off toggle.
     ///
     /// Default: enabled with a swap threshold of 0.35.
     #[serde(default)]
@@ -732,7 +742,7 @@ const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 /// - Handle network events and peer lifecycle
 ///
 /// Transport concerns (connections, messaging, events) are delegated to
-/// [`TransportHandle`](crate::transport_handle::TransportHandle).
+/// `TransportHandle`.
 pub struct P2PNode {
     /// Node configuration
     config: NodeConfig,
@@ -969,7 +979,7 @@ impl P2PNode {
     ///
     /// # Returns
     ///
-    /// A [`PeerResponse`] on success, or an error on timeout / connection failure.
+    /// A `PeerResponse` on success, or an error on timeout / connection failure.
     ///
     /// # Example
     ///
@@ -1120,51 +1130,71 @@ impl P2PNode {
         self.connect_bootstrap_peers(close_group_cache.as_ref())
             .await?;
 
-        // Spawn background task to forward peer address updates to DHT.
-        // When a connected peer advertises a new address (e.g., relay), update
-        // the DHT routing table so future lookups return the new address.
+        // Spawn background task to forward peer address updates to the DHT.
         //
-        // Also handles RelayEstablished events: when THIS node sets up a relay,
-        // it does a DHT self-lookup to connect to K closest peers. The transport
-        // layer's re-advertisement loop then sends ADD_ADDRESS to those peers,
-        // propagating the relay address beyond the initial direct connections.
+        // Two event streams are bridged from the transport layer onto DHT
+        // routing-table mutations:
+        //
+        //  - **Relay established**: when THIS node sets up a MASQUE relay,
+        //    perform a DHT self-lookup so the transport's re-advertisement
+        //    loop can ADD_ADDRESS the new relay address to the K closest
+        //    peers — propagating it beyond peers we already happen to be
+        //    connected to.
+        //  - **Peer address update**: when a connected peer advertises a new
+        //    reachable address via ADD_ADDRESS (typically its relay), update
+        //    the DHT routing table so future lookups return that address.
+        //
+        // Both are handled in a `tokio::select!` against the receiver
+        // futures so updates propagate immediately. The previous
+        // implementation polled both queues on a 1-second interval, which
+        // opened a race window in which a freshly-established relay was
+        // invisible to outbound DHT queries until the next tick — causing
+        // the first peers to dial direct (and fail) before learning about
+        // the relay.
+        //
+        // **Slow work isolation**: the relay-propagation path runs an
+        // iterative DHT lookup (`find_closest_nodes_network`) which can
+        // take many seconds. Doing it inline in the select loop would
+        // starve the peer-address-update branch and back up the bounded
+        // forwarder mpsc into drop territory. Instead, the lookup +
+        // publish is detached into its own task per relay event, so the
+        // select loop keeps polling both branches.
         {
             let transport = Arc::clone(&self.transport);
             let dht = self.adaptive_dht.dht_manager().clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 loop {
                     tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => break,
-                        _ = interval.tick() => {
-                            // Check for relay established events.
-                            // When this node sets up a relay, do a self-lookup to
-                            // connect to K closest peers for relay address propagation.
-                            if let Some(relay_addr) = transport.drain_relay_established().await {
-                                // Normalize IPv6-mapped addresses to IPv4 so the
-                                // published address is dialable by IPv4-only clients.
-                                let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
-                                let relay_multi =
-                                    crate::MultiAddr::quic(normalized);
-                                info!(
-                                    "DHT_BRIDGE: relay established at {} — self-lookup then PublishAddress to K closest",
-                                    relay_addr
-                                );
-                                let own_key = *dht.peer_id().to_bytes();
-                                // Self-lookup to discover K closest peers, then
-                                // send PublishAddress to each. This is O(K) messages
-                                // sent once, not a field on every DHT message.
-                                match dht.find_closest_nodes_network(&own_key, dht.k_value()).await {
+                        relay = transport.recv_relay_established() => {
+                            let Some(relay_addr) = relay else { break };
+                            // Normalize IPv6-mapped addresses to IPv4 so the
+                            // published address is dialable by IPv4-only clients.
+                            let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
+                            let relay_multi = crate::MultiAddr::quic(normalized);
+                            info!(
+                                "DHT_BRIDGE: relay established at {} — spawning self-lookup + PublishAddress",
+                                relay_addr
+                            );
+                            // Detach the slow work so the select loop is
+                            // free to keep polling peer-address updates.
+                            let dht_for_propagation = dht.clone();
+                            tokio::spawn(async move {
+                                let own_key = *dht_for_propagation.peer_id().to_bytes();
+                                match dht_for_propagation
+                                    .find_closest_nodes_network(&own_key, dht_for_propagation.k_value())
+                                    .await
+                                {
                                     Ok(nodes) => {
                                         info!(
                                             "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
                                             nodes.len()
                                         );
-                                        dht.publish_address_to_peers(
-                                            vec![relay_multi],
-                                            &nodes,
-                                        ).await;
+                                        dht_for_propagation
+                                            .publish_address_to_peers(vec![relay_multi], &nodes)
+                                            .await;
                                     }
                                     Err(e) => {
                                         warn!(
@@ -1173,44 +1203,41 @@ impl P2PNode {
                                         );
                                     }
                                 }
+                            });
+                        }
+                        update = transport.recv_peer_address_update() => {
+                            let Some((peer_addr, advertised_addr)) = update else { break };
+                            info!(
+                                "DHT_BRIDGE: processing update peer={} addr={} same_ip={}",
+                                peer_addr,
+                                advertised_addr,
+                                peer_addr.ip() == advertised_addr.ip()
+                            );
+                            // Only update DHT when the advertised IP differs
+                            // from the peer's connection IP. Same-IP updates
+                            // are just different NATted ports (useless for
+                            // symmetric NAT); different-IP means a relay.
+                            if peer_addr.ip() == advertised_addr.ip() {
+                                continue;
                             }
-
-                            let updates = transport.drain_peer_address_updates().await;
-                            if !updates.is_empty() {
-                                info!("DHT_BRIDGE: drained {} address updates", updates.len());
-                            }
-                            for (peer_addr, advertised_addr) in updates {
+                            // Look up peer ID by address (tries both IPv4 and
+                            // IPv4-mapped IPv6 forms via dual_stack_alternate).
+                            // For symmetric NAT, this may fail because the
+                            // connection's channel key uses a different NATted port.
+                            if let Some(peer_id) = transport.peer_id_for_addr(&peer_addr).await {
+                                let normalized_adv =
+                                    saorsa_transport::shared::normalize_socket_addr(advertised_addr);
+                                let multi_addr = crate::MultiAddr::quic(normalized_adv);
                                 info!(
-                                    "DHT_BRIDGE: processing update peer={} addr={} same_ip={}",
-                                    peer_addr, advertised_addr, peer_addr.ip() == advertised_addr.ip()
+                                    "Updating DHT: peer {} relay address {} (connection was {})",
+                                    peer_id, advertised_addr, peer_addr
                                 );
-                                // Only update DHT when the advertised IP differs
-                                // from the peer's connection IP. Same-IP updates
-                                // are just different NATted ports (useless for
-                                // symmetric NAT); different-IP means a relay.
-                                if peer_addr.ip() == advertised_addr.ip() {
-                                    continue;
-                                }
-
-                                // Look up peer ID by address (tries both IPv4 and
-                                // IPv4-mapped IPv6 forms via dual_stack_alternate).
-                                // For symmetric NAT, this may fail because the
-                                // connection's channel key uses a different NATted port.
-                                let peer_id = transport.peer_id_for_addr(&peer_addr).await;
-                                if let Some(peer_id) = peer_id {
-                                    let normalized_adv = saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                                    let multi_addr = crate::MultiAddr::quic(normalized_adv);
-                                    info!(
-                                        "Updating DHT: peer {} relay address {} (connection was {})",
-                                        peer_id, advertised_addr, peer_addr
-                                    );
-                                    dht.touch_node_typed(
-                                        &peer_id,
-                                        Some(&multi_addr),
-                                        crate::dht::AddressType::Relay,
-                                    )
-                                    .await;
-                                }
+                                dht.touch_node_typed(
+                                    &peer_id,
+                                    Some(&multi_addr),
+                                    crate::dht::AddressType::Relay,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1587,13 +1614,20 @@ impl P2PNode {
 /// can pass it directly to `send_message()`. This eliminates a spoofing
 /// vector where a peer could claim an arbitrary identity via the payload.
 ///
-/// Maximum allowed clock skew for message timestamps (5 minutes).
-/// This is intentionally lenient for initial deployment to accommodate nodes with
-/// misconfigured clocks or high-latency network conditions. Can be tightened (e.g., to 60s)
-/// once the network stabilizes and node clock synchronization improves.
+/// Maximum allowed clock skew for message timestamps.
+///
+/// A decentralized network cannot assume participants have accurate clocks.
+/// Consumer devices commonly have clocks that drift by minutes (no NTP, wrong
+/// timezone offset applied to UTC, suspended laptops, VMs without guest
+/// additions, etc.). Both past and future windows must be symmetric and
+/// generous enough that normal clock drift does not partition the network.
+///
+/// 5 minutes in both directions provides replay protection while tolerating
+/// the clock skew observed in real-world deployments (31-42 seconds was
+/// measured between a macOS client and NTP-synced VPS nodes).
 const MAX_MESSAGE_AGE_SECS: u64 = 300;
-/// Maximum allowed future timestamp (30 seconds to account for clock drift)
-const MAX_FUTURE_SECS: u64 = 30;
+/// Maximum allowed future timestamp — symmetric with the past window.
+const MAX_FUTURE_SECS: u64 = 300;
 
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
@@ -2271,7 +2305,7 @@ mod tests {
 
         assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
         assert_eq!(config.max_connections, 10000);
-        assert_eq!(config.connection_timeout, Duration::from_secs(90));
+        assert_eq!(config.connection_timeout, Duration::from_secs(15));
     }
 
     #[tokio::test]
