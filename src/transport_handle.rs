@@ -1528,12 +1528,26 @@ impl TransportHandle {
                     continue;
                 }
 
-                let channel_id = remote_sock.to_string();
-                let remote_addr = MultiAddr::quic(remote_sock);
-                // PeerConnected is emitted later when the peer's identity is
-                // authenticated via a signed message — not at transport level.
-                register_new_channel(&peers, &channel_id, &remote_addr).await;
-                active_connections.write().await.insert(channel_id);
+                // Spawn registration work so the accept loop immediately
+                // returns to draining the handshake channel. Previously
+                // the two write locks below were taken inline, serialising
+                // the accept loop behind `peers` and `active_connections`
+                // contention. In a 1000-node network this caused the
+                // bounded handshake channel (cap 32) to fill, blocking all
+                // new connection handoffs and stalling identity exchange.
+                let peers = peers.clone();
+                let active_connections = active_connections.clone();
+                let handle = tokio::spawn(async move {
+                    let channel_id = remote_sock.to_string();
+                    let remote_addr = MultiAddr::quic(remote_sock);
+                    register_new_channel(&peers, &channel_id, &remote_addr).await;
+                    active_connections.write().await.insert(channel_id);
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        warn!("Accept registration task failed: {}", e);
+                    }
+                });
             }
         });
         *self.listener_handle.write().await = Some(handle);
