@@ -1743,13 +1743,36 @@ impl TransportHandle {
         // routing to the other healthy shards. The dispatcher only exits
         // when its upstream channel closes (i.e. transport shutdown).
         let drop_counter = Arc::new(AtomicU64::new(0));
+        let shard_cap = per_shard_capacity;
         handles.push(tokio::spawn(async move {
             info!(
                 "Message dispatcher loop started (sharded across {} consumers)",
                 MESSAGE_DISPATCH_SHARDS
             );
+            let mut last_depth_report = Instant::now();
+            const DEPTH_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
             while let Some((from_addr, bytes)) = upstream_rx.recv().await {
                 let shard_idx = shard_index_for_addr(&from_addr);
+
+                // Periodically log channel depth for all shards.
+                if last_depth_report.elapsed() >= DEPTH_REPORT_INTERVAL {
+                    let depths: Vec<String> = shard_txs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tx)| {
+                            let capacity = tx.capacity();
+                            let queued = shard_cap.saturating_sub(capacity);
+                            format!("s{}={}/{}", i, queued, shard_cap)
+                        })
+                        .collect();
+                    warn!(
+                        "[SHARD DEPTH] {}",
+                        depths.join(" ")
+                    );
+                    last_depth_report = Instant::now();
+                }
+
                 match shard_txs[shard_idx].try_send((from_addr, bytes)) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_dropped)) => {
@@ -1813,7 +1836,26 @@ impl TransportHandle {
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
     ) {
         info!("Message dispatch shard {shard_idx} started");
+
+        // Instrumentation: track per-stage timing over a reporting window.
+        const REPORT_INTERVAL: Duration = Duration::from_secs(60);
+        let mut last_report = Instant::now();
+        let mut msg_count: u64 = 0;
+        let mut parse_total = Duration::ZERO;
+        let mut parse_max = Duration::ZERO;
+        let mut p2c_lock_total = Duration::ZERO;
+        let mut p2c_lock_max = Duration::ZERO;
+        let mut c2p_lock_total = Duration::ZERO;
+        let mut c2p_lock_max = Duration::ZERO;
+        let mut register_total = Duration::ZERO;
+        let mut register_max = Duration::ZERO;
+        let mut active_req_lock_total = Duration::ZERO;
+        let mut active_req_lock_max = Duration::ZERO;
+        let mut loop_total = Duration::ZERO;
+        let mut loop_max = Duration::ZERO;
+
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
+            let loop_start = Instant::now();
             let channel_id = from_addr.to_string();
             trace!(
                 shard = shard_idx,
@@ -1822,12 +1864,17 @@ impl TransportHandle {
                 channel_id
             );
 
+            let t0 = Instant::now();
             match parse_protocol_message(&bytes, &channel_id) {
                 Some(ParsedMessage {
                     event,
                     authenticated_node_id,
                     user_agent: peer_user_agent,
                 }) => {
+                    let parse_elapsed = t0.elapsed();
+                    parse_total += parse_elapsed;
+                    parse_max = parse_max.max(parse_elapsed);
+
                     // If the message was signed, record the app↔channel mapping.
                     // A peer may be reachable over multiple channels simultaneously
                     // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
@@ -1869,6 +1916,7 @@ impl TransportHandle {
                         // Two concurrent shard consumers for the same
                         // `app_id` serialise on the DashMap shard lock so
                         // exactly one sees `Entry::Vacant`.
+                        let t1 = Instant::now();
                         let is_new_peer = {
                             let is_new = match peer_to_channel.entry(*app_id) {
                                 Entry::Vacant(vacant) => {
@@ -1882,6 +1930,10 @@ impl TransportHandle {
                                     false
                                 }
                             }; // p2c Entry guard dropped here
+                            let p2c_elapsed = t1.elapsed();
+                            p2c_lock_total += p2c_elapsed;
+                            p2c_lock_max = p2c_lock_max.max(p2c_elapsed);
+
                             // Always re-insert into `channel_to_peers` rather
                             // than gating on the p2c `inserted` return.
                             // Pre-migration, `inserted == false` implied the
@@ -1895,18 +1947,27 @@ impl TransportHandle {
                             // insert() on a HashSet is sync, cheap, and
                             // idempotent — so we eat the tiny extra cost to
                             // keep the bidirectional invariant intact.
+                            let t2 = Instant::now();
                             channel_to_peers
                                 .entry(channel_id.clone())
                                 .or_default()
                                 .insert(*app_id);
+                            let c2p_elapsed = t2.elapsed();
+                            c2p_lock_total += c2p_elapsed;
+                            c2p_lock_max = c2p_lock_max.max(c2p_elapsed);
+
                             is_new
                         }; // no .await anywhere in the block
 
                         // Register peer ID at the low-level transport endpoint.
                         // Now runs without holding any write locks.
+                        let t3 = Instant::now();
                         dual_node_for_peer_reg
                             .register_connection_peer_id(from_addr, *app_id.to_bytes())
                             .await;
+                        let reg_elapsed = t3.elapsed();
+                        register_total += reg_elapsed;
+                        register_max = register_max.max(reg_elapsed);
 
                         if is_new_peer {
                             peer_user_agents
@@ -1925,6 +1986,35 @@ impl TransportHandle {
                     if let P2PEvent::Message { ref topic, .. } = event
                         && topic == IDENTITY_ANNOUNCE_PROTOCOL
                     {
+                        msg_count += 1;
+                        let loop_elapsed = loop_start.elapsed();
+                        loop_total += loop_elapsed;
+                        loop_max = loop_max.max(loop_elapsed);
+                        if last_report.elapsed() >= REPORT_INTERVAL {
+                            Self::log_shard_stats(
+                                shard_idx, msg_count,
+                                parse_total, parse_max,
+                                p2c_lock_total, p2c_lock_max,
+                                c2p_lock_total, c2p_lock_max,
+                                register_total, register_max,
+                                active_req_lock_total, active_req_lock_max,
+                                loop_total, loop_max,
+                            );
+                            last_report = Instant::now();
+                            msg_count = 0;
+                            parse_total = Duration::ZERO;
+                            parse_max = Duration::ZERO;
+                            p2c_lock_total = Duration::ZERO;
+                            p2c_lock_max = Duration::ZERO;
+                            c2p_lock_total = Duration::ZERO;
+                            c2p_lock_max = Duration::ZERO;
+                            register_total = Duration::ZERO;
+                            register_max = Duration::ZERO;
+                            active_req_lock_total = Duration::ZERO;
+                            active_req_lock_max = Duration::ZERO;
+                            loop_total = Duration::ZERO;
+                            loop_max = Duration::ZERO;
+                        }
                         continue;
                     }
 
@@ -1937,7 +2027,12 @@ impl TransportHandle {
                         && let Ok(envelope) = postcard::from_bytes::<RequestResponseEnvelope>(data)
                         && envelope.is_response
                     {
+                        let t4 = Instant::now();
                         let mut reqs = active_requests.write().await;
+                        let ar_elapsed = t4.elapsed();
+                        active_req_lock_total += ar_elapsed;
+                        active_req_lock_max = active_req_lock_max.max(ar_elapsed);
+
                         let expected_peer = match reqs.get(&envelope.message_id) {
                             Some(pending) => pending.expected_peer,
                             None => {
@@ -1986,8 +2081,76 @@ impl TransportHandle {
                     );
                 }
             }
+
+            msg_count += 1;
+            let loop_elapsed = loop_start.elapsed();
+            loop_total += loop_elapsed;
+            loop_max = loop_max.max(loop_elapsed);
+
+            if last_report.elapsed() >= REPORT_INTERVAL {
+                Self::log_shard_stats(
+                    shard_idx, msg_count,
+                    parse_total, parse_max,
+                    p2c_lock_total, p2c_lock_max,
+                    c2p_lock_total, c2p_lock_max,
+                    register_total, register_max,
+                    active_req_lock_total, active_req_lock_max,
+                    loop_total, loop_max,
+                );
+                last_report = Instant::now();
+                msg_count = 0;
+                parse_total = Duration::ZERO;
+                parse_max = Duration::ZERO;
+                p2c_lock_total = Duration::ZERO;
+                p2c_lock_max = Duration::ZERO;
+                c2p_lock_total = Duration::ZERO;
+                c2p_lock_max = Duration::ZERO;
+                register_total = Duration::ZERO;
+                register_max = Duration::ZERO;
+                active_req_lock_total = Duration::ZERO;
+                active_req_lock_max = Duration::ZERO;
+                loop_total = Duration::ZERO;
+                loop_max = Duration::ZERO;
+            }
         }
         info!("Message dispatch shard {shard_idx} ended — channel closed");
+    }
+
+    /// Log per-stage timing stats for a shard consumer's reporting window.
+    #[allow(clippy::too_many_arguments)]
+    fn log_shard_stats(
+        shard_idx: usize,
+        msg_count: u64,
+        parse_total: Duration,
+        parse_max: Duration,
+        p2c_lock_total: Duration,
+        p2c_lock_max: Duration,
+        c2p_lock_total: Duration,
+        c2p_lock_max: Duration,
+        register_total: Duration,
+        register_max: Duration,
+        active_req_lock_total: Duration,
+        active_req_lock_max: Duration,
+        loop_total: Duration,
+        loop_max: Duration,
+    ) {
+        warn!(
+            shard = shard_idx,
+            messages = msg_count,
+            parse_total_ms = parse_total.as_millis() as u64,
+            parse_max_ms = parse_max.as_millis() as u64,
+            p2c_lock_total_ms = p2c_lock_total.as_millis() as u64,
+            p2c_lock_max_ms = p2c_lock_max.as_millis() as u64,
+            c2p_lock_total_ms = c2p_lock_total.as_millis() as u64,
+            c2p_lock_max_ms = c2p_lock_max.as_millis() as u64,
+            register_total_ms = register_total.as_millis() as u64,
+            register_max_ms = register_max.as_millis() as u64,
+            active_req_lock_total_ms = active_req_lock_total.as_millis() as u64,
+            active_req_lock_max_ms = active_req_lock_max.as_millis() as u64,
+            loop_total_ms = loop_total.as_millis() as u64,
+            loop_max_ms = loop_max.as_millis() as u64,
+            "[SHARD PERF] shard consumer timing stats"
+        );
     }
 }
 
