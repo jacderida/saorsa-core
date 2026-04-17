@@ -33,9 +33,10 @@ use crate::transport::external_addresses::ExternalAddresses;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::{DashMap, DashSet};
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -131,7 +132,7 @@ pub struct TransportHandle {
     event_tx: broadcast::Sender<P2PEvent>,
     listen_addrs: RwLock<Vec<MultiAddr>>,
     rate_limiter: Arc<RateLimiter>,
-    active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
+    active_requests: Arc<DashMap<String, PendingRequest>>,
     // Held to keep the Arc alive for background tasks that captured a clone.
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
@@ -175,14 +176,16 @@ pub struct TransportHandle {
     /// Maps app-level [`PeerId`] → set of channel IDs (QUIC, Bluetooth, …).
     ///
     /// A single peer may communicate over multiple channels simultaneously.
-    peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+    /// Sharded `DashMap` so concurrent registrations for different peers
+    /// don't serialise behind a single writer.
+    peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
     /// Reverse index: channel ID → set of app-level [`PeerId`]s on that channel.
-    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+    channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
     /// Maps app-level [`PeerId`] → user agent string received during authentication.
     ///
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
     /// up a peer's mode without re-receiving the `PeerConnected` event.
-    peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+    peer_user_agents: Arc<DashMap<PeerId, String>>,
 }
 
 // ============================================================================
@@ -254,10 +257,9 @@ impl TransportHandle {
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
 
-        let peer_to_channel = Arc::new(RwLock::new(HashMap::new()));
-        let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
-        let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>> = Arc::new(DashMap::new());
+        let channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>> = Arc::new(DashMap::new());
+        let peer_user_agents: Arc<DashMap<PeerId, String>> = Arc::new(DashMap::new());
         // (peer_addr_update_tx removed — dedicated forwarder creates its own)
 
         let connection_monitor_handle = {
@@ -300,7 +302,7 @@ impl TransportHandle {
             event_tx,
             listen_addrs: RwLock::new(Vec::new()),
             rate_limiter,
-            active_requests: Arc::new(RwLock::new(HashMap::new())),
+            active_requests: Arc::new(DashMap::new()),
             geo_provider,
             shutdown,
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
@@ -365,7 +367,7 @@ impl TransportHandle {
                 window: std::time::Duration::from_secs(TEST_RATE_LIMIT_WINDOW_SECS),
                 ..Default::default()
             })),
-            active_requests: Arc::new(RwLock::new(HashMap::new())),
+            active_requests: Arc::new(DashMap::new()),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
             peer_address_update_rx: {
@@ -393,9 +395,9 @@ impl TransportHandle {
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: identity,
             user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
-            peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
-            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
-            peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
+            peer_to_channel: Arc::new(DashMap::new()),
+            channel_to_peers: Arc::new(DashMap::new()),
+            peer_user_agents: Arc::new(DashMap::new()),
         })
     }
 }
@@ -505,17 +507,19 @@ impl TransportHandle {
 impl TransportHandle {
     /// Get list of authenticated app-level peer IDs.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
-        self.peer_to_channel.read().await.keys().cloned().collect()
+        self.peer_to_channel.iter().map(|e| *e.key()).collect()
     }
 
     /// Get count of authenticated app-level peers.
     pub async fn peer_count(&self) -> usize {
-        self.peer_to_channel.read().await.len()
+        self.peer_to_channel.len()
     }
 
     /// Get the user agent string for a connected peer, if known.
     pub async fn peer_user_agent(&self, peer_id: &PeerId) -> Option<String> {
-        self.peer_user_agents.read().await.get(peer_id).cloned()
+        self.peer_user_agents
+            .get(peer_id)
+            .map(|e| e.value().clone())
     }
 
     /// Get all active transport-level channel IDs (internal bookkeeping).
@@ -532,11 +536,10 @@ impl TransportHandle {
     /// Resolves the app-level [`PeerId`] to a channel ID via the
     /// `peer_to_channel` mapping, then looks up the channel's [`PeerInfo`].
     pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
-        let channel = {
-            let p2c = self.peer_to_channel.read().await;
-            p2c.get(peer_id)
-                .and_then(|chs| chs.iter().next().cloned())?
-        };
+        let channel = self
+            .peer_to_channel
+            .get(peer_id)
+            .and_then(|chs| chs.value().iter().next().cloned())?;
         self.peers.get(&channel).map(|e| e.value().clone())
     }
 
@@ -614,11 +617,13 @@ impl TransportHandle {
 
     /// Look up the peer ID for a given connection address.
     pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
-        let c2p = self.channel_to_peers.read().await;
-
         // Try the exact stringified address first.
         let channel_id = addr.to_string();
-        if let Some(peer_id) = c2p.get(&channel_id).and_then(|p| p.iter().next().copied()) {
+        if let Some(peer_id) = self
+            .channel_to_peers
+            .get(&channel_id)
+            .and_then(|p| p.value().iter().next().copied())
+        {
             return Some(peer_id);
         }
 
@@ -626,8 +631,9 @@ impl TransportHandle {
         // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
         let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
         let alt_channel_id = alt_addr.to_string();
-        c2p.get(&alt_channel_id)
-            .and_then(|p| p.iter().next().copied())
+        self.channel_to_peers
+            .get(&alt_channel_id)
+            .and_then(|p| p.value().iter().next().copied())
     }
 
     /// Drain pending peer address updates from ADD_ADDRESS frames.
@@ -702,7 +708,7 @@ impl TransportHandle {
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
-        self.peer_to_channel.read().await.contains_key(peer_id)
+        self.peer_to_channel.contains_key(peer_id)
     }
 
     /// Check if a connection to a peer is active at the transport layer (internal only).
@@ -722,31 +728,45 @@ impl TransportHandle {
             &self.channel_to_peers,
             &self.peer_user_agents,
             &self.event_tx,
-        )
-        .await;
+        );
     }
 
     /// Static version of channel mapping removal — usable from background tasks
     /// that don't have `&self`.
-    async fn remove_channel_mappings_static(
+    ///
+    /// Operations are sync (DashMap shard locks) so the function is sync; the
+    /// caller still awaits it at existing call sites via the returned future.
+    fn remove_channel_mappings_static(
         channel_id: &str,
-        peer_to_channel: &RwLock<HashMap<PeerId, HashSet<String>>>,
-        channel_to_peers: &RwLock<HashMap<String, HashSet<PeerId>>>,
-        peer_user_agents: &RwLock<HashMap<PeerId, String>>,
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
+        peer_user_agents: &DashMap<PeerId, String>,
         event_tx: &broadcast::Sender<P2PEvent>,
     ) {
-        let mut p2c = peer_to_channel.write().await;
-        let mut c2p = channel_to_peers.write().await;
-        if let Some(app_peers) = c2p.remove(channel_id) {
-            for app_peer in &app_peers {
-                if let Some(channels) = p2c.get_mut(app_peer) {
+        let Some((_, app_peers)) = channel_to_peers.remove(channel_id) else {
+            return;
+        };
+        for app_peer in &app_peers {
+            // Remove the channel from this peer's set and check whether the
+            // peer has any channels left — atomic per-shard via the entry API
+            // so a concurrent accept-loop insertion for the same peer can't
+            // race us into an inconsistent state.
+            let became_empty = match peer_to_channel.entry(*app_peer) {
+                DashEntry::Occupied(mut entry) => {
+                    let channels = entry.get_mut();
                     channels.remove(channel_id);
                     if channels.is_empty() {
-                        p2c.remove(app_peer);
-                        peer_user_agents.write().await.remove(app_peer);
-                        let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
+                        entry.remove();
+                        true
+                    } else {
+                        false
                     }
                 }
+                DashEntry::Vacant(_) => false,
+            };
+            if became_empty {
+                peer_user_agents.remove(app_peer);
+                let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
             }
         }
     }
@@ -948,35 +968,41 @@ impl TransportHandle {
         // Remove this peer from the bidirectional maps, collecting channels
         // that have no remaining peers and should be closed at QUIC level.
         let orphaned_channels = {
-            let mut p2c = self.peer_to_channel.write().await;
-            let mut c2p = self.channel_to_peers.write().await;
-
-            let channel_ids = match p2c.remove(peer_id) {
-                Some(chs) => chs,
-                None => {
-                    info!(
-                        "Peer {} has no tracked channels, nothing to disconnect",
-                        peer_id
-                    );
-                    return Ok(());
-                }
+            let Some((_, channel_ids)) = self.peer_to_channel.remove(peer_id) else {
+                info!(
+                    "Peer {} has no tracked channels, nothing to disconnect",
+                    peer_id
+                );
+                return Ok(());
             };
 
             let mut orphaned = Vec::new();
             for channel_id in &channel_ids {
-                if let Some(peers) = c2p.get_mut(channel_id) {
-                    peers.remove(peer_id);
-                    if peers.is_empty() {
-                        c2p.remove(channel_id);
-                        orphaned.push(channel_id.clone());
+                // Atomic per-shard check-and-remove so a concurrent
+                // registration for the same channel can't leave an orphaned
+                // entry behind.
+                let became_empty = match self.channel_to_peers.entry(channel_id.clone()) {
+                    DashEntry::Occupied(mut entry) => {
+                        let peers = entry.get_mut();
+                        peers.remove(peer_id);
+                        if peers.is_empty() {
+                            entry.remove();
+                            true
+                        } else {
+                            false
+                        }
                     }
+                    DashEntry::Vacant(_) => false,
+                };
+                if became_empty {
+                    orphaned.push(channel_id.clone());
                 }
             }
 
             orphaned
         };
 
-        self.peer_user_agents.write().await.remove(peer_id);
+        self.peer_user_agents.remove(peer_id);
         let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
 
         // Close QUIC connections for channels with no remaining peers.
@@ -1002,7 +1028,7 @@ impl TransportHandle {
 
     /// Disconnect from all peers.
     async fn disconnect_all_peers(&self) -> Result<()> {
-        let peer_ids: Vec<PeerId> = self.peer_to_channel.read().await.keys().cloned().collect();
+        let peer_ids: Vec<PeerId> = self.peer_to_channel.iter().map(|e| *e.key()).collect();
         for peer_id in &peer_ids {
             self.disconnect_peer(peer_id).await?;
         }
@@ -1029,10 +1055,8 @@ impl TransportHandle {
         let peer_hex = peer_id.to_hex();
         let channels: Vec<String> = self
             .peer_to_channel
-            .read()
-            .await
             .get(peer_id)
-            .map(|set| set.iter().cloned().collect())
+            .map(|set| set.value().iter().cloned().collect())
             .unwrap_or_default();
 
         if channels.is_empty() {
@@ -1175,26 +1199,22 @@ impl TransportHandle {
     /// Return all channel IDs for an app-level peer, if known.
     pub async fn channels_for_peer(&self, app_peer_id: &PeerId) -> Vec<String> {
         self.peer_to_channel
-            .read()
-            .await
             .get(app_peer_id)
-            .map(|channels| channels.iter().cloned().collect())
+            .map(|channels| channels.value().iter().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
     pub(crate) async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
         self.channel_to_peers
-            .read()
-            .await
             .get(channel_id)
-            .map(|set| set.iter().cloned().collect())
+            .map(|set| set.value().iter().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Return true if `peer_id` is a known authenticated app-level peer ID.
     pub async fn is_known_app_peer_id(&self, peer_id: &PeerId) -> bool {
-        self.peer_to_channel.read().await.contains_key(peer_id)
+        self.peer_to_channel.contains_key(peer_id)
     }
 
     /// Wait for the identity exchange to complete on `channel_id` and return
@@ -1275,26 +1295,25 @@ impl TransportHandle {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let started_at = Instant::now();
 
-        {
-            let mut reqs = self.active_requests.write().await;
-            if reqs.len() >= MAX_ACTIVE_REQUESTS {
-                return Err(P2PError::Transport(
-                    crate::error::TransportError::StreamError(
-                        format!(
-                            "Too many active requests ({MAX_ACTIVE_REQUESTS}); try again later"
-                        )
+        // MAX_ACTIVE_REQUESTS is a soft backpressure ceiling: a microscopic
+        // race across shards may admit one request over the limit under
+        // extreme contention, but the next caller is rejected — good enough
+        // for a guard that exists to cap unbounded growth.
+        if self.active_requests.len() >= MAX_ACTIVE_REQUESTS {
+            return Err(P2PError::Transport(
+                crate::error::TransportError::StreamError(
+                    format!("Too many active requests ({MAX_ACTIVE_REQUESTS}); try again later")
                         .into(),
-                    ),
-                ));
-            }
-            reqs.insert(
-                message_id.clone(),
-                PendingRequest {
-                    response_tx: tx,
-                    expected_peer: *peer_id,
-                },
-            );
+                ),
+            ));
         }
+        self.active_requests.insert(
+            message_id.clone(),
+            PendingRequest {
+                response_tx: tx,
+                expected_peer: *peer_id,
+            },
+        );
 
         let envelope = RequestResponseEnvelope {
             message_id: message_id.clone(),
@@ -1304,7 +1323,7 @@ impl TransportHandle {
         let envelope_bytes = match postcard::to_allocvec(&envelope) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.active_requests.write().await.remove(&message_id);
+                self.active_requests.remove(&message_id);
                 return Err(P2PError::Serialization(
                     format!("Failed to serialize request envelope: {e}").into(),
                 ));
@@ -1316,7 +1335,7 @@ impl TransportHandle {
             .send_message(peer_id, &wire_protocol, envelope_bytes)
             .await
         {
-            self.active_requests.write().await.remove(&message_id);
+            self.active_requests.remove(&message_id);
             return Err(e);
         }
 
@@ -1343,7 +1362,7 @@ impl TransportHandle {
             )),
         };
 
-        self.active_requests.write().await.remove(&message_id);
+        self.active_requests.remove(&message_id);
         result
     }
 
@@ -1500,17 +1519,16 @@ impl TransportHandle {
         );
 
         // Collect all channels grouped by authenticated app-level peer,
-        // plus any unauthenticated channels.
+        // plus any unauthenticated channels. DashMap iteration is not a
+        // consistent snapshot, but a peer added/removed mid-iteration is
+        // not a correctness issue — the next publish picks it up.
         let mut peer_channel_groups: Vec<Vec<String>> = Vec::new();
         let mut mapped_channels: HashSet<String> = HashSet::new();
-        {
-            let p2c = self.peer_to_channel.read().await;
-            for channels in p2c.values() {
-                let chs: Vec<String> = channels.iter().cloned().collect();
-                mapped_channels.extend(chs.iter().cloned());
-                if !chs.is_empty() {
-                    peer_channel_groups.push(chs);
-                }
+        for entry in self.peer_to_channel.iter() {
+            let chs: Vec<String> = entry.value().iter().cloned().collect();
+            mapped_channels.extend(chs.iter().cloned());
+            if !chs.is_empty() {
+                peer_channel_groups.push(chs);
             }
         }
 
@@ -1786,18 +1804,18 @@ impl TransportHandle {
     /// assignment is by hash of the source IP, so messages from the same
     /// peer always go through the same shard (ordering is preserved per
     /// peer). Shared state (`peer_to_channel`, `active_requests`, etc.) is
-    /// still behind global `RwLock`s but the lock hold times are now
-    /// spread across [`MESSAGE_DISPATCH_SHARDS`] concurrent consumers
-    /// instead of being fully serialised.
+    /// held in sharded `DashMap`s, so writes from different shard consumers
+    /// never contend unless they hit the same map shard — contention is now
+    /// bounded by the DashMap shard count rather than a single global writer.
     #[allow(clippy::too_many_arguments)]
     async fn run_shard_consumer(
         shard_idx: usize,
         mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
         event_tx: broadcast::Sender<P2PEvent>,
-        active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
-        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+        active_requests: Arc<DashMap<String, PendingRequest>>,
+        peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
+        channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
+        peer_user_agents: Arc<DashMap<PeerId, String>>,
         self_peer_id: PeerId,
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
     ) {
@@ -1824,43 +1842,47 @@ impl TransportHandle {
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                     {
-                        // Hold `peer_to_channel` across the transport-level
-                        // `register_connection_peer_id` call so the app-level
-                        // map and the transport's internal addr→peer map are
-                        // consistent for any concurrent reader. Without this,
-                        // there is a microsecond window in which a hole-punch
-                        // lookup that depends on the registration can fail
-                        // spuriously even though the app-level map already
-                        // says the peer is known.
-                        let mut p2c = peer_to_channel.write().await;
-                        let is_new_peer = !p2c.contains_key(app_id);
-                        let channels = p2c.entry(*app_id).or_default();
-                        let inserted = channels.insert(channel_id.clone());
+                        // Register peer ID at the low-level transport
+                        // endpoint BEFORE inserting into peer_to_channel so
+                        // any concurrent reader who observes the app-level
+                        // entry already has the transport's addr→peer map
+                        // populated. Previously this was achieved by
+                        // holding a `peer_to_channel` write lock across the
+                        // await; under sharded `DashMap` we can't hold a
+                        // shard guard across an await, so we rely on
+                        // happens-before via operation ordering instead.
+                        dual_node_for_peer_reg
+                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                            .await;
+
+                        // Atomically determine whether this is the peer's
+                        // first channel. Using `entry` per-shard avoids the
+                        // contains_key/insert TOCTOU that could otherwise
+                        // double-fire `PeerConnected` when two channels for
+                        // the same peer arrive concurrently on different
+                        // dispatch shards.
+                        let mut is_new_peer = false;
+                        let inserted = match peer_to_channel.entry(*app_id) {
+                            DashEntry::Occupied(mut entry) => {
+                                entry.get_mut().insert(channel_id.clone())
+                            }
+                            DashEntry::Vacant(entry) => {
+                                is_new_peer = true;
+                                let mut set = HashSet::new();
+                                set.insert(channel_id.clone());
+                                entry.insert(set);
+                                true
+                            }
+                        };
                         if inserted {
                             channel_to_peers
-                                .write()
-                                .await
                                 .entry(channel_id.clone())
                                 .or_default()
                                 .insert(*app_id);
                         }
 
-                        // Register peer ID at the low-level transport
-                        // endpoint so PUNCH_ME_NOW relay can find this
-                        // peer by identity instead of socket address.
-                        dual_node_for_peer_reg
-                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
-                            .await;
-
-                        // Drop the lock before emitting events so subscribers
-                        // that re-enter the registry don't deadlock.
-                        drop(p2c);
-
                         if is_new_peer {
-                            peer_user_agents
-                                .write()
-                                .await
-                                .insert(*app_id, peer_user_agent.clone());
+                            peer_user_agents.insert(*app_id, peer_user_agent.clone());
                             broadcast_event(
                                 &event_tx,
                                 P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
@@ -1885,8 +1907,11 @@ impl TransportHandle {
                         && let Ok(envelope) = postcard::from_bytes::<RequestResponseEnvelope>(data)
                         && envelope.is_response
                     {
-                        let mut reqs = active_requests.write().await;
-                        let expected_peer = match reqs.get(&envelope.message_id) {
+                        // Peek at the expected peer without removing so a
+                        // spoofed response can't evict a legitimate pending
+                        // request — the entry stays until either a matching
+                        // response arrives or the caller times out.
+                        let expected_peer = match active_requests.get(&envelope.message_id) {
                             Some(pending) => pending.expected_peer,
                             None => {
                                 trace!(
@@ -1909,19 +1934,14 @@ impl TransportHandle {
                             );
                             continue;
                         }
-                        if let Some(pending) = reqs.remove(&envelope.message_id) {
-                            if pending.response_tx.send(envelope.payload).is_err() {
-                                warn!(
-                                    message_id = %envelope.message_id,
-                                    "Response receiver dropped before delivery"
-                                );
-                            }
-                            continue;
+                        if let Some((_, pending)) = active_requests.remove(&envelope.message_id)
+                            && pending.response_tx.send(envelope.payload).is_err()
+                        {
+                            warn!(
+                                message_id = %envelope.message_id,
+                                "Response receiver dropped before delivery"
+                            );
                         }
-                        trace!(
-                            message_id = %envelope.message_id,
-                            "Unmatched /rr/ response (likely timed out) — suppressing"
-                        );
                         continue;
                     }
                     broadcast_event(&event_tx, event);
@@ -1945,8 +1965,8 @@ impl TransportHandle {
 /// messages are processed by the same consumer (preserving per-peer
 /// ordering) while different peers' messages run in parallel. Picked to
 /// match typical core counts on deployment hardware — tuning higher helps
-/// only if the shared state `RwLock`s are no longer the dominant
-/// contention, which is not the case today.
+/// only if `DashMap` shard contention in `peer_to_channel` / `active_requests`
+/// is observed to be the dominant bottleneck.
 const MESSAGE_DISPATCH_SHARDS: usize = 8;
 
 /// Minimum mpsc capacity for an individual dispatch shard channel.
@@ -2054,9 +2074,9 @@ impl TransportHandle {
         event_tx: broadcast::Sender<P2PEvent>,
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
-        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+        peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
+        channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
+        peer_user_agents: Arc<DashMap<PeerId, String>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
     ) {
@@ -2151,7 +2171,7 @@ impl TransportHandle {
                                     &channel_to_peers,
                                     &peer_user_agents,
                                     &event_tx,
-                                ).await;
+                                );
                             }
                             ConnectionEvent::PeerAddressUpdated { .. } => {
                                 // Handled by dedicated forwarder, not here
@@ -2223,14 +2243,10 @@ impl TransportHandle {
     /// `remove_channel` correctly cleans up both maps.
     pub(crate) async fn inject_peer_to_channel(&self, peer_id: PeerId, channel_id: String) {
         self.peer_to_channel
-            .write()
-            .await
             .entry(peer_id)
             .or_default()
             .insert(channel_id.clone());
         self.channel_to_peers
-            .write()
-            .await
             .entry(channel_id)
             .or_default()
             .insert(peer_id);
