@@ -40,7 +40,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -186,6 +186,21 @@ pub struct TransportHandle {
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
     /// up a peer's mode without re-receiving the `PeerConnected` event.
     peer_user_agents: Arc<DashMap<PeerId, String>>,
+    /// Remote socket addresses this handle has dialed out to, populated
+    /// before each dial in [`Self::connect_peer`]. Read-only input to the
+    /// passive direct-reachability classifier spawned below. Monotonic —
+    /// entries are never removed for the lifetime of the handle because the
+    /// classifier only cares about "did we ever dial this remote?".
+    dialed_addrs: Arc<DashSet<SocketAddr>>,
+    /// Becomes `true` the first time an unsolicited inbound handshake
+    /// completes (an accepted connection from a remote address that is not
+    /// in `dialed_addrs`). Once set, the flag latches — reachability does
+    /// not "un-prove" itself within a single process lifetime. Consumed by
+    /// [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
+    /// to decide between publishing `AddressType::Direct` and
+    /// `AddressType::Unverified` for the local node's observed external
+    /// addresses.
+    direct_reachability_observed: Arc<AtomicBool>,
 }
 
 // ============================================================================
@@ -254,6 +269,20 @@ impl TransportHandle {
         let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) =
             dual_node.spawn_peer_address_update_forwarder(Arc::clone(&external_addresses));
 
+        // Passive direct-reachability classifier: subscribe to
+        // `P2pEvent::PeerConnected` and flip `direct_reachability_observed`
+        // the first time an inbound (`Side::Server`) handshake completes
+        // from a remote we did not dial first. Consumed by
+        // `AcquisitionDriver::publish_typed_set` to pick between
+        // `AddressType::Direct` and `AddressType::Unverified` for the
+        // self-record's observed external addresses.
+        let dialed_addrs: Arc<DashSet<SocketAddr>> = Arc::new(DashSet::new());
+        let direct_reachability_observed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        dual_node.spawn_direct_reachability_classifier(
+            Arc::clone(&dialed_addrs),
+            Arc::clone(&direct_reachability_observed),
+        );
+
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
 
@@ -318,6 +347,8 @@ impl TransportHandle {
             peer_to_channel,
             channel_to_peers,
             peer_user_agents,
+            dialed_addrs,
+            direct_reachability_observed,
         })
     }
 
@@ -398,6 +429,8 @@ impl TransportHandle {
             peer_to_channel: Arc::new(DashMap::new()),
             channel_to_peers: Arc::new(DashMap::new()),
             peer_user_agents: Arc::new(DashMap::new()),
+            dialed_addrs: Arc::new(DashSet::new()),
+            direct_reachability_observed: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -415,6 +448,24 @@ impl TransportHandle {
     /// Get the cryptographic node identity.
     pub fn node_identity(&self) -> &Arc<NodeIdentity> {
         &self.node_identity
+    }
+
+    /// Whether the local listener is known to be cold-dialable.
+    ///
+    /// Set by the passive reachability classifier (see
+    /// [`crate::transport::saorsa_transport_adapter::DualStackNetworkNode::spawn_direct_reachability_classifier`])
+    /// the first time a `Side::Server` handshake completes from a remote
+    /// address we had not previously dialed. Once set, the flag latches —
+    /// reachability is not considered to have "un-proven" itself for the
+    /// lifetime of this `TransportHandle`.
+    ///
+    /// Consumed by [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
+    /// to decide whether this node's observed external addresses are
+    /// published as [`crate::dht::AddressType::Direct`] (flag set) or
+    /// [`crate::dht::AddressType::Unverified`] (flag unset, and no relay
+    /// available).
+    pub fn direct_reachability_observed(&self) -> bool {
+        self.direct_reachability_observed.load(Ordering::Acquire)
     }
 
     /// Get the first listen address as a string.
@@ -817,6 +868,15 @@ impl TransportHandle {
 
         let normalized_addr = normalize_wildcard_to_loopback(socket_addr);
         let addr_list = vec![normalized_addr];
+
+        // Record this outbound dial target BEFORE the dial starts so the
+        // passive reachability classifier can distinguish simultaneous-open
+        // replies from genuinely unsolicited inbounds. The set is
+        // monotonic; we do not remove entries on disconnect.
+        self.dialed_addrs
+            .insert(saorsa_transport::shared::normalize_socket_addr(
+                normalized_addr,
+            ));
 
         let peer_id = match tokio::time::timeout(
             self.connection_timeout,

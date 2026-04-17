@@ -41,10 +41,11 @@
 use crate::error::{GeoRejectionError, GeographicConfig};
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
+use dashmap::DashSet;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
@@ -53,7 +54,7 @@ use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
-    LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId,
+    LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId, Side,
     StrategyConfig,
 };
 
@@ -1148,6 +1149,67 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             });
         }
         (rx, relay_rx, relay_lost_rx)
+    }
+
+    /// Spawn a background task per stack that watches `P2pEvent::PeerConnected`
+    /// and sets `flag` the first time an unsolicited inbound handshake
+    /// completes — i.e. a connection accepted from a remote address that is
+    /// not in `dialed_addrs`.
+    ///
+    /// This is the passive NAT-reachability classifier: one confirmed
+    /// inbound from a peer we never dialed proves that our listener is
+    /// cold-dialable, which is what [`AcquisitionDriver::publish_typed_set`]
+    /// needs to decide whether to publish addresses tagged `Direct` or
+    /// `Unverified`.
+    ///
+    /// `dialed_addrs` is expected to be populated at the dial site
+    /// (`TransportHandle::connect_peer`) *before* the dial starts so that a
+    /// simultaneous-open race cannot mis-classify a reply as unsolicited.
+    pub fn spawn_direct_reachability_classifier(
+        &self,
+        dialed_addrs: Arc<DashSet<SocketAddr>>,
+        flag: Arc<AtomicBool>,
+    ) {
+        for node in [&self.v6, &self.v4].into_iter().flatten() {
+            let mut p2p_rx = node.transport.endpoint().subscribe();
+            let dialed = Arc::clone(&dialed_addrs);
+            let flag = Arc::clone(&flag);
+            tokio::spawn(async move {
+                loop {
+                    match p2p_rx.recv().await {
+                        Ok(saorsa_transport::P2pEvent::PeerConnected {
+                            addr,
+                            side: Side::Server,
+                            ..
+                        }) => {
+                            if flag.load(Ordering::Relaxed) {
+                                // Already proven; nothing more to learn here.
+                                continue;
+                            }
+                            let Some(socket_addr) = addr.as_socket_addr() else {
+                                continue;
+                            };
+                            let normalized =
+                                saorsa_transport::shared::normalize_socket_addr(socket_addr);
+                            // Anything the NAT/firewall accepted inbound
+                            // without us having dialed the remote first is
+                            // proof of cold-reachability.
+                            if !dialed.contains(&normalized) {
+                                tracing::info!(
+                                    remote = %normalized,
+                                    "direct reachability observed: unsolicited inbound handshake \
+                                     from peer not in dialed set"
+                                );
+                                flag.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Ok(_other) => continue,
+                    }
+                }
+            });
+        }
     }
 
     /// Create dual nodes bound to IPv6 and IPv4 addresses with default

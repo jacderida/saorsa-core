@@ -111,17 +111,29 @@ const MAX_ADDRESSES_PER_NODE: usize = 8;
 /// directly reachable. We keep 1 for diagnostic/logging purposes.
 const MAX_NATTED_ADDRESSES: usize = 1;
 
+/// Maximum `Unverified` addresses to keep per node. These are self-published
+/// observed externals that have not been confirmed reachable by the local
+/// classifier. Bounded tightly because a cold-start node typically has 1–2
+/// observed externals and stale extras add only dial-timeout cost.
+const MAX_UNVERIFIED_ADDRESSES: usize = 2;
+
 /// Address classification for priority ordering and staleness eviction.
 ///
-/// Relay addresses are always preferred over Direct, which are preferred over
-/// NATted. The `merge_typed_address` method uses this for insertion ordering
-/// and the eviction of excess NATted entries.
+/// Priority: Relay > Direct > Unverified > NATted. The `merge_typed_address`
+/// method uses this for insertion ordering and the eviction of excess
+/// `NATted` / `Unverified` entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressType {
     /// Address through a MASQUE relay server (always reachable)
     Relay,
-    /// Direct public IP address (reachable without NAT traversal)
+    /// Direct public IP address verified reachable without NAT traversal
     Direct,
+    /// Self-published observed external address whose reachability has not
+    /// been confirmed by the local classifier. Published by cold-start nodes
+    /// that have not yet accepted an unsolicited inbound handshake and have
+    /// not yet acquired a relay. Dialers try these last (before `NATted`)
+    /// and must accept the possibility of a timeout.
+    Unverified,
     /// NATted address (ephemeral, typically unreachable from outside)
     NATted,
 }
@@ -129,7 +141,7 @@ pub enum AddressType {
 impl AddressType {
     /// Priority index for ordering addresses by type. Lower is preferred.
     ///
-    /// Relay (0) → Direct (1) → NATted (2).
+    /// Relay (0) → Direct (1) → Unverified (2) → NATted (3).
     ///
     /// Used by [`NodeInfo::merge_typed_address`], [`KBucket::replace_node_addresses`],
     /// [`DHTNode::addresses_by_priority`], and [`DhtNetworkManager::dialable_addresses_typed`]
@@ -138,7 +150,8 @@ impl AddressType {
         match self {
             Self::Relay => 0,
             Self::Direct => 1,
-            Self::NATted => 2,
+            Self::Unverified => 2,
+            Self::NATted => 3,
         }
     }
 }
@@ -245,6 +258,36 @@ impl NodeInfo {
                     .unwrap_or(self.addresses.len());
                 self.addresses.insert(pos, addr);
                 self.address_types.insert(pos, AddressType::Direct);
+            }
+            AddressType::Unverified => {
+                // After all Relay and Direct entries, before NATted
+                let pos = self
+                    .address_types
+                    .iter()
+                    .position(|t| *t != AddressType::Relay && *t != AddressType::Direct)
+                    .unwrap_or(self.addresses.len());
+                self.addresses.insert(pos, addr);
+                self.address_types.insert(pos, AddressType::Unverified);
+
+                // Evict excess Unverified addresses
+                let unverified_count = self
+                    .address_types
+                    .iter()
+                    .filter(|t| **t == AddressType::Unverified)
+                    .count();
+                if unverified_count > MAX_UNVERIFIED_ADDRESSES {
+                    let mut to_remove = unverified_count - MAX_UNVERIFIED_ADDRESSES;
+                    let mut i = 0;
+                    while i < self.address_types.len() && to_remove > 0 {
+                        if self.address_types[i] == AddressType::Unverified {
+                            self.addresses.remove(i);
+                            self.address_types.remove(i);
+                            to_remove -= 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
             }
             AddressType::NATted => {
                 // At the back
@@ -3698,5 +3741,61 @@ mod tests {
         }
         // Low-trust peer should still be in the table
         assert!(dht.has_node(&low_peer).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // AddressType::Unverified tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn address_type_priority_is_relay_direct_unverified_natted() {
+        assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
+        assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
+        assert!(AddressType::Unverified.priority() < AddressType::NATted.priority());
+    }
+
+    #[test]
+    fn merge_unverified_lands_between_direct_and_natted() {
+        let mut node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+        // Existing single entry is Direct (via make_node).
+        let relay: MultiAddr = "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap();
+        let unverified: MultiAddr = "/ip4/10.0.0.3/udp/9000/quic".parse().unwrap();
+        let natted: MultiAddr = "/ip4/10.0.0.4/udp/9000/quic".parse().unwrap();
+
+        node.merge_typed_address(natted.clone(), AddressType::NATted);
+        node.merge_typed_address(unverified.clone(), AddressType::Unverified);
+        node.merge_typed_address(relay.clone(), AddressType::Relay);
+
+        // Priority order in the stored vec: Relay, Direct, Unverified, NATted
+        assert_eq!(
+            node.address_types,
+            vec![
+                AddressType::Relay,
+                AddressType::Direct,
+                AddressType::Unverified,
+                AddressType::NATted,
+            ]
+        );
+        assert_eq!(node.addresses[0], relay);
+        assert_eq!(node.addresses[2], unverified);
+        assert_eq!(node.addresses[3], natted);
+    }
+
+    #[test]
+    fn merge_unverified_caps_at_max_unverified_addresses() {
+        let mut node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
+
+        // Insert more Unverified than the cap allows; earliest should be evicted.
+        for i in 0..(MAX_UNVERIFIED_ADDRESSES as u16 + 2) {
+            let addr: MultiAddr = format!("/ip4/10.1.0.{}/udp/9000/quic", i).parse().unwrap();
+            node.merge_typed_address(addr, AddressType::Unverified);
+        }
+
+        let unverified_count = node
+            .address_types
+            .iter()
+            .filter(|t| **t == AddressType::Unverified)
+            .count();
+        assert_eq!(unverified_count, MAX_UNVERIFIED_ADDRESSES);
     }
 }

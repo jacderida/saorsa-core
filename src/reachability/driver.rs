@@ -175,10 +175,19 @@ impl AcquisitionDriver {
 
     /// Publish this node's current typed address set to K-closest peers.
     ///
-    /// The set always includes every non-wildcard listen address tagged
-    /// [`AddressType::Direct`]. When `relay` is `Some`, the relay-allocated
-    /// socket is appended tagged [`AddressType::Relay`]. When `None`
-    /// (acquisition failed or relay was lost), the set is direct-only.
+    /// The direct tier's [`AddressType`] depends on the passive
+    /// reachability classifier (see
+    /// [`TransportHandle::direct_reachability_observed`]): when at least
+    /// one unsolicited inbound handshake has completed, observed external
+    /// addresses are tagged [`AddressType::Direct`]; otherwise they are
+    /// tagged [`AddressType::Unverified`] so dialers know they may time
+    /// out. When `relay` is `Some`, the relay-allocated socket is appended
+    /// tagged [`AddressType::Relay`].
+    ///
+    /// When a relay has been acquired, unverified-only addresses are
+    /// suppressed — the relay address is the authoritative contact and
+    /// publishing undialable direct entries alongside it just adds
+    /// timeout cost for dialers.
     ///
     /// Quietly drops the publish when there are no dialable addresses to
     /// advertise — a fully wildcard-bound node cannot meaningfully tell
@@ -186,6 +195,23 @@ impl AcquisitionDriver {
     async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
         let listen = self.transport.listen_addrs().await;
         let observed = self.transport.direct_external_addresses();
+        let direct_verified = self.transport.direct_reachability_observed();
+
+        // Choose the tag for observed/listen addresses:
+        //   - classifier has proven reachability → Direct
+        //   - no proof yet, no relay either      → Unverified (cold-start;
+        //                                          dialers eat the risk)
+        //   - no proof yet, but relay is held    → suppress (relay is
+        //                                          authoritative; don't
+        //                                          waste dialers on
+        //                                          unverified direct)
+        let direct_tag: Option<AddressType> = if direct_verified {
+            Some(AddressType::Direct)
+        } else if relay.is_none() {
+            Some(AddressType::Unverified)
+        } else {
+            None
+        };
 
         let mut typed: Vec<(MultiAddr, AddressType)> = Vec::new();
         // Normalize addresses before dedup so IPv4-mapped IPv6
@@ -194,30 +220,32 @@ impl AcquisitionDriver {
         // different representations.
         let mut seen: HashSet<SocketAddr> = HashSet::new();
 
-        // Prefer observed (post-NAT) addresses for the direct tier since
-        // those are what peers actually see from the outside. Fall back
-        // to locally-bound listen addresses when no observations exist.
-        if !observed.is_empty() {
-            for sa in observed {
+        if let Some(tag) = direct_tag {
+            // Prefer observed (post-NAT) addresses for the direct tier since
+            // those are what peers actually see from the outside. Fall back
+            // to locally-bound listen addresses when no observations exist.
+            if !observed.is_empty() {
+                for sa in observed {
+                    if sa.ip().is_unspecified() {
+                        continue;
+                    }
+                    let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+                    if seen.insert(normalized) {
+                        typed.push((MultiAddr::quic(normalized), tag));
+                    }
+                }
+            }
+            for addr in listen {
+                let Some(sa) = addr.dialable_socket_addr() else {
+                    continue;
+                };
                 if sa.ip().is_unspecified() {
                     continue;
                 }
                 let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
                 if seen.insert(normalized) {
-                    typed.push((MultiAddr::quic(normalized), AddressType::Direct));
+                    typed.push((MultiAddr::quic(normalized), tag));
                 }
-            }
-        }
-        for addr in listen {
-            let Some(sa) = addr.dialable_socket_addr() else {
-                continue;
-            };
-            if sa.ip().is_unspecified() {
-                continue;
-            }
-            let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-            if seen.insert(normalized) {
-                typed.push((MultiAddr::quic(normalized), AddressType::Direct));
             }
         }
 

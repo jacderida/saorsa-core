@@ -3138,6 +3138,38 @@ mod tests {
     }
 
     #[test]
+    fn first_direct_dialable_skips_unverified() {
+        // Unverified addresses are self-published observed externals that
+        // have not been proven reachable by the local classifier. The
+        // relay-acquisition walker must not pick them as candidate relays
+        // (that was the bug which caused NAT'd droplets to dial
+        // ephemeral-port "Direct" entries and treat them as reachable).
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Unverified),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        let picked = DhtNetworkManager::first_direct_dialable(&node).unwrap();
+        assert_eq!(
+            picked,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn first_direct_dialable_returns_none_when_only_unverified() {
+        let node = dht_node(
+            1,
+            vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Unverified)],
+        );
+        assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    #[test]
     fn test_peer_rejected_round_trips_through_serialization() {
         let result = DhtNetworkResult::PeerRejected;
         let bytes = postcard::to_stdvec(&result).expect("serialization should succeed");
