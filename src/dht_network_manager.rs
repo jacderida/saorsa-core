@@ -121,7 +121,12 @@ pub struct DHTNode {
     ///
     /// Defaults to empty on deserialization (legacy records or wire data from
     /// nodes that predate ADR-014). When empty, callers treat all addresses
-    /// as [`AddressType::Direct`] — the conservative assumption.
+    /// as [`AddressType::Unverified`] — a legacy peer never asserted
+    /// reachability for its published sockets, so the conservative default
+    /// is "publisher did not claim direct-dialability." This excludes the
+    /// entries from `first_direct_dialable` (relay-candidate selection)
+    /// while keeping them in the general dial priority queue as a
+    /// last-resort cold-start fallback.
     ///
     /// Populated when constructing from DHT routing-table entries so
     /// consumers (e.g., saorsa-node) can inspect the address types of
@@ -137,8 +142,10 @@ impl DHTNode {
     ///
     /// Untagged entries (legacy records that predate ADR-014, or any
     /// position past the end of `address_types`) default to
-    /// [`AddressType::Direct`] — the conservative assumption that
-    /// matches `address_type_at` on `NodeInfo`.
+    /// [`AddressType::Unverified`] — the conservative assumption that
+    /// matches `address_type_at` on `NodeInfo`. A legacy publisher never
+    /// asserted reachability for these sockets, so we refuse to let them
+    /// stand in for a verified `Direct` tag.
     ///
     /// The returned vec preserves the storage order from `addresses`;
     /// callers that need Relay-first ordering should pass the result to
@@ -153,7 +160,7 @@ impl DHTNode {
                     .address_types
                     .get(i)
                     .copied()
-                    .unwrap_or(AddressType::Direct);
+                    .unwrap_or(AddressType::Unverified);
                 (addr.clone(), ty)
             })
             .collect()
@@ -1421,13 +1428,20 @@ impl DhtNetworkManager {
     /// socket is dialable (QUIC, non-unspecified, not port zero). Returns
     /// `None` when no such address exists — the caller should skip this
     /// candidate and walk to the next-closest peer.
+    ///
+    /// Untagged entries fall through as `Unverified`, not `Direct` — a
+    /// legacy record with no `address_types` is NOT a valid relay
+    /// candidate because its publisher never asserted reachability. This
+    /// closes the "NAT-through-NAT relay chain" failure mode where a
+    /// node's observed-but-unverified ephemeral port would be treated as
+    /// a dialable Direct candidate.
     pub(crate) fn first_direct_dialable(node: &DHTNode) -> Option<MultiAddr> {
         for (i, addr) in node.addresses.iter().enumerate() {
             let addr_type = node
                 .address_types
                 .get(i)
                 .copied()
-                .unwrap_or(AddressType::Direct);
+                .unwrap_or(AddressType::Unverified);
             if addr_type != AddressType::Direct {
                 continue;
             }
@@ -3166,6 +3180,23 @@ mod tests {
             1,
             vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Unverified)],
         );
+        assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    #[test]
+    fn first_direct_dialable_rejects_legacy_untagged_addresses() {
+        // A DHTNode with a non-empty `addresses` vec but an empty
+        // `address_types` — the shape produced by deserializing a
+        // pre-ADR-014 record. Legacy publishers never asserted
+        // reachability, so such entries must NOT be picked as relay
+        // candidates; the fallback is `Unverified`, not `Direct`.
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec!["/ip4/203.0.113.7/udp/9001/quic".parse().unwrap()],
+            address_types: vec![], // legacy wire payload
+            distance: None,
+            reliability: 1.0,
+        };
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
     }
 

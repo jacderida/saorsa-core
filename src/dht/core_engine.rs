@@ -229,9 +229,12 @@ impl NodeInfo {
     /// Relay addresses always go to the front. NATted addresses go to the
     /// back and are evicted beyond [`MAX_NATTED_ADDRESSES`].
     pub fn merge_typed_address(&mut self, addr: MultiAddr, addr_type: AddressType) {
-        // Ensure address_types is in sync with addresses (legacy compat)
+        // Ensure address_types is in sync with addresses (legacy compat).
+        // Trailing untagged entries are padded with `Unverified` so we do not
+        // claim direct-reachability for addresses whose publisher never
+        // asserted it — the whole point of the typed-record migration.
         while self.address_types.len() < self.addresses.len() {
-            self.address_types.push(AddressType::Direct);
+            self.address_types.push(AddressType::Unverified);
         }
 
         // Remove existing duplicate (same address may be re-classified)
@@ -322,13 +325,15 @@ impl NodeInfo {
         self.address_types.truncate(MAX_ADDRESSES_PER_NODE);
     }
 
-    /// Get the address type at the given index. Returns `Direct` for
-    /// untagged addresses (legacy compatibility).
+    /// Get the address type at the given index. Returns `Unverified` for
+    /// untagged addresses — legacy records that predate ADR-014 never
+    /// asserted reachability for their entries, so the conservative default
+    /// is "publisher did not claim this is directly dialable."
     pub fn address_type_at(&self, index: usize) -> AddressType {
         self.address_types
             .get(index)
             .copied()
-            .unwrap_or(AddressType::Direct)
+            .unwrap_or(AddressType::Unverified)
     }
 }
 
@@ -373,7 +378,7 @@ impl KBucket {
                     .address_types
                     .get(i)
                     .copied()
-                    .unwrap_or(AddressType::Direct);
+                    .unwrap_or(AddressType::Unverified);
                 existing.merge_typed_address(addr, addr_type);
             }
             self.nodes.push(existing);
@@ -1126,7 +1131,7 @@ impl DhtCoreEngine {
                             .address_types
                             .get(i)
                             .copied()
-                            .unwrap_or(AddressType::Direct);
+                            .unwrap_or(AddressType::Unverified);
                         (addr.clone(), addr_type)
                     })
                     .collect()
@@ -2467,15 +2472,21 @@ mod tests {
             .unwrap();
         assert_eq!(bucket.get_nodes()[0].addresses.len(), 1);
 
-        // Replace with an oversized address list.
+        // Replace with an oversized Direct-tagged address list. We use
+        // explicit Direct tags here so the test exercises the
+        // `MAX_ADDRESSES_PER_NODE` bucket-level cap rather than the
+        // per-type Unverified/NATted sub-caps (legacy untagged entries
+        // fall through as Unverified and would be bounded by
+        // `MAX_UNVERIFIED_ADDRESSES` instead).
         let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
             .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
             .collect();
+        let address_types = vec![AddressType::Direct; addresses.len()];
         let replacement = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
             last_seen: AtomicInstant::now(),
-            address_types: vec![],
+            address_types,
         };
         bucket.add_node(replacement).unwrap();
 
@@ -3797,5 +3808,22 @@ mod tests {
             .filter(|t| **t == AddressType::Unverified)
             .count();
         assert_eq!(unverified_count, MAX_UNVERIFIED_ADDRESSES);
+    }
+
+    #[test]
+    fn untagged_address_type_falls_back_to_unverified() {
+        // NodeInfo::address_type_at — an untagged index must not claim
+        // Direct-reachability; legacy records never asserted it.
+        let node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![
+                "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
+                "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+            ],
+            address_types: vec![], // legacy: no tags at all
+            last_seen: AtomicInstant::now(),
+        };
+        assert_eq!(node.address_type_at(0), AddressType::Unverified);
+        assert_eq!(node.address_type_at(1), AddressType::Unverified);
     }
 }
