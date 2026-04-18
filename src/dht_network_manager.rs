@@ -1904,13 +1904,18 @@ impl DhtNetworkManager {
 
         // 2. Transport layer — for connected peers not yet in the
         //    routing table. No type info available, so each address is
-        //    tagged Direct (the conservative assumption).
+        //    tagged `Unverified`: a transport-level handshake does not
+        //    prove the address is cold-dialable from arbitrary peers.
+        //    `Unverified` is still dialable (sorted after Relay/Direct,
+        //    before NATted) so these peers remain reachable for regular
+        //    DHT ops, but relay-candidate selection (which requires
+        //    `Direct`) correctly skips them.
         if let Some(info) = self.transport.peer_info(peer_id).await {
             return info
                 .addresses
                 .into_iter()
                 .filter(Self::is_dialable)
-                .map(|a| (a, AddressType::Direct))
+                .map(|a| (a, AddressType::Unverified))
                 .collect();
         }
 
@@ -2258,13 +2263,20 @@ impl DhtNetworkManager {
         })
     }
 
-    /// Update routing-table liveness (and address) for a peer on successful
-    /// message exchange.
+    /// Update routing-table liveness for a peer on successful message
+    /// exchange.
     ///
     /// Standard Kademlia: any successful RPC proves liveness. We touch the
-    /// routing table entry to move it to the tail of its k-bucket and refresh
-    /// the stored address so that `FindNode` responses stay current when a peer
-    /// reconnects from a different endpoint.
+    /// routing table entry to move it to the tail of its k-bucket.
+    ///
+    /// Intentionally does NOT pass an address: transport-layer observations
+    /// only prove reachability from *us* to the peer (possibly through a
+    /// NAT mapping we opened), not public reachability. Tagging the
+    /// observed address as `Direct` here used to poison relay-candidate
+    /// selection by making NAT'd peers look cold-dialable. Authoritative
+    /// address typing is the peer's responsibility via `PublishAddressSet`;
+    /// new peers not yet in the routing table pick up an initial address
+    /// list via [`Self::handle_peer_connected`] (tagged `Unverified`).
     async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
@@ -2274,25 +2286,9 @@ impl DhtNetworkManager {
             return;
         };
 
-        // Transport-layer address is tagged as Direct. The typed merge
-        // ensures it never displaces a Relay address at the front.
-        // NATted addresses (from NAT connections) are handled separately
-        // by the DHT bridge which tags them explicitly. Transport
-        // peer_info has no AddressType info, so we just pick the first
-        // dialable entry to refresh the routing-table record.
-        let transport_addr = self
-            .transport
-            .peer_info(&app_peer_id)
-            .await
-            .and_then(|info| info.addresses.into_iter().find(Self::is_dialable));
-
         let dht = self.dht.read().await;
         if dht
-            .touch_node_typed(
-                &app_peer_id,
-                transport_addr.as_ref(),
-                crate::dht::AddressType::Direct,
-            )
+            .touch_node_typed(&app_peer_id, None, crate::dht::AddressType::Unverified)
             .await
         {
             trace!("Touched routing table entry for {}", app_peer_id.to_hex());
@@ -2381,7 +2377,13 @@ impl DhtNetworkManager {
                 app_peer_id_hex, user_agent
             );
         } else {
-            let address_types = vec![crate::dht::AddressType::Direct; addresses.len()];
+            // Transport-observed addresses are `Unverified` by default: a
+            // successful handshake with us doesn't prove the peer is
+            // cold-dialable by arbitrary third parties. The peer's own
+            // `PublishAddressSet` (driven by the reachability classifier)
+            // upgrades to `Direct` or `Relay` when authoritative info
+            // arrives.
+            let address_types = vec![crate::dht::AddressType::Unverified; addresses.len()];
             let node_info = NodeInfo {
                 id: node_id,
                 addresses,

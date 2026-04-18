@@ -281,6 +281,7 @@ impl TransportHandle {
         dual_node.spawn_direct_reachability_classifier(
             Arc::clone(&dialed_addrs),
             Arc::clone(&direct_reachability_observed),
+            Arc::clone(&external_addresses),
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task

@@ -39,6 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::security::canonicalize_ip;
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
 use dashmap::DashSet;
@@ -1165,15 +1166,25 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// `dialed_addrs` is expected to be populated at the dial site
     /// (`TransportHandle::connect_peer`) *before* the dial starts so that a
     /// simultaneous-open race cannot mis-classify a reply as unsolicited.
+    ///
+    /// `external_addresses` is consulted to reject sibling-hairpin
+    /// handshakes: on a NAT droplet that hosts multiple nodes behind a
+    /// shared public IP, a sibling node opening a connection to us appears
+    /// as inbound from our own external IP after MASQUERADE. That traffic
+    /// is NOT evidence of public reachability — it never left the droplet.
+    /// Without this filter, sibling hairpins flip the flag true on NAT'd
+    /// hosts and defeat the whole Direct/Unverified distinction.
     pub fn spawn_direct_reachability_classifier(
         &self,
         dialed_addrs: Arc<DashSet<SocketAddr>>,
         flag: Arc<AtomicBool>,
+        external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
     ) {
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let dialed = Arc::clone(&dialed_addrs);
             let flag = Arc::clone(&flag);
+            let external = Arc::clone(&external_addresses);
             tokio::spawn(async move {
                 loop {
                     match p2p_rx.recv().await {
@@ -1191,17 +1202,29 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                             };
                             let normalized =
                                 saorsa_transport::shared::normalize_socket_addr(socket_addr);
-                            // Anything the NAT/firewall accepted inbound
-                            // without us having dialed the remote first is
-                            // proof of cold-reachability.
-                            if !dialed.contains(&normalized) {
-                                tracing::info!(
-                                    remote = %normalized,
-                                    "direct reachability observed: unsolicited inbound handshake \
-                                     from peer not in dialed set"
-                                );
-                                flag.store(true, Ordering::Release);
+                            if dialed.contains(&normalized) {
+                                // Simultaneous-open reply to our own dial; not proof.
+                                continue;
                             }
+                            let remote_ip = canonicalize_ip(normalized.ip());
+                            let is_own_external_ip = external
+                                .lock()
+                                .direct_addresses()
+                                .into_iter()
+                                .any(|sa| canonicalize_ip(sa.ip()) == remote_ip);
+                            if is_own_external_ip {
+                                tracing::trace!(
+                                    remote = %normalized,
+                                    "classifier: ignoring sibling-hairpin handshake from own external IP"
+                                );
+                                continue;
+                            }
+                            tracing::info!(
+                                remote = %normalized,
+                                "direct reachability observed: unsolicited inbound handshake \
+                                 from peer not in dialed set"
+                            );
+                            flag.store(true, Ordering::Release);
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
