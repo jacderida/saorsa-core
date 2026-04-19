@@ -154,6 +154,17 @@ const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
 /// IPv4 take over quickly when the v6 attempt is failing or stalled.
 const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
+/// Per-attempt direct-connect timeout used by the Happy Eyeballs race.
+///
+/// saorsa-transport's `StrategyConfig` default is 3 s, sized for relay
+/// handshakes that add one extra RTT. With the dial planner now capping
+/// attempts at two addresses per peer (see
+/// [`crate::dht_network_manager::DhtNetworkManager::select_dial_candidates`]),
+/// a tighter 2 s budget matches the direct / relay-transport RTT we see
+/// in practice and shaves a full second off worst-case cold-start
+/// latency when the first address is unreachable.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Increment the drop counter and log periodically when the address-event
 /// forwarder fails to push into a bounded channel.
 ///
@@ -234,7 +245,11 @@ impl P2PNetworkNode<P2pLinkTransport> {
         let transport = P2pLinkTransport::new(config)
             .await
             .context("Failed to create transport")?
-            .with_default_strategy(StrategyConfig::direct_only());
+            .with_default_strategy(
+                StrategyConfig::direct_only()
+                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+            );
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
         let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
@@ -251,7 +266,11 @@ impl P2PNetworkNode<P2pLinkTransport> {
         let transport = P2pLinkTransport::new(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?
-            .with_default_strategy(StrategyConfig::direct_only());
+            .with_default_strategy(
+                StrategyConfig::direct_only()
+                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+            );
 
         // Get the actual bound address from the endpoint
         let actual_addr = transport.endpoint().local_addr().ok_or_else(|| {
