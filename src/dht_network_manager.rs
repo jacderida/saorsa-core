@@ -2793,7 +2793,11 @@ impl DhtNetworkManager {
     /// Get current statistics
     /// Update a node's address in the DHT routing table.
     ///
-    /// Called when a peer advertises a new reachable address (e.g., relay).
+    /// The address is classified [`crate::dht::AddressType::Unverified`]:
+    /// transport-layer observations prove only reachability from us, not
+    /// public dialability. Callers with authoritative type information (e.g.,
+    /// a relay allocation or a peer-advertised `PublishAddressSet`) must use
+    /// [`Self::touch_node_typed`].
     pub async fn touch_node(&self, peer_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let dht = self.dht.read().await;
         dht.touch_node(peer_id, address).await

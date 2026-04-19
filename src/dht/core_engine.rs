@@ -1184,9 +1184,15 @@ impl DhtCoreEngine {
     /// routing table should reflect this without requiring dedicated pings.
     /// Passing the current address ensures stale addresses are replaced when a
     /// peer reconnects from a different endpoint.
+    ///
+    /// Any address passed here is classified [`AddressType::Unverified`]: a
+    /// successful RPC with us proves reachability from *us* to the peer
+    /// (possibly through a NAT mapping we opened), not public
+    /// cold-dialability. Callers with authoritative type information must use
+    /// [`Self::touch_node_typed`].
     pub async fn touch_node(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let mut routing = self.routing_table.write().await;
-        routing.touch_node(node_id, address, AddressType::Direct)
+        routing.touch_node(node_id, address, AddressType::Unverified)
     }
 
     /// Touch a peer's routing-table entry with an optional typed address.
@@ -1327,8 +1333,8 @@ impl DhtCoreEngine {
             // refresh last_seen without emitting PeerAdded (matches the main
             // diversity path's update logic at the "Design step 5" block).
             if routing.find_node_by_id(&peer_id).is_some() {
-                for addr in &node.addresses {
-                    routing.touch_node(&peer_id, Some(addr), AddressType::Direct);
+                for (i, addr) in node.addresses.iter().enumerate() {
+                    routing.touch_node(&peer_id, Some(addr), node.address_type_at(i));
                 }
                 return Ok(AdmissionResult::Admitted(vec![]));
             }
@@ -1634,8 +1640,8 @@ impl DhtCoreEngine {
             // Update short-circuit: if peer already exists, merge addresses and
             // refresh last_seen without emitting PeerAdded.
             if routing.find_node_by_id(&peer_id).is_some() {
-                for addr in &node.addresses {
-                    routing.touch_node(&peer_id, Some(addr), AddressType::Direct);
+                for (i, addr) in node.addresses.iter().enumerate() {
+                    routing.touch_node(&peer_id, Some(addr), node.address_type_at(i));
                 }
                 return Ok(AdmissionResult::Admitted(vec![]));
             }
@@ -1671,7 +1677,7 @@ impl DhtCoreEngine {
             let existing = &mut routing.buckets[bucket_idx].nodes[pos];
             existing.last_seen.store_now();
             // Merge each address from the candidate, respecting loopback injection prevention
-            for addr in &node.addresses {
+            for (i, addr) in node.addresses.iter().enumerate() {
                 let addr_is_loopback = addr
                     .ip()
                     .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
@@ -1683,7 +1689,7 @@ impl DhtCoreEngine {
                 if addr_is_loopback && existing_has_non_loopback {
                     continue;
                 }
-                existing.merge_address(addr.clone());
+                existing.merge_typed_address(addr.clone(), node.address_type_at(i));
             }
             // Move to tail (most recently seen)
             let updated = routing.buckets[bucket_idx].nodes.remove(pos);
@@ -2552,12 +2558,15 @@ mod tests {
         let peer_id = node.id;
         dht.add_node_no_trust(node).await.unwrap();
 
-        // Re-add same peer with a new address
+        // Re-add same peer with a new address. Tag Direct explicitly —
+        // `merge_typed_address` places Direct addresses at the front of
+        // the list (after any Relay entries), so the new 10.0.0.2 should
+        // land at index 0 ahead of the existing 10.0.0.1.
         let updated = NodeInfo {
             id: peer_id,
             addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
             last_seen: AtomicInstant::now(),
-            address_types: vec![],
+            address_types: vec![AddressType::Direct],
         };
         let result = dht.add_node_no_trust(updated).await;
         assert!(result.is_ok(), "update short-circuit should succeed");
