@@ -1479,16 +1479,15 @@ impl DhtNetworkManager {
         true
     }
 
-    /// Try dialing each address in `typed_addresses` in priority order
-    /// (Relay → Direct → NATted) until one succeeds. Returns the transport
-    /// channel ID on the first success, `None` if every dial failed.
+    /// Try dialing at most two addresses from `typed_addresses`, chosen by
+    /// [`Self::select_dial_candidates`]. Returns the transport channel ID on
+    /// the first success, `None` if every attempted dial failed.
     ///
     /// The caller hands in typed pairs from a `DHTNode` (via
     /// [`DHTNode::typed_addresses`]) or a candidate list returned by
-    /// [`Self::peer_addresses_for_dial_typed`]. Internal call to
-    /// [`Self::dialable_addresses_typed`] sorts by priority so the order
-    /// of the input slice does not matter for correctness — the dialer
-    /// always tries the highest-priority address first.
+    /// [`Self::peer_addresses_for_dial_typed`]. Ordering of the input slice
+    /// does not matter for correctness — the selector picks deterministically
+    /// by [`AddressType`].
     ///
     /// Bails out early when the peer is already connected — the caller
     /// would otherwise be paying N redundant `is_peer_connected` reads
@@ -1505,22 +1504,22 @@ impl DhtNetworkManager {
             );
             return None;
         }
-        let dialable = Self::dialable_addresses_typed(typed_addresses);
-        if dialable.is_empty() {
+        let plan = Self::select_dial_candidates(typed_addresses);
+        if plan.is_empty() {
             debug!(
                 "dial_addresses: no dialable addresses for {}",
                 peer_id.to_hex()
             );
             return None;
         }
-        for (addr, _ty) in &dialable {
+        for (addr, _ty) in &plan {
             if let Some(channel_id) = self.dial_candidate(peer_id, addr).await {
                 return Some(channel_id);
             }
         }
         debug!(
-            "dial_addresses: all {} address(es) failed for {}",
-            dialable.len(),
+            "dial_addresses: all {} attempted address(es) failed for {}",
+            plan.len(),
             peer_id.to_hex()
         );
         None
@@ -1940,6 +1939,56 @@ impl DhtNetworkManager {
         candidates.sort_by_key(|pair| pair.1.priority());
 
         candidates
+    }
+
+    /// Pick at most two addresses to dial for a single peer, applying the
+    /// cold-start policy documented on [`Self::dial_addresses`].
+    ///
+    /// Rules:
+    /// - If a Relay is published, dial the Relay and (when present) one
+    ///   Direct address. Relay paths are the reliable fallback, so we do
+    ///   not burn a second attempt on an Unverified guess.
+    /// - If no Relay is published but a Direct is, dial the Direct and
+    ///   (when present) a single Unverified/NATted address as backup.
+    /// - If only Unverified/NATted addresses exist, dial one of them and
+    ///   stop. A second attempt from the same bucket is rarely more
+    ///   likely to succeed and just extends cold-start latency.
+    ///
+    /// Peers routinely publish several addresses (IPv4+IPv6, plus one or
+    /// more observed externals). Dialing all of them costs a full
+    /// connect-timeout per failure, which dominates first-contact latency
+    /// when the top choice is unreachable. Capping at two keeps the
+    /// worst case to a single retry while still covering the expected
+    /// relay→direct and direct→unverified handoffs.
+    fn select_dial_candidates(typed: &[(MultiAddr, AddressType)]) -> Vec<(MultiAddr, AddressType)> {
+        let dialable: Vec<(MultiAddr, AddressType)> = typed
+            .iter()
+            .filter(|pair| Self::is_dialable(&pair.0))
+            .cloned()
+            .collect();
+
+        let relay = dialable
+            .iter()
+            .find(|(_, t)| *t == AddressType::Relay)
+            .cloned();
+        let direct = dialable
+            .iter()
+            .find(|(_, t)| *t == AddressType::Direct)
+            .cloned();
+        let other = dialable
+            .iter()
+            .filter(|(_, t)| !matches!(*t, AddressType::Relay | AddressType::Direct))
+            .min_by_key(|(_, t)| t.priority())
+            .cloned();
+
+        match (relay, direct, other) {
+            (Some(r), Some(d), _) => vec![r, d],
+            (Some(r), None, _) => vec![r],
+            (None, Some(d), Some(o)) => vec![d, o],
+            (None, Some(d), None) => vec![d],
+            (None, None, Some(o)) => vec![o],
+            (None, None, None) => Vec::new(),
+        }
     }
 
     /// Wait for DHT network response via oneshot channel with timeout
@@ -3204,6 +3253,128 @@ mod tests {
             reliability: 1.0,
         };
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    fn typed(entries: Vec<(&str, AddressType)>) -> Vec<(MultiAddr, AddressType)> {
+        entries
+            .into_iter()
+            .map(|(s, t)| (s.parse().unwrap(), t))
+            .collect()
+    }
+
+    #[test]
+    fn select_dial_candidates_returns_empty_for_empty_input() {
+        let picks = DhtNetworkManager::select_dial_candidates(&[]);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn select_dial_candidates_relay_plus_direct_gives_two() {
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Relay);
+        assert_eq!(picks[1].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn select_dial_candidates_relay_only_without_direct_is_one() {
+        // With a relay but no direct we do NOT fall back to an Unverified
+        // guess — relay paths are already the robust fallback, and the
+        // caller gets a deterministic single-dial budget.
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Relay);
+    }
+
+    #[test]
+    fn select_dial_candidates_direct_plus_unverified_when_no_relay() {
+        let addrs = typed(vec![
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Direct);
+        assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn select_dial_candidates_direct_only_is_one() {
+        let addrs = typed(vec![(
+            "/ip4/203.0.113.7/udp/9001/quic",
+            AddressType::Direct,
+        )]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn select_dial_candidates_only_unverified_is_one() {
+        let addrs = typed(vec![
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/192.0.2.11/udp/9004/quic", AddressType::Unverified),
+            ("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn select_dial_candidates_only_natted_is_one() {
+        let addrs = typed(vec![("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted)]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::NATted);
+    }
+
+    #[test]
+    fn select_dial_candidates_filters_undialable_wildcard() {
+        // Wildcard `Direct` must be skipped, leaving the real Direct as
+        // the first pick. The other slot stays empty (only Unverified
+        // left, which does not combine with a real Direct in this case
+        // because we still only keep two total).
+        let addrs = typed(vec![
+            ("/ip4/0.0.0.0/udp/9000/quic", AddressType::Direct),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Direct);
+        assert_eq!(
+            picks[0].0,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn select_dial_candidates_prefers_unverified_over_natted() {
+        // When the "other" slot is contested, Unverified wins because it
+        // has a lower AddressType priority index than NATted.
+        let addrs = typed(vec![
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.0.2.10/udp/9003/quic", AddressType::NATted),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Direct);
+        assert_eq!(picks[1].1, AddressType::Unverified);
     }
 
     #[test]
