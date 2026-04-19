@@ -29,10 +29,11 @@ use crate::{
     network::NodeConfig,
 };
 use anyhow::Context as _;
+use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -107,6 +108,16 @@ const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
 /// Minimum time between consecutive auto re-bootstrap attempts.
 const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Duration a dial failure is remembered before it may be retried.
+///
+/// 30 minutes is the sweet spot: long enough to absorb the common
+/// causes of transient direct-dial failure (short-lived NAT rebinds,
+/// bootstrap hiccups, routing churn) without permanently banning an
+/// address that was temporarily unreachable. Combined with the
+/// per-peer two-address dial cap, this prevents retry storms against
+/// stale Unverified/Direct entries published by NATed peers.
+const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// DHT node representation for network operations.
 ///
@@ -337,6 +348,72 @@ pub struct DhtNetworkManager {
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
+    /// TTL-indexed cache of recently failed dial targets. Consulted by
+    /// [`Self::dial_addresses`] so planned addresses that failed within
+    /// the last [`DIAL_FAILURE_CACHE_TTL`] count toward the two-address
+    /// dial cap without actually being re-dialed.
+    dial_failure_cache: Arc<DialFailureCache>,
+}
+
+/// TTL-indexed cache of [`SocketAddr`]s that recently failed to dial.
+///
+/// Entries are keyed by the `SocketAddr` the dialer actually attempts
+/// (i.e. [`MultiAddr::dialable_socket_addr`]) so the cache hits across
+/// every `AddressType` that resolves to the same endpoint.
+///
+/// Backed by [`DashMap`] for sharded, lock-free-in-the-common-case
+/// access. A single iterative lookup may invoke `dial_addresses`
+/// concurrently on several peers (alpha=3 probes plus parallel RPC
+/// paths), and each invocation does two independent cache queries —
+/// so the sharded map removes the single-mutex bottleneck that a
+/// `Mutex<HashMap>` would impose on those paths.
+///
+/// Lookups perform lazy expiry: stale entries are removed on access
+/// rather than by a background sweeper. A 30-minute TTL keeps the
+/// hot-set small enough that lazy eviction is sufficient, even on
+/// long-lived nodes.
+#[derive(Debug, Default)]
+struct DialFailureCache {
+    entries: DashMap<SocketAddr, Instant>,
+}
+
+impl DialFailureCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true if `addr` failed a dial within the last
+    /// [`DIAL_FAILURE_CACHE_TTL`]. Expired entries are removed as a
+    /// side effect of the lookup so the cache stays bounded without a
+    /// dedicated sweeper.
+    ///
+    /// The `DashMap::get` read guard is released via a scoped copy of
+    /// the stored `Instant` before any `remove` call so the shard's
+    /// read lock never overlaps with the write lock.
+    fn is_failed(&self, addr: &SocketAddr) -> bool {
+        let recorded_at = {
+            let Some(entry) = self.entries.get(addr) else {
+                return false;
+            };
+            *entry.value()
+        };
+        if recorded_at.elapsed() < DIAL_FAILURE_CACHE_TTL {
+            return true;
+        }
+        self.entries.remove(addr);
+        false
+    }
+
+    fn record_failure(&self, addr: SocketAddr) {
+        self.entries.insert(addr, Instant::now());
+    }
+
+    /// Clear the cached failure for `addr` after a successful dial so
+    /// the next retry is not suppressed by a stale entry. Cheap when
+    /// the address is absent (typical success path).
+    fn clear(&self, addr: &SocketAddr) {
+        self.entries.remove(addr);
+    }
 }
 
 /// DHT operation context
@@ -508,6 +585,7 @@ impl DhtNetworkManager {
             self_lookup_handle: Arc::new(RwLock::new(None)),
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
+            dial_failure_cache: Arc::new(DialFailureCache::new()),
         })
     }
 
@@ -1489,6 +1567,14 @@ impl DhtNetworkManager {
     /// does not matter for correctness — the selector picks deterministically
     /// by [`AddressType`].
     ///
+    /// Addresses that failed a dial within the last
+    /// [`DIAL_FAILURE_CACHE_TTL`] are **not re-dialed**, but they still
+    /// consume one of the two plan slots — a fully cached plan therefore
+    /// returns `None` without trying anything further down the priority
+    /// list. This stops a peer that republishes the same broken Direct /
+    /// Unverified pair on every DHT query from causing a dial retry
+    /// every time we encounter them.
+    ///
     /// Bails out early when the peer is already connected — the caller
     /// would otherwise be paying N redundant `is_peer_connected` reads
     /// (one per address) only to learn the dial is unnecessary.
@@ -1512,15 +1598,37 @@ impl DhtNetworkManager {
             );
             return None;
         }
+        let mut attempted = 0usize;
+        let mut skipped_cached = 0usize;
         for (addr, _ty) in &plan {
-            if let Some(channel_id) = self.dial_candidate(peer_id, addr).await {
-                return Some(channel_id);
+            attempted += 1;
+            let Some(socket_addr) = addr.dialable_socket_addr() else {
+                continue;
+            };
+            if self.dial_failure_cache.is_failed(&socket_addr) {
+                skipped_cached += 1;
+                trace!(
+                    "dial_addresses: skipping recently failed address {} for {}",
+                    addr,
+                    peer_id.to_hex()
+                );
+                continue;
+            }
+            match self.dial_candidate(peer_id, addr).await {
+                Some(channel_id) => {
+                    self.dial_failure_cache.clear(&socket_addr);
+                    return Some(channel_id);
+                }
+                None => {
+                    self.dial_failure_cache.record_failure(socket_addr);
+                }
             }
         }
         debug!(
-            "dial_addresses: all {} attempted address(es) failed for {}",
-            plan.len(),
-            peer_id.to_hex()
+            "dial_addresses: all {} attempted address(es) failed for {} ({} skipped from failure cache)",
+            attempted,
+            peer_id.to_hex(),
+            skipped_cached
         );
         None
     }
@@ -3375,6 +3483,64 @@ mod tests {
         assert_eq!(picks.len(), 2);
         assert_eq!(picks[0].1, AddressType::Direct);
         assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    fn sock(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn dial_failure_cache_records_and_checks() {
+        let cache = DialFailureCache::new();
+        let addr = sock("203.0.113.7:9001");
+        assert!(!cache.is_failed(&addr), "empty cache never reports failed");
+        cache.record_failure(addr);
+        assert!(
+            cache.is_failed(&addr),
+            "recorded address must be treated as failed within the TTL"
+        );
+    }
+
+    #[test]
+    fn dial_failure_cache_clear_removes_entry() {
+        let cache = DialFailureCache::new();
+        let addr = sock("203.0.113.7:9001");
+        cache.record_failure(addr);
+        cache.clear(&addr);
+        assert!(
+            !cache.is_failed(&addr),
+            "clear() must drop the entry so a subsequent dial is allowed"
+        );
+    }
+
+    #[test]
+    fn dial_failure_cache_expires_stale_entries_on_read() {
+        // Insert an entry with a recorded_at timestamp older than the TTL
+        // and verify is_failed() returns false and removes the entry.
+        let cache = DialFailureCache::new();
+        let addr = sock("203.0.113.7:9001");
+        let stale = Instant::now()
+            .checked_sub(DIAL_FAILURE_CACHE_TTL + Duration::from_secs(1))
+            .unwrap();
+        cache.entries.insert(addr, stale);
+        assert!(
+            !cache.is_failed(&addr),
+            "stale entry must not suppress a fresh dial"
+        );
+        assert!(
+            cache.entries.get(&addr).is_none(),
+            "stale entry must be evicted lazily on read"
+        );
+    }
+
+    #[test]
+    fn dial_failure_cache_independent_keys_do_not_collide() {
+        let cache = DialFailureCache::new();
+        let a = sock("203.0.113.7:9001");
+        let b = sock("203.0.113.8:9001");
+        cache.record_failure(a);
+        assert!(cache.is_failed(&a));
+        assert!(!cache.is_failed(&b), "different SocketAddr must not hit");
     }
 
     #[test]
