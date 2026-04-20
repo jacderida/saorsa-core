@@ -30,6 +30,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -84,6 +85,15 @@ const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Buffer size for the broadcast channel that
+/// [`DhtNetworkManager::ensure_peer_channel`] uses to fan a single
+/// dial's outcome out to tasks that joined in flight. The owner
+/// removes the coordinator entry immediately before broadcasting,
+/// so subscribers can only accumulate during the narrow dial window
+/// (milliseconds) — a small buffer is enough to absorb them without
+/// lagging.
+const PENDING_DIAL_BROADCAST_CAPACITY: usize = 16;
 
 /// Maximum concurrent stale revalidation passes across all buckets.
 const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
@@ -353,6 +363,68 @@ pub struct DhtNetworkManager {
     /// the last [`DIAL_FAILURE_CACHE_TTL`] count toward the two-address
     /// dial cap without actually being re-dialed.
     dial_failure_cache: Arc<DialFailureCache>,
+    /// In-flight dial+identity-exchange coordinator keyed by app-level
+    /// `PeerId`. Collapses concurrent [`Self::ensure_peer_channel`]
+    /// calls for the same peer onto a single dial so the identity
+    /// handshake runs once — not once per caller racing through the
+    /// window where `peer_to_channel` has not yet been populated.
+    pending_peer_dials: Arc<DashMap<PeerId, broadcast::Sender<PendingDialOutcome>>>,
+}
+
+/// Outcome of a shared dial+identity-exchange attempt, broadcast to
+/// every task that joined the in-flight dial via
+/// [`DhtNetworkManager::ensure_peer_channel`].
+///
+/// `Clone` is required because `broadcast::Sender::send` hands each
+/// subscriber its own copy; that rules out embedding a [`P2PError`]
+/// directly (the error type is not `Clone`). Instead we carry just
+/// enough to reconstruct a representative error in
+/// [`PendingDialOutcome::into_result`].
+#[derive(Clone, Debug)]
+enum PendingDialOutcome {
+    /// QUIC handshake completed and identity exchange authenticated
+    /// the remote as the expected peer.
+    Connected,
+    /// Every candidate address failed to dial.
+    DialFailed { candidates_count: usize },
+    /// The dial succeeded but identity exchange failed or timed out —
+    /// the owning task has already torn down the transport channel.
+    IdentityFailed { err: String },
+    /// The dial succeeded but the authenticated identity disagreed
+    /// with the expected `peer_id` (stale routing entry).
+    IdentityMismatch { actual: PeerId },
+}
+
+impl PendingDialOutcome {
+    /// Translate a shared outcome into the caller-facing [`Result`].
+    ///
+    /// Side effects (disconnect, trust-score penalty) are performed
+    /// once by the owning task before it broadcasts the outcome, so
+    /// subscribers only need to reconstruct the error.
+    fn into_result(self, peer_id: &PeerId) -> Result<()> {
+        let peer_hex = peer_id.to_hex();
+        match self {
+            Self::Connected => Ok(()),
+            Self::DialFailed { candidates_count } => {
+                Err(P2PError::Network(NetworkError::PeerNotFound(
+                    format!(
+                        "failed to dial {} at any of {} candidate address(es)",
+                        peer_hex, candidates_count
+                    )
+                    .into(),
+                )))
+            }
+            Self::IdentityFailed { err } => Err(P2PError::Network(NetworkError::ProtocolError(
+                format!("identity exchange with {} failed: {}", peer_hex, err).into(),
+            ))),
+            Self::IdentityMismatch { actual } => {
+                Err(P2PError::Identity(IdentityError::IdentityMismatch {
+                    expected: peer_hex.into(),
+                    actual: actual.to_hex().into(),
+                }))
+            }
+        }
+    }
 }
 
 /// TTL-indexed cache of [`SocketAddr`]s that recently failed to dial.
@@ -586,6 +658,7 @@ impl DhtNetworkManager {
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
             dial_failure_cache: Arc::new(DialFailureCache::new()),
+            pending_peer_dials: Arc::new(DashMap::new()),
         })
     }
 
@@ -1218,14 +1291,23 @@ impl DhtNetworkManager {
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         // Pass the same typed candidate list to both
-                        // dial_addresses and send_dht_request so the
-                        // request path doesn't pay a redundant routing-
-                        // table read. Trying every dialable address —
-                        // instead of stopping at the first — protects
-                        // against stale NAT bindings, single-IP-family
-                        // failures, and recently-relayed peers whose
-                        // direct address is no longer reachable.
-                        self.dial_addresses(&peer_id, &typed).await;
+                        // ensure_peer_channel and send_dht_request so
+                        // the request path doesn't pay a redundant
+                        // routing-table read. Trying every dialable
+                        // address — instead of stopping at the first
+                        // — protects against stale NAT bindings,
+                        // single-IP-family failures, and
+                        // recently-relayed peers whose direct address
+                        // is no longer reachable.
+                        //
+                        // Going through ensure_peer_channel (instead
+                        // of dial_addresses directly) registers the
+                        // in-flight dial in the peer-dial coordinator,
+                        // so a concurrent iterative lookup from a
+                        // different top-level operation that happens
+                        // to batch the same peer joins this dial
+                        // rather than racing it.
+                        let _ = self.ensure_peer_channel(&peer_id, &typed).await;
                         (
                             peer_id,
                             self.send_dht_request(&peer_id, op, Some(&typed)).await,
@@ -1642,6 +1724,204 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Ensure an identity-authenticated channel to `peer_id` exists,
+    /// collapsing concurrent calls for the same peer onto a single
+    /// dial + identity-exchange sequence.
+    ///
+    /// Without this dedup every task that enters the window between
+    /// the QUIC handshake completing and the peer's first signed
+    /// identity message arriving sees `is_peer_connected` return
+    /// `false` and kicks off its own
+    /// `dial_addresses → connect_peer` cascade. Those redundant
+    /// dials spawn duplicate reader tasks on the shared QUIC
+    /// connection and, in practice, trip the remote's
+    /// simultaneous-open detector into closing the channel with
+    /// `b"duplicate"` — which tears down the working connection.
+    ///
+    /// The first task to arrive for a given `peer_id` becomes the
+    /// dial owner: it runs the dial, awaits identity exchange,
+    /// performs any cleanup (channel disconnect, trust penalty),
+    /// then broadcasts the outcome to every subscriber before
+    /// removing the coordinator entry. Subsequent tasks that race in
+    /// while the dial is in flight subscribe to the owner's
+    /// broadcast and translate the shared outcome back into a
+    /// caller-facing [`P2PError`] — they do not duplicate the
+    /// owner's side effects.
+    async fn ensure_peer_channel(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+    ) -> Result<()> {
+        // Fast path: identity exchange already completed for this peer.
+        if self.transport.is_peer_connected(peer_id).await {
+            return Ok(());
+        }
+
+        let local_hex = self.config.peer_id.to_hex();
+        let peer_hex = peer_id.to_hex();
+
+        // Try to claim the coordinator slot. If another task is
+        // already dialing this peer, the Occupied branch returns us
+        // a subscription to their outcome; only the Vacant branch
+        // runs the actual dial. Doing the check via the `entry` API
+        // prevents the contains/insert TOCTOU that would otherwise
+        // let two tasks both see "no existing dial" and start their
+        // own cascades in parallel.
+        let tx = match self.pending_peer_dials.entry(*peer_id) {
+            DashEntry::Occupied(entry) => {
+                let mut rx = entry.get().subscribe();
+                drop(entry);
+                debug!(
+                    "[STEP 1b] {} -> {}: joining in-flight dial",
+                    local_hex, peer_hex
+                );
+                return match rx.recv().await {
+                    Ok(outcome) => outcome.into_result(peer_id),
+                    Err(_) => Err(P2PError::Network(NetworkError::PeerNotFound(
+                        format!(
+                            "in-flight dial to {} dropped before producing a result",
+                            peer_hex
+                        )
+                        .into(),
+                    ))),
+                };
+            }
+            DashEntry::Vacant(entry) => {
+                let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
+                entry.insert(tx.clone());
+                tx
+            }
+        };
+
+        // We own the dial. Make absolutely sure the coordinator slot
+        // is cleared no matter how we exit from here — a panic or
+        // early return would otherwise leave a permanent entry that
+        // causes every future dial to this peer to wait on a dead
+        // broadcast.
+        struct DialGuard<'a> {
+            map: &'a DashMap<PeerId, broadcast::Sender<PendingDialOutcome>>,
+            peer_id: PeerId,
+            cleared: bool,
+        }
+        impl<'a> Drop for DialGuard<'a> {
+            fn drop(&mut self) {
+                if !self.cleared {
+                    self.map.remove(&self.peer_id);
+                }
+            }
+        }
+        let mut guard = DialGuard {
+            map: &self.pending_peer_dials,
+            peer_id: *peer_id,
+            cleared: false,
+        };
+
+        let outcome = self
+            .run_owned_dial(peer_id, candidates, &local_hex, &peer_hex)
+            .await;
+
+        // Stale routing entries: when the remote authenticated as a
+        // different peer, the expected `peer_id` doesn't actually
+        // live at any of the candidate addresses. Leaving it in the
+        // routing table causes every future DHT lookup that hits
+        // this peer_id to pay another `connect_peer` +
+        // `wait_for_peer_identity` round-trip only to fail with the
+        // same mismatch — so drop it now. The real peer (carried as
+        // `actual` in the outcome) is learned via the normal
+        // connection-event path that registers it against the
+        // channel it actually authenticated on.
+        if matches!(outcome, PendingDialOutcome::IdentityMismatch { .. }) {
+            let rt_events = {
+                let mut dht = self.dht.write().await;
+                dht.remove_node_by_id(peer_id).await
+            };
+            self.broadcast_routing_events(&rt_events);
+        }
+
+        // Broadcast and clear. Remove BEFORE sending so any task
+        // arriving between send and this remove creates a fresh dial
+        // rather than waiting on a coordinator whose result has
+        // already been delivered.
+        self.pending_peer_dials.remove(peer_id);
+        guard.cleared = true;
+        // `send` fails only if there are no subscribers — that's the
+        // common case (we're the only caller), so ignore the error.
+        let _ = tx.send(outcome.clone());
+
+        outcome.into_result(peer_id)
+    }
+
+    /// Owner-side dial + identity exchange for
+    /// [`Self::ensure_peer_channel`]. Runs outside the coordinator
+    /// bookkeeping so the owner's side effects (disconnect on
+    /// failure, trust penalty) happen exactly once per dial, not
+    /// once per subscribed caller.
+    async fn run_owned_dial(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+        local_hex: &str,
+        peer_hex: &str,
+    ) -> PendingDialOutcome {
+        info!(
+            "[STEP 1b] {} -> {}: No open channel, trying {} dialable address(es)",
+            local_hex,
+            peer_hex,
+            candidates.len()
+        );
+
+        let Some(channel_id) = self.dial_addresses(peer_id, candidates).await else {
+            warn!(
+                "[STEP 1b] {} -> {}: dial failed for all {} candidate address(es)",
+                local_hex,
+                peer_hex,
+                candidates.len()
+            );
+            self.record_peer_failure(peer_id).await;
+            return PendingDialOutcome::DialFailed {
+                candidates_count: candidates.len(),
+            };
+        };
+
+        let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
+        match self
+            .transport
+            .wait_for_peer_identity(&channel_id, identity_timeout)
+            .await
+        {
+            Ok(authenticated) if &authenticated == peer_id => {
+                debug!(
+                    "[STEP 1b] {} -> {}: identity confirmed ({})",
+                    local_hex,
+                    peer_hex,
+                    authenticated.to_hex()
+                );
+                PendingDialOutcome::Connected
+            }
+            Ok(authenticated) => {
+                warn!(
+                    "[STEP 1b] {} -> {}: identity MISMATCH — authenticated as {}. \
+                     Routing table entry may be stale.",
+                    local_hex,
+                    peer_hex,
+                    authenticated.to_hex()
+                );
+                PendingDialOutcome::IdentityMismatch {
+                    actual: authenticated,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[STEP 1b] {} -> {}: identity exchange failed, disconnecting channel: {}",
+                    local_hex, peer_hex, e
+                );
+                self.transport.disconnect_channel(&channel_id).await;
+                self.record_peer_failure(peer_id).await;
+                PendingDialOutcome::IdentityFailed { err: e.to_string() }
+            }
+        }
+    }
+
     /// Remove expired operations from `active_operations`.
     ///
     /// Uses a 2x timeout multiplier as safety margin. Called at the start of
@@ -1741,103 +2021,42 @@ impl DhtNetworkManager {
             local_hex, peer_hex, message.payload, message_id
         );
 
-        // Ensure we have an open channel to the peer before sending.
-        // A fresh dial establishes a QUIC connection but the app-level
-        // `peer_to_channel` mapping is only populated after the asynchronous
-        // identity-exchange handshake completes. Without waiting, the
-        // subsequent `send_message` would fail with `PeerNotFound`.
+        // Ensure we have an identity-authenticated channel to the
+        // peer before sending. A fresh dial establishes a QUIC
+        // connection but the app-level `peer_to_channel` mapping is
+        // only populated after the asynchronous identity-exchange
+        // handshake completes — without waiting, a subsequent
+        // `send_message` would fail with `PeerNotFound`.
         //
-        // Build the candidate address list. When the caller already has
-        // typed addresses for this peer (e.g., the iterative lookup batch
-        // passes the same `node.typed_addresses()` it just read), use
-        // those directly to avoid a redundant routing-table read.
-        // Otherwise, consult the routing table via
-        // `peer_addresses_for_dial_typed`. Trying every candidate —
-        // instead of stopping at the first — protects against stale NAT
-        // bindings, single-IP-family failures, and recently-relayed
-        // peers whose direct address is no longer reachable.
-        let candidate_addresses: Vec<(MultiAddr, AddressType)> =
-            if self.transport.is_peer_connected(peer_id).await {
-                Vec::new()
-            } else if let Some(provided) = candidates {
-                provided.to_vec()
-            } else {
-                self.peer_addresses_for_dial_typed(peer_id).await
-            };
-
-        if !candidate_addresses.is_empty() {
-            info!(
-                "[STEP 1b] {} -> {}: No open channel, trying {} dialable address(es)",
-                local_hex,
-                peer_hex,
-                candidate_addresses.len()
-            );
-            if let Some(channel_id) = self.dial_addresses(peer_id, &candidate_addresses).await {
-                let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
-                match self
-                    .transport
-                    .wait_for_peer_identity(&channel_id, identity_timeout)
-                    .await
-                {
-                    Ok(authenticated) => {
-                        if &authenticated != peer_id {
-                            warn!(
-                                "[STEP 1b] {} -> {}: identity MISMATCH — authenticated as {}. \
-                                 Routing table entry may be stale.",
-                                local_hex,
-                                peer_hex,
-                                authenticated.to_hex()
-                            );
-                            if let Ok(mut ops) = self.active_operations.lock() {
-                                ops.remove(&message_id);
-                            }
-                            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
-                                expected: peer_hex.into(),
-                                actual: authenticated.to_hex().into(),
-                            }));
-                        }
-                        debug!(
-                            "[STEP 1b] {} -> {}: identity confirmed ({})",
-                            local_hex,
-                            peer_hex,
-                            authenticated.to_hex()
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[STEP 1b] {} -> {}: identity exchange failed, disconnecting channel: {}",
-                            local_hex, peer_hex, e
-                        );
-                        self.transport.disconnect_channel(&channel_id).await;
-                        if let Ok(mut ops) = self.active_operations.lock() {
-                            ops.remove(&message_id);
-                        }
-                        self.record_peer_failure(peer_id).await;
-                        return Err(P2PError::Network(NetworkError::ProtocolError(
-                            format!("identity exchange with {} failed: {}", peer_hex, e).into(),
-                        )));
-                    }
-                }
-            } else {
-                warn!(
-                    "[STEP 1b] {} -> {}: dial failed for all {} candidate address(es)",
-                    local_hex,
-                    peer_hex,
-                    candidate_addresses.len()
-                );
-                if let Ok(mut ops) = self.active_operations.lock() {
-                    ops.remove(&message_id);
-                }
-                self.record_peer_failure(peer_id).await;
-                return Err(P2PError::Network(NetworkError::PeerNotFound(
-                    format!(
-                        "failed to dial {} at any of {} candidate address(es)",
-                        peer_hex,
-                        candidate_addresses.len()
-                    )
-                    .into(),
-                )));
+        // Build the candidate address list. When the caller already
+        // has typed addresses for this peer (e.g., the iterative
+        // lookup batch passes the same `node.typed_addresses()` it
+        // just read), use those directly to avoid a redundant
+        // routing-table read; otherwise consult the routing table.
+        // Trying every candidate — rather than stopping at the first
+        // — protects against stale NAT bindings, single-IP-family
+        // failures, and recently-relayed peers whose direct address
+        // is no longer reachable.
+        //
+        // [`Self::ensure_peer_channel`] collapses concurrent calls
+        // for the same peer onto a single dial so N parallel DHT
+        // lookups that all target the same popular peer don't each
+        // start their own dial cascade in the identity-exchange
+        // window.
+        let candidate_addresses: Vec<(MultiAddr, AddressType)> = if let Some(provided) = candidates
+        {
+            provided.to_vec()
+        } else {
+            self.peer_addresses_for_dial_typed(peer_id).await
+        };
+        if let Err(e) = self
+            .ensure_peer_channel(peer_id, &candidate_addresses)
+            .await
+        {
+            if let Ok(mut ops) = self.active_operations.lock() {
+                ops.remove(&message_id);
             }
+            return Err(e);
         }
 
         let result = match self
