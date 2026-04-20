@@ -1034,6 +1034,13 @@ impl DhtNetworkManager {
                             node.addresses.len(),
                             dialable_count
                         );
+                        // Ingest the responder's typed view of this peer so
+                        // later relay acquisition / dial paths can see Direct
+                        // and Relay tags without having to rely on the peer
+                        // landing in our own K-closest PublishAddressSet
+                        // fan-out. No-op when the peer isn't already in the
+                        // routing table; upgrade-only on existing entries.
+                        self.merge_gossiped_typed_addresses(node).await;
                         if seen.insert(node.peer_id) && dialable_count > 0 {
                             self.dial_addresses(&node.peer_id, &typed).await;
                         }
@@ -1396,6 +1403,16 @@ impl DhtNetworkManager {
                             {
                                 continue;
                             }
+                            // Ingest the responder's typed view into our
+                            // routing table (upgrade-only on existing
+                            // entries) so `Direct` and `Relay` tags
+                            // propagate beyond the publisher's K-closest
+                            // PublishAddressSet fan-out. Without this, a
+                            // peer that isn't in any open node's top-K
+                            // never learns which of its neighbours expose
+                            // a dialable Direct address and fails relay
+                            // acquisition.
+                            self.merge_gossiped_typed_addresses(&node).await;
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
                             // Duplicate peer_id across responses: merge typed
@@ -3261,6 +3278,30 @@ impl DhtNetworkManager {
     ) -> bool {
         let dht = self.dht.read().await;
         dht.touch_node_typed(peer_id, address, addr_type).await
+    }
+
+    /// Ingest a peer's typed address set from a FIND_NODE gossip response
+    /// into the local routing table, upgrading tags only.
+    ///
+    /// For each `(addr, ty)` pair in `node`, if the peer is already in the
+    /// routing table, either add the new address or promote the existing
+    /// entry — but never demote a higher-priority tag already held (which
+    /// typically came from the peer's own `PublishAddressSet` or from our
+    /// own classifier). Peers absent from the routing table are left alone;
+    /// we don't accept *new* peer identities from untrusted gossip, only
+    /// additional information about peers we already know.
+    ///
+    /// This closes the hole where a NAT'd peer XOR-far from every open
+    /// node could never land in anyone's K-closest for `PublishAddressSet`
+    /// fan-out — without gossip ingestion it stayed starved of `Direct`
+    /// addresses and failed relay acquisition with "no direct-addressable
+    /// candidates in routing table" despite having 17 peers in its RT.
+    pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
+        let dht = self.dht.read().await;
+        for (addr, ty) in node.typed_addresses() {
+            dht.touch_node_typed_upgrade_only(&node.peer_id, Some(&addr), ty)
+                .await;
+        }
     }
 
     pub async fn get_stats(&self) -> DhtNetworkStats {

@@ -335,6 +335,36 @@ impl NodeInfo {
             .copied()
             .unwrap_or(AddressType::Unverified)
     }
+
+    /// Merge a typed address but only if it would upgrade the peer's record.
+    ///
+    /// Unlike [`Self::merge_typed_address`], which blindly remove-and-reinserts
+    /// (and thus can *demote* a Relay/Direct entry to Unverified if gossip
+    /// arrives out of order), this variant no-ops when the address is already
+    /// present with a tag of equal-or-higher priority. New addresses are
+    /// always added.
+    ///
+    /// Returns `true` when the state actually changed (new address appended
+    /// or an existing tag was promoted to a better tier), `false` otherwise.
+    ///
+    /// Used for FIND_NODE gossip: a responder's view of a peer's addresses
+    /// is trusted enough to *upgrade* our local record, but not trusted
+    /// enough to overwrite an authoritative higher-priority tag we already
+    /// hold (typically from the peer's own `PublishAddressSet`).
+    pub fn merge_typed_address_upgrade_only(
+        &mut self,
+        addr: MultiAddr,
+        addr_type: AddressType,
+    ) -> bool {
+        if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
+            let existing = self.address_type_at(pos);
+            if existing.priority() <= addr_type.priority() {
+                return false;
+            }
+        }
+        self.merge_typed_address(addr, addr_type);
+        true
+    }
 }
 
 /// K-bucket for Kademlia routing
@@ -428,6 +458,46 @@ impl KBucket {
                     .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
                 if !(addr_is_loopback && node_has_non_loopback) {
                     self.nodes[pos].merge_typed_address(addr.clone(), addr_type);
+                }
+            }
+            let node = self.nodes.remove(pos);
+            self.nodes.push(node);
+            self.last_refreshed = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Upgrade-only variant of [`Self::touch_node_typed`]: merge `address`
+    /// with `addr_type` into the peer's `NodeInfo`, but never demote a
+    /// higher-priority tag already on the same address.
+    ///
+    /// Returns `true` when the peer is in this bucket (regardless of
+    /// whether the merge changed state); `false` when the peer is absent.
+    /// The loopback-injection guard from [`Self::touch_node_typed`] applies
+    /// equally.
+    ///
+    /// Intended for FIND_NODE gossip ingestion — see
+    /// [`NodeInfo::merge_typed_address_upgrade_only`].
+    fn touch_node_typed_upgrade_only(
+        &mut self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
+        if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
+            self.nodes[pos].last_seen.store_now();
+            if let Some(addr) = address {
+                let addr_is_loopback = addr
+                    .ip()
+                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
+                let node_has_non_loopback = self.nodes[pos]
+                    .addresses
+                    .iter()
+                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
+                if !(addr_is_loopback && node_has_non_loopback) {
+                    self.nodes[pos].merge_typed_address_upgrade_only(addr.clone(), addr_type);
                 }
             }
             let node = self.nodes.remove(pos);
@@ -643,6 +713,22 @@ impl KademliaRoutingTable {
             Some(bucket_index) => {
                 self.buckets[bucket_index].touch_node_typed(node_id, address, addr_type)
             }
+            None => false,
+        }
+    }
+
+    /// Upgrade-only variant of [`Self::touch_node`]: the merge never
+    /// demotes an existing higher-priority tag on the same address. See
+    /// [`KBucket::touch_node_typed_upgrade_only`].
+    fn touch_node_upgrade_only(
+        &mut self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
+        match self.get_bucket_index(node_id) {
+            Some(bucket_index) => self.buckets[bucket_index]
+                .touch_node_typed_upgrade_only(node_id, address, addr_type),
             None => false,
         }
     }
@@ -1236,6 +1322,34 @@ impl DhtCoreEngine {
         // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
+    }
+
+    /// Upgrade-only variant of [`Self::touch_node_typed`]: merge `address`
+    /// with `addr_type` into the peer's record, but never demote a
+    /// higher-priority tag already on the same address.
+    ///
+    /// Returns `true` when the peer is in the routing table (regardless of
+    /// whether the merge changed state); `false` otherwise.
+    ///
+    /// Intended for FIND_NODE gossip ingestion: a responder's typed set is
+    /// trusted enough to widen our record (new addresses) or promote a
+    /// cold-start `Unverified` to `Direct`/`Relay`, but not trusted enough
+    /// to overwrite an authoritative higher-priority tag — which typically
+    /// came from the peer's own `PublishAddressSet` (full-replace) or from
+    /// our own classifier.
+    pub async fn touch_node_typed_upgrade_only(
+        &self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> bool {
+        // No fast path: the read-locked fast path is only valid when the
+        // merge is a no-op. For the upgrade-only variant the decision
+        // ("would this upgrade the tag?") requires inspecting the stored
+        // tag, which must happen under the write lock to avoid a TOCTOU
+        // race with a concurrent PublishAddressSet replace.
+        let mut routing = self.routing_table.write().await;
+        routing.touch_node_upgrade_only(node_id, address, addr_type)
     }
 
     /// Replace a peer's advertised address list with `typed_addresses`, under
@@ -3834,5 +3948,74 @@ mod tests {
         };
         assert_eq!(node.address_type_at(0), AddressType::Unverified);
         assert_eq!(node.address_type_at(1), AddressType::Unverified);
+    }
+
+    #[test]
+    fn merge_typed_address_upgrade_only_promotes_unverified_to_direct() {
+        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![addr.clone()],
+            address_types: vec![AddressType::Unverified],
+            last_seen: AtomicInstant::now(),
+        };
+        let changed = node.merge_typed_address_upgrade_only(addr.clone(), AddressType::Direct);
+        assert!(changed);
+        assert_eq!(node.address_type_at(0), AddressType::Direct);
+    }
+
+    #[test]
+    fn merge_typed_address_upgrade_only_refuses_to_demote() {
+        // Existing Relay must not be demoted by incoming Unverified/Direct
+        // arriving out of order via FIND_NODE gossip.
+        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        for incoming in [AddressType::Unverified, AddressType::Direct] {
+            let mut node = NodeInfo {
+                id: PeerId::from_bytes([1u8; 32]),
+                addresses: vec![addr.clone()],
+                address_types: vec![AddressType::Relay],
+                last_seen: AtomicInstant::now(),
+            };
+            let changed = node.merge_typed_address_upgrade_only(addr.clone(), incoming);
+            assert!(!changed, "unexpected change for incoming {:?}", incoming);
+            assert_eq!(node.address_type_at(0), AddressType::Relay);
+            assert_eq!(node.addresses.len(), 1);
+        }
+    }
+
+    #[test]
+    fn merge_typed_address_upgrade_only_adds_new_address() {
+        // A new address is always added, regardless of tag — this is how a
+        // peer XOR-far from every PublishAddressSet source learns about
+        // its neighbours' Relay/Direct addresses via gossip.
+        let existing: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let new_relay: MultiAddr = "/ip4/192.0.2.7/udp/44100/quic".parse().unwrap();
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![existing.clone()],
+            address_types: vec![AddressType::Unverified],
+            last_seen: AtomicInstant::now(),
+        };
+        let changed = node.merge_typed_address_upgrade_only(new_relay.clone(), AddressType::Relay);
+        assert!(changed);
+        assert_eq!(node.addresses.len(), 2);
+        // Relay sorts to the front.
+        assert_eq!(node.addresses[0], new_relay);
+        assert_eq!(node.address_type_at(0), AddressType::Relay);
+    }
+
+    #[test]
+    fn merge_typed_address_upgrade_only_idempotent_on_same_tag() {
+        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![addr.clone()],
+            address_types: vec![AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        };
+        let changed = node.merge_typed_address_upgrade_only(addr.clone(), AddressType::Direct);
+        assert!(!changed);
+        assert_eq!(node.addresses.len(), 1);
+        assert_eq!(node.address_type_at(0), AddressType::Direct);
     }
 }
