@@ -199,6 +199,63 @@ impl DHTNode {
         typed.sort_by_key(|(_, ty)| ty.priority());
         typed.into_iter().map(|(addr, _)| addr).collect()
     }
+
+    /// Merge another `DHTNode`'s typed addresses into this one.
+    ///
+    /// Each incoming `(addr, ty)` pair is added if the address is not
+    /// already present; if it is present, the type is upgraded when the
+    /// incoming tag has strictly higher priority (e.g. an existing
+    /// `Unverified` is promoted to `Relay` when a Relay-tagged duplicate
+    /// arrives). The final list is sorted by [`AddressType::priority`]
+    /// and capped at the incoming node's entry count plus the existing
+    /// entries — no arbitrary truncation.
+    ///
+    /// Intended for the iterative FIND_NODE path in
+    /// [`DhtNetworkManager::find_closest_nodes_network`]: different
+    /// responders may have different views of the same peer (one saw
+    /// only a connection-observed listen port, another received the
+    /// peer's `PublishAddressSet` with a Relay entry), and merging all
+    /// of them gives the caller the union — so `select_dial_candidates`
+    /// can pick the best tier rather than being locked into whichever
+    /// response happened to arrive first.
+    pub fn merge_from(&mut self, other: DHTNode) {
+        // Pad own address_types to match addresses length (defensive
+        // against legacy entries with trailing untagged addresses).
+        while self.address_types.len() < self.addresses.len() {
+            self.address_types.push(AddressType::Unverified);
+        }
+
+        for (addr, ty) in other.typed_addresses() {
+            if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
+                // Already present — upgrade tag if incoming has strictly
+                // higher priority (lower numeric value).
+                if ty.priority() < self.address_types[pos].priority() {
+                    self.address_types[pos] = ty;
+                }
+            } else {
+                self.addresses.push(addr);
+                self.address_types.push(ty);
+            }
+        }
+
+        // Re-sort by priority so Relay comes first.
+        let mut pairs: Vec<(MultiAddr, AddressType)> = self
+            .addresses
+            .drain(..)
+            .zip(self.address_types.drain(..))
+            .collect();
+        pairs.sort_by_key(|(_, ty)| ty.priority());
+        for (addr, ty) in pairs {
+            self.addresses.push(addr);
+            self.address_types.push(ty);
+        }
+
+        // Prefer the higher reliability score — the duplicate responder
+        // may be more authoritative (e.g. closer to the peer in XOR).
+        if other.reliability > self.reliability {
+            self.reliability = other.reliability;
+        }
+    }
 }
 
 /// Alias for serialization compatibility
@@ -1341,7 +1398,19 @@ impl DhtNetworkManager {
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
-                            if candidates.contains_key(&cand_key) {
+                            // Duplicate peer_id across responses: merge typed
+                            // addresses instead of dropping the later one.
+                            // Different responders often have different views —
+                            // one may have only observed a direct-connected
+                            // listen port (Unverified), while another received
+                            // the target's `PublishAddressSet` with a Relay
+                            // entry. Locking in the first response keeps the
+                            // caller from ever seeing the Relay address for a
+                            // NAT'd peer, producing pointless dials into
+                            // port-restricted cones. Merging gives the union
+                            // so `select_dial_candidates` can pick Relay first.
+                            if let Some(existing) = candidates.get_mut(&cand_key) {
+                                existing.merge_from(node);
                                 continue;
                             }
                             if candidates.len() >= MAX_CANDIDATE_NODES {
@@ -3459,6 +3528,63 @@ mod tests {
             distance: None,
             reliability: 1.0,
         }
+    }
+
+    #[test]
+    fn merge_from_adds_relay_entry_to_existing_unverified() {
+        let mut existing = dht_node(
+            1,
+            vec![("/ip4/192.0.2.10/udp/10003/quic", AddressType::Unverified)],
+        );
+        let incoming = dht_node(
+            1,
+            vec![("/ip4/198.51.100.7/udp/44100/quic", AddressType::Relay)],
+        );
+
+        existing.merge_from(incoming);
+
+        assert_eq!(existing.addresses.len(), 2);
+        // Relay sorts first by priority
+        assert_eq!(existing.address_types[0], AddressType::Relay);
+        assert_eq!(existing.address_types[1], AddressType::Unverified);
+        assert_eq!(
+            existing.addresses[0],
+            "/ip4/198.51.100.7/udp/44100/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_from_upgrades_existing_tag_but_never_demotes() {
+        let addr = "/ip4/198.51.100.7/udp/44100/quic";
+
+        // Existing Relay + incoming Unverified for the SAME address must not
+        // demote the Relay tag (gossip arriving out of order must not erase
+        // authoritative routing information).
+        let mut existing = dht_node(1, vec![(addr, AddressType::Relay)]);
+        let incoming_demotion = dht_node(1, vec![(addr, AddressType::Unverified)]);
+        existing.merge_from(incoming_demotion);
+        assert_eq!(existing.addresses.len(), 1);
+        assert_eq!(existing.address_types[0], AddressType::Relay);
+
+        // Existing Unverified + incoming Direct for the same address MUST
+        // promote (authoritative reachability claim beats a cold-start tag).
+        let mut existing = dht_node(1, vec![(addr, AddressType::Unverified)]);
+        let incoming_promotion = dht_node(1, vec![(addr, AddressType::Direct)]);
+        existing.merge_from(incoming_promotion);
+        assert_eq!(existing.addresses.len(), 1);
+        assert_eq!(existing.address_types[0], AddressType::Direct);
+    }
+
+    #[test]
+    fn merge_from_dedupes_identical_relay_entry() {
+        let addr = "/ip4/198.51.100.7/udp/44100/quic";
+        let mut existing = dht_node(1, vec![(addr, AddressType::Relay)]);
+        let incoming = dht_node(1, vec![(addr, AddressType::Relay)]);
+        existing.merge_from(incoming);
+        assert_eq!(existing.addresses.len(), 1);
+        assert_eq!(existing.address_types[0], AddressType::Relay);
     }
 
     #[test]
