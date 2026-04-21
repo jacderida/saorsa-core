@@ -2582,6 +2582,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick%2Falways-masque-relay-rebased#ec163406f526f42667f12a1ed4f5b6ec0ed4e02e"
 dependencies = [
  "anyhow",
  "async-trait",
