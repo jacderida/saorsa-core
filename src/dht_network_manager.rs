@@ -26,7 +26,7 @@ use crate::{
     dht::core_engine::{AddressType, AtomicInstant, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
-    network::NodeConfig,
+    network::{NodeConfig, NodeMode},
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
@@ -100,6 +100,19 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
+
+/// Maximum concurrent dials fanned out to gossiped peers after a
+/// `FIND_NODE` during `bootstrap_from_peers`.
+///
+/// The batch here is unrelated to the CLI bootstrap set — it contains every
+/// peer the bootstrap contacts returned, which on a healthy network is
+/// dozens to low hundreds. Dialing them serially compounds the per-peer
+/// Happy Eyeballs timeout (2 s) into minutes of cold-start latency when the
+/// gossiped addresses include unreachable NAT-observed ports. Higher than
+/// `MAX_CONCURRENT_BOOTSTRAP_DIALS` because these dials happen after the
+/// node is already talking to its bootstrap set, so the CPU budget is less
+/// constrained, but still bounded to cap simultaneous QUIC+PQC handshakes.
+const MAX_CONCURRENT_GOSSIP_DIALS: usize = 8;
 
 /// Duration after which a bucket without activity is considered stale.
 const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
@@ -1020,6 +1033,12 @@ impl DhtNetworkManager {
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
+        // Collect peers that are worth dialing so the dials can fan out in
+        // parallel (or be skipped entirely for clients). Serial dials here
+        // compound the 2 s Happy Eyeballs timeout into minutes of cold-start
+        // latency when the gossiped address set is dominated by unreachable
+        // NAT-observed ports.
+        let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
@@ -1042,7 +1061,7 @@ impl DhtNetworkManager {
                         // routing table; upgrade-only on existing entries.
                         self.merge_gossiped_typed_addresses(node).await;
                         if seen.insert(node.peer_id) && dialable_count > 0 {
-                            self.dial_addresses(&node.peer_id, &typed).await;
+                            to_dial.push((node.peer_id, typed));
                         }
                     }
                 }
@@ -1051,6 +1070,29 @@ impl DhtNetworkManager {
                     warn!("Bootstrap FIND_NODE to {} failed: {}", peer_id.to_hex(), e);
                 }
             }
+        }
+
+        // Client-mode nodes don't serve the DHT, so they don't need a live
+        // QUIC channel to every gossiped peer. Iterative lookups will dial on
+        // demand when the client needs to reach one, which is enough for its
+        // own requests — matching the rationale for skipping post-bootstrap
+        // self-lookups in `P2PNode::start()`.
+        if matches!(self.config.node_config.mode, NodeMode::Client) {
+            debug!(
+                "DHT bootstrap: client mode — skipping {} gossiped-peer dial(s)",
+                to_dial.len()
+            );
+        } else if !to_dial.is_empty() {
+            let dial_count = to_dial.len();
+            debug!(
+                "DHT bootstrap: dialing {dial_count} gossiped peer(s) with concurrency={MAX_CONCURRENT_GOSSIP_DIALS}"
+            );
+            let mut dial_stream =
+                futures::stream::iter(to_dial.into_iter().map(|(peer_id, typed)| async move {
+                    let _ = self.dial_addresses(&peer_id, &typed).await;
+                }))
+                .buffer_unordered(MAX_CONCURRENT_GOSSIP_DIALS);
+            while dial_stream.next().await.is_some() {}
         }
 
         // Emit RoutingTableReady — routing table is populated but the node has
