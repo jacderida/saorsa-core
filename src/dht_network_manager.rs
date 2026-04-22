@@ -101,19 +101,6 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
 
-/// Maximum concurrent dials fanned out to gossiped peers after a
-/// `FIND_NODE` during `bootstrap_from_peers`.
-///
-/// The batch here is unrelated to the CLI bootstrap set — it contains every
-/// peer the bootstrap contacts returned, which on a healthy network is
-/// dozens to low hundreds. Dialing them serially compounds the per-peer
-/// Happy Eyeballs timeout (2 s) into minutes of cold-start latency when the
-/// gossiped addresses include unreachable NAT-observed ports. Higher than
-/// `MAX_CONCURRENT_BOOTSTRAP_DIALS` because these dials happen after the
-/// node is already talking to its bootstrap set, so the CPU budget is less
-/// constrained, but still bounded to cap simultaneous QUIC+PQC handshakes.
-const MAX_CONCURRENT_GOSSIP_DIALS: usize = 8;
-
 /// Duration after which a bucket without activity is considered stale.
 const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
 
@@ -1149,11 +1136,8 @@ impl DhtNetworkManager {
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
-        // Collect peers that are worth dialing so the dials can fan out in
-        // parallel (or be skipped entirely for clients). Serial dials here
-        // compound the 2 s Happy Eyeballs timeout into minutes of cold-start
-        // latency when the gossiped address set is dominated by unreachable
-        // NAT-observed ports.
+        // Collect peers that are worth dialing so the dial step can be skipped
+        // entirely for clients. Node-mode dials are issued serially below.
         let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
@@ -1198,17 +1182,10 @@ impl DhtNetworkManager {
                 "DHT bootstrap: client mode — skipping {} gossiped-peer dial(s)",
                 to_dial.len()
             );
-        } else if !to_dial.is_empty() {
-            let dial_count = to_dial.len();
-            debug!(
-                "DHT bootstrap: dialing {dial_count} gossiped peer(s) with concurrency={MAX_CONCURRENT_GOSSIP_DIALS}"
-            );
-            let mut dial_stream =
-                futures::stream::iter(to_dial.into_iter().map(|(peer_id, typed)| async move {
-                    let _ = self.dial_addresses(&peer_id, &typed).await;
-                }))
-                .buffer_unordered(MAX_CONCURRENT_GOSSIP_DIALS);
-            while dial_stream.next().await.is_some() {}
+        } else {
+            for (peer_id, typed) in to_dial {
+                self.dial_addresses(&peer_id, &typed).await;
+            }
         }
 
         // Emit RoutingTableReady — routing table is populated but the node has
