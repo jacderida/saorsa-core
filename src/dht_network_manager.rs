@@ -681,6 +681,79 @@ impl Drop for BucketRevalidationGuard {
     }
 }
 
+/// Source-of-record for a candidate peer in the iterative FIND_NODE
+/// aggregation map. Drives [`should_replace_candidate`] when two
+/// responders disagree about a subject peer's address set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReportSource {
+    /// The responder spoke for itself (`responder_id == subject_id`).
+    /// Authoritative — no third-party report can override it.
+    SelfReport,
+    /// Another peer reported addresses for this subject. Carries the
+    /// responder's XOR distance to the subject so a strictly-closer
+    /// later responder can overrule.
+    ThirdParty { xor_to_subject: Key },
+}
+
+/// Best (lowest-numeric) [`AddressType::priority`] across a node's
+/// address tags. `u8::MAX` when the address list is empty.
+///
+/// Used as a tie-breaker in the iterative FIND_NODE aggregator: on an
+/// exact responder-to-subject XOR tie, the report whose strongest tag
+/// tier is stronger wins. Relay and Direct tags only enter the network
+/// via the subject's own `PublishAddressSet`, so their presence is
+/// weak evidence the responder saw a recent publish.
+fn best_tier_priority(node: &DHTNode) -> u8 {
+    node.typed_addresses()
+        .iter()
+        .map(|(_, t)| t.priority())
+        .min()
+        .unwrap_or(u8::MAX)
+}
+
+/// Selection rule for the iterative FIND_NODE aggregator.
+///
+/// When multiple responders return conflicting address sets for the same
+/// subject peer, the aggregator keeps the report likeliest to be freshest.
+/// Kademlia replicates `PublishAddressSet` to the subject's K-closest
+/// peers, so a responder XOR-closer to the subject is disproportionately
+/// likely to hold a recent publish.
+///
+/// Returns `true` iff the incoming report should overwrite the currently
+/// stored one:
+///
+/// - No existing entry → accept.
+/// - Existing is a self-report → reject (self-reports lock in).
+/// - Incoming is a self-report → accept (authoritative).
+/// - Both third-party → the strictly XOR-closer responder wins; on
+///   exact tie, the report with the stronger best-tier tag wins.
+///
+/// This rule is not cryptographically authenticated: a close-XOR
+/// adversary can still lie about the subject's addresses. Quorum
+/// hardening (a follow-up commit) reduces that exposure.
+fn should_replace_candidate(
+    existing: Option<&ReportSource>,
+    incoming: &ReportSource,
+    existing_best_tier: Option<u8>,
+    incoming_best_tier: u8,
+) -> bool {
+    match (existing, incoming) {
+        (None, _) => true,
+        (Some(ReportSource::SelfReport), _) => false,
+        (Some(_), ReportSource::SelfReport) => true,
+        (
+            Some(ReportSource::ThirdParty { xor_to_subject: e }),
+            ReportSource::ThirdParty { xor_to_subject: i },
+        ) => match i.cmp(e) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => {
+                matches!(existing_best_tier, Some(b) if incoming_best_tier < b)
+            }
+        },
+    }
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -1321,6 +1394,11 @@ impl DhtNetworkManager {
         // Composite key (distance, peer_id) ensures uniqueness when two peers
         // share the same distance.
         let mut candidates: BTreeMap<(Key, PeerId), DHTNode> = BTreeMap::new();
+        // Parallel to `candidates`, keyed by subject peer_id, tracking
+        // which responder's report currently populates the entry.
+        // `should_replace_candidate` consults this to decide whether an
+        // incoming report from another responder can overwrite.
+        let mut candidate_source: HashMap<PeerId, ReportSource> = HashMap::new();
 
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
@@ -1455,23 +1533,43 @@ impl DhtNetworkManager {
                             // a dialable Direct address and fails relay
                             // acquisition.
                             self.merge_gossiped_typed_addresses(&node).await;
-                            let dist = node.peer_id.distance(&target_key);
-                            let cand_key = (dist, node.peer_id);
-                            // Duplicate peer_id across responses: merge typed
-                            // addresses instead of dropping the later one.
-                            // Different responders often have different views —
-                            // one may have only observed a direct-connected
-                            // listen port (Unverified), while another received
-                            // the target's `PublishAddressSet` with a Relay
-                            // entry. Locking in the first response keeps the
-                            // caller from ever seeing the Relay address for a
-                            // NAT'd peer, producing pointless dials into
-                            // port-restricted cones. Merging gives the union
-                            // so `select_dial_candidates` can pick Relay first.
-                            if let Some(existing) = candidates.get_mut(&cand_key) {
-                                existing.merge_from(node);
+                            let subject_id = node.peer_id;
+                            let dist = subject_id.distance(&target_key);
+                            let cand_key = (dist, subject_id);
+
+                            // Classify this incoming report. When the
+                            // responder is the subject itself, it is
+                            // authoritative — otherwise carry the XOR
+                            // distance for the selection rule.
+                            let incoming_source = if peer_id == subject_id {
+                                ReportSource::SelfReport
+                            } else {
+                                ReportSource::ThirdParty {
+                                    xor_to_subject: peer_id.xor_distance(&subject_id),
+                                }
+                            };
+                            let existing_best = candidates.get(&cand_key).map(best_tier_priority);
+                            let incoming_best = best_tier_priority(&node);
+
+                            if !should_replace_candidate(
+                                candidate_source.get(&subject_id),
+                                &incoming_source,
+                                existing_best,
+                                incoming_best,
+                            ) {
                                 continue;
                             }
+
+                            // Already present at the same cand_key? Replace
+                            // in place — no capacity change.
+                            if let std::collections::btree_map::Entry::Occupied(mut e) =
+                                candidates.entry(cand_key)
+                            {
+                                e.insert(node);
+                                candidate_source.insert(subject_id, incoming_source);
+                                continue;
+                            }
+
                             if candidates.len() >= MAX_CANDIDATE_NODES {
                                 // At capacity — evict the farthest candidate if the
                                 // new one is closer, otherwise drop the new one.
@@ -1479,6 +1577,7 @@ impl DhtNetworkManager {
                                 match farthest_key {
                                     Some(fk) if cand_key < fk => {
                                         candidates.remove(&fk);
+                                        candidate_source.remove(&fk.1);
                                     }
                                     _ => {
                                         trace!(
@@ -1491,6 +1590,7 @@ impl DhtNetworkManager {
                                 }
                             }
                             candidates.insert(cand_key, node);
+                            candidate_source.insert(subject_id, incoming_source);
                         }
                     }
                     Ok(DhtNetworkResult::PeerRejected) => {
@@ -3668,6 +3768,153 @@ mod tests {
         existing.merge_from(incoming);
         assert_eq!(existing.addresses.len(), 1);
         assert_eq!(existing.address_types[0], AddressType::Relay);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIND_NODE aggregator selection rule — closest-XOR-responder wins with
+    // self-report lock-in and tier tie-break.
+    // -----------------------------------------------------------------------
+
+    /// Synthesise a 32-byte key with `b` in byte 0 and zeros elsewhere.
+    /// Differing leading bits make XOR-distance ordering easy to reason about.
+    fn key_leading(b: u8) -> Key {
+        let mut k = [0u8; 32];
+        k[0] = b;
+        k
+    }
+
+    #[test]
+    fn selection_no_existing_accepts_any_incoming() {
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0xFF),
+        };
+        assert!(should_replace_candidate(None, &incoming, None, 0));
+    }
+
+    #[test]
+    fn selection_self_report_locks_out_third_party() {
+        let existing = ReportSource::SelfReport;
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x01), // very close responder
+        };
+        assert!(!should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Relay.priority()),
+            AddressType::Relay.priority(),
+        ));
+    }
+
+    #[test]
+    fn selection_self_report_overrides_third_party() {
+        let existing = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x01),
+        };
+        let incoming = ReportSource::SelfReport;
+        assert!(should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            None,
+            0
+        ));
+    }
+
+    #[test]
+    fn selection_closer_xor_responder_wins() {
+        let existing = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0xFF),
+        };
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x01),
+        };
+        assert!(should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Direct.priority()),
+            AddressType::Unverified.priority(),
+        ));
+    }
+
+    #[test]
+    fn selection_farther_xor_responder_rejected() {
+        let existing = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x01),
+        };
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0xFF),
+        };
+        // Even if the incoming has a stronger tier, farther-XOR loses.
+        assert!(!should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Unverified.priority()),
+            AddressType::Relay.priority(),
+        ));
+    }
+
+    #[test]
+    fn selection_tie_breaks_on_stronger_best_tier() {
+        let existing = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x10),
+        };
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x10),
+        };
+        assert!(should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Unverified.priority()),
+            AddressType::Relay.priority(),
+        ));
+    }
+
+    #[test]
+    fn selection_tie_with_equal_or_weaker_tier_rejected() {
+        let existing = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x10),
+        };
+        let incoming = ReportSource::ThirdParty {
+            xor_to_subject: key_leading(0x10),
+        };
+        // Equal tier → reject.
+        assert!(!should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Direct.priority()),
+            AddressType::Direct.priority(),
+        ));
+        // Weaker tier → reject.
+        assert!(!should_replace_candidate(
+            Some(&existing),
+            &incoming,
+            Some(AddressType::Relay.priority()),
+            AddressType::Unverified.priority(),
+        ));
+    }
+
+    #[test]
+    fn best_tier_priority_picks_strongest_tag() {
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Unverified),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Relay),
+                ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Direct),
+            ],
+        );
+        assert_eq!(best_tier_priority(&node), AddressType::Relay.priority());
+    }
+
+    #[test]
+    fn best_tier_priority_empty_node_returns_max() {
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            distance: None,
+            reliability: 1.0,
+        };
+        assert_eq!(best_tier_priority(&node), u8::MAX);
     }
 
     #[test]
