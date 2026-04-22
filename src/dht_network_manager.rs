@@ -116,6 +116,11 @@ const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minute
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
+/// Maximum time to wait for a background task to stop during shutdown before
+/// aborting it. Defense in depth against tasks that fail to respond to the
+/// shutdown cancellation token.
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Minimum time between consecutive auto re-bootstrap attempts.
 const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -946,15 +951,20 @@ impl DhtNetworkManager {
                     () = shutdown.cancelled() => break,
                 }
 
-                if let Err(e) = this.trigger_self_lookup().await {
-                    warn!("Periodic self-lookup failed: {e}");
+                // Wrap the work in a select so shutdown cancels in-progress
+                // operations rather than waiting for them to complete. Without
+                // this, iterative DHT lookups under active traffic can block
+                // for minutes, preventing the task from noticing shutdown.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = async {
+                        if let Err(e) = this.trigger_self_lookup().await {
+                            warn!("Periodic self-lookup failed: {e}");
+                        }
+                        this.revalidate_stale_k_closest().await;
+                        this.maybe_rebootstrap().await;
+                    } => {}
                 }
-
-                // Evict any stale K-closest peers that fail to respond.
-                this.revalidate_stale_k_closest().await;
-
-                // Check if routing table is depleted after the self-lookup.
-                this.maybe_rebootstrap().await;
             }
         });
         *handle_slot.write().await = Some(handle);
@@ -978,53 +988,63 @@ impl DhtNetworkManager {
                     () = shutdown.cancelled() => break,
                 }
 
-                let stale_indices = this
-                    .dht
-                    .read()
-                    .await
-                    .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
-                    .await;
+                // Wrap the work in a select so shutdown cancels in-progress
+                // lookups rather than waiting for all buckets to be refreshed.
+                let shutdown_ref = &shutdown;
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = async {
+                        let stale_indices = this
+                            .dht
+                            .read()
+                            .await
+                            .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
+                            .await;
 
-                if stale_indices.is_empty() {
-                    trace!("Bucket refresh: no stale buckets");
-                    continue;
-                }
+                        if stale_indices.is_empty() {
+                            trace!("Bucket refresh: no stale buckets");
+                            return;
+                        }
 
-                debug!("Bucket refresh: {} stale buckets", stale_indices.len());
-                let k = this.k_value();
+                        debug!("Bucket refresh: {} stale buckets", stale_indices.len());
+                        let k = this.k_value();
 
-                for bucket_idx in stale_indices {
-                    let random_key = {
-                        let dht = this.dht.read().await;
-                        dht.generate_random_key_for_bucket(bucket_idx)
-                    };
-                    let Some(key) = random_key else {
-                        continue;
-                    };
+                        for bucket_idx in stale_indices {
+                            if shutdown_ref.is_cancelled() {
+                                break;
+                            }
+                            let random_key = {
+                                let dht = this.dht.read().await;
+                                dht.generate_random_key_for_bucket(bucket_idx)
+                            };
+                            let Some(key) = random_key else {
+                                continue;
+                            };
 
-                    let key_bytes: Key = *key.as_bytes();
-                    match this.find_closest_nodes_network(&key_bytes, k).await {
-                        Ok(nodes) => {
-                            trace!(
-                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
-                                nodes.len()
-                            );
-                            for dht_node in nodes {
-                                if dht_node.peer_id == this.config.peer_id {
-                                    continue;
+                            let key_bytes: Key = *key.as_bytes();
+                            match this.find_closest_nodes_network(&key_bytes, k).await {
+                                Ok(nodes) => {
+                                    trace!(
+                                        "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                        nodes.len()
+                                    );
+                                    for dht_node in nodes {
+                                        if dht_node.peer_id == this.config.peer_id {
+                                            continue;
+                                        }
+                                        this.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
+                                            .await;
+                                    }
                                 }
-                                this.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
-                                    .await;
+                                Err(e) => {
+                                    debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
+                                }
                             }
                         }
-                        Err(e) => {
-                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
-                        }
-                    }
-                }
 
-                // Check if routing table is depleted after refresh.
-                this.maybe_rebootstrap().await;
+                        this.maybe_rebootstrap().await;
+                    } => {}
+                }
             }
         });
         *handle_slot.write().await = Some(handle);
@@ -1219,13 +1239,24 @@ impl DhtNetworkManager {
         // Signal background tasks to stop
         self.dht.read().await.signal_shutdown();
 
-        // Join all background tasks
+        // Join all background tasks with a timeout. The tasks check
+        // `shutdown.cancelled()` but may be mid-operation when cancel fires.
+        // The select-wrapped work blocks (added to fix shutdown hangs under
+        // active traffic) should make tasks exit promptly, but as defense in
+        // depth we abort any task that exceeds `TASK_SHUTDOWN_TIMEOUT`.
         async fn join_task(name: &str, slot: &RwLock<Option<tokio::task::JoinHandle<()>>>) {
-            if let Some(handle) = slot.write().await.take() {
-                match handle.await {
-                    Ok(()) => debug!("{name} task stopped cleanly"),
-                    Err(e) if e.is_cancelled() => debug!("{name} task was cancelled"),
-                    Err(e) => warn!("{name} task panicked: {e}"),
+            if let Some(mut handle) = slot.write().await.take() {
+                match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut handle).await {
+                    Ok(Ok(())) => debug!("{name} task stopped cleanly"),
+                    Ok(Err(e)) if e.is_cancelled() => debug!("{name} task was cancelled"),
+                    Ok(Err(e)) => warn!("{name} task panicked: {e}"),
+                    Err(_) => {
+                        warn!(
+                            "{name} task did not stop within {}s, aborting",
+                            TASK_SHUTDOWN_TIMEOUT.as_secs()
+                        );
+                        handle.abort();
+                    }
                 }
             }
         }
