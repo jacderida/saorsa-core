@@ -102,20 +102,11 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Maximum addresses stored per node to prevent memory exhaustion.
-/// A peer can legitimately have several addresses (multi-homed, NAT traversal),
-/// but unbounded lists would be an abuse vector.
+/// This cap is the last-line guard; in normal operation the per-IP-family
+/// cap ([`NodeInfo::enforce_per_ip_family_cap`]) holds each external peer
+/// to at most 2 IP addresses per family. Non-IP transports (Bluetooth,
+/// LoRa) are outside the per-family cap and rely on this bound.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
-
-/// Maximum NATted addresses to keep per node. Symmetric NAT generates a
-/// different address per peer — keeping them all is wasteful since none are
-/// directly reachable. We keep 1 for diagnostic/logging purposes.
-const MAX_NATTED_ADDRESSES: usize = 1;
-
-/// Maximum `Unverified` addresses to keep per node. These are self-published
-/// observed externals that have not been confirmed reachable by the local
-/// classifier. Bounded tightly because a cold-start node typically has 1–2
-/// observed externals and stale extras add only dial-timeout cost.
-const MAX_UNVERIFIED_ADDRESSES: usize = 2;
 
 /// Address classification for priority ordering and staleness eviction.
 ///
@@ -225,9 +216,11 @@ impl NodeInfo {
 
     /// Merge a new address with an explicit type tag.
     ///
-    /// Insertion position depends on type priority: Relay → Direct → NATted.
-    /// Relay addresses always go to the front. NATted addresses go to the
-    /// back and are evicted beyond [`MAX_NATTED_ADDRESSES`].
+    /// Insertion position depends on type priority: Relay → Direct →
+    /// Unverified → NATted. Relay addresses always go to the front. After
+    /// insertion, [`Self::enforce_per_ip_family_cap`] prunes the list so
+    /// the "at most 1 Relay + 1 non-Relay per IP family, Direct dominates
+    /// Unverified dominates NATted" invariant holds.
     pub fn merge_typed_address(&mut self, addr: MultiAddr, addr_type: AddressType) {
         // Ensure address_types is in sync with addresses (legacy compat).
         // Trailing untagged entries are padded with `Unverified` so we do not
@@ -245,15 +238,17 @@ impl NodeInfo {
             }
         }
 
-        // Insert based on type priority
+        // Insert based on type priority. Insertion order is what the cap
+        // uses to break "newest wins" ties: Relay / Direct / Unverified
+        // insert at the front of their tier so the newest sits at the
+        // lowest index among same-tier entries; NATted appends so the
+        // newest sits at the highest index.
         match addr_type {
             AddressType::Relay => {
-                // Always at front
                 self.addresses.insert(0, addr);
                 self.address_types.insert(0, AddressType::Relay);
             }
             AddressType::Direct => {
-                // After all Relay entries (most recently seen Direct first)
                 let pos = self
                     .address_types
                     .iter()
@@ -263,7 +258,6 @@ impl NodeInfo {
                 self.address_types.insert(pos, AddressType::Direct);
             }
             AddressType::Unverified => {
-                // After all Relay and Direct entries, before NATted
                 let pos = self
                     .address_types
                     .iter()
@@ -271,56 +265,16 @@ impl NodeInfo {
                     .unwrap_or(self.addresses.len());
                 self.addresses.insert(pos, addr);
                 self.address_types.insert(pos, AddressType::Unverified);
-
-                // Evict excess Unverified addresses
-                let unverified_count = self
-                    .address_types
-                    .iter()
-                    .filter(|t| **t == AddressType::Unverified)
-                    .count();
-                if unverified_count > MAX_UNVERIFIED_ADDRESSES {
-                    let mut to_remove = unverified_count - MAX_UNVERIFIED_ADDRESSES;
-                    let mut i = 0;
-                    while i < self.address_types.len() && to_remove > 0 {
-                        if self.address_types[i] == AddressType::Unverified {
-                            self.addresses.remove(i);
-                            self.address_types.remove(i);
-                            to_remove -= 1;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
             }
             AddressType::NATted => {
-                // At the back
                 self.addresses.push(addr);
                 self.address_types.push(AddressType::NATted);
-
-                // Evict excess NATted addresses (keep only MAX_NATTED_ADDRESSES)
-                let natted_count = self
-                    .address_types
-                    .iter()
-                    .filter(|t| **t == AddressType::NATted)
-                    .count();
-                if natted_count > MAX_NATTED_ADDRESSES {
-                    // Remove oldest NATted entries (earliest in the list)
-                    let mut to_remove = natted_count - MAX_NATTED_ADDRESSES;
-                    let mut i = 0;
-                    while i < self.address_types.len() && to_remove > 0 {
-                        if self.address_types[i] == AddressType::NATted {
-                            self.addresses.remove(i);
-                            self.address_types.remove(i);
-                            to_remove -= 1;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
             }
         }
 
-        // Cap total addresses
+        self.enforce_per_ip_family_cap();
+
+        // Last-line guard for non-IP transports (outside the per-family cap).
         self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
         self.address_types.truncate(MAX_ADDRESSES_PER_NODE);
     }
@@ -334,6 +288,98 @@ impl NodeInfo {
             .get(index)
             .copied()
             .unwrap_or(AddressType::Unverified)
+    }
+
+    /// Enforce the per-IP-family address cap for an external peer.
+    ///
+    /// For each IP family (IPv4, IPv6 — IPv4-mapped IPv6 is canonicalised
+    /// to IPv4 so it is counted against the IPv4 slot), keep at most:
+    ///
+    /// - 1 [`AddressType::Relay`] (newest wins)
+    /// - 1 of {[`AddressType::Direct`], [`AddressType::Unverified`],
+    ///   [`AddressType::NATted`]} — the entry with the highest priority
+    ///   tier present in that family wins, newer entries within a tier
+    ///   win over older ones
+    ///
+    /// That yields the invariant: at most 2 addresses per IP family, and
+    /// weaker tiers (Unverified, NATted) never coexist with a stronger
+    /// same-family tier (Direct) — they add no useful dial option once
+    /// the stronger one is known. A dual-stack peer may therefore hold
+    /// up to 4 IP addresses (2 per family).
+    ///
+    /// Non-IP transport addresses (Bluetooth, LoRa) are left alone — they
+    /// have no IP family and are governed only by [`MAX_ADDRESSES_PER_NODE`].
+    ///
+    /// "Newest wins" is encoded by the insertion positions in
+    /// [`Self::merge_typed_address`]: Relay, Direct, and Unverified insert
+    /// at the front of their tier, so the newest entry has the lowest
+    /// index; NATted appends, so the newest has the highest index.
+    ///
+    /// This enforces the invariant for *external peers*. The routing
+    /// table never stores `NodeInfo` for self (admission rejects
+    /// self-insertion), so the self-record — held by the transport /
+    /// reachability driver — is unaffected by this cap.
+    fn enforce_per_ip_family_cap(&mut self) {
+        while self.address_types.len() < self.addresses.len() {
+            self.address_types.push(AddressType::Unverified);
+        }
+
+        // Non-IP addresses are exempt from the per-family cap.
+        let mut keep: Vec<bool> = self.addresses.iter().map(|a| a.ip().is_none()).collect();
+
+        let family_matches = |addr: &MultiAddr, want_v4: bool| match addr.ip() {
+            Some(ip) => canonicalize_ip(ip).is_ipv4() == want_v4,
+            None => false,
+        };
+
+        for want_v4 in [true, false] {
+            let family: Vec<usize> = (0..self.addresses.len())
+                .filter(|&i| family_matches(&self.addresses[i], want_v4))
+                .collect();
+            if family.is_empty() {
+                continue;
+            }
+
+            // Slot 1: newest Relay for the family (lowest-index Relay).
+            if let Some(&i) = family
+                .iter()
+                .find(|&&i| self.address_types[i] == AddressType::Relay)
+            {
+                keep[i] = true;
+            }
+
+            // Slot 2: the single highest-priority non-Relay entry for the
+            // family. Precedence is Direct > Unverified > NATted. Within
+            // Direct/Unverified, newer is at the lowest index; within
+            // NATted, newer is at the highest (append ordering).
+            let best_non_relay = [
+                AddressType::Direct,
+                AddressType::Unverified,
+                AddressType::NATted,
+            ]
+            .iter()
+            .find_map(|t| match t {
+                AddressType::NATted => family
+                    .iter()
+                    .rev()
+                    .find(|&&i| self.address_types[i] == AddressType::NATted)
+                    .copied(),
+                tier => family
+                    .iter()
+                    .find(|&&i| self.address_types[i] == *tier)
+                    .copied(),
+            });
+            if let Some(i) = best_non_relay {
+                keep[i] = true;
+            }
+        }
+
+        for i in (0..keep.len()).rev() {
+            if !keep[i] {
+                self.addresses.remove(i);
+                self.address_types.remove(i);
+            }
+        }
     }
 
     /// Merge a typed address but only if it would upgrade the peer's record.
@@ -417,6 +463,11 @@ impl KBucket {
         }
 
         if self.nodes.len() < self.max_size {
+            // External peers are bounded by the per-IP-family cap even on
+            // first insertion: an incoming `NodeInfo` could carry multiple
+            // same-family same-type addresses from deserialization or the
+            // connection handler batching advertised addresses.
+            node.enforce_per_ip_family_cap();
             self.nodes.push(node);
             self.last_refreshed = Instant::now();
             Ok(())
@@ -613,6 +664,11 @@ impl KBucket {
             let node = &mut self.nodes[pos];
             node.addresses = addresses;
             node.address_types = address_types;
+            // Apply the per-IP-family cap on the incoming publish set: a
+            // peer is not expected to publish more than Relay+{one other}
+            // per family, but a misbehaving sender could try to exceed
+            // that. The cap enforces the invariant regardless.
+            node.enforce_per_ip_family_cap();
             node.last_seen.store_now();
         }
 
@@ -2101,9 +2157,10 @@ mod tests {
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
-        // Touch with a new address — should be prepended, old kept
+        // Touch with a new same-family-same-type (IPv4 Direct) address.
+        // The per-IP-family cap keeps the newest Direct and drops the old
+        // one — both cannot coexist under the "1 Direct per IPv4" rule.
         let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
-        let old_addr: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         let found = bucket.touch_node_typed(
             &PeerId::from_bytes([1u8; 32]),
             Some(&new_addr),
@@ -2111,8 +2168,7 @@ mod tests {
         );
         assert!(found);
         let addrs = &bucket.get_nodes().last().unwrap().addresses;
-        assert_eq!(addrs[0], new_addr);
-        assert_eq!(addrs[1], old_addr);
+        assert_eq!(addrs, &vec![new_addr]);
     }
 
     #[test]
@@ -2216,13 +2272,16 @@ mod tests {
     }
 
     #[test]
-    fn replace_addresses_truncates_to_max() {
+    fn replace_addresses_collapses_under_per_ip_family_cap() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         bucket
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
 
+        // A misbehaving publisher sends 12 same-family same-type
+        // addresses. The per-IP-family cap collapses them to one IPv4
+        // Direct regardless of the `MAX_ADDRESSES_PER_NODE` sizing.
         let typed: Vec<(MultiAddr, AddressType)> = (0..12)
             .map(|i| {
                 (
@@ -2233,8 +2292,8 @@ mod tests {
             .collect();
         assert!(bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed));
         let node = bucket.find_node(&PeerId::from_bytes([1u8; 32])).unwrap();
-        assert_eq!(node.addresses.len(), MAX_ADDRESSES_PER_NODE);
-        assert_eq!(node.address_types.len(), MAX_ADDRESSES_PER_NODE);
+        assert_eq!(node.addresses.len(), 1);
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
     }
 
     // -----------------------------------------------------------------------
@@ -2561,14 +2620,16 @@ mod tests {
     }
 
     #[test]
-    fn test_add_node_truncates_excess_addresses() {
+    fn test_add_node_oversized_same_family_collapses_to_cap() {
         let mut bucket = KBucket::new(8);
 
-        // Build a NodeInfo with more addresses than the cap.
+        // An incoming `NodeInfo` with many same-family, same-type
+        // addresses collapses under the per-IP-family cap on insertion.
+        // Legacy `address_types: vec![]` means each entry is treated as
+        // `Unverified`, so the cap keeps exactly one Unverified per family.
         let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
             .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
             .collect();
-        assert!(addresses.len() > MAX_ADDRESSES_PER_NODE);
 
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
@@ -2579,25 +2640,22 @@ mod tests {
         bucket.add_node(node).unwrap();
 
         let stored = &bucket.get_nodes()[0].addresses;
-        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+        assert_eq!(stored.len(), 1);
     }
 
     #[test]
-    fn test_add_node_replace_also_truncates() {
+    fn test_add_node_replace_collapses_under_cap() {
         let mut bucket = KBucket::new(8);
 
-        // Insert once with a single address.
         bucket
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
         assert_eq!(bucket.get_nodes()[0].addresses.len(), 1);
 
-        // Replace with an oversized Direct-tagged address list. We use
-        // explicit Direct tags here so the test exercises the
-        // `MAX_ADDRESSES_PER_NODE` bucket-level cap rather than the
-        // per-type Unverified/NATted sub-caps (legacy untagged entries
-        // fall through as Unverified and would be bounded by
-        // `MAX_UNVERIFIED_ADDRESSES` instead).
+        // Re-add the peer with an oversized Direct-tagged list. The
+        // duplicate-admission path merges each address via
+        // `merge_typed_address`, and the per-IP-family cap keeps exactly
+        // one Direct per family.
         let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
             .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
             .collect();
@@ -2611,7 +2669,7 @@ mod tests {
         bucket.add_node(replacement).unwrap();
 
         let stored = &bucket.get_nodes().last().unwrap().addresses;
-        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+        assert_eq!(stored.len(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -2672,10 +2730,7 @@ mod tests {
         let peer_id = node.id;
         dht.add_node_no_trust(node).await.unwrap();
 
-        // Re-add same peer with a new address. Tag Direct explicitly —
-        // `merge_typed_address` places Direct addresses at the front of
-        // the list (after any Relay entries), so the new 10.0.0.2 should
-        // land at index 0 ahead of the existing 10.0.0.1.
+        // Re-add same peer with a new same-family (IPv4 Direct) address.
         let updated = NodeInfo {
             id: peer_id,
             addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
@@ -2685,12 +2740,12 @@ mod tests {
         let result = dht.add_node_no_trust(updated).await;
         assert!(result.is_ok(), "update short-circuit should succeed");
 
-        // Should have both addresses (new one first)
+        // Per-IP-family cap: the newest IPv4 Direct wins; the old one is
+        // dropped rather than kept alongside.
         let addrs = dht.get_node_addresses(&peer_id).await;
-        assert_eq!(addrs.len(), 2);
         assert_eq!(
-            addrs[0],
-            "/ip4/10.0.0.2/udp/9000/quic".parse::<MultiAddr>().unwrap()
+            addrs,
+            vec!["/ip4/10.0.0.2/udp/9000/quic".parse::<MultiAddr>().unwrap()]
         );
     }
 
@@ -3889,48 +3944,215 @@ mod tests {
     }
 
     #[test]
-    fn merge_unverified_lands_between_direct_and_natted() {
+    fn merge_same_family_keeps_relay_and_best_non_relay() {
+        // Under the per-IP-family cap: at most 1 Relay + 1 of {Direct,
+        // Unverified, NATted} per family. Direct is the strongest
+        // non-Relay tier, so when all four tiers are fed into the same
+        // IPv4 family, only Relay+Direct survive.
         let mut node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
-        // Existing single entry is Direct (via make_node).
+        let direct = node.addresses[0].clone();
         let relay: MultiAddr = "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap();
         let unverified: MultiAddr = "/ip4/10.0.0.3/udp/9000/quic".parse().unwrap();
         let natted: MultiAddr = "/ip4/10.0.0.4/udp/9000/quic".parse().unwrap();
 
-        node.merge_typed_address(natted.clone(), AddressType::NATted);
-        node.merge_typed_address(unverified.clone(), AddressType::Unverified);
+        node.merge_typed_address(natted, AddressType::NATted);
+        node.merge_typed_address(unverified, AddressType::Unverified);
         node.merge_typed_address(relay.clone(), AddressType::Relay);
 
-        // Priority order in the stored vec: Relay, Direct, Unverified, NATted
         assert_eq!(
             node.address_types,
-            vec![
-                AddressType::Relay,
-                AddressType::Direct,
-                AddressType::Unverified,
-                AddressType::NATted,
-            ]
+            vec![AddressType::Relay, AddressType::Direct]
         );
-        assert_eq!(node.addresses[0], relay);
-        assert_eq!(node.addresses[2], unverified);
-        assert_eq!(node.addresses[3], natted);
+        assert_eq!(node.addresses, vec![relay, direct]);
     }
 
     #[test]
-    fn merge_unverified_caps_at_max_unverified_addresses() {
+    fn merge_unverified_caps_at_one_per_ip_family() {
+        // Per the per-IP-family cap, a peer with a same-family Direct
+        // (from `make_node`) retains it and any subsequent Unverified in
+        // that family is dropped. If the Direct is absent, the cap keeps
+        // exactly one Unverified per IP family — the newest.
         let mut node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
 
-        // Insert more Unverified than the cap allows; earliest should be evicted.
-        for i in 0..(MAX_UNVERIFIED_ADDRESSES as u16 + 2) {
+        for i in 0..4 {
             let addr: MultiAddr = format!("/ip4/10.1.0.{}/udp/9000/quic", i).parse().unwrap();
             node.merge_typed_address(addr, AddressType::Unverified);
         }
 
+        // Direct dominates Unverified within the same family.
+        let direct_count = node
+            .address_types
+            .iter()
+            .filter(|t| **t == AddressType::Direct)
+            .count();
         let unverified_count = node
             .address_types
             .iter()
             .filter(|t| **t == AddressType::Unverified)
             .count();
-        assert_eq!(unverified_count, MAX_UNVERIFIED_ADDRESSES);
+        assert_eq!(direct_count, 1);
+        assert_eq!(unverified_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-IP-family cap — targeted tests
+    // -----------------------------------------------------------------------
+
+    fn node_with(addresses: Vec<(&str, AddressType)>) -> NodeInfo {
+        NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: addresses
+                .iter()
+                .map(|(a, _)| a.parse::<MultiAddr>().unwrap())
+                .collect(),
+            address_types: addresses.iter().map(|(_, t)| *t).collect(),
+            last_seen: AtomicInstant::now(),
+        }
+    }
+
+    #[test]
+    fn cap_allows_relay_plus_best_non_relay_per_family() {
+        let mut node = node_with(vec![
+            ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct),
+            ("/ip6/2001:db8::1/udp/9000/quic", AddressType::Relay),
+            ("/ip6/2001:db8::2/udp/9000/quic", AddressType::Direct),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.addresses.len(), 4);
+    }
+
+    #[test]
+    fn cap_direct_dominates_unverified_same_family() {
+        let mut node = node_with(vec![
+            ("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct),
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Unverified),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(
+            node.addresses,
+            vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn cap_direct_dominates_natted_same_family() {
+        let mut node = node_with(vec![
+            ("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct),
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::NATted),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+    }
+
+    #[test]
+    fn cap_unverified_dominates_natted_same_family() {
+        let mut node = node_with(vec![
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Unverified),
+            ("/ip4/3.3.3.3/udp/9000/quic", AddressType::NATted),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.address_types, vec![AddressType::Unverified]);
+    }
+
+    #[test]
+    fn cap_relay_plus_unverified_allowed() {
+        let mut node = node_with(vec![
+            ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Unverified),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Relay, AddressType::Unverified]
+        );
+    }
+
+    #[test]
+    fn cap_ipv4_and_ipv6_are_independent() {
+        // IPv4 has only an Unverified, IPv6 has a Direct. The IPv6 Direct
+        // must not cross-drop the IPv4 Unverified — precedence is scoped
+        // to the same family.
+        let mut node = node_with(vec![
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Unverified),
+            ("/ip6/2001:db8::1/udp/9000/quic", AddressType::Direct),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.addresses.len(), 2);
+    }
+
+    #[test]
+    fn cap_merge_direct_then_natted_drops_natted() {
+        let mut node = node_with(vec![("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct)]);
+        node.merge_typed_address(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::NATted,
+        );
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+    }
+
+    #[test]
+    fn cap_merge_natted_then_direct_drops_natted() {
+        let mut node = node_with(vec![("/ip4/2.2.2.2/udp/9000/quic", AddressType::NATted)]);
+        node.merge_typed_address(
+            "/ip4/1.1.1.1/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        );
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(
+            node.addresses,
+            vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn cap_newest_relay_replaces_stale_same_family_relay() {
+        let mut node = node_with(vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        node.merge_typed_address(
+            "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Relay,
+        );
+        assert_eq!(
+            node.addresses,
+            vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()]
+        );
+        assert_eq!(node.address_types, vec![AddressType::Relay]);
+    }
+
+    #[test]
+    fn cap_newest_relay_preserves_different_family_relay() {
+        let mut node = node_with(vec![("/ip6/2001:db8::1/udp/9000/quic", AddressType::Relay)]);
+        node.merge_typed_address(
+            "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
+            AddressType::Relay,
+        );
+        let mut relays: Vec<_> = node
+            .addresses
+            .iter()
+            .zip(node.address_types.iter())
+            .filter(|(_, t)| **t == AddressType::Relay)
+            .map(|(a, _)| a.to_string())
+            .collect();
+        relays.sort();
+        assert_eq!(
+            relays,
+            vec![
+                "/ip4/10.0.0.1/udp/9000/quic".to_string(),
+                "/ip6/2001:db8::1/udp/9000/quic".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cap_normalizes_legacy_multi_entry_input() {
+        let mut node = node_with(vec![
+            ("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct),
+            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Direct),
+            ("/ip4/3.3.3.3/udp/9000/quic", AddressType::Direct),
+        ]);
+        node.enforce_per_ip_family_cap();
+        assert_eq!(node.addresses.len(), 1);
     }
 
     #[test]
