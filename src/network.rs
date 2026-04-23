@@ -2093,8 +2093,11 @@ impl P2PNode {
         // handshakes.
         let mut parallel_stream = futures::stream::iter(
             parallel_addr_sets
-                .iter()
-                .map(|addrs| self.dial_bootstrap_addr_set(addrs, used_cache, identity_timeout)),
+                .into_iter()
+                .map(|addrs| async move {
+                    self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
+                        .await
+                }),
         )
         .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
         while let Some(result) = parallel_stream.next().await {
