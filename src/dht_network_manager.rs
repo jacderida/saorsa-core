@@ -712,7 +712,7 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
         .into_iter()
         .map(|(addr, t)| (addr, t.priority()))
         .collect();
-    sig.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+    sig.sort_by_key(|a| a.0.to_string());
     sig
 }
 
@@ -4263,9 +4263,17 @@ mod tests {
         // and verify is_failed() returns false and removes the entry.
         let cache = DialFailureCache::new();
         let addr = sock("203.0.113.7:9001");
-        let stale = Instant::now()
-            .checked_sub(DIAL_FAILURE_CACHE_TTL + Duration::from_secs(1))
-            .unwrap();
+        // Skip when the runner's monotonic clock has less uptime than the
+        // TTL. Hit on freshly-booted Windows CI where Instant starts near
+        // zero, making `checked_sub` underflow.
+        let Some(stale) =
+            Instant::now().checked_sub(DIAL_FAILURE_CACHE_TTL + Duration::from_secs(1))
+        else {
+            eprintln!(
+                "skipping: runner Instant is fresher than DIAL_FAILURE_CACHE_TTL ({DIAL_FAILURE_CACHE_TTL:?})"
+            );
+            return;
+        };
         cache.entries.insert(addr, stale);
         assert!(
             !cache.is_failed(&addr),
