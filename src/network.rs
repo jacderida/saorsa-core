@@ -2091,15 +2091,12 @@ impl P2PNode {
         // Phase B: concurrent dials of CLI + cached bootstrap peers, bounded
         // by `MAX_CONCURRENT_BOOTSTRAP_DIALS` to cap simultaneous QUIC+PQC
         // handshakes.
-        let mut parallel_stream = futures::stream::iter(
-            parallel_addr_sets
-                .into_iter()
-                .map(|addrs| async move {
-                    self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
-                        .await
-                }),
-        )
-        .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
+        let mut parallel_stream =
+            futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
+                self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
+                    .await
+            }))
+            .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
         while let Some(result) = parallel_stream.next().await {
             if let Some(peer_id) = result {
                 successful_connections += 1;
