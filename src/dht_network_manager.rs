@@ -3413,7 +3413,24 @@ impl DhtNetworkManager {
         let ping_ok = tokio::time::timeout(STALE_REVALIDATION_BUDGET, self.ping_peer(peer_id))
             .await
             .is_ok_and(|r| r.is_ok());
-        ping_ok && self.transport.is_known_app_peer_id(peer_id).await
+        let identity_ok = self.transport.is_known_app_peer_id(peer_id).await;
+        Self::is_revalidation_alive(ping_ok, identity_ok)
+    }
+
+    /// Combine the two stale-peer revalidation signals.
+    ///
+    /// A peer counts as alive only when **both** `ping_ok` (wire-level
+    /// reachability proven by a successful ping within
+    /// [`STALE_REVALIDATION_BUDGET`]) and `identity_ok` (membership in
+    /// the authenticated app-level peer set per
+    /// [`crate::transport_handle::TransportHandle::is_known_app_peer_id`])
+    /// hold. Either condition failing causes eviction.
+    ///
+    /// Extracted as a pure const fn so the AND invariant is unit-testable
+    /// without spinning up a transport — see the truth-table tests in
+    /// this module's `#[cfg(test)] mod tests` block.
+    const fn is_revalidation_alive(ping_ok: bool, identity_ok: bool) -> bool {
+        ping_ok && identity_ok
     }
 
     /// Revalidate stale K-closest peers by pinging them and evicting non-responders.
@@ -3783,6 +3800,62 @@ mod tests {
     fn is_dialable_accepts_quic_with_routable_ip() {
         let quic = MultiAddr::quic("203.0.113.7:9000".parse().unwrap());
         assert!(DhtNetworkManager::is_dialable(&quic));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale-peer revalidation invariants
+    //
+    // `ping_with_identity_confirmation` is the routing-table eviction gate.
+    // The full path requires a real transport (constructing a
+    // `DhtNetworkManager` is non-trivial in a sync test), but the load-bearing
+    // *logic* — the AND combinator and the budget arithmetic — is extracted
+    // so refactoring regressions surface here, fast and deterministically.
+    //
+    // Invariants locked in:
+    //   - AND, not OR: failing either signal causes eviction.
+    //   - Budget covers a full identity exchange + ping RTT, so cold-channel
+    //     revalidation does not false-evict healthy peers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revalidation_alive_only_when_both_signals_pass() {
+        assert!(DhtNetworkManager::is_revalidation_alive(true, true));
+    }
+
+    #[test]
+    fn revalidation_dead_when_ping_fails_even_with_identity() {
+        // A peer that is in the authenticated set but does not answer
+        // pings within the budget is dead-on-the-wire and must be evicted.
+        assert!(!DhtNetworkManager::is_revalidation_alive(false, true));
+    }
+
+    #[test]
+    fn revalidation_dead_when_identity_missing_even_with_ping() {
+        // The load-bearing case from the bug fix: a peer that responds at
+        // the transport layer but is not in the authenticated app-level
+        // set (e.g. older-protocol nodes whose identity exchange always
+        // times out) must be evicted regardless of ping success. Catches
+        // any refactor that drops the identity check or weakens AND to OR.
+        assert!(!DhtNetworkManager::is_revalidation_alive(true, false));
+    }
+
+    #[test]
+    fn revalidation_dead_when_both_signals_fail() {
+        assert!(!DhtNetworkManager::is_revalidation_alive(false, false));
+    }
+
+    #[test]
+    fn stale_revalidation_budget_covers_identity_exchange_plus_ping_rtt() {
+        // Cold-channel revalidation must survive a fresh identity exchange
+        // (≤ IDENTITY_EXCHANGE_TIMEOUT) followed by a ping round-trip on
+        // the resulting authenticated channel. Capping below this is the
+        // exact regression the constant was introduced to close — guard
+        // the arithmetic so a future tweak to either input is mirrored
+        // here intentionally.
+        assert_eq!(
+            STALE_REVALIDATION_BUDGET,
+            IDENTITY_EXCHANGE_TIMEOUT + STALE_REVALIDATION_PING_RTT,
+        );
     }
 
     #[test]

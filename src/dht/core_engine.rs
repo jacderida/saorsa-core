@@ -543,33 +543,36 @@ impl KBucket {
     ///   genuinely-stale buckets and silently suppress discovery as long
     ///   as some neighbour kept gossiping about a peer in that range).
     ///
-    /// Returns `true` when the peer is in this bucket (regardless of
-    /// whether the merge changed state); `false` when the peer is absent.
-    /// The loopback-injection guard from [`Self::touch_node_typed`] applies
-    /// equally.
+    /// Returns `true` when the merge changed the peer's address record
+    /// (a new address was appended, or an existing tag was promoted to a
+    /// higher-priority tier); `false` when the peer is absent, the
+    /// loopback-injection guard skipped the merge, or the merge was a
+    /// no-op (address already present with an equal-or-higher-priority
+    /// tag). The loopback-injection guard from [`Self::touch_node_typed`]
+    /// applies equally.
     fn merge_typed_address_upgrade_only(
         &mut self,
         node_id: &PeerId,
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
-        if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
-            if let Some(addr) = address {
-                let addr_is_loopback = addr
-                    .ip()
-                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
-                let node_has_non_loopback = self.nodes[pos]
-                    .addresses
-                    .iter()
-                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
-                if !(addr_is_loopback && node_has_non_loopback) {
-                    self.nodes[pos].merge_typed_address_upgrade_only(addr.clone(), addr_type);
-                }
-            }
-            true
-        } else {
-            false
+        let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
+            return false;
+        };
+        let Some(addr) = address else {
+            return false;
+        };
+        let addr_is_loopback = addr
+            .ip()
+            .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
+        let node_has_non_loopback = self.nodes[pos]
+            .addresses
+            .iter()
+            .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
+        if addr_is_loopback && node_has_non_loopback {
+            return false;
         }
+        self.nodes[pos].merge_typed_address_upgrade_only(addr.clone(), addr_type)
     }
 
     /// Fast path: if `node_id` is in this bucket AND the optional address
@@ -791,6 +794,9 @@ impl KademliaRoutingTable {
     /// on the same address, and does NOT bump `last_seen` or reorder the
     /// bucket — see [`KBucket::merge_typed_address_upgrade_only`] for the
     /// rationale (gossip ingestion must not refresh peer liveness).
+    ///
+    /// Returns `true` when the merge changed the peer's address record;
+    /// `false` for missing peer, no-op merge, or loopback-skip.
     fn merge_typed_address_upgrade_only(
         &mut self,
         node_id: &PeerId,
@@ -1415,8 +1421,12 @@ impl DhtCoreEngine {
     /// peers we cannot authenticate with ourselves (e.g., older
     /// protocol versions whose identity exchange always times out).
     ///
-    /// Returns `true` when the peer is in the routing table (regardless
-    /// of whether the merge changed state); `false` otherwise.
+    /// Returns `true` when the merge changed the peer's address record
+    /// (a new address was appended, or an existing tag was promoted to
+    /// a higher-priority tier); `false` for missing peer, no-op merge,
+    /// or loopback-skip — see
+    /// [`KBucket::merge_typed_address_upgrade_only`] for the full
+    /// classification.
     pub async fn merge_typed_address_upgrade_only(
         &self,
         node_id: &PeerId,
@@ -2257,13 +2267,13 @@ mod tests {
     // peer's addresses without claiming the peer is alive from our point of
     // view. Liveness (`last_seen`) and bucket-MRU position must be preserved
     // — see the rationale on `KBucket::merge_typed_address_upgrade_only`.
+    //
+    // The robust pattern here is capture-before-merge / compare-after-merge:
+    // any leaked `store_now()` would write a strictly later `Instant` than
+    // the captured snapshot (the merge does a Vec scan, mutex unlock, and
+    // assertion code in between), so exact-equality detects refresh leaks
+    // without depending on system uptime or clock granularity.
     // -----------------------------------------------------------------------
-
-    /// Offset used when pinning `last_seen` to a past instant in
-    /// gossip-merge tests. Chosen well above [`LIVE_THRESHOLD`] (15 min)
-    /// so that a leaked `last_seen` refresh would be unmistakable
-    /// regardless of test scheduling jitter.
-    const GOSSIP_LAST_SEEN_PIN_OFFSET: Duration = Duration::from_secs(3600);
 
     #[test]
     fn gossip_merge_does_not_bump_last_seen() {
@@ -2273,26 +2283,18 @@ mod tests {
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
 
-        // Pin `last_seen` to a known past instant so we can detect any
-        // refresh. The offset (see `GOSSIP_LAST_SEEN_PIN_OFFSET`) far
-        // exceeds LIVE_THRESHOLD, so a leaked refresh would be obvious.
-        let pinned = Instant::now()
-            .checked_sub(GOSSIP_LAST_SEEN_PIN_OFFSET)
-            .expect("monotonic clock supports the configured pin offset");
-        bucket.nodes[0].last_seen.store(pinned);
+        let before = bucket.nodes[0].last_seen.load();
 
-        // Gossip ingestion: another peer reports a new Relay address for
-        // peer 1. Should merge the address but leave liveness alone.
         let gossiped: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
-        let found = bucket.merge_typed_address_upgrade_only(
+        let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
             Some(&gossiped),
             AddressType::Relay,
         );
-        assert!(found, "peer 1 should be in the bucket");
+        assert!(changed, "merge of new address should report a state change");
         assert_eq!(
             bucket.nodes[0].last_seen.load(),
-            pinned,
+            before,
             "gossip ingestion must not refresh last_seen"
         );
     }
@@ -2342,14 +2344,15 @@ mod tests {
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
 
-        // A previously unseen Direct address from gossip. Should be added.
+        // A previously unseen Direct address from gossip. Should be added
+        // and the merge should report a state change.
         let gossiped: MultiAddr = "/ip4/7.7.7.7/udp/9000/quic".parse().unwrap();
-        let found = bucket.merge_typed_address_upgrade_only(
+        let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
             Some(&gossiped),
             AddressType::Direct,
         );
-        assert!(found);
+        assert!(changed);
         assert!(
             bucket.nodes[0].addresses.iter().any(|a| a == &gossiped),
             "gossip ingestion must merge a previously-unseen address"
@@ -2365,14 +2368,43 @@ mod tests {
             .unwrap();
 
         let gossiped: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
-        let found = bucket.merge_typed_address_upgrade_only(
+        let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([42u8; 32]),
             Some(&gossiped),
             AddressType::Direct,
         );
         assert!(
-            !found,
+            !changed,
             "missing peer should return false (gossip never inserts new identities)"
+        );
+    }
+
+    #[test]
+    fn gossip_merge_returns_false_when_already_known_with_same_tag() {
+        // The return value signals "did the merge change anything",
+        // not "is the peer in the bucket". When gossip reports an
+        // already-known address with the same tag classification, the
+        // merge is a no-op and must report `false` so a future caller
+        // can gate downstream work (logging, event emission, etc.) on
+        // genuine record changes.
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let addr_str = "/ip4/1.1.1.1/udp/9000/quic";
+        bucket.add_node(make_node(1, addr_str)).unwrap();
+
+        // Promote the existing address to `Direct` so the redundant
+        // gossip below cannot upgrade it from the default `Unverified`.
+        let known: MultiAddr = addr_str.parse().unwrap();
+        bucket.nodes[0].merge_typed_address_upgrade_only(known.clone(), AddressType::Direct);
+
+        let changed = bucket.merge_typed_address_upgrade_only(
+            &PeerId::from_bytes([1u8; 32]),
+            Some(&known),
+            AddressType::Direct,
+        );
+        assert!(
+            !changed,
+            "no-op merge (same address, same tag) must report false"
         );
     }
 
@@ -2384,24 +2416,17 @@ mod tests {
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
 
-        // Pin `last_refreshed` to a known past instant. The same offset
-        // used for last_seen tests is well above STALE_BUCKET_THRESHOLD
-        // (1 hour), so a leak would unmistakably appear as a fresh
-        // timestamp.
-        let pinned = Instant::now()
-            .checked_sub(GOSSIP_LAST_SEEN_PIN_OFFSET)
-            .expect("monotonic clock supports the configured pin offset");
-        bucket.last_refreshed = pinned;
+        let before = bucket.last_refreshed;
 
         let gossiped: MultiAddr = "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap();
-        let found = bucket.merge_typed_address_upgrade_only(
+        let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
             Some(&gossiped),
             AddressType::Relay,
         );
-        assert!(found);
+        assert!(changed);
         assert_eq!(
-            bucket.last_refreshed, pinned,
+            bucket.last_refreshed, before,
             "gossip ingestion is not bucket-level discovery — last_refreshed must not advance"
         );
     }
