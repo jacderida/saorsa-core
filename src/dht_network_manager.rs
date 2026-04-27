@@ -1421,7 +1421,7 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<Vec<DHTNode>> {
-        const MAX_ITERATIONS: usize = 10;
+        const MAX_ITERATIONS: usize = 12;
         const ALPHA: usize = 3; // Parallel queries per iteration
 
         debug!(
