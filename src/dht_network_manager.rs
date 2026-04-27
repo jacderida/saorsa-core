@@ -134,6 +134,26 @@ const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 /// stale Unverified/Direct entries published by NATed peers.
 const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Duration an identity-exchange failure is remembered before the peer
+/// may be re-dialed.
+///
+/// Distinct from [`DIAL_FAILURE_CACHE_TTL`]: that cache is keyed by
+/// [`SocketAddr`] (per-address dial failure). This one is keyed by
+/// [`PeerId`] — a peer whose QUIC handshake completes but whose
+/// app-level identity exchange repeatedly times out is poisoning every
+/// iterative DHT lookup that names it as a candidate, regardless of
+/// which of its advertised addresses we tried.
+///
+/// 5 minutes is a deliberate compromise:
+///
+/// * Long enough to suppress the in-session retry storm we observed in
+///   the field (one peer dialed 6× in ~80 s during a single download,
+///   each attempt eating the full 5 s identity-exchange timeout).
+/// * Short enough that a peer that is genuinely recovering — e.g. an
+///   operator restarting the binary onto a fixed protocol version —
+///   re-enters our dial set within a coffee break, not a workday.
+const IDENTITY_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// DHT node representation for network operations.
 ///
 /// The `addresses` field stores one or more typed [`MultiAddr`] values.
@@ -425,6 +445,13 @@ pub struct DhtNetworkManager {
     /// the last [`DIAL_FAILURE_CACHE_TTL`] count toward the two-address
     /// dial cap without actually being re-dialed.
     dial_failure_cache: Arc<DialFailureCache>,
+    /// TTL-indexed cache of peer IDs whose app-level identity exchange
+    /// recently failed. Consulted by [`Self::ensure_peer_channel`] to
+    /// short-circuit the dial cascade for known-broken peers before
+    /// paying the [`IDENTITY_EXCHANGE_TIMEOUT`] (5 s) again — the
+    /// in-session counterpart to the `last_seen`/revalidation gating
+    /// that closes the cross-session eviction loop.
+    identity_failure_cache: Arc<IdentityFailureCache>,
     /// In-flight dial+identity-exchange coordinator keyed by app-level
     /// `PeerId`. Collapses concurrent [`Self::ensure_peer_channel`]
     /// calls for the same peer onto a single dial so the identity
@@ -547,6 +574,68 @@ impl DialFailureCache {
     /// the address is absent (typical success path).
     fn clear(&self, addr: &SocketAddr) {
         self.entries.remove(addr);
+    }
+}
+
+/// TTL-indexed cache of [`PeerId`]s whose identity exchange recently
+/// failed.
+///
+/// Distinct from [`DialFailureCache`] which only suppresses re-dials of
+/// individual unreachable [`SocketAddr`]s. This cache fires before the
+/// dial coordinator in [`DhtNetworkManager::ensure_peer_channel`] and
+/// short-circuits the entire `peer → address-list → dial → 5 s
+/// wait_for_peer_identity` cascade when we already learned that
+/// app-level identity exchange with this peer is currently broken
+/// (e.g., older-protocol nodes whose QUIC handshake completes but whose
+/// identity announce never arrives).
+///
+/// Backed by [`DashMap`] for sharded, lock-free-in-the-common-case
+/// access — every iterative DHT lookup invokes this on the hot path,
+/// so a single mutex would bottleneck. Lookups perform lazy expiry:
+/// stale entries are removed on access rather than by a sweeper, and
+/// the TTL ([`IDENTITY_FAILURE_CACHE_TTL`]) is short enough that the
+/// hot-set stays bounded.
+#[derive(Debug, Default)]
+struct IdentityFailureCache {
+    entries: DashMap<PeerId, Instant>,
+}
+
+impl IdentityFailureCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true if `peer_id` failed identity exchange within the
+    /// last [`IDENTITY_FAILURE_CACHE_TTL`]. Expired entries are removed
+    /// as a side effect of the lookup so the cache stays bounded
+    /// without a dedicated sweeper.
+    ///
+    /// The `DashMap::get` read guard is released via a scoped copy of
+    /// the stored `Instant` before any `remove` call so the shard's
+    /// read lock never overlaps with the write lock.
+    fn is_failed(&self, peer_id: &PeerId) -> bool {
+        let recorded_at = {
+            let Some(entry) = self.entries.get(peer_id) else {
+                return false;
+            };
+            *entry.value()
+        };
+        if recorded_at.elapsed() < IDENTITY_FAILURE_CACHE_TTL {
+            return true;
+        }
+        self.entries.remove(peer_id);
+        false
+    }
+
+    fn record_failure(&self, peer_id: PeerId) {
+        self.entries.insert(peer_id, Instant::now());
+    }
+
+    /// Clear the cached failure for `peer_id` after a successful
+    /// identity exchange so the next dial is not suppressed by a stale
+    /// entry. Cheap when the peer is absent (typical success path).
+    fn clear(&self, peer_id: &PeerId) {
+        self.entries.remove(peer_id);
     }
 }
 
@@ -836,6 +925,7 @@ impl DhtNetworkManager {
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
             dial_failure_cache: Arc::new(DialFailureCache::new()),
+            identity_failure_cache: Arc::new(IdentityFailureCache::new()),
             pending_peer_dials: Arc::new(DashMap::new()),
         })
     }
@@ -2037,6 +2127,13 @@ impl DhtNetworkManager {
         // prevents the contains/insert TOCTOU that would otherwise
         // let two tasks both see "no existing dial" and start their
         // own cascades in parallel.
+        //
+        // The identity-failure cache check lives **inside** the Vacant
+        // branch — not before the entry call — so that subscribers
+        // to an in-flight dial (Occupied branch) still receive its
+        // genuine outcome rather than being short-circuited by a
+        // stale cache entry from a prior attempt that the in-flight
+        // dial may already be on track to invalidate.
         let tx = match self.pending_peer_dials.entry(*peer_id) {
             DashEntry::Occupied(entry) => {
                 let mut rx = entry.get().subscribe();
@@ -2057,6 +2154,19 @@ impl DhtNetworkManager {
                 };
             }
             DashEntry::Vacant(entry) => {
+                if self.identity_failure_cache.is_failed(peer_id) {
+                    debug!(
+                        "[STEP 1b] {} -> {}: suppressed by identity-failure cache (last failure within {:?})",
+                        local_hex, peer_hex, IDENTITY_FAILURE_CACHE_TTL
+                    );
+                    return Err(P2PError::Network(NetworkError::ProtocolError(
+                        format!(
+                            "identity exchange with {} suppressed (recent failure)",
+                            peer_hex
+                        )
+                        .into(),
+                    )));
+                }
                 let (tx, _) = broadcast::channel(PENDING_DIAL_BROADCAST_CAPACITY);
                 entry.insert(tx.clone());
                 tx
@@ -2166,6 +2276,11 @@ impl DhtNetworkManager {
                     peer_hex,
                     authenticated.to_hex()
                 );
+                // Drop any cached identity-failure entry: the peer is
+                // currently healthy and a stale entry would suppress
+                // legitimate dials from other call sites that race in
+                // before TTL expiry.
+                self.identity_failure_cache.clear(peer_id);
                 PendingDialOutcome::Connected
             }
             Ok(authenticated) => {
@@ -2187,6 +2302,13 @@ impl DhtNetworkManager {
                 );
                 self.transport.disconnect_channel(&channel_id).await;
                 self.record_peer_failure(peer_id).await;
+                // Suppress further dials to this peer for
+                // [`IDENTITY_FAILURE_CACHE_TTL`] so that the next
+                // iterative DHT lookup (or chunk-fetch close-group
+                // walk) doesn't pay the same 5 s timeout against the
+                // same broken peer the next time it shows up as a
+                // candidate in someone else's FIND_NODE response.
+                self.identity_failure_cache.record_failure(*peer_id);
                 PendingDialOutcome::IdentityFailed { err: e.to_string() }
             }
         }
@@ -4293,6 +4415,73 @@ mod tests {
         cache.record_failure(a);
         assert!(cache.is_failed(&a));
         assert!(!cache.is_failed(&b), "different SocketAddr must not hit");
+    }
+
+    /// Helper: deterministic [`PeerId`] from a single byte. Mirrors
+    /// `make_node` in `core_engine` tests but without addresses since
+    /// the identity-failure cache only keys on peer ID.
+    fn pid(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn identity_failure_cache_records_and_checks() {
+        let cache = IdentityFailureCache::new();
+        let peer = pid(7);
+        assert!(!cache.is_failed(&peer), "empty cache never reports failed");
+        cache.record_failure(peer);
+        assert!(
+            cache.is_failed(&peer),
+            "recorded peer must be treated as failed within the TTL"
+        );
+    }
+
+    #[test]
+    fn identity_failure_cache_clear_removes_entry() {
+        let cache = IdentityFailureCache::new();
+        let peer = pid(7);
+        cache.record_failure(peer);
+        cache.clear(&peer);
+        assert!(
+            !cache.is_failed(&peer),
+            "clear() must drop the entry so a successful re-handshake is not suppressed"
+        );
+    }
+
+    #[test]
+    fn identity_failure_cache_expires_stale_entries_on_read() {
+        // Insert an entry with a recorded_at timestamp older than the
+        // TTL and verify is_failed() returns false and removes the
+        // entry. Mirrors the dial-failure cache test.
+        let cache = IdentityFailureCache::new();
+        let peer = pid(7);
+        let Some(stale) =
+            Instant::now().checked_sub(IDENTITY_FAILURE_CACHE_TTL + Duration::from_secs(1))
+        else {
+            eprintln!(
+                "skipping: runner Instant is fresher than IDENTITY_FAILURE_CACHE_TTL ({IDENTITY_FAILURE_CACHE_TTL:?})"
+            );
+            return;
+        };
+        cache.entries.insert(peer, stale);
+        assert!(
+            !cache.is_failed(&peer),
+            "stale entry must not suppress a fresh dial"
+        );
+        assert!(
+            cache.entries.get(&peer).is_none(),
+            "stale entry must be evicted lazily on read"
+        );
+    }
+
+    #[test]
+    fn identity_failure_cache_independent_keys_do_not_collide() {
+        let cache = IdentityFailureCache::new();
+        let a = pid(7);
+        let b = pid(8);
+        cache.record_failure(a);
+        assert!(cache.is_failed(&a));
+        assert!(!cache.is_failed(&b), "different PeerId must not hit");
     }
 
     #[test]
