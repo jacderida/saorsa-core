@@ -1421,7 +1421,7 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<Vec<DHTNode>> {
-        const MAX_ITERATIONS: usize = 20;
+        const MAX_ITERATIONS: usize = 10;
         const ALPHA: usize = 3; // Parallel queries per iteration
 
         debug!(
@@ -3681,11 +3681,11 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// proceed. Once the first response is in, we have new candidates for the
 /// next iteration and can safely cap the wait on the stragglers.
 ///
-/// Sized at 5s: a peer with an already-open channel replies in well under
+/// Sized at 2s: a peer with an already-open channel replies in well under
 /// a second, so this leaves ample slack for legitimate stragglers while
 /// letting us abandon dial cascades that are almost certainly going to
 /// fail anyway.
-const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
+const ITERATION_GRACE_TIMEOUT_SECS: u64 = 2;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
