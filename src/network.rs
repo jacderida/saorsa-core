@@ -21,7 +21,9 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
-use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
+use crate::dht_network_manager::{
+    DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT,
+};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 use crate::reachability::spawn_acquisition_driver;
 
@@ -138,17 +140,18 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
-/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. 5 s covers loopback (<100 ms
-/// in practice) and reasonable WAN paths (~2 s with one handshake retry),
-/// while keeping dead-channel detection fast enough that bootstrap
-/// convergence does not serialise on a single stuck peer. Kept in lockstep
-/// with `IDENTITY_EXCHANGE_TIMEOUT` in `dht_network_manager.rs`, which
-/// covers the same exchange for every subsequent dial.
+/// Tighter than the post-bootstrap budget (`IDENTITY_EXCHANGE_TIMEOUT`,
+/// 5 s) on purpose: bootstrap candidates are unverified and a stuck one
+/// must not be allowed to head-of-line block convergence. 3 s covers
+/// loopback (<100 ms) and direct WAN paths (~1–2 s with one handshake
+/// retry); a relay-tunnelled path with congested ML-DSA verification
+/// can exceed this and will fail identity exchange, but the bootstrap
+/// manager simply moves on to other candidates rather than retrying the
+/// same one.
 ///
 /// `wait_for_peer_identity` short-circuits on channel close, so most dead
 /// channels surface in microseconds regardless of this budget.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 3;
 
 /// Maximum number of bootstrap peers dialed concurrently in Phase B.
 ///
@@ -735,9 +738,6 @@ pub(crate) struct PendingRequest {
     /// The peer we expect the response from (for origin validation).
     pub(crate) expected_peer: PeerId,
 }
-
-/// Maximum time to wait for identity exchange during a reconnect-on-send dial.
-const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Short grace period after closing stale QUIC connections before re-dialing.
 ///
@@ -1580,7 +1580,7 @@ impl P2PNode {
         let channel_id = self.transport.connect_peer(&address).await?;
         let authenticated = match self
             .transport
-            .wait_for_peer_identity(&channel_id, RECONNECT_IDENTITY_TIMEOUT)
+            .wait_for_peer_identity(&channel_id, IDENTITY_EXCHANGE_TIMEOUT)
             .await
         {
             Ok(peer) => peer,
