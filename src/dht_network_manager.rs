@@ -114,9 +114,14 @@ const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// don't pay the full 6 s. The budget is the worst-case ceiling, not
 /// the typical path.
 const STALE_REVALIDATION_PING_RTT: Duration = Duration::from_secs(1);
-const STALE_REVALIDATION_BUDGET: Duration = Duration::from_secs(
-    IDENTITY_EXCHANGE_TIMEOUT.as_secs() + STALE_REVALIDATION_PING_RTT.as_secs(),
-);
+// Use `saturating_add` rather than re-deriving from `as_secs()`: the latter
+// truncates any sub-second component, so a future tweak that adds millis or
+// nanos to either input would silently shrink the budget below the documented
+// "identity exchange + ping RTT" invariant. `saturating_add` is `const fn`,
+// preserves every nanosecond, and only saturates at `Duration::MAX` (~584 Gyr)
+// — well outside any realistic input range here.
+const STALE_REVALIDATION_BUDGET: Duration =
+    IDENTITY_EXCHANGE_TIMEOUT.saturating_add(STALE_REVALIDATION_PING_RTT);
 
 /// Buffer size for the broadcast channel that
 /// [`DhtNetworkManager::ensure_peer_channel`] uses to fan a single
