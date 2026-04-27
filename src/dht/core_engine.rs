@@ -553,16 +553,13 @@ impl KBucket {
     fn merge_typed_address_upgrade_only(
         &mut self,
         node_id: &PeerId,
-        address: Option<&MultiAddr>,
+        address: &MultiAddr,
         addr_type: AddressType,
     ) -> bool {
         let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
             return false;
         };
-        let Some(addr) = address else {
-            return false;
-        };
-        let addr_is_loopback = addr
+        let addr_is_loopback = address
             .ip()
             .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
         let node_has_non_loopback = self.nodes[pos]
@@ -572,7 +569,7 @@ impl KBucket {
         if addr_is_loopback && node_has_non_loopback {
             return false;
         }
-        self.nodes[pos].merge_typed_address_upgrade_only(addr.clone(), addr_type)
+        self.nodes[pos].merge_typed_address_upgrade_only(address.clone(), addr_type)
     }
 
     /// Fast path: if `node_id` is in this bucket AND the optional address
@@ -800,7 +797,7 @@ impl KademliaRoutingTable {
     fn merge_typed_address_upgrade_only(
         &mut self,
         node_id: &PeerId,
-        address: Option<&MultiAddr>,
+        address: &MultiAddr,
         addr_type: AddressType,
     ) -> bool {
         match self.get_bucket_index(node_id) {
@@ -1430,7 +1427,7 @@ impl DhtCoreEngine {
     pub async fn merge_typed_address_upgrade_only(
         &self,
         node_id: &PeerId,
-        address: Option<&MultiAddr>,
+        address: &MultiAddr,
         addr_type: AddressType,
     ) -> bool {
         // No fast path: the read-locked fast path is only valid when the
@@ -2288,7 +2285,7 @@ mod tests {
         let gossiped: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
         let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
-            Some(&gossiped),
+            &gossiped,
             AddressType::Relay,
         );
         assert!(changed, "merge of new address should report a state change");
@@ -2320,7 +2317,7 @@ mod tests {
         let gossiped: MultiAddr = "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap();
         bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
-            Some(&gossiped),
+            &gossiped,
             AddressType::Relay,
         );
 
@@ -2349,7 +2346,7 @@ mod tests {
         let gossiped: MultiAddr = "/ip4/7.7.7.7/udp/9000/quic".parse().unwrap();
         let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
-            Some(&gossiped),
+            &gossiped,
             AddressType::Direct,
         );
         assert!(changed);
@@ -2370,7 +2367,7 @@ mod tests {
         let gossiped: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
         let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([42u8; 32]),
-            Some(&gossiped),
+            &gossiped,
             AddressType::Direct,
         );
         assert!(
@@ -2399,7 +2396,7 @@ mod tests {
 
         let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
-            Some(&known),
+            &known,
             AddressType::Direct,
         );
         assert!(
@@ -2421,7 +2418,7 @@ mod tests {
         let gossiped: MultiAddr = "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap();
         let changed = bucket.merge_typed_address_upgrade_only(
             &PeerId::from_bytes([1u8; 32]),
-            Some(&gossiped),
+            &gossiped,
             AddressType::Relay,
         );
         assert!(changed);

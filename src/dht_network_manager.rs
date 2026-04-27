@@ -3558,7 +3558,7 @@ impl DhtNetworkManager {
     pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
         let dht = self.dht.read().await;
         for (addr, ty) in node.typed_addresses() {
-            dht.merge_typed_address_upgrade_only(&node.peer_id, Some(&addr), ty)
+            dht.merge_typed_address_upgrade_only(&node.peer_id, &addr, ty)
                 .await;
         }
     }
