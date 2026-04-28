@@ -2506,11 +2506,16 @@ impl DhtNetworkManager {
         }
 
         // Send message via network layer, reconnecting on demand if needed.
-        let peer_hex = peer_id.to_hex();
-        let local_hex = self.config.peer_id.to_hex();
-        info!(
+        // Hex-encode peer IDs lazily inside each tracing macro: tracing only
+        // evaluates the macro's arguments when the level is enabled, so we
+        // pay the allocation cost only on warn (rare) or when DEBUG logging
+        // is explicitly turned on.
+        debug!(
             "[STEP 1] {} -> {}: Sending {:?} request (msg_id: {})",
-            local_hex, peer_hex, message.payload, message_id
+            self.config.peer_id.to_hex(),
+            peer_id.to_hex(),
+            message.payload,
+            message_id
         );
 
         // Ensure we have an identity-authenticated channel to the
@@ -2557,9 +2562,10 @@ impl DhtNetworkManager {
             .await
         {
             Ok(_) => {
-                info!(
+                debug!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
-                    local_hex, peer_hex
+                    self.config.peer_id.to_hex(),
+                    peer_id.to_hex()
                 );
 
                 // Wait for response via oneshot channel with timeout
@@ -2567,15 +2573,17 @@ impl DhtNetworkManager {
                     .wait_for_response(&message_id, response_rx, peer_id)
                     .await;
                 match &result {
-                    Ok(r) => info!(
+                    Ok(r) => debug!(
                         "[STEP 6] {} <- {}: Got response: {:?}",
-                        local_hex,
-                        peer_hex,
+                        self.config.peer_id.to_hex(),
+                        peer_id.to_hex(),
                         std::mem::discriminant(r)
                     ),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
-                        local_hex, peer_hex, e
+                        self.config.peer_id.to_hex(),
+                        peer_id.to_hex(),
+                        e
                     ),
                 }
                 result
@@ -2583,7 +2591,8 @@ impl DhtNetworkManager {
             Err(e) => {
                 warn!(
                     "[STEP 1 FAILED] Failed to send DHT request to {}: {}",
-                    peer_hex, e
+                    peer_id.to_hex(),
+                    e
                 );
                 Err(e)
             }

@@ -1176,7 +1176,7 @@ impl TransportHandle {
         // shard, so two concurrent senders will not produce duplicate
         // PeerInfo entries.
         self.peers.entry(channel_id.to_string()).or_insert_with(|| {
-            info!(
+            debug!(
                 "send_on_channel: registering new channel {} on the fly",
                 channel_id
             );
@@ -1214,7 +1214,7 @@ impl TransportHandle {
 
         let raw_data_len = data.len();
         let message_data = self.create_protocol_message(protocol, data)?;
-        info!(
+        debug!(
             "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
             message_data.len(),
             channel_id,
@@ -1242,7 +1242,7 @@ impl TransportHandle {
             });
 
         if result.is_ok() {
-            info!(
+            debug!(
                 "Successfully sent {} bytes to channel {}",
                 message_data.len(),
                 channel_id
