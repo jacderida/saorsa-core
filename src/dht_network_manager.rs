@@ -83,8 +83,45 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 /// timeout.
 const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum time to wait for a stale peer's ping response during admission contention.
-const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+/// Wall-clock budget for a single stale-peer revalidation probe.
+///
+/// The probe is `ping_peer`, which will dial and run identity exchange
+/// from cold when no authenticated channel is currently open — the
+/// common case for a peer that has been silent for `LIVE_THRESHOLD`
+/// (15 min) and may have lost its transport channel to a NAT rebind,
+/// idle timeout, or transient network blip. We must therefore budget
+/// for the full identity-exchange handshake before the ping reply is
+/// even possible:
+///
+/// ```text
+///   IDENTITY_EXCHANGE_TIMEOUT  (up to 5 s)   — fresh handshake from cold
+/// + STALE_REVALIDATION_PING_RTT (1 s)        — ping round-trip over the
+///                                              freshly-authenticated channel
+/// = STALE_REVALIDATION_BUDGET   (6 s)
+/// ```
+///
+/// Capping at 1 s — the original budget — silently false-evicted
+/// healthy peers whose channel had to be re-established, because the
+/// outer timeout fired mid-handshake. The strict identity-confirmation
+/// check in [`DhtNetworkManager::ping_with_identity_confirmation`]
+/// makes that especially harmful: even if the wire ping somehow
+/// succeeded, `is_known_app_peer_id` would still be `false` until
+/// identity exchange completed.
+///
+/// `wait_for_peer_identity` short-circuits on transport-level channel
+/// close, so genuinely-broken peers (the case that motivated the
+/// strict check) usually surface their failure in microseconds and
+/// don't pay the full 6 s. The budget is the worst-case ceiling, not
+/// the typical path.
+const STALE_REVALIDATION_PING_RTT: Duration = Duration::from_secs(1);
+// Use `saturating_add` rather than re-deriving from `as_secs()`: the latter
+// truncates any sub-second component, so a future tweak that adds millis or
+// nanos to either input would silently shrink the budget below the documented
+// "identity exchange + ping RTT" invariant. `saturating_add` is `const fn`,
+// preserves every nanosecond, and only saturates at `Duration::MAX` (~584 Gyr)
+// — well outside any realistic input range here.
+const STALE_REVALIDATION_BUDGET: Duration =
+    IDENTITY_EXCHANGE_TIMEOUT.saturating_add(STALE_REVALIDATION_PING_RTT);
 
 /// Buffer size for the broadcast channel that
 /// [`DhtNetworkManager::ensure_peer_channel`] uses to fan a single
@@ -3287,17 +3324,14 @@ impl DhtNetworkManager {
 
         // --- Ping stale peers concurrently with DHT write lock released ---
         // Process in chunks to bound concurrent pings while still parallelising
-        // within each chunk (total wall time: chunks * STALE_REVALIDATION_TIMEOUT
-        // instead of stale_peers.len() * STALE_REVALIDATION_TIMEOUT).
+        // within each chunk (worst-case wall time: chunks * STALE_REVALIDATION_BUDGET
+        // instead of stale_peers.len() * STALE_REVALIDATION_BUDGET).
         let mut evicted_peers = Vec::new();
         let mut retained_peers = Vec::new();
 
         for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
             let results = futures::future::join_all(chunk.iter().map(|(peer_id, _)| async {
-                let responded =
-                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
-                        .await
-                        .is_ok_and(|r| r.is_ok());
+                let responded = self.ping_with_identity_confirmation(peer_id).await;
                 (*peer_id, responded)
             }))
             .await;
@@ -3351,6 +3385,45 @@ impl DhtNetworkManager {
             .context("ping failed")
     }
 
+    /// Liveness probe used by the stale-peer eviction paths.
+    ///
+    /// A peer counts as alive only when **both** conditions hold:
+    /// 1. [`Self::ping_peer`] completes successfully within
+    ///    [`STALE_REVALIDATION_BUDGET`]. The budget covers a fresh
+    ///    identity exchange ([`IDENTITY_EXCHANGE_TIMEOUT`]) plus the
+    ///    ping round-trip on the resulting channel — see the constant's
+    ///    docs for the breakdown. A stale peer's transport channel is
+    ///    routinely gone (NAT rebind, idle timeout) by the time we
+    ///    revalidate, and a 1 s budget would cancel the dial mid-handshake
+    ///    and false-evict an otherwise-healthy peer.
+    /// 2. The peer is in the authenticated app-level set
+    ///    ([`TransportHandle::is_known_app_peer_id`]) at the moment of the
+    ///    check.
+    ///
+    /// Condition (1) catches dead-on-the-wire peers (no QUIC reachability,
+    /// or no DHT response). Condition (2) is the load-bearing identity
+    /// gate: it rejects peers that respond at the transport layer but
+    /// have never completed (or have lost) the saorsa-core identity
+    /// exchange — the exact failure mode of older-protocol nodes whose
+    /// QUIC handshake succeeds but whose identity exchange always times
+    /// out. Without (2), such peers could be retained because some
+    /// other path opened a half-authenticated transport channel.
+    ///
+    /// Used by [`Self::revalidate_and_retry_admission`] and
+    /// [`Self::revalidate_stale_k_closest`] in place of a bare
+    /// `ping_peer().is_ok()` so the routing-table invariant ("every
+    /// retained peer is currently identity-confirmed") is enforced
+    /// exactly where eviction decisions are made.
+    async fn ping_with_identity_confirmation(&self, peer_id: &PeerId) -> bool {
+        let ping_ok = tokio::time::timeout(STALE_REVALIDATION_BUDGET, self.ping_peer(peer_id))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if !ping_ok {
+            return false;
+        }
+        self.transport.is_known_app_peer_id(peer_id).await
+    }
+
     /// Revalidate stale K-closest peers by pinging them and evicting non-responders.
     ///
     /// Piggybacked on the periodic self-lookup to avoid a dedicated background
@@ -3374,10 +3447,7 @@ impl DhtNetworkManager {
 
         for chunk in stale_peers.chunks(MAX_CONCURRENT_REVALIDATION_PINGS) {
             let results = futures::future::join_all(chunk.iter().map(|peer_id| async {
-                let responded =
-                    tokio::time::timeout(STALE_REVALIDATION_TIMEOUT, self.ping_peer(peer_id))
-                        .await
-                        .is_ok_and(|r| r.is_ok());
+                let responded = self.ping_with_identity_confirmation(peer_id).await;
                 (*peer_id, responded)
             }))
             .await;
@@ -3480,10 +3550,20 @@ impl DhtNetworkManager {
     /// fan-out — without gossip ingestion it stayed starved of `Direct`
     /// addresses and failed relay acquisition with "no direct-addressable
     /// candidates in routing table" despite having 17 peers in its RT.
+    ///
+    /// Crucially, this path does NOT refresh `last_seen` for the subject
+    /// peer: we ingest *address* information from gossip, but liveness
+    /// claims from a third party are not evidence the subject is alive
+    /// from our point of view. Letting gossip refresh `last_seen` would
+    /// indefinitely defer
+    /// [`crate::dht::core_engine::DhtCoreEngine::stale_k_closest`]
+    /// eviction for peers we cannot authenticate with (e.g., old-protocol
+    /// nodes whose identity exchange always times out) as long as some
+    /// authenticated neighbour keeps mentioning them.
     pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
         let dht = self.dht.read().await;
         for (addr, ty) in node.typed_addresses() {
-            dht.touch_node_typed_upgrade_only(&node.peer_id, Some(&addr), ty)
+            dht.merge_typed_address_upgrade_only(&node.peer_id, &addr, ty)
                 .await;
         }
     }
@@ -3711,6 +3791,20 @@ mod tests {
     fn is_dialable_accepts_quic_with_routable_ip() {
         let quic = MultiAddr::quic("203.0.113.7:9000".parse().unwrap());
         assert!(DhtNetworkManager::is_dialable(&quic));
+    }
+
+    #[test]
+    fn stale_revalidation_budget_covers_identity_exchange_plus_ping_rtt() {
+        // Cold-channel revalidation must survive a fresh identity exchange
+        // (≤ IDENTITY_EXCHANGE_TIMEOUT) followed by a ping round-trip on
+        // the resulting authenticated channel. Capping below this is the
+        // exact regression the constant was introduced to close — guard
+        // the arithmetic so a future tweak to either input is mirrored
+        // here intentionally.
+        assert_eq!(
+            STALE_REVALIDATION_BUDGET,
+            IDENTITY_EXCHANGE_TIMEOUT + STALE_REVALIDATION_PING_RTT,
+        );
     }
 
     #[test]
