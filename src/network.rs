@@ -21,7 +21,9 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
-use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
+use crate::dht_network_manager::{
+    DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT,
+};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 use crate::reachability::spawn_acquisition_driver;
 
@@ -138,17 +140,18 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
-/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. 5 s covers loopback (<100 ms
-/// in practice) and reasonable WAN paths (~2 s with one handshake retry),
-/// while keeping dead-channel detection fast enough that bootstrap
-/// convergence does not serialise on a single stuck peer. Kept in lockstep
-/// with `IDENTITY_EXCHANGE_TIMEOUT` in `dht_network_manager.rs`, which
-/// covers the same exchange for every subsequent dial.
+/// Tighter than the post-bootstrap budget (`IDENTITY_EXCHANGE_TIMEOUT`,
+/// 5 s) on purpose: bootstrap candidates are unverified and a stuck one
+/// must not be allowed to head-of-line block convergence. 3 s covers
+/// loopback (<100 ms) and direct WAN paths (~1–2 s with one handshake
+/// retry); a relay-tunnelled path with congested ML-DSA verification
+/// can exceed this and will fail identity exchange, but the bootstrap
+/// manager simply moves on to other candidates rather than retrying the
+/// same one.
 ///
 /// `wait_for_peer_identity` short-circuits on channel close, so most dead
 /// channels surface in microseconds regardless of this budget.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 3;
 
 /// Maximum number of bootstrap peers dialed concurrently in Phase B.
 ///
@@ -157,6 +160,16 @@ const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 10;
 /// low on purpose: each dial runs a full ML-KEM key exchange and ML-DSA
 /// verification, and a cold-start node has no spare compute budget.
 const MAX_CONCURRENT_BOOTSTRAP_DIALS: usize = 4;
+
+/// Number of successful bootstrap connections after which a client-mode
+/// node stops dialing further candidates.
+///
+/// Clients only need enough peers to route their own lookups (α=3 parallel
+/// queries → 6 gives ~2× redundancy) and don't serve the DHT, so a fully
+/// populated close-group buys them nothing. Stopping early cuts cold-start
+/// latency by skipping the tail of slow / dead candidates. Nodes always
+/// dial every candidate so their routing table converges fully.
+const CLIENT_BOOTSTRAP_TARGET: usize = 6;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
@@ -735,9 +748,6 @@ pub(crate) struct PendingRequest {
     /// The peer we expect the response from (for origin validation).
     pub(crate) expected_peer: PeerId,
 }
-
-/// Maximum time to wait for identity exchange during a reconnect-on-send dial.
-const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Short grace period after closing stale QUIC connections before re-dialing.
 ///
@@ -1580,7 +1590,7 @@ impl P2PNode {
         let channel_id = self.transport.connect_peer(&address).await?;
         let authenticated = match self
             .transport
-            .wait_for_peer_identity(&channel_id, RECONNECT_IDENTITY_TIMEOUT)
+            .wait_for_peer_identity(&channel_id, IDENTITY_EXCHANGE_TIMEOUT)
             .await
         {
             Ok(peer) => peer,
@@ -2078,6 +2088,7 @@ impl P2PNode {
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
         // Phase A: serial close-group dials to preserve trust-priority ordering.
+        let client_mode = matches!(self.config.mode, NodeMode::Client);
         for addrs in &serial_addr_sets {
             if let Some(peer_id) = self
                 .dial_bootstrap_addr_set(addrs, used_cache, identity_timeout)
@@ -2085,23 +2096,41 @@ impl P2PNode {
             {
                 successful_connections += 1;
                 connected_peer_ids.push(peer_id);
+                if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
+                    debug!(
+                        "Client bootstrap target reached ({successful_connections} peers) — skipping remaining serial dials"
+                    );
+                    break;
+                }
             }
         }
 
         // Phase B: concurrent dials of CLI + cached bootstrap peers, bounded
         // by `MAX_CONCURRENT_BOOTSTRAP_DIALS` to cap simultaneous QUIC+PQC
-        // handshakes.
-        let mut parallel_stream =
-            futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
-                self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
-                    .await
-            }))
-            .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
-        while let Some(result) = parallel_stream.next().await {
-            if let Some(peer_id) = result {
-                successful_connections += 1;
-                connected_peer_ids.push(peer_id);
+        // handshakes. Skipped entirely when a client has already hit its
+        // target during Phase A.
+        if !client_mode || successful_connections < CLIENT_BOOTSTRAP_TARGET {
+            let mut parallel_stream =
+                futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
+                    self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
+                        .await
+                }))
+                .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
+            while let Some(result) = parallel_stream.next().await {
+                if let Some(peer_id) = result {
+                    successful_connections += 1;
+                    connected_peer_ids.push(peer_id);
+                    if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
+                        debug!(
+                            "Client bootstrap target reached ({successful_connections} peers) — cancelling pending dials"
+                        );
+                        break;
+                    }
+                }
             }
+            // `parallel_stream` is dropped here when the `if` block exits,
+            // cancelling any in-flight futures inside `buffer_unordered`
+            // before we proceed to the DHT discovery phase below.
         }
 
         if successful_connections == 0 {
