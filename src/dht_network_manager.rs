@@ -3325,7 +3325,7 @@ impl DhtNetworkManager {
                     }
                 }
                 Err(e) => {
-                    warn!(
+                    debug!(
                         "Failed to add peer {} to DHT routing table: {}",
                         app_peer_id_hex, e
                     );
