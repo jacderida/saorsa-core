@@ -53,9 +53,9 @@ pub(crate) enum RelayAcquisitionOutcome {
     /// The caller (acquisition driver) is responsible for:
     ///
     /// 1. Storing the relayer peer ID for the K-closest eviction monitor.
-    /// 2. Publishing the full typed self-record (direct addresses +
-    ///    relay-allocated address tagged [`AddressType::Relay`]) to K
-    ///    closest peers.
+    /// 2. Publishing the full typed self-record (relay-allocated address
+    ///    tagged [`AddressType::Relay`] first, then one best non-relay
+    ///    address per IP family) to K closest peers.
     /// 3. Disabling local relay serving so this node does not form a
     ///    relay loop by accepting reservations while its own traffic
     ///    tunnels through someone else.
@@ -95,13 +95,25 @@ pub(crate) async fn run_relay_acquisition(
     let own_key = *dht.peer_id().to_bytes();
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
 
-    let candidates: Vec<RelayCandidate> = closest
-        .iter()
-        .filter_map(|node| {
-            let direct = DhtNetworkManager::first_direct_dialable(node)?;
-            Some(RelayCandidate::new(node.peer_id, direct))
-        })
-        .collect();
+    debug!(
+        closest_count = closest.len(),
+        "relay acquisition: evaluating closest peers for Direct relay candidates"
+    );
+
+    let mut candidates: Vec<RelayCandidate> = Vec::new();
+    for node in &closest {
+        let typed = node.typed_addresses();
+        let direct = DhtNetworkManager::first_direct_dialable(node);
+        debug!(
+            peer = %node.peer_id.to_hex(),
+            typed_addresses = ?typed,
+            selected_direct = ?direct,
+            "relay acquisition: evaluated peer as relay candidate"
+        );
+        if let Some(direct) = direct {
+            candidates.push(RelayCandidate::new(node.peer_id, direct));
+        }
+    }
 
     if candidates.is_empty() {
         warn!("relay acquisition: no direct-addressable candidates in routing table");
