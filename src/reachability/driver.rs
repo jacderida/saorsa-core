@@ -110,6 +110,7 @@ pub(crate) fn spawn_acquisition_driver(
             relay_address,
             shutdown,
             current_backoff: BACKOFF_INITIAL,
+            last_published_typed_set: None,
         };
         driver.run().await;
     });
@@ -125,6 +126,13 @@ struct AcquisitionDriver {
     relay_address: Arc<RwLock<Option<SocketAddr>>>,
     shutdown: CancellationToken,
     current_backoff: Duration,
+    last_published_typed_set: Option<PublishedTypedSet>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PublishedTypedSet {
+    typed_addresses: Vec<(MultiAddr, AddressType)>,
+    peers: Vec<PeerId>,
 }
 
 impl AcquisitionDriver {
@@ -144,7 +152,7 @@ impl AcquisitionDriver {
                     *self.relay_address.write().await = Some(relay.allocated_public_addr);
                     self.transport
                         .set_relay_address(relay.allocated_public_addr);
-                    self.publish_typed_set(Some(relay.allocated_public_addr))
+                    self.force_publish_typed_set(Some(relay.allocated_public_addr))
                         .await;
                     info!(
                         relayer = ?relay.relayer,
@@ -202,7 +210,15 @@ impl AcquisitionDriver {
     /// Quietly drops the publish when there are no dialable addresses to
     /// advertise — a fully wildcard-bound node cannot meaningfully tell
     /// peers how to reach it.
-    async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
+    async fn publish_typed_set(&mut self, relay: Option<SocketAddr>) {
+        self.publish_typed_set_with_policy(relay, false).await;
+    }
+
+    async fn force_publish_typed_set(&mut self, relay: Option<SocketAddr>) {
+        self.publish_typed_set_with_policy(relay, true).await;
+    }
+
+    async fn publish_typed_set_with_policy(&mut self, relay: Option<SocketAddr>, force: bool) {
         let listen = self.transport.listen_addrs().await;
         let observed = self.transport.non_relay_external_addresses();
 
@@ -227,6 +243,21 @@ impl AcquisitionDriver {
             .dht
             .find_closest_nodes_local(&own_key, self.dht.k_value())
             .await;
+        let peers = all_peers.iter().map(|node| node.peer_id).collect();
+        let publish_snapshot = PublishedTypedSet {
+            typed_addresses: typed.clone(),
+            peers,
+        };
+        if !force && self.last_published_typed_set.as_ref() == Some(&publish_snapshot) {
+            debug!(
+                peers = all_peers.len(),
+                typed_addresses = ?typed,
+                relay = ?relay,
+                "driver: publish skipped, typed self address set unchanged"
+            );
+            return;
+        }
+
         debug!(
             peers = all_peers.len(),
             typed_addresses = ?typed,
@@ -242,13 +273,14 @@ impl AcquisitionDriver {
         self.dht
             .publish_address_set_to_peers(typed, &all_peers)
             .await;
+        self.last_published_typed_set = Some(publish_snapshot);
     }
 
     /// Hold the acquired relay until an eviction or death event forces a
     /// rebind. Returns `true` on shutdown (caller should exit), `false`
     /// when the relay is considered lost and a republish+reacquire is
     /// needed.
-    async fn hold_until_lost(&self) -> bool {
+    async fn hold_until_lost(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
         health.tick().await; // drop the immediate first tick
@@ -304,10 +336,10 @@ impl AcquisitionDriver {
                     match updated {
                         Some(addr) => {
                             let relay = *self.relay_address.read().await;
-                            info!(
+                            debug!(
                                 address = %addr,
                                 relay = ?relay,
-                                "driver: self address updated, republishing typed self address set"
+                                "driver: self address updated, refreshing typed self address set"
                             );
                             self.publish_typed_set(relay).await;
                         }
@@ -360,17 +392,17 @@ impl AcquisitionDriver {
     /// pre-retry publish is critical — without it, other peers would
     /// continue dialing the dead relay address during the 1–10 s
     /// acquisition walk.
-    async fn lose_relay_and_republish(&self) {
+    async fn lose_relay_and_republish(&mut self) {
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
         self.transport.clear_relay_address();
-        self.publish_typed_set(None).await;
+        self.force_publish_typed_set(None).await;
     }
 
     /// Wait out the current backoff window, or short-circuit on a
     /// `KClosestPeersChanged` event (new peers may offer fresh candidates).
     /// Returns `true` on shutdown.
-    async fn wait_backoff_or_event(&self) -> bool {
+    async fn wait_backoff_or_event(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let sleep = tokio::time::sleep(self.current_backoff);
         tokio::pin!(sleep);
@@ -401,9 +433,9 @@ impl AcquisitionDriver {
                 updated = self.transport.recv_self_address_updated() => {
                     match updated {
                         Some(addr) => {
-                            info!(
+                            debug!(
                                 address = %addr,
-                                "driver: self address updated during relay backoff, republishing typed self address set"
+                                "driver: self address updated during relay backoff, refreshing typed self address set"
                             );
                             self.publish_typed_set(None).await;
                         }
