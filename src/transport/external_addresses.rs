@@ -71,18 +71,22 @@ impl ExternalAddresses {
     ///
     /// Inserts `addr` if it is not already present. When the list is at
     /// capacity, the oldest entry is evicted first.
-    pub(crate) fn pin_direct(&mut self, addr: SocketAddr) {
-        if self.direct.contains(&addr) {
-            return;
+    pub(crate) fn pin_direct(&mut self, addr: SocketAddr) -> bool {
+        let addr = saorsa_transport::shared::normalize_socket_addr(addr);
+        if Some(addr) == self.relay || self.direct.contains(&addr) {
+            return false;
         }
         if self.direct.len() >= MAX_DIRECT_ADDRESSES {
             self.direct.remove(0);
         }
         self.direct.push(addr);
+        true
     }
 
     /// Set the relay-allocated address.
     pub(crate) fn set_relay(&mut self, addr: SocketAddr) {
+        let addr = saorsa_transport::shared::normalize_socket_addr(addr);
+        self.direct.retain(|direct| *direct != addr);
         self.relay = Some(addr);
     }
 
@@ -140,9 +144,9 @@ mod tests {
     fn pin_direct_dedup() {
         let mut ext = ExternalAddresses::new();
         let a = addr(1, 9000);
-        ext.pin_direct(a);
-        ext.pin_direct(a);
-        ext.pin_direct(a);
+        assert!(ext.pin_direct(a));
+        assert!(!ext.pin_direct(a));
+        assert!(!ext.pin_direct(a));
         assert_eq!(ext.direct_addresses(), vec![a]);
         assert_eq!(ext.all_addresses(), vec![a]);
     }
@@ -178,6 +182,31 @@ mod tests {
         ext.set_relay(same);
         // Should appear only once, as relay (preferred position).
         assert_eq!(ext.all_addresses(), vec![same]);
+        assert!(ext.direct_addresses().is_empty());
+    }
+
+    #[test]
+    fn relay_address_is_not_pinned_as_direct() {
+        let mut ext = ExternalAddresses::new();
+        let same = addr(1, 9000);
+        ext.set_relay(same);
+        assert!(!ext.pin_direct(same));
+        assert!(ext.direct_addresses().is_empty());
+        assert_eq!(ext.all_addresses(), vec![same]);
+    }
+
+    #[test]
+    fn relay_address_is_normalized_before_direct_dedup() {
+        let mut ext = ExternalAddresses::new();
+        let plain = addr(1, 9000);
+        let mapped = "[::ffff:192.0.2.1]:9000".parse().unwrap();
+
+        ext.set_relay(mapped);
+
+        assert_eq!(ext.relay_address(), Some(plain));
+        assert!(!ext.pin_direct(plain));
+        assert!(ext.direct_addresses().is_empty());
+        assert_eq!(ext.all_addresses(), vec![plain]);
     }
 
     #[test]

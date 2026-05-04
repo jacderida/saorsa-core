@@ -53,9 +53,9 @@ pub(crate) enum RelayAcquisitionOutcome {
     /// The caller (acquisition driver) is responsible for:
     ///
     /// 1. Storing the relayer peer ID for the K-closest eviction monitor.
-    /// 2. Publishing the full typed self-record (direct addresses +
-    ///    relay-allocated address tagged [`AddressType::Relay`]) to K
-    ///    closest peers.
+    /// 2. Publishing the full typed self-record (relay-allocated address
+    ///    tagged [`AddressType::Relay`] first, then one best non-relay
+    ///    address per IP family) to K closest peers.
     /// 3. Disabling local relay serving so this node does not form a
     ///    relay loop by accepting reservations while its own traffic
     ///    tunnels through someone else.

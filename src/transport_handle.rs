@@ -251,6 +251,15 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     relay_lost_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Direct address promotion events — received when the passive
+    /// reachability classifier proves one of this node's pinned external
+    /// addresses is cold-dialable. Drained by the reachability driver while
+    /// holding a relay so it can republish `Relay + Direct` instead of
+    /// leaving peers with the older `Relay + Unverified` self-record.
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Pinned external addresses: direct addresses observed from QUIC
     /// `OBSERVED_ADDRESS` frames during bootstrap, plus the relay-allocated
     /// address when a MASQUE relay is held. Populated by the address-update
@@ -425,15 +434,20 @@ impl TransportHandle {
         //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
         //   - RelayEstablished → mpsc, drained by the DHT bridge
         //   - RelayLost → mpsc, drained by the reachability driver
+        //   - DirectAddressPromoted → mpsc, drained by the reachability driver
         //   - ExternalAddressDiscovered → pinned into external_addresses
         //     and triggers a back-fill of any earlier observations now
         //     that the address is known.
+        let (direct_promoted_tx, direct_address_promoted_rx) = tokio::sync::mpsc::channel(
+            crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+        );
         let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
             .spawn_peer_address_update_forwarder(
                 Arc::clone(&external_addresses),
                 Arc::clone(&peer_observations),
                 Arc::clone(&proof_eligible_peers),
                 Arc::clone(&proven_externals),
+                direct_promoted_tx.clone(),
             );
 
         dual_node.spawn_direct_reachability_classifier(
@@ -443,6 +457,7 @@ impl TransportHandle {
             Arc::clone(&external_addresses),
             Arc::clone(&peer_observations),
             Arc::clone(&proof_eligible_peers),
+            direct_promoted_tx,
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -499,6 +514,7 @@ impl TransportHandle {
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
+            direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
             external_addresses,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
@@ -584,6 +600,12 @@ impl TransportHandle {
                 );
                 tokio::sync::Mutex::new(rx)
             },
+            direct_address_promoted_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
+                tokio::sync::Mutex::new(rx)
+            },
             external_addresses: Arc::new(parking_lot::Mutex::new(ExternalAddresses::new())),
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
@@ -636,8 +658,7 @@ impl TransportHandle {
     /// to tag each address as
     /// [`AddressType::Direct`](crate::dht::AddressType::Direct) (proven)
     /// or [`AddressType::Unverified`](crate::dht::AddressType::Unverified)
-    /// (not yet proven, no relay held) — or to suppress unverified entries
-    /// entirely when a relay is held.
+    /// (not yet proven).
     pub fn is_external_proven(&self, addr: SocketAddr) -> bool {
         external_meets_proof_threshold(addr, &self.proven_externals)
     }
@@ -912,6 +933,13 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
+    /// Drain any direct-address promotion events. Returns the address that
+    /// just crossed the proof threshold, if one is queued.
+    pub async fn drain_direct_address_promoted(&self) -> Option<SocketAddr> {
+        let mut rx = self.direct_address_promoted_rx.lock().await;
+        rx.try_recv().ok()
+    }
+
     /// Wait for the next relay-lost event.
     ///
     /// Resolves when a previously-advertised MASQUE relay address has
@@ -925,6 +953,17 @@ impl TransportHandle {
     /// dead relay address.
     pub async fn recv_relay_lost(&self) -> Option<SocketAddr> {
         let mut rx = self.relay_lost_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next direct-address promotion event.
+    ///
+    /// Resolves when one of this node's pinned external addresses crosses
+    /// the passive proof threshold and should be republished as
+    /// [`AddressType::Direct`](crate::dht::AddressType::Direct), or `None`
+    /// if the underlying channel has closed.
+    pub async fn recv_direct_address_promoted(&self) -> Option<SocketAddr> {
+        let mut rx = self.direct_address_promoted_rx.lock().await;
         rx.recv().await
     }
 
