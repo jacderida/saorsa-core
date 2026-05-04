@@ -1995,13 +1995,17 @@ impl DhtNetworkManager {
     async fn local_dht_node(&self) -> DHTNode {
         let mut addresses: Vec<MultiAddr> = Vec::new();
 
-        // 1. Pinned direct external addresses — the post-NAT addresses
-        //    peers observed from QUIC OBSERVED_ADDRESS frames during
-        //    bootstrap. Empty until at least one peer has observed us.
-        //    Uses `direct_external_addresses()` (not `observed_external_addresses()`)
-        //    because the relay address is published via the typed-set path
-        //    in the relay driver, not here.
-        for observed in self.transport.direct_external_addresses() {
+        // 1. Non-relay external addresses — pinned Direct (post-NAT
+        //    addresses peers observed via QUIC OBSERVED_ADDRESS during
+        //    bootstrap, quorum-cleared by the source-disjoint classifier)
+        //    plus single-peer Unverified candidates retained as a
+        //    fallback. Mirrors what the typed-publish path advertises so
+        //    a node behind NAT remains reachable via the OBSERVED_ADDRESS
+        //    hint before it crosses the Direct proof threshold. Empty
+        //    until at least one peer has observed us. Excludes the relay
+        //    address, which is advertised via the typed-set path in the
+        //    relay driver.
+        for observed in self.transport.non_relay_external_addresses() {
             let resolved = MultiAddr::quic(observed);
             if !addresses.contains(&resolved) {
                 addresses.push(resolved);
