@@ -1665,40 +1665,27 @@ impl P2PNode {
         caller_addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
     ) -> Option<(MultiAddr, AddressType)> {
-        // Pull the typed DHT view once so we can both prefer it as a
-        // fallback source and use it to look up the kind for caller- /
-        // saved-supplied addresses.
-        let dht_typed = self
-            .adaptive_dht
-            .peer_addresses_for_dial_typed(peer_id)
-            .await;
-        let lookup_kind = |addr: &MultiAddr| -> AddressType {
-            dht_typed
-                .iter()
-                .find(|(a, _)| a == addr)
-                .map(|(_, ty)| *ty)
-                .unwrap_or(AddressType::Unverified)
-        };
-
-        // 1. Caller-provided addresses (highest priority).
+        // Caller- and saved-supplied addresses skip the routing-table read.
+        // The kind is only consumed as a log tag by `connect_peer_typed`, so
+        // defaulting to Unverified — the same fallback the routing table
+        // applies to legacy peers — saves an async lookup on the hot
+        // reconnect path. Only consult the DHT when both upstream sources
+        // are exhausted.
         if let Some(addr) = Self::first_dialable(caller_addrs) {
-            let kind = lookup_kind(&addr);
-            return Some((addr, kind));
+            return Some((addr, AddressType::Unverified));
         }
-
-        // 2. Addresses snapshotted from the transport layer before the send
-        //    attempt cleaned them up.
         if let Some(addr) = Self::first_dialable(saved_addrs) {
-            let kind = lookup_kind(&addr);
-            return Some((addr, kind));
+            return Some((addr, AddressType::Unverified));
         }
 
-        // 3. DHT routing table — apply the same dialability filter and
-        //    keep the type tag the routing table provided.
-        dht_typed.into_iter().find(|(a, _)| {
-            a.dialable_socket_addr()
-                .is_some_and(|sa| !sa.ip().is_unspecified())
-        })
+        self.adaptive_dht
+            .peer_addresses_for_dial_typed(peer_id)
+            .await
+            .into_iter()
+            .find(|(a, _)| {
+                a.dialable_socket_addr()
+                    .is_some_and(|sa| !sa.ip().is_unspecified())
+            })
     }
 
     /// Return the first dialable QUIC address from a slice, skipping

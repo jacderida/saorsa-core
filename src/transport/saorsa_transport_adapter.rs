@@ -1299,19 +1299,34 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
     /// relay routing. Called when identity exchange completes on a connection.
+    ///
+    /// Walks both stacks rather than stopping at the first hit so a dual-stack
+    /// node registers the peer ID against every endpoint that actually owns a
+    /// connection to it. Also registers the IPv4-mapped alternate form so peer
+    /// ID lookups resolve regardless of which form the relay path supplies.
     pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
         let normalized = saorsa_transport::shared::normalize_socket_addr(addr);
+        let alternate = saorsa_transport::shared::dual_stack_alternate(&normalized);
+        let mut registered = false;
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let endpoint = node.transport.endpoint();
             if endpoint.has_active_connection(&normalized) {
                 endpoint.register_connection_peer_id(normalized, peer_id);
-                return;
+                registered = true;
+            }
+            if let Some(alt) = alternate
+                && endpoint.has_active_connection(&alt)
+            {
+                endpoint.register_connection_peer_id(alt, peer_id);
+                registered = true;
             }
         }
-        debug!(
-            "No active transport endpoint found while registering peer ID for {}",
-            normalized
-        );
+        if !registered {
+            debug!(
+                "No active transport endpoint found while registering peer ID for {}",
+                normalized
+            );
+        }
     }
 
     /// Check if a peer has a live QUIC connection via either stack.
