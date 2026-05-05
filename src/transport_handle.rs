@@ -20,7 +20,8 @@
 use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
-use crate::error::{NetworkError, P2PError, P2pResult as Result};
+use crate::dht::core_engine::AddressType;
+use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind, TransportError};
 use crate::identity::node_identity::NodeIdentity;
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
@@ -30,7 +31,9 @@ use crate::network::{
 };
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::external_addresses::ExternalAddresses;
-use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
+use crate::transport::saorsa_transport_adapter::{
+    AddressEventPublisher, ConnectionEvent, DualStackNetworkNode,
+};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
 use dashmap::mapref::entry::Entry as DashEntry;
@@ -38,11 +41,11 @@ use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -55,6 +58,96 @@ const TEST_BURST_SIZE: u32 = 100;
 const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
 const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
+/// Minimum distinct source-disjoint observers required before an external
+/// address is considered cold-dialable.
+///
+/// "Source-disjoint" means the observer IP was not already in this node's
+/// known-peer set at the time of the inbound — i.e. not a peer we had ever
+/// dialed or seen connect to us. Two such observers eliminates the
+/// pinhole-self-fulfillment case (one already-known peer redialing through
+/// their pre-existing NAT binding) while still allowing prompt promotion
+/// in healthy clusters where multiple bootstraps independently reach the
+/// node within the first connect window.
+///
+/// Matches `MIN_OBSERVERS_FOR_QUORUM` in saorsa-transport's address-pinning
+/// path (`nat_traversal_api.rs`) — same statistical argument.
+pub(crate) const MIN_DISTINCT_OBSERVERS_FOR_DIRECT: usize = 2;
+
+/// Cap on the number of distinct externals a single peer's IP may
+/// have on record in `peer_observations` before further reports are
+/// dropped.
+///
+/// A well-behaved peer observes us at exactly one external per family
+/// (the one their packets reached us through). The cap protects against
+/// a hostile peer flooding many fake `OBSERVED_ADDRESS` entries to bloat
+/// memory or to "vote" for arbitrary externals — that vote still requires
+/// a separate Side::Server inbound from the same peer to count, but the
+/// table itself should not grow without bound under attack. 8 is well
+/// above the realistic 1–2 needed for v4+v6 and dual-NAT setups.
+pub(crate) const MAX_OBSERVATIONS_PER_PEER: usize = 8;
+
+/// Return `true` iff `external` has cleared the per-address proof
+/// threshold in `proven_externals`.
+///
+/// Free function so the threshold semantics — and the address
+/// normalisation that backs lookups — can be exercised in unit tests
+/// without constructing a full [`TransportHandle`] (which performs real
+/// network binds).
+pub(crate) fn external_meets_proof_threshold(
+    external: SocketAddr,
+    proven_externals: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> bool {
+    let normalized = saorsa_transport::shared::normalize_socket_addr(external);
+    proven_externals
+        .get(&normalized)
+        .map(|set| set.len() >= MIN_DISTINCT_OBSERVERS_FOR_DIRECT)
+        .unwrap_or(false)
+}
+
+/// Stable label for an address-type tag, used as a structured `kind`
+/// field on the `connect_peer` success/failure logs. `None` is rendered
+/// as `"unknown"` for callers that don't carry a tag (e.g., the public
+/// `connect_peer` entry point used by tests).
+fn address_kind_label(kind: Option<AddressType>) -> &'static str {
+    match kind {
+        Some(AddressType::Relay) => "Relay",
+        Some(AddressType::Direct) => "Direct",
+        Some(AddressType::Unverified) => "Unverified",
+        Some(AddressType::NATted) => "NATted",
+        None => "unknown",
+    }
+}
+
+fn classify_send_error(error: &anyhow::Error) -> SendFailureKind {
+    for cause in error.chain() {
+        if let Some(endpoint_error) = cause.downcast_ref::<saorsa_transport::EndpointError>() {
+            return match endpoint_error {
+                saorsa_transport::EndpointError::PeerNotFound(_) => SendFailureKind::StaleChannel,
+                saorsa_transport::EndpointError::SendFailed { stage, .. } => {
+                    classify_transport_send_stage(*stage)
+                }
+                _ => SendFailureKind::Other,
+            };
+        }
+    }
+
+    SendFailureKind::Other
+}
+
+fn classify_transport_send_stage(stage: saorsa_transport::SendFailureStage) -> SendFailureKind {
+    match stage {
+        saorsa_transport::SendFailureStage::OpenStream => SendFailureKind::StaleChannel,
+        saorsa_transport::SendFailureStage::OpenStreamProgressTimeout => {
+            SendFailureKind::OpenStreamProgressTimeout
+        }
+        saorsa_transport::SendFailureStage::WriteProgressTimeout => {
+            SendFailureKind::WriteProgressTimeout
+        }
+        saorsa_transport::SendFailureStage::Write => SendFailureKind::StreamWrite,
+        saorsa_transport::SendFailureStage::Finish => SendFailureKind::StreamFinish,
+    }
+}
+
 /// Internal protocol for automatic identity announcement on connect.
 /// Filtered from P2PEvent::Message emission — not visible to applications.
 const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
@@ -64,7 +157,7 @@ pub struct TransportConfig {
     /// Addresses to bind on. The transport partitions these into at most
     /// one IPv4 and one IPv6 QUIC endpoint.
     pub listen_addrs: Vec<MultiAddr>,
-    /// Connection timeout for outbound dials and sends.
+    /// Connection timeout for outbound dials and request waits.
     pub connection_timeout: Duration,
     /// Maximum concurrent connections.
     pub max_connections: usize,
@@ -160,10 +253,40 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     relay_lost_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
-    /// Pinned external addresses: direct addresses observed from QUIC
-    /// `OBSERVED_ADDRESS` frames during bootstrap, plus the relay-allocated
-    /// address when a MASQUE relay is held. Populated by the address-update
-    /// forwarder; survives connection drops; reset on process restart.
+    /// Direct address promotion events — received when the passive
+    /// reachability classifier proves one of this node's pinned external
+    /// addresses is cold-dialable. Drained by the reachability driver while
+    /// holding a relay so it can republish `Relay + Direct` instead of
+    /// leaving peers with the older `Relay + Unverified` self-record.
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Latest direct-address promotion for observers/tests. This is
+    /// separate from the driver's single-consumer mpsc receiver so callers
+    /// can observe state changes without contending with the driver's
+    /// `recv().await`.
+    direct_address_promoted_watch_tx: watch::Sender<Option<SocketAddr>>,
+    direct_address_promoted_watch_rx: parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
+    /// Self-address update events — received when a newly observed
+    /// external address becomes publishable as Unverified or is pinned as
+    /// Direct without crossing the Direct proof threshold. Drained by the
+    /// reachability driver so a relay-only self-record can be corrected as
+    /// soon as a non-relay fallback appears.
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    self_address_updated_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Latest self-address update for observers/tests. Separate from the
+    /// driver's single-consumer mpsc receiver for the same reason as
+    /// `direct_address_promoted_watch_rx`.
+    self_address_updated_watch_tx: watch::Sender<Option<SocketAddr>>,
+    self_address_updated_watch_rx: parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
+    /// External addresses: direct addresses pinned from transport quorum,
+    /// unverified candidates from QUIC `OBSERVED_ADDRESS` frames, plus the
+    /// relay-allocated address when a MASQUE relay is held. Populated by
+    /// the address-update forwarder and reachability classifier; survives
+    /// connection drops; reset on process restart.
     external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -192,15 +315,68 @@ pub struct TransportHandle {
     /// entries are never removed for the lifetime of the handle because the
     /// classifier only cares about "did we ever dial this remote?".
     dialed_addrs: Arc<DashSet<SocketAddr>>,
-    /// Becomes `true` the first time an unsolicited inbound handshake
-    /// completes (an accepted connection from a remote address that is not
-    /// in `dialed_addrs`). Once set, the flag latches — reachability does
-    /// not "un-prove" itself within a single process lifetime. Consumed by
-    /// [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
-    /// to decide between publishing `AddressType::Direct` and
-    /// `AddressType::Unverified` for the local node's observed external
-    /// addresses.
-    direct_reachability_observed: Arc<AtomicBool>,
+    /// IPs of every peer this handle has ever interacted with. Populated by
+    /// [`Self::connect_peer`] (alongside `dialed_addrs`) and by the passive
+    /// reachability classifier on every `PeerConnected` event (both sides).
+    /// Used as the source-disjointness exclusion set for the per-address
+    /// proof: an inbound from an IP already in this set does not prove
+    /// cold-dialability — that peer already had reason to know our address
+    /// (we dialed them, or they connected to us before) and could therefore
+    /// reach us through a pre-existing NAT pinhole. Per-IP (not per
+    /// SocketAddr) because NAT remappings between sessions change the port
+    /// while the IP — and therefore the pinhole — is what matters.
+    known_peer_ips: Arc<DashSet<IpAddr>>,
+    /// Distinct source-disjoint observer IPs per pinned external address.
+    ///
+    /// An entry is added when a peer that passed the source-disjoint /
+    /// sibling-hairpin / Side::Server filter reports — via a QUIC
+    /// `OBSERVED_ADDRESS` frame — that they observe us at the named
+    /// external. The peer's own report is the per-address attribution
+    /// signal: an inbound from peer P on local v4 stack only credits the
+    /// externals P actually told us about, never any other same-family
+    /// pinned external.
+    ///
+    /// An external is considered cold-dialable
+    /// ([`AddressType::Direct`](crate::dht::AddressType::Direct)) once its
+    /// observer set reaches [`MIN_DISTINCT_OBSERVERS_FOR_DIRECT`].
+    /// Per-address — never globally — so one external's proof does not
+    /// promote unrelated externals, even on multi-WAN hosts with several
+    /// concurrently-pinned same-family externals.
+    proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
+    /// Per-peer-IP set of externals each peer has reported observing us
+    /// at, derived from `P2pEvent::PeerObservedExternal`.
+    ///
+    /// Used by the classifier to do per-address attribution: when peer P
+    /// makes a source-disjoint Side::Server inbound, only the externals
+    /// P has told us about (intersected with currently pinned externals)
+    /// are credited with P's IP. A peer reporting external `E` is the
+    /// peer's own statement that they reached us at `E` — there is no
+    /// stronger per-address signal available at this layer.
+    ///
+    /// Capped at [`MAX_OBSERVATIONS_PER_PEER`] entries per peer to bound
+    /// memory under hostile reporting. Per-IP (not per-SocketAddr)
+    /// because NAT remappings rotate the port between sessions while the
+    /// IP — and therefore the proof identity — is what matters.
+    ///
+    /// Held to keep the `Arc` alive for the classifier and forwarder
+    /// tasks that captured clones — `self`-side accesses go through the
+    /// background tasks, not through this field directly.
+    #[allow(dead_code)]
+    peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
+    /// IPs of source-disjoint Side::Server inbounds that passed the
+    /// classifier's filters and are therefore eligible to contribute proof.
+    ///
+    /// An observation from a peer not in this set is recorded in
+    /// `peer_observations` but does not credit `proven_externals`.
+    /// Membership is monotonic: once a peer's IP is added (i.e. they
+    /// arrived as a stranger), their observations remain attributable
+    /// for the lifetime of the handle.
+    ///
+    /// Held to keep the `Arc` alive for the classifier and forwarder
+    /// tasks that captured clones — `self`-side accesses go through the
+    /// background tasks, not through this field directly.
+    #[allow(dead_code)]
+    proof_eligible_peers: Arc<DashSet<IpAddr>>,
 }
 
 // ============================================================================
@@ -256,32 +432,77 @@ impl TransportHandle {
 
         let shutdown = CancellationToken::new();
 
-        // Pinned external addresses. The forwarder spawned below feeds
-        // this from `P2pEvent::ExternalAddressDiscovered` events; once an
-        // address is pinned it is retained for the process lifetime.
+        // External addresses. The forwarder and classifier below feed this
+        // from `ExternalAddressDiscovered` and `PeerObservedExternal`
+        // events; pinned direct addresses are retained for the process
+        // lifetime and single-observer reports are retained as Unverified
+        // publish candidates.
         let external_addresses = Arc::new(parking_lot::Mutex::new(ExternalAddresses::new()));
+
+        // Passive direct-reachability classifier: subscribe to
+        // `P2pEvent::PeerConnected` and `P2pEvent::PeerObservedExternal`,
+        // attribute proof per-address using each peer's own
+        // `OBSERVED_ADDRESS` reports. Consumed by
+        // `AcquisitionDriver::publish_typed_set` (via
+        // `Self::is_external_proven`) to tag each address as
+        // `AddressType::Direct` only once that address itself has cleared
+        // the observer threshold. The classifier also writes into
+        // `known_peer_ips` on every `PeerConnected` event so subsequent
+        // inbounds from the same IP do not count as fresh proof.
+        let dialed_addrs: Arc<DashSet<SocketAddr>> = Arc::new(DashSet::new());
+        let known_peer_ips: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
+        let proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>> = Arc::new(DashMap::new());
+        let peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>> = Arc::new(DashMap::new());
+        let proof_eligible_peers: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
 
         // Subscribe to address-related P2pEvents from the transport layer:
         //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
         //   - RelayEstablished → mpsc, drained by the DHT bridge
         //   - RelayLost → mpsc, drained by the reachability driver
+        //   - DirectAddressPromoted → mpsc, drained by the reachability driver
+        //   - SelfAddressUpdated → mpsc, drained by the reachability driver
         //   - ExternalAddressDiscovered → pinned into external_addresses
-        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) =
-            dual_node.spawn_peer_address_update_forwarder(Arc::clone(&external_addresses));
+        //     and triggers a back-fill of any earlier observations now
+        //     that the address is known. PeerObservedExternal is consumed
+        //     by the classifier and retained as an Unverified candidate.
+        let (direct_promoted_tx, direct_address_promoted_rx) = tokio::sync::mpsc::channel(
+            crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+        );
+        let (self_address_updated_tx, self_address_updated_rx) = tokio::sync::mpsc::channel(
+            crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+        );
+        let (direct_address_promoted_watch_tx, direct_address_promoted_watch_rx) =
+            watch::channel(None);
+        let (self_address_updated_watch_tx, self_address_updated_watch_rx) = watch::channel(None);
+        let direct_promoted_events = AddressEventPublisher::new(
+            "DirectAddressPromoted",
+            direct_promoted_tx,
+            direct_address_promoted_watch_tx.clone(),
+        );
+        let self_address_updated_events = AddressEventPublisher::new(
+            "SelfAddressUpdated",
+            self_address_updated_tx,
+            self_address_updated_watch_tx.clone(),
+        );
+        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
+            .spawn_peer_address_update_forwarder(
+                Arc::clone(&external_addresses),
+                Arc::clone(&peer_observations),
+                Arc::clone(&proof_eligible_peers),
+                Arc::clone(&proven_externals),
+                direct_promoted_events.clone(),
+                self_address_updated_events.clone(),
+            );
 
-        // Passive direct-reachability classifier: subscribe to
-        // `P2pEvent::PeerConnected` and flip `direct_reachability_observed`
-        // the first time an inbound (`Side::Server`) handshake completes
-        // from a remote we did not dial first. Consumed by
-        // `AcquisitionDriver::publish_typed_set` to pick between
-        // `AddressType::Direct` and `AddressType::Unverified` for the
-        // self-record's observed external addresses.
-        let dialed_addrs: Arc<DashSet<SocketAddr>> = Arc::new(DashSet::new());
-        let direct_reachability_observed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         dual_node.spawn_direct_reachability_classifier(
             Arc::clone(&dialed_addrs),
-            Arc::clone(&direct_reachability_observed),
+            Arc::clone(&known_peer_ips),
+            Arc::clone(&proven_externals),
             Arc::clone(&external_addresses),
+            Arc::clone(&peer_observations),
+            Arc::clone(&proof_eligible_peers),
+            direct_promoted_events,
+            self_address_updated_events,
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -338,6 +559,14 @@ impl TransportHandle {
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
+            direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
+            direct_address_promoted_watch_tx,
+            direct_address_promoted_watch_rx: parking_lot::Mutex::new(
+                direct_address_promoted_watch_rx,
+            ),
+            self_address_updated_rx: tokio::sync::Mutex::new(self_address_updated_rx),
+            self_address_updated_watch_tx,
+            self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
             external_addresses,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
@@ -349,7 +578,10 @@ impl TransportHandle {
             channel_to_peers,
             peer_user_agents,
             dialed_addrs,
-            direct_reachability_observed,
+            known_peer_ips,
+            proven_externals,
+            peer_observations,
+            proof_eligible_peers,
         })
     }
 
@@ -386,6 +618,9 @@ impl TransportHandle {
             };
             Arc::new(dual)
         };
+        let (direct_address_promoted_watch_tx, direct_address_promoted_watch_rx) =
+            watch::channel(None);
+        let (self_address_updated_watch_tx, self_address_updated_watch_rx) = watch::channel(None);
 
         Ok(Self {
             dual_node,
@@ -420,6 +655,24 @@ impl TransportHandle {
                 );
                 tokio::sync::Mutex::new(rx)
             },
+            direct_address_promoted_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
+                tokio::sync::Mutex::new(rx)
+            },
+            direct_address_promoted_watch_tx,
+            direct_address_promoted_watch_rx: parking_lot::Mutex::new(
+                direct_address_promoted_watch_rx,
+            ),
+            self_address_updated_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
+                tokio::sync::Mutex::new(rx)
+            },
+            self_address_updated_watch_tx,
+            self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
             external_addresses: Arc::new(parking_lot::Mutex::new(ExternalAddresses::new())),
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
@@ -431,7 +684,10 @@ impl TransportHandle {
             channel_to_peers: Arc::new(DashMap::new()),
             peer_user_agents: Arc::new(DashMap::new()),
             dialed_addrs: Arc::new(DashSet::new()),
-            direct_reachability_observed: Arc::new(AtomicBool::new(false)),
+            known_peer_ips: Arc::new(DashSet::new()),
+            proven_externals: Arc::new(DashMap::new()),
+            peer_observations: Arc::new(DashMap::new()),
+            proof_eligible_peers: Arc::new(DashSet::new()),
         })
     }
 }
@@ -451,22 +707,25 @@ impl TransportHandle {
         &self.node_identity
     }
 
-    /// Whether the local listener is known to be cold-dialable.
+    /// Whether the named external address has been proven cold-dialable.
     ///
-    /// Set by the passive reachability classifier (see
-    /// [`crate::transport::saorsa_transport_adapter::DualStackNetworkNode::spawn_direct_reachability_classifier`])
-    /// the first time a `Side::Server` handshake completes from a remote
-    /// address we had not previously dialed. Once set, the flag latches —
-    /// reachability is not considered to have "un-proven" itself for the
-    /// lifetime of this `TransportHandle`.
+    /// Returns `true` iff at least
+    /// [`MIN_DISTINCT_OBSERVERS_FOR_DIRECT`] distinct source-disjoint peers
+    /// have made unsolicited inbound connections that the classifier
+    /// attributed to this external. "Source-disjoint" means the observer
+    /// IP was not in `known_peer_ips` at the time of the inbound — i.e.
+    /// not a peer this handle had any prior reason to know about.
     ///
-    /// Consumed by [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
-    /// to decide whether this node's observed external addresses are
-    /// published as [`crate::dht::AddressType::Direct`] (flag set) or
-    /// [`crate::dht::AddressType::Unverified`] (flag unset, and no relay
-    /// available).
-    pub fn direct_reachability_observed(&self) -> bool {
-        self.direct_reachability_observed.load(Ordering::Acquire)
+    /// Per-address: one external's proof never promotes another. An
+    /// inbound on the v4 stack only credits v4 externals, and an inbound
+    /// from a peer behind the same NAT (sibling-hairpin) is rejected.
+    ///
+    /// Consumed by the shared self-address builder to tag each address as
+    /// [`AddressType::Direct`](crate::dht::AddressType::Direct) (proven)
+    /// or [`AddressType::Unverified`](crate::dht::AddressType::Unverified)
+    /// (not yet proven).
+    pub fn is_external_proven(&self, addr: SocketAddr) -> bool {
+        external_meets_proof_threshold(addr, &self.proven_externals)
     }
 
     /// Get the first listen address as a string.
@@ -493,33 +752,40 @@ impl TransportHandle {
     }
 
     /// Return **all** external addresses for this node: relay first
-    /// (preferred), then pinned direct addresses from bootstrap
-    /// OBSERVED_ADDRESS frames.
+    /// (preferred), then pinned direct addresses, then observed-but-
+    /// unverified external candidates from QUIC `OBSERVED_ADDRESS` frames.
     ///
-    /// If no addresses have been pinned yet (the brief ~1s window after
-    /// bootstrap connection before the first `ExternalAddressDiscovered`
-    /// event), falls back to the live observation from active connections.
+    /// Callers should still use [`Self::is_external_proven`] to decide
+    /// whether a non-relay address is Direct or Unverified. A single
+    /// observation is publishable as Unverified so dialers can try it
+    /// after the relay, but it is not treated as proven Direct until it
+    /// crosses the passive proof threshold.
     pub fn observed_external_addresses(&self) -> Vec<SocketAddr> {
-        let pinned = self.external_addresses.lock().all_addresses();
-        if !pinned.is_empty() {
-            return pinned;
-        }
-        // Brief-window fallback: before the forwarder has pinned any
-        // address, try the live query on active connections.
-        self.dual_node.get_observed_external_addresses()
+        self.external_addresses.lock().all_addresses()
     }
 
-    /// Return only the pinned **direct** external addresses (no relay).
+    /// Return only the pinned **direct** external addresses (no relay, no
+    /// unverified candidates).
+    pub fn direct_external_addresses(&self) -> Vec<SocketAddr> {
+        self.external_addresses.lock().direct_addresses()
+    }
+
+    /// Return all non-relay external addresses that should be considered
+    /// for typed self-publication.
     ///
     /// Used by callers that tag addresses by type (e.g. the relay driver's
     /// `publish_typed_set`) to avoid double-tagging the relay address as
-    /// both Direct and Relay.
-    pub fn direct_external_addresses(&self) -> Vec<SocketAddr> {
-        let pinned = self.external_addresses.lock().direct_addresses();
-        if !pinned.is_empty() {
-            return pinned;
-        }
-        self.dual_node.get_observed_external_addresses()
+    /// both Direct and Relay. Returned addresses may be Direct or
+    /// Unverified; call [`Self::is_external_proven`] per address to tag
+    /// them correctly.
+    pub fn non_relay_external_addresses(&self) -> Vec<SocketAddr> {
+        self.external_addresses.lock().non_relay_addresses()
+    }
+
+    /// Return the relay-allocated external address, if a relay is currently
+    /// held.
+    pub(crate) fn relay_external_address(&self) -> Option<SocketAddr> {
+        self.external_addresses.lock().relay_address()
     }
 
     /// Store the relay-allocated address so it is included (first) in
@@ -669,8 +935,8 @@ impl TransportHandle {
 
     /// Look up the peer ID for a given connection address.
     pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
-        // Try the exact stringified address first.
-        let channel_id = addr.to_string();
+        let normalized = saorsa_transport::shared::normalize_socket_addr(*addr);
+        let channel_id = normalized.to_string();
         if let Some(peer_id) = self
             .channel_to_peers
             .get(&channel_id)
@@ -679,9 +945,9 @@ impl TransportHandle {
             return Some(peer_id);
         }
 
-        // The channel key may be stored as IPv4-mapped IPv6 (e.g., "[::ffff:1.2.3.4]:PORT")
-        // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
-        let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
+        // Defensive lookup against the IPv4-mapped IPv6 alternate form in case
+        // any code path inserts via a non-canonical key.
+        let alt_addr = saorsa_transport::shared::dual_stack_alternate(&normalized)?;
         let alt_channel_id = alt_addr.to_string();
         self.channel_to_peers
             .get(&alt_channel_id)
@@ -741,6 +1007,56 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
+    fn drain_latest_socket_event(
+        rx: &parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
+    ) -> Option<SocketAddr> {
+        let mut rx = rx.lock();
+        if rx.has_changed().ok()? {
+            *rx.borrow_and_update()
+        } else {
+            None
+        }
+    }
+
+    /// Drain the latest direct-address promotion notification, if one has
+    /// arrived since the previous drain.
+    ///
+    /// This is watch-backed and never waits on the reachability driver's
+    /// single-consumer mpsc receiver. Multiple raw promotion events may
+    /// coalesce to the latest address.
+    pub async fn drain_direct_address_promoted(&self) -> Option<SocketAddr> {
+        Self::drain_latest_socket_event(&self.direct_address_promoted_watch_rx)
+    }
+
+    /// Drain the latest self-address update notification, if one has
+    /// arrived since the previous drain.
+    ///
+    /// This is watch-backed and never waits on the reachability driver's
+    /// single-consumer mpsc receiver. Multiple raw update events may
+    /// coalesce to the latest address.
+    pub async fn drain_self_address_updated(&self) -> Option<SocketAddr> {
+        Self::drain_latest_socket_event(&self.self_address_updated_watch_rx)
+    }
+
+    /// Subscribe to direct-address promotion notifications.
+    ///
+    /// The returned watch receiver retains only the latest promoted
+    /// address. Its initial value is `None`; after `changed().await`,
+    /// read the current value with `borrow_and_update()`.
+    pub fn subscribe_direct_address_promoted(&self) -> watch::Receiver<Option<SocketAddr>> {
+        self.direct_address_promoted_watch_tx.subscribe()
+    }
+
+    /// Subscribe to self-address update notifications.
+    ///
+    /// The returned watch receiver retains only the latest publishable
+    /// address update. Its initial value is `None`; after
+    /// `changed().await`, read the current value with
+    /// `borrow_and_update()`.
+    pub fn subscribe_self_address_updated(&self) -> watch::Receiver<Option<SocketAddr>> {
+        self.self_address_updated_watch_tx.subscribe()
+    }
+
     /// Wait for the next relay-lost event.
     ///
     /// Resolves when a previously-advertised MASQUE relay address has
@@ -754,6 +1070,27 @@ impl TransportHandle {
     /// dead relay address.
     pub async fn recv_relay_lost(&self) -> Option<SocketAddr> {
         let mut rx = self.relay_lost_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next direct-address promotion event.
+    ///
+    /// Resolves when one of this node's pinned external addresses crosses
+    /// the passive proof threshold and should be republished as
+    /// [`AddressType::Direct`](crate::dht::AddressType::Direct), or `None`
+    /// if the underlying channel has closed.
+    pub async fn recv_direct_address_promoted(&self) -> Option<SocketAddr> {
+        let mut rx = self.direct_address_promoted_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next self-address update event.
+    ///
+    /// Resolves when a non-relay external address newly becomes
+    /// publishable as Unverified or is pinned as Direct without crossing
+    /// the Direct proof threshold, or `None` if the channel has closed.
+    pub async fn recv_self_address_updated(&self) -> Option<SocketAddr> {
+        let mut rx = self.self_address_updated_rx.lock().await;
         rx.recv().await
     }
 
@@ -854,7 +1191,37 @@ impl TransportHandle {
     ///
     /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
     /// return [`NetworkError::InvalidAddress`].
+    ///
+    /// Callers that already know how the address was classified (Direct,
+    /// Relay, Unverified, NATted) should prefer
+    /// [`Self::connect_peer_typed`] so the success/failure logs include
+    /// the address kind. This entry point is preserved for callers
+    /// (tests, public API consumers) that don't have type metadata.
     pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
+        self.connect_peer_inner(address, None).await
+    }
+
+    /// Connect to a peer at the given typed address.
+    ///
+    /// Same as [`Self::connect_peer`] but additionally records the
+    /// [`AddressType`] tag in the success/failure logs so an operator
+    /// can tell, after the fact, whether a failed dial was against a
+    /// `Direct`, `Relay`, `Unverified`, or `NATted` address.
+    pub async fn connect_peer_typed(
+        &self,
+        address: &MultiAddr,
+        kind: AddressType,
+    ) -> Result<String> {
+        self.connect_peer_inner(address, Some(kind)).await
+    }
+
+    async fn connect_peer_inner(
+        &self,
+        address: &MultiAddr,
+        kind: Option<AddressType>,
+    ) -> Result<String> {
+        let kind_label = address_kind_label(kind);
+
         // Require a dialable (QUIC) transport.
         let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
             P2PError::Network(NetworkError::InvalidAddress(
@@ -874,10 +1241,17 @@ impl TransportHandle {
         // passive reachability classifier can distinguish simultaneous-open
         // replies from genuinely unsolicited inbounds. The set is
         // monotonic; we do not remove entries on disconnect.
-        self.dialed_addrs
-            .insert(saorsa_transport::shared::normalize_socket_addr(
-                normalized_addr,
-            ));
+        let dial_target_normalized =
+            saorsa_transport::shared::normalize_socket_addr(normalized_addr);
+        self.dialed_addrs.insert(dial_target_normalized);
+        // Also record the dial target's IP in `known_peer_ips` so that an
+        // inbound from this peer through a NAT-remapped source port — same
+        // IP, different port, missed by the SocketAddr-keyed `dialed_addrs`
+        // — is correctly recognised as not source-disjoint by the
+        // reachability classifier.
+        self.known_peer_ips.insert(crate::security::canonicalize_ip(
+            dial_target_normalized.ip(),
+        ));
 
         let peer_id = match tokio::time::timeout(
             self.connection_timeout,
@@ -886,7 +1260,7 @@ impl TransportHandle {
         .await
         {
             Ok(Ok(addr)) => {
-                let connected_peer_id = addr.to_string();
+                let connected_peer_id = canonical_channel_id(addr);
 
                 // Prevent self-connections by comparing against all listen
                 // addresses (dual-stack nodes may have both IPv4 and IPv6).
@@ -896,8 +1270,10 @@ impl TransportHandle {
                 };
                 if is_self {
                     warn!(
-                        "Detected self-connection to own address {} (channel_id: {}), rejecting",
-                        address, connected_peer_id
+                        kind = kind_label,
+                        %address,
+                        channel_id = %connected_peer_id,
+                        "Detected self-connection to own address, rejecting"
                     );
                     self.dual_node.disconnect_peer_by_addr(&addr).await;
                     return Err(P2PError::Network(NetworkError::InvalidAddress(
@@ -905,11 +1281,21 @@ impl TransportHandle {
                     )));
                 }
 
-                info!("Successfully connected to channel: {}", connected_peer_id);
+                info!(
+                    kind = kind_label,
+                    %address,
+                    channel_id = %connected_peer_id,
+                    "Successfully connected to channel"
+                );
                 connected_peer_id
             }
             Ok(Err(e)) => {
-                warn!("connect_happy_eyeballs failed for {}: {}", address, e);
+                warn!(
+                    kind = kind_label,
+                    %address,
+                    error = %e,
+                    "connect_happy_eyeballs failed"
+                );
                 return Err(P2PError::Transport(
                     crate::error::TransportError::ConnectionFailed {
                         addr: normalized_addr,
@@ -919,8 +1305,10 @@ impl TransportHandle {
             }
             Err(_) => {
                 warn!(
-                    "connect_happy_eyeballs timed out for {} after {:?}",
-                    address, self.connection_timeout
+                    kind = kind_label,
+                    %address,
+                    timeout = ?self.connection_timeout,
+                    "connect_happy_eyeballs timed out"
                 );
                 return Err(P2PError::Timeout(self.connection_timeout));
             }
@@ -1105,8 +1493,9 @@ impl TransportHandle {
     /// Send a message to an authenticated peer (raw, no trust reporting).
     ///
     /// Resolves the app-level [`PeerId`] to transport channels via the
-    /// `peer_to_channel` mapping and tries each channel until one succeeds.
-    /// Dead channels are pruned during the attempt loop.
+    /// `peer_to_channel` mapping. Stale channels are pruned and skipped, but
+    /// active send failures are returned without trying another channel so
+    /// large/partial writes are not duplicated.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
@@ -1134,14 +1523,26 @@ impl TransportHandle {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    if e.is_stale_channel_send_failure() {
+                        warn!(
+                            peer = %peer_hex,
+                            channel = %channel_id,
+                            error = %e,
+                            "Stale channel send failed, removing and trying next",
+                        );
+                        self.remove_channel(channel_id).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+
                     warn!(
                         peer = %peer_hex,
                         channel = %channel_id,
                         error = %e,
-                        "Channel send failed, removing and trying next",
+                        "Channel send failed during active send, removing without retry",
                     );
                     self.remove_channel(channel_id).await;
-                    last_err = Some(e);
+                    return Err(e);
                 }
             }
         }
@@ -1227,18 +1628,16 @@ impl TransportHandle {
                 format!("Invalid channel ID address: {e}").into(),
             ))
         })?;
-        let send_fut = self.dual_node.send_to_peer_optimized(&addr, &message_data);
-        let result = tokio::time::timeout(self.connection_timeout, send_fut)
+        let result = self
+            .dual_node
+            .send_to_peer_optimized(&addr, &message_data)
             .await
-            .map_err(|_| {
-                P2PError::Transport(crate::error::TransportError::StreamError(
-                    "Timed out sending message".into(),
-                ))
-            })?
             .map_err(|e| {
-                P2PError::Transport(crate::error::TransportError::StreamError(
-                    e.to_string().into(),
-                ))
+                let kind = classify_send_error(&e);
+                P2PError::Transport(TransportError::SendFailed {
+                    kind,
+                    reason: e.to_string().into(),
+                })
             });
 
         if result.is_ok() {
@@ -1704,7 +2103,7 @@ impl TransportHandle {
                     continue;
                 }
 
-                let channel_id = remote_sock.to_string();
+                let channel_id = canonical_channel_id(remote_sock);
                 let remote_addr = MultiAddr::quic(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
@@ -1882,7 +2281,7 @@ impl TransportHandle {
     ) {
         info!("Message dispatch shard {shard_idx} started");
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
-            let channel_id = from_addr.to_string();
+            let channel_id = canonical_channel_id(from_addr);
             trace!(
                 shard = shard_idx,
                 "Received {} bytes from channel {}",
@@ -1903,6 +2302,10 @@ impl TransportHandle {
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                     {
+                        let already_mapped = peer_to_channel
+                            .get(app_id)
+                            .is_some_and(|channels| channels.value().contains(&channel_id));
+
                         // Register peer ID at the low-level transport
                         // endpoint BEFORE inserting into peer_to_channel so
                         // any concurrent reader who observes the app-level
@@ -1912,9 +2315,11 @@ impl TransportHandle {
                         // await; under sharded `DashMap` we can't hold a
                         // shard guard across an await, so we rely on
                         // happens-before via operation ordering instead.
-                        dual_node_for_peer_reg
-                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
-                            .await;
+                        if !already_mapped {
+                            dual_node_for_peer_reg
+                                .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                                .await;
+                        }
 
                         // Atomically determine whether this is the peer's
                         // first channel. Using `entry` per-shard avoids the
@@ -2065,6 +2470,10 @@ fn shard_index_for_addr(addr: &SocketAddr) -> usize {
     (hasher.finish() as usize) % MESSAGE_DISPATCH_SHARDS
 }
 
+fn canonical_channel_id(addr: SocketAddr) -> String {
+    saorsa_transport::shared::normalize_socket_addr(addr).to_string()
+}
+
 // ============================================================================
 // Shutdown
 // ============================================================================
@@ -2155,7 +2564,7 @@ impl TransportHandle {
                             ConnectionEvent::Established {
                                 remote_address, ..
                             } => {
-                                let channel_id = remote_address.to_string();
+                                let channel_id = canonical_channel_id(remote_address);
                                 debug!(
                                     "Connection established: channel={}, addr={}",
                                     channel_id, remote_address
@@ -2219,7 +2628,7 @@ impl TransportHandle {
                             }
                             ConnectionEvent::Lost { remote_address, reason }
                             | ConnectionEvent::Failed { remote_address, reason } => {
-                                let channel_id = remote_address.to_string();
+                                let channel_id = canonical_channel_id(remote_address);
                                 debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
 
                                 active_connections.remove(&channel_id);
@@ -2339,5 +2748,139 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
         relay_addr: SocketAddr,
     ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
+    }
+}
+
+#[cfg(test)]
+mod address_event_observer_tests {
+    use super::*;
+
+    #[test]
+    fn watch_drain_returns_latest_event_once() {
+        let (tx, rx) = watch::channel(None);
+        let rx = parking_lot::Mutex::new(rx);
+        let first: SocketAddr = "198.51.100.1:10000".parse().expect("test addr");
+        let second: SocketAddr = "198.51.100.2:10000".parse().expect("test addr");
+
+        assert_eq!(TransportHandle::drain_latest_socket_event(&rx), None);
+
+        let _ = tx.send_replace(Some(first));
+        let _ = tx.send_replace(Some(second));
+
+        assert_eq!(
+            TransportHandle::drain_latest_socket_event(&rx),
+            Some(second)
+        );
+        assert_eq!(TransportHandle::drain_latest_socket_event(&rx), None);
+    }
+}
+
+#[cfg(test)]
+mod proven_externals_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test IP")
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().expect("test socket addr")
+    }
+
+    fn seed_observer(
+        proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+        external: SocketAddr,
+        observer: IpAddr,
+    ) {
+        let normalized = saorsa_transport::shared::normalize_socket_addr(external);
+        proven.entry(normalized).or_default().insert(observer);
+    }
+
+    #[test]
+    fn external_with_no_observers_is_not_proven() {
+        let proven = DashMap::new();
+        assert!(!external_meets_proof_threshold(
+            sa("198.51.100.1:10000"),
+            &proven
+        ));
+    }
+
+    #[test]
+    fn external_with_one_observer_is_not_proven() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        assert!(!external_meets_proof_threshold(ext, &proven));
+    }
+
+    #[test]
+    fn external_with_two_distinct_observers_is_proven() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        seed_observer(&proven, ext, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(ext, &proven));
+    }
+
+    #[test]
+    fn duplicate_observer_does_not_count_twice() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        assert!(
+            !external_meets_proof_threshold(ext, &proven),
+            "the same observer reporting twice must not satisfy the distinct-observer quorum"
+        );
+    }
+
+    #[test]
+    fn one_externals_proof_does_not_promote_another() {
+        let proven = DashMap::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let ext_b = sa("198.51.100.2:10000");
+        seed_observer(&proven, ext_a, ip("203.0.113.1"));
+        seed_observer(&proven, ext_a, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(ext_a, &proven));
+        assert!(
+            !external_meets_proof_threshold(ext_b, &proven),
+            "B has no observers; A's proof must not leak across externals"
+        );
+    }
+
+    #[test]
+    fn v4_external_proof_does_not_promote_v6_external() {
+        let proven = DashMap::new();
+        let v4 = sa("198.51.100.1:10000");
+        let v6 = sa("[2001:db8::1]:10000");
+        seed_observer(&proven, v4, ip("203.0.113.1"));
+        seed_observer(&proven, v4, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(v4, &proven));
+        assert!(
+            !external_meets_proof_threshold(v6, &proven),
+            "different family: v4 proof must not leak to a v6 external"
+        );
+    }
+
+    #[test]
+    fn lookup_normalises_v4_mapped_v6() {
+        // External pinned in plain v4 form; caller queries via
+        // IPv4-mapped IPv6 (`::ffff:198.51.100.1`). Both must hit the
+        // same entry after normalisation; otherwise the publisher's
+        // per-address tag computation can disagree with what the
+        // classifier wrote, and an address would be tagged Unverified
+        // despite having reached its observer quorum.
+        let proven = DashMap::new();
+        let v4 = sa("198.51.100.1:10000");
+        seed_observer(&proven, v4, ip("203.0.113.1"));
+        seed_observer(&proven, v4, ip("203.0.113.2"));
+
+        let mapped: SocketAddr = "[::ffff:198.51.100.1]:10000"
+            .parse()
+            .expect("test mapped addr");
+        assert!(
+            external_meets_proof_threshold(mapped, &proven),
+            "lookup via IPv4-mapped IPv6 must normalize to the v4 entry"
+        );
     }
 }

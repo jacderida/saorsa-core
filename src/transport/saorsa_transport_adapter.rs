@@ -42,13 +42,13 @@ use crate::error::{GeoRejectionError, GeographicConfig};
 use crate::security::canonicalize_ip;
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
-use dashmap::DashSet;
-use std::collections::HashMap;
+use dashmap::{DashMap, DashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
@@ -154,16 +154,14 @@ const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
 /// IPv4 take over quickly when the v6 attempt is failing or stalled.
 const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
-/// Per-attempt direct-connect timeout used by the Happy Eyeballs race.
+/// Per-attempt direct connect timeout used by the Happy Eyeballs race.
 ///
-/// saorsa-transport's `StrategyConfig` default is 3 s, sized for relay
-/// handshakes that add one extra RTT. With the dial planner now capping
-/// attempts at two addresses per peer (see
-/// [`crate::dht_network_manager::DhtNetworkManager::select_dial_candidates`]),
-/// a tighter 2 s budget matches the direct / relay-transport RTT we see
-/// in practice and shaves a full second off worst-case cold-start
-/// latency when the first address is unreachable.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Keep this short because DHT lookups expect to encounter unreachable
+/// candidates on live networks and should move on quickly.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Per-attempt direct handshake timeout after connection progress is observed.
+const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Increment the drop counter and log periodically when the address-event
 /// forwarder fails to push into a bounded channel.
@@ -191,6 +189,303 @@ fn handle_address_event_drop<T>(
             total_drops = prev + 1,
             "ADDR_FWD: dropped address event"
         );
+    }
+}
+
+/// Paired address-event outputs: an mpsc work queue for the reachability
+/// driver and a watch-backed latest-value stream for observers/tests.
+#[derive(Clone)]
+pub(crate) struct AddressEventPublisher {
+    tx: tokio::sync::mpsc::Sender<SocketAddr>,
+    latest_tx: watch::Sender<Option<SocketAddr>>,
+    event_kind: &'static str,
+}
+
+impl AddressEventPublisher {
+    pub(crate) fn new(
+        event_kind: &'static str,
+        tx: tokio::sync::mpsc::Sender<SocketAddr>,
+        latest_tx: watch::Sender<Option<SocketAddr>>,
+    ) -> Self {
+        Self {
+            tx,
+            latest_tx,
+            event_kind,
+        }
+    }
+
+    fn emit(&self, drops: &AtomicU64, address: SocketAddr) {
+        let _ = self.latest_tx.send_replace(Some(address));
+        if let Err(err) = self.tx.try_send(address) {
+            handle_address_event_drop(drops, self.event_kind, &err);
+        }
+    }
+}
+
+/// Handle a `P2pEvent::PeerConnected` event for the passive
+/// reachability classifier.
+///
+/// Runs the source-disjoint / sibling-hairpin filters, updates
+/// `known_peer_ips`, and on a passing `Side::Server` inbound:
+/// 1. Marks the peer's IP as `proof_eligible`.
+/// 2. Credits the peer's IP against any externals they have already
+///    reported observing us at (intersected with currently pinned
+///    externals).
+///
+/// Pure with respect to its arguments — extracted from
+/// [`DualStackNetworkNode::spawn_direct_reachability_classifier`] so
+/// the per-event logic is independently testable without spawning the
+/// whole broadcast loop.
+fn handle_peer_connected_for_proof(
+    addr: saorsa_transport::TransportAddr,
+    side: Side,
+    dialed: &DashSet<SocketAddr>,
+    known: &DashSet<IpAddr>,
+    external: &parking_lot::Mutex<ExternalAddresses>,
+    observations: &DashMap<IpAddr, HashSet<SocketAddr>>,
+    eligible: &DashSet<IpAddr>,
+    proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> Vec<SocketAddr> {
+    let Some(socket_addr) = addr.as_socket_addr() else {
+        tracing::trace!(
+            remote = %addr,
+            "classifier: ignoring non-socket transport handshake"
+        );
+        return Vec::new();
+    };
+    let normalized = saorsa_transport::shared::normalize_socket_addr(socket_addr);
+    let remote_ip = canonicalize_ip(normalized.ip());
+
+    let was_known_before = known.contains(&remote_ip) || dialed.contains(&normalized);
+    known.insert(remote_ip);
+
+    if !matches!(side, Side::Server) {
+        tracing::trace!(
+            remote = %normalized,
+            side = ?side,
+            "classifier: recorded outbound peer; not a proof candidate"
+        );
+        return Vec::new();
+    }
+
+    if was_known_before {
+        tracing::debug!(
+            remote = %normalized,
+            "classifier: ignoring inbound from previously-known peer \
+             (not source-disjoint; possible pinhole redial)"
+        );
+        return Vec::new();
+    }
+
+    let pinned_direct = external.lock().direct_addresses();
+    let is_own_external_ip = pinned_direct
+        .iter()
+        .any(|sa| canonicalize_ip(sa.ip()) == remote_ip);
+    if is_own_external_ip {
+        tracing::trace!(
+            remote = %normalized,
+            "classifier: ignoring sibling-hairpin handshake from own external IP"
+        );
+        return Vec::new();
+    }
+
+    eligible.insert(remote_ip);
+
+    if let Some(reports) = observations.get(&remote_ip) {
+        // Materialise to a local Vec so the DashMap shard guard is
+        // released before recursing into other DashMaps; defensive
+        // against a future change adding self-referential writes.
+        let prior: Vec<SocketAddr> = reports.iter().copied().collect();
+        drop(reports);
+        let mut promoted = Vec::new();
+        for ext in prior {
+            if let Some(addr) = credit_observation(remote_ip, ext, &pinned_direct, proven) {
+                promoted.push(addr);
+            }
+        }
+        promoted
+    } else {
+        tracing::trace!(
+            remote = %remote_ip,
+            "classifier: peer is now proof-eligible but has no prior observations; \
+             credit deferred until OBSERVED_ADDRESS frame arrives"
+        );
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ObservedExternalOutcome {
+    /// The address crossed the Direct proof threshold.
+    promoted: Option<SocketAddr>,
+    /// The address newly became publishable as an Unverified candidate.
+    publishable_added: Option<SocketAddr>,
+}
+
+/// Handle a `P2pEvent::PeerObservedExternal` event.
+///
+/// Records the peer's report in `peer_observations` (capped at
+/// [`crate::transport_handle::MAX_OBSERVATIONS_PER_PEER`]), retains the
+/// reported external as a publishable Unverified candidate, and, if the
+/// peer is already proof-eligible and the reported external is currently
+/// pinned, credits the observation against `proven_externals`.
+fn handle_peer_observed_external(
+    peer_addr: SocketAddr,
+    observed_external: SocketAddr,
+    external: &parking_lot::Mutex<ExternalAddresses>,
+    observations: &DashMap<IpAddr, HashSet<SocketAddr>>,
+    eligible: &DashSet<IpAddr>,
+    proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> ObservedExternalOutcome {
+    let normalized_peer = saorsa_transport::shared::normalize_socket_addr(peer_addr);
+    let peer_ip = canonicalize_ip(normalized_peer.ip());
+    let normalized_ext = saorsa_transport::shared::normalize_socket_addr(observed_external);
+
+    let recorded = {
+        let mut entry = observations.entry(peer_ip).or_default();
+        if entry.len() >= crate::transport_handle::MAX_OBSERVATIONS_PER_PEER
+            && !entry.contains(&normalized_ext)
+        {
+            tracing::debug!(
+                peer = %peer_ip,
+                external = %normalized_ext,
+                cap = crate::transport_handle::MAX_OBSERVATIONS_PER_PEER,
+                "classifier: dropping OBSERVED_ADDRESS report; per-peer observation cap reached"
+            );
+            false
+        } else {
+            entry.insert(normalized_ext)
+        }
+    };
+
+    if !recorded {
+        return ObservedExternalOutcome::default();
+    }
+
+    let publishable_added = external
+        .lock()
+        .record_unverified(normalized_ext)
+        .then_some(normalized_ext);
+
+    if !eligible.contains(&peer_ip) {
+        tracing::trace!(
+            peer = %peer_ip,
+            external = %normalized_ext,
+            "classifier: observation recorded; peer not yet proof-eligible — credit deferred"
+        );
+        return ObservedExternalOutcome {
+            promoted: None,
+            publishable_added,
+        };
+    }
+
+    let pinned_direct = external.lock().direct_addresses();
+    ObservedExternalOutcome {
+        promoted: credit_observation(peer_ip, normalized_ext, &pinned_direct, proven),
+        publishable_added,
+    }
+}
+
+/// Back-fill `proven_externals` when an external is freshly pinned.
+///
+/// Walks `peer_observations` and credits every proof-eligible peer that
+/// previously reported `external` — closing the timing window where a
+/// peer's `OBSERVED_ADDRESS` report arrives before saorsa-transport's
+/// pinning quorum is reached. The pinned-status check is implicit
+/// (`external` is being pinned by the caller), so no further gating is
+/// needed before recording.
+fn back_fill_proof_on_pin(
+    external: SocketAddr,
+    observations: &DashMap<IpAddr, HashSet<SocketAddr>>,
+    eligible: &DashSet<IpAddr>,
+    proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> Vec<SocketAddr> {
+    let normalized_ext = saorsa_transport::shared::normalize_socket_addr(external);
+    let mut promoted = Vec::new();
+    for entry in observations.iter() {
+        let peer_ip = *entry.key();
+        if !eligible.contains(&peer_ip) {
+            continue;
+        }
+        if entry.value().contains(&normalized_ext)
+            && let Some(addr) = record_attributed_observer(peer_ip, normalized_ext, proven)
+        {
+            promoted.push(addr);
+        }
+    }
+    promoted
+}
+
+/// Credit `peer_ip` against `external` iff the address is currently
+/// pinned. Defers to [`record_attributed_observer`] for the actual
+/// write+log.
+///
+/// Used by the live event handlers; `back_fill_proof_on_pin` calls
+/// `record_attributed_observer` directly because the pinned check is
+/// trivially satisfied at the call site.
+fn credit_observation(
+    peer_ip: IpAddr,
+    external: SocketAddr,
+    pinned_direct: &[SocketAddr],
+    proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> Option<SocketAddr> {
+    let normalized_ext = saorsa_transport::shared::normalize_socket_addr(external);
+    if !pinned_direct.contains(&normalized_ext) {
+        tracing::trace!(
+            peer = %peer_ip,
+            external = %normalized_ext,
+            "classifier: peer reported external but it is not currently pinned; \
+             back-fill on pin will catch this if quorum is reached later"
+        );
+        return None;
+    }
+    record_attributed_observer(peer_ip, normalized_ext, proven)
+}
+
+/// Insert `peer_ip` into `proven_externals[external]` and log threshold
+/// crossings. Caller is responsible for confirming that `external` is
+/// pinned (or being pinned right now).
+fn record_attributed_observer(
+    peer_ip: IpAddr,
+    normalized_ext: SocketAddr,
+    proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> Option<SocketAddr> {
+    let mut entry = proven.entry(normalized_ext).or_default();
+    let inserted = entry.insert(peer_ip);
+    let count = entry.len();
+    drop(entry);
+
+    if !inserted {
+        return None;
+    }
+
+    if count == crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT {
+        tracing::info!(
+            external = %normalized_ext,
+            observers = count,
+            threshold = crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+            new_observer = %peer_ip,
+            "classifier: external promoted to Direct (per-address attribution)"
+        );
+        Some(normalized_ext)
+    } else if count > crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT {
+        tracing::debug!(
+            external = %normalized_ext,
+            observers = count,
+            threshold = crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+            new_observer = %peer_ip,
+            "classifier: additional source-disjoint observer recorded for Direct external"
+        );
+        None
+    } else {
+        tracing::debug!(
+            external = %normalized_ext,
+            observers = count,
+            threshold = crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+            new_observer = %peer_ip,
+            "classifier: source-disjoint observer recorded; below threshold"
+        );
+        None
     }
 }
 
@@ -247,8 +542,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .context("Failed to create transport")?
             .with_default_strategy(
                 StrategyConfig::direct_only()
-                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+                    .with_direct_connect_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
@@ -268,8 +563,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?
             .with_default_strategy(
                 StrategyConfig::direct_only()
-                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+                    .with_direct_connect_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
         // Get the actual bound address from the endpoint
@@ -532,9 +827,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         //
         // The transport's default StrategyConfig::direct_only() disables
         // hole-punching and the in-cascade relay fallback, so this dial
-        // is single-shot. 5 s covers a QUIC handshake (1 RTT) + ML-DSA
-        // verification + margin for network jitter.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+        // is single-shot. 6 s covers the transport's 1 s progress timeout
+        // plus 4 s handshake timeout, with margin for task scheduling.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(6);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
@@ -1004,15 +1299,33 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
     /// relay routing. Called when identity exchange completes on a connection.
+    ///
+    /// Walks both stacks rather than stopping at the first hit so a dual-stack
+    /// node registers the peer ID against every endpoint that actually owns a
+    /// connection to it. Also registers the IPv4-mapped alternate form so peer
+    /// ID lookups resolve regardless of which form the relay path supplies.
     pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
+        let normalized = saorsa_transport::shared::normalize_socket_addr(addr);
+        let alternate = saorsa_transport::shared::dual_stack_alternate(&normalized);
+        let mut registered = false;
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let endpoint = node.transport.endpoint();
-            endpoint.register_connection_peer_id(addr, peer_id);
-            // Also register the dual-stack alternate form (IPv4 ↔ IPv4-mapped IPv6)
-            // so peer ID routing works regardless of which form the connection uses.
-            if let Some(alt) = saorsa_transport::shared::dual_stack_alternate(&addr) {
-                endpoint.register_connection_peer_id(alt, peer_id);
+            if endpoint.has_active_connection(&normalized) {
+                endpoint.register_connection_peer_id(normalized, peer_id);
+                registered = true;
             }
+            if let Some(alt) = alternate
+                && endpoint.has_active_connection(&alt)
+            {
+                endpoint.register_connection_peer_id(alt, peer_id);
+                registered = true;
+            }
+        }
+        if !registered {
+            debug!(
+                "No active transport endpoint found while registering peer ID for {}",
+                normalized
+            );
         }
     }
 
@@ -1131,7 +1444,9 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Spawn background tasks that forward address-related `P2pEvent`s from
     /// each stack's `P2pEndpoint` to the upper layers.
     ///
-    /// Four event flavours are bridged:
+    /// Four transport event flavours are bridged, and direct-address
+    /// promotion notifications are emitted when the classifier state crosses
+    /// its proof threshold:
     ///
     /// - **`PeerAddressUpdated`**: a connected peer advertised a new
     ///   reachable address via an ADD_ADDRESS frame (typically a relay).
@@ -1144,16 +1459,25 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     ///   no longer reachable. The reachability driver republishes the
     ///   address set without the relay entry on receipt.  Returned via
     ///   the third mpsc receiver.
-    /// - **`ExternalAddressDiscovered`**: a peer reported the address it
-    ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Pinned
-    ///   directly into the supplied [`ExternalAddresses`] store. Once
-    ///   pinned, the address is retained for the process lifetime.
+    /// - **`ExternalAddressDiscovered`**: saorsa-transport's observed
+    ///   address quorum cleared. The address is pinned into the supplied
+    ///   [`ExternalAddresses`] store and a self-address update is emitted
+    ///   unless the same event also promotes it to Direct.
+    /// - **Direct address promoted**: not a transport event itself; emitted
+    ///   to `direct_promoted_tx` when either live attribution or the
+    ///   `ExternalAddressDiscovered` back-fill proves a pinned external
+    ///   address is cold-dialable.
     ///
     /// Other `P2pEvent` variants are not consumed by saorsa-core and are
     /// silently ignored.
     pub fn spawn_peer_address_update_forwarder(
         &self,
         external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
+        peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
+        proof_eligible_peers: Arc<DashSet<IpAddr>>,
+        proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
+        direct_promoted_events: AddressEventPublisher,
+        self_address_updated_events: AddressEventPublisher,
     ) -> (
         tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
@@ -1170,6 +1494,11 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let relay_tx_clone = relay_tx.clone();
             let relay_lost_tx_clone = relay_lost_tx.clone();
             let ext_clone = Arc::clone(&external_addresses);
+            let observations_clone = Arc::clone(&peer_observations);
+            let eligible_clone = Arc::clone(&proof_eligible_peers);
+            let proven_clone = Arc::clone(&proven_externals);
+            let direct_promoted_events_clone = direct_promoted_events.clone();
+            let self_address_updated_events_clone = self_address_updated_events.clone();
             let drops = Arc::clone(&drop_counter);
             let local_bind = node.local_address();
             tokio::spawn(async move {
@@ -1227,7 +1556,37 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                     "ADDR_FWD: pinning observed external address {}",
                                     normalized
                                 );
-                                ext_clone.lock().pin_direct(normalized);
+                                let pinned = ext_clone.lock().pin_direct(normalized);
+
+                                // Back-fill: any peer that already reported
+                                // observing us at this address before it
+                                // cleared saorsa-transport's pinning quorum
+                                // gets credited now. Without this, the very
+                                // first peer's report (which doesn't trigger
+                                // a pin on its own) is lost — saorsa-core
+                                // would otherwise need a third independent
+                                // observer to reach the proof threshold.
+                                if pinned {
+                                    let mut promoted_any = false;
+                                    for promoted in back_fill_proof_on_pin(
+                                        normalized,
+                                        &observations_clone,
+                                        &eligible_clone,
+                                        &proven_clone,
+                                    ) {
+                                        promoted_any = true;
+                                        direct_promoted_events_clone.emit(&drops, promoted);
+                                    }
+                                    if !promoted_any {
+                                        self_address_updated_events_clone.emit(&drops, normalized);
+                                    }
+                                } else {
+                                    tracing::trace!(
+                                        local_bind = %local_bind,
+                                        address = %normalized,
+                                        "ADDR_FWD: observed external address was already pinned or is the active relay; skipping direct back-fill"
+                                    );
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -1254,79 +1613,128 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         (rx, relay_rx, relay_lost_rx)
     }
 
-    /// Spawn a background task per stack that watches `P2pEvent::PeerConnected`
-    /// and sets `flag` the first time an unsolicited inbound handshake
-    /// completes — i.e. a connection accepted from a remote address that is
+    /// Spawn one background task per bound stack (v4, v6) to classify
+    /// inbound connections and accumulate per-address proof sets.
+    ///
+    /// ## What this proves
+    ///
+    /// `Side::Server` alone is not proof of cold-dialability — it only
+    /// proves "a packet landed at our listener," which on a NAT'd host
+    /// can be a redial through a NAT pinhole that the inbound peer
+    /// already knew about. The classifier records an inbound peer `P`
+    /// as proof of cold-dialability for an external `E` iff **all** hold:
+    ///
+    /// 1. `Side::Server` (someone connected to us, we did not initiate).
+    /// 2. The remote socket is not in `dialed_addrs` — guards
+    ///    simultaneous-open replies. Pre-populated at every dial site
+    ///    (`TransportHandle::connect_peer`).
+    /// 3. The remote IP is not in `known_peer_ips` at the moment of the
+    ///    event — i.e. not a peer we have ever dialed or accepted from
+    ///    before. Closes the bootstrap-redial / pinhole-self-fulfillment
+    ///    case where a peer we previously connected to opens a fresh
+    ///    QUIC connection through their pre-existing NAT binding.
+    /// 4. The remote IP is not equal to any of our own pinned external
+    ///    IPs — sibling-hairpin filter (multiple nodes behind one shared
+    ///    NAT see each other's traffic as "inbound from our public IP"
+    ///    after MASQUERADE; this never left the LAN).
+    /// 5. **`P` itself reported `E` via a QUIC `OBSERVED_ADDRESS` frame.**
+    ///    `E` is then the per-address attribution signal: the peer's own
+    ///    statement that they reached us at `E`. A v4 inbound from `P`
+    ///    that reported only `E_v4` cannot promote any other pinned
+    ///    external — same family or otherwise.
+    ///
+    /// When all conditions hold, the remote IP is added to the **specific**
+    /// reported external's observer set in `proven_externals`. Once any
+    /// external reaches `MIN_DISTINCT_OBSERVERS_FOR_DIRECT` distinct
+    /// observer IPs it is considered cold-dialable, and
+    /// [`TransportHandle::is_external_proven`] returns `true` for it.
+    ///
+    /// Per-address attribution is what condition 5 provides. Without it
+    /// (a peer that doesn't send `OBSERVED_ADDRESS` — older clients,
+    /// constrained transports), the inbound contributes no proof.
+    ///
+    /// ## Event ordering
+    ///
+    /// `P2pEvent::PeerConnected` and `P2pEvent::PeerObservedExternal`
+    /// arrive in arbitrary order from saorsa-transport. The classifier
+    /// stores both `peer_observations` and `proof_eligible_peers` and
+    /// credits at whichever event completes the pair (with the further
+    /// requirement that the address is currently in `pinned_direct`).
+    /// A back-fill on `ExternalAddressDiscovered` (in the address
+    /// forwarder) handles the third case where the observation arrives
+    /// before saorsa-transport's pinning quorum clears.
+    ///
+    /// ## What this also does
+    ///
+    /// On every `PeerConnected` event (any `Side`), the remote IP is
+    /// recorded in `known_peer_ips`. This means the very first inbound
+    /// from a stranger IP can contribute proof, but every subsequent
+    /// inbound from that same IP is recognised as not source-disjoint
+    /// and skipped — preventing one chatty peer from inflating its own
+    /// proof beyond the single observer slot it deserves.
+    ///
+    /// `Side::Client` events also write `known_peer_ips`, ensuring that
+    /// a peer we dial first cannot later "appear unsolicited" via a
+    /// pinhole redial — even if their NAT has remapped them to a port
     /// not in `dialed_addrs`.
-    ///
-    /// This is the passive NAT-reachability classifier: one confirmed
-    /// inbound from a peer we never dialed proves that our listener is
-    /// cold-dialable, which is what [`AcquisitionDriver::publish_typed_set`]
-    /// needs to decide whether to publish addresses tagged `Direct` or
-    /// `Unverified`.
-    ///
-    /// `dialed_addrs` is expected to be populated at the dial site
-    /// (`TransportHandle::connect_peer`) *before* the dial starts so that a
-    /// simultaneous-open race cannot mis-classify a reply as unsolicited.
-    ///
-    /// `external_addresses` is consulted to reject sibling-hairpin
-    /// handshakes: on a NAT droplet that hosts multiple nodes behind a
-    /// shared public IP, a sibling node opening a connection to us appears
-    /// as inbound from our own external IP after MASQUERADE. That traffic
-    /// is NOT evidence of public reachability — it never left the droplet.
-    /// Without this filter, sibling hairpins flip the flag true on NAT'd
-    /// hosts and defeat the whole Direct/Unverified distinction.
     pub fn spawn_direct_reachability_classifier(
         &self,
         dialed_addrs: Arc<DashSet<SocketAddr>>,
-        flag: Arc<AtomicBool>,
+        known_peer_ips: Arc<DashSet<IpAddr>>,
+        proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
         external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
+        peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
+        proof_eligible_peers: Arc<DashSet<IpAddr>>,
+        direct_promoted_events: AddressEventPublisher,
+        self_address_updated_events: AddressEventPublisher,
     ) {
+        let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let dialed = Arc::clone(&dialed_addrs);
-            let flag = Arc::clone(&flag);
+            let known = Arc::clone(&known_peer_ips);
+            let proven = Arc::clone(&proven_externals);
             let external = Arc::clone(&external_addresses);
+            let observations = Arc::clone(&peer_observations);
+            let eligible = Arc::clone(&proof_eligible_peers);
+            let promoted_events = direct_promoted_events.clone();
+            let self_address_events = self_address_updated_events.clone();
+            let drops = Arc::clone(&drop_counter);
             tokio::spawn(async move {
                 loop {
                     match p2p_rx.recv().await {
-                        Ok(saorsa_transport::P2pEvent::PeerConnected {
-                            addr,
-                            side: Side::Server,
-                            ..
+                        Ok(saorsa_transport::P2pEvent::PeerConnected { addr, side, .. }) => {
+                            for promoted in handle_peer_connected_for_proof(
+                                addr,
+                                side,
+                                &dialed,
+                                &known,
+                                &external,
+                                &observations,
+                                &eligible,
+                                &proven,
+                            ) {
+                                promoted_events.emit(&drops, promoted);
+                            }
+                        }
+                        Ok(saorsa_transport::P2pEvent::PeerObservedExternal {
+                            peer_addr,
+                            observed_external,
                         }) => {
-                            if flag.load(Ordering::Relaxed) {
-                                // Already proven; nothing more to learn here.
-                                continue;
-                            }
-                            let Some(socket_addr) = addr.as_socket_addr() else {
-                                continue;
-                            };
-                            let normalized =
-                                saorsa_transport::shared::normalize_socket_addr(socket_addr);
-                            if dialed.contains(&normalized) {
-                                // Simultaneous-open reply to our own dial; not proof.
-                                continue;
-                            }
-                            let remote_ip = canonicalize_ip(normalized.ip());
-                            let is_own_external_ip = external
-                                .lock()
-                                .direct_addresses()
-                                .into_iter()
-                                .any(|sa| canonicalize_ip(sa.ip()) == remote_ip);
-                            if is_own_external_ip {
-                                tracing::trace!(
-                                    remote = %normalized,
-                                    "classifier: ignoring sibling-hairpin handshake from own external IP"
-                                );
-                                continue;
-                            }
-                            tracing::info!(
-                                remote = %normalized,
-                                "direct reachability observed: unsolicited inbound handshake \
-                                 from peer not in dialed set"
+                            let outcome = handle_peer_observed_external(
+                                peer_addr,
+                                observed_external,
+                                &external,
+                                &observations,
+                                &eligible,
+                                &proven,
                             );
-                            flag.store(true, Ordering::Release);
+                            if let Some(address) = outcome.publishable_added {
+                                self_address_events.emit(&drops, address);
+                            }
+                            if let Some(promoted) = outcome.promoted {
+                                promoted_events.emit(&drops, promoted);
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2296,5 +2704,452 @@ mod tests {
     #[test]
     fn to_dual_stack_dial_list_empty_input_empty_output() {
         assert!(to_dual_stack_dial_list(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::{
+        ObservedExternalOutcome, back_fill_proof_on_pin, handle_peer_connected_for_proof,
+        handle_peer_observed_external,
+    };
+    use crate::transport::external_addresses::ExternalAddresses;
+    use crate::transport_handle::{
+        MAX_OBSERVATIONS_PER_PEER, MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+        external_meets_proof_threshold,
+    };
+    use dashmap::{DashMap, DashSet};
+    use saorsa_transport::{Side, TransportAddr};
+    use std::collections::HashSet;
+    use std::net::{IpAddr, SocketAddr};
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().expect("test socket addr")
+    }
+
+    /// One harness scoped to a single classifier under test.
+    ///
+    /// Wires up the same Arcs the real classifier owns so the helper
+    /// functions can be invoked directly with deterministic state.
+    struct ProofHarness {
+        dialed: DashSet<SocketAddr>,
+        known: DashSet<IpAddr>,
+        external: parking_lot::Mutex<ExternalAddresses>,
+        observations: DashMap<IpAddr, HashSet<SocketAddr>>,
+        eligible: DashSet<IpAddr>,
+        proven: DashMap<SocketAddr, HashSet<IpAddr>>,
+    }
+
+    impl ProofHarness {
+        fn new() -> Self {
+            Self {
+                dialed: DashSet::new(),
+                known: DashSet::new(),
+                external: parking_lot::Mutex::new(ExternalAddresses::new()),
+                observations: DashMap::new(),
+                eligible: DashSet::new(),
+                proven: DashMap::new(),
+            }
+        }
+
+        fn pin(&self, addr: SocketAddr) {
+            self.external.lock().pin_direct(addr);
+        }
+
+        fn inbound(&self, peer: SocketAddr) {
+            let _ = self.dispatch_peer_connected(peer, Side::Server);
+        }
+
+        fn outbound(&self, peer: SocketAddr) {
+            let _ = self.dispatch_peer_connected(peer, Side::Client);
+        }
+
+        fn dispatch_peer_connected(&self, peer: SocketAddr, side: Side) -> Vec<SocketAddr> {
+            handle_peer_connected_for_proof(
+                TransportAddr::Quic(peer),
+                side,
+                &self.dialed,
+                &self.known,
+                &self.external,
+                &self.observations,
+                &self.eligible,
+                &self.proven,
+            )
+        }
+
+        fn observe(&self, peer: SocketAddr, observed: SocketAddr) {
+            let _ = self.observe_promoted(peer, observed);
+        }
+
+        fn observe_promoted(&self, peer: SocketAddr, observed: SocketAddr) -> Option<SocketAddr> {
+            self.observe_outcome(peer, observed).promoted
+        }
+
+        fn observe_outcome(
+            &self,
+            peer: SocketAddr,
+            observed: SocketAddr,
+        ) -> ObservedExternalOutcome {
+            handle_peer_observed_external(
+                peer,
+                observed,
+                &self.external,
+                &self.observations,
+                &self.eligible,
+                &self.proven,
+            )
+        }
+
+        fn non_relay_addresses(&self) -> Vec<SocketAddr> {
+            self.external.lock().non_relay_addresses()
+        }
+
+        fn pin_with_back_fill(&self, addr: SocketAddr) -> Vec<SocketAddr> {
+            if self.external.lock().pin_direct(addr) {
+                back_fill_proof_on_pin(addr, &self.observations, &self.eligible, &self.proven)
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn is_proven(&self, addr: SocketAddr) -> bool {
+            external_meets_proof_threshold(addr, &self.proven)
+        }
+
+        fn observer_count(&self, addr: SocketAddr) -> usize {
+            let normalized = saorsa_transport::shared::normalize_socket_addr(addr);
+            self.proven.get(&normalized).map(|s| s.len()).unwrap_or(0)
+        }
+    }
+
+    /// **Reviewer's regression test.** Two pinned IPv4 externals and two
+    /// source-disjoint inbound peers. Each peer reports observing only
+    /// one — different — external. Neither external reaches the
+    /// distinct-observer quorum, because the other peer's inbound is not
+    /// per-address attribution for this address.
+    ///
+    /// Pre-fix behavior would have promoted **both** externals to Direct
+    /// (every same-family pinned external got credited by every
+    /// source-disjoint inbound). Post-fix, attribution is per the peer's
+    /// own `OBSERVED_ADDRESS` report — no leakage across externals.
+    #[test]
+    fn two_pinned_externals_two_disjoint_inbounds_each_reports_one_promotes_neither() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let ext_b = sa("198.51.100.2:10000");
+        h.pin(ext_a);
+        h.pin(ext_b);
+
+        let p1 = sa("203.0.113.10:55555");
+        let p2 = sa("203.0.113.20:55555");
+
+        h.inbound(p1);
+        h.observe(p1, ext_a);
+
+        h.inbound(p2);
+        h.observe(p2, ext_b);
+
+        assert_eq!(
+            h.observer_count(ext_a),
+            1,
+            "ext_a only got attributed by P1"
+        );
+        assert_eq!(
+            h.observer_count(ext_b),
+            1,
+            "ext_b only got attributed by P2"
+        );
+        assert!(
+            !h.is_proven(ext_a),
+            "ext_a must NOT be promoted by P2's inbound — P2 reported a different external"
+        );
+        assert!(
+            !h.is_proven(ext_b),
+            "ext_b must NOT be promoted by P1's inbound — P1 reported a different external"
+        );
+    }
+
+    /// Convergent case: two pinned externals, both peers report the same
+    /// one. Only the reported external reaches quorum.
+    #[test]
+    fn two_disjoint_inbounds_reporting_same_external_promotes_only_that_external() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let ext_b = sa("198.51.100.2:10000");
+        h.pin(ext_a);
+        h.pin(ext_b);
+
+        let p1 = sa("203.0.113.10:0");
+        let p2 = sa("203.0.113.20:0");
+
+        h.inbound(p1);
+        h.observe(p1, ext_a);
+        h.inbound(p2);
+        h.observe(p2, ext_a);
+
+        assert!(h.is_proven(ext_a));
+        assert!(!h.is_proven(ext_b));
+    }
+
+    /// Multi-WAN: two pinned externals, both peers genuinely reach us
+    /// via both (e.g. anycast or dual-WAN). Both promote.
+    #[test]
+    fn two_disjoint_inbounds_reporting_both_externals_promote_both() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let ext_b = sa("198.51.100.2:10000");
+        h.pin(ext_a);
+        h.pin(ext_b);
+
+        let p1 = sa("203.0.113.10:0");
+        let p2 = sa("203.0.113.20:0");
+
+        h.inbound(p1);
+        h.observe(p1, ext_a);
+        h.observe(p1, ext_b);
+        h.inbound(p2);
+        h.observe(p2, ext_a);
+        h.observe(p2, ext_b);
+
+        assert!(h.is_proven(ext_a));
+        assert!(h.is_proven(ext_b));
+    }
+
+    /// Source-disjointness: an inbound from a peer we previously dialed
+    /// is not proof-eligible, and their `OBSERVED_ADDRESS` reports do not
+    /// credit.
+    #[test]
+    fn previously_dialed_peer_observation_does_not_credit() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let p1 = sa("203.0.113.10:0");
+        h.outbound(p1); // marks the peer's IP in `known`
+        h.inbound(p1); // arrives later; previously known → not eligible
+        h.observe(p1, ext_a);
+
+        assert_eq!(h.observer_count(ext_a), 0);
+    }
+
+    /// Sibling-hairpin: an inbound whose source IP equals one of our
+    /// own pinned externals is rejected (NAT loopback, never left LAN).
+    #[test]
+    fn inbound_from_own_external_ip_is_filtered() {
+        let h = ProofHarness::new();
+        let our_external = sa("198.51.100.1:10000");
+        h.pin(our_external);
+
+        let sibling = sa("198.51.100.1:55555"); // same IP, different port
+        h.inbound(sibling);
+        h.observe(sibling, our_external);
+
+        assert_eq!(h.observer_count(our_external), 0);
+    }
+
+    /// Out-of-order: observation arrives before its `PeerConnected`.
+    /// The cached observation is credited when the peer becomes
+    /// proof-eligible.
+    #[test]
+    fn observation_before_peer_connected_credits_on_inbound() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let p1 = sa("203.0.113.10:0");
+        h.observe(p1, ext_a); // recorded but peer not yet eligible
+        h.inbound(p1);
+
+        assert_eq!(h.observer_count(ext_a), 1);
+    }
+
+    /// Out-of-order: address pinned after its observation arrived.
+    /// The back-fill on pin credits the eligible peer.
+    #[test]
+    fn observation_before_pin_credits_on_back_fill() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+
+        let p1 = sa("203.0.113.10:0");
+        h.inbound(p1); // eligible (no pinned externals to compare against)
+        let outcome = h.observe_outcome(p1, ext_a); // observed external not yet pinned
+
+        assert_eq!(outcome.publishable_added, Some(ext_a));
+        assert_eq!(h.non_relay_addresses(), vec![ext_a]);
+        assert_eq!(
+            h.observer_count(ext_a),
+            0,
+            "credit must wait until the address is actually pinned"
+        );
+
+        h.pin_with_back_fill(ext_a);
+
+        assert_eq!(h.observer_count(ext_a), 1);
+    }
+
+    #[test]
+    fn unpinned_observation_is_retained_as_unverified_candidate_once() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let p1 = sa("203.0.113.10:0");
+        let p2 = sa("203.0.113.20:0");
+
+        assert_eq!(h.observe_outcome(p1, ext_a).publishable_added, Some(ext_a));
+        assert_eq!(h.observe_outcome(p2, ext_a).publishable_added, None);
+        assert_eq!(h.non_relay_addresses(), vec![ext_a]);
+    }
+
+    /// Side::Client never becomes proof-eligible: even a peer we dialed
+    /// who later sends us OBSERVED_ADDRESS does not contribute proof.
+    #[test]
+    fn side_client_does_not_become_proof_eligible() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let p1 = sa("203.0.113.10:0");
+        h.outbound(p1);
+        h.observe(p1, ext_a);
+
+        assert_eq!(h.observer_count(ext_a), 0);
+    }
+
+    /// IP-level dedup: a chatty peer reconnecting from new ephemeral
+    /// ports cannot inflate their proof count beyond one slot.
+    #[test]
+    fn duplicate_observation_from_same_peer_ip_does_not_double_count() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let p1 = sa("203.0.113.10:0");
+        h.inbound(p1);
+        h.observe(p1, ext_a);
+        h.observe(p1, ext_a);
+
+        assert_eq!(h.observer_count(ext_a), 1);
+        assert!(!h.is_proven(ext_a));
+    }
+
+    /// Cross-family isolation: a v4-only inbound and a v6-only inbound
+    /// each credit only their reported externals. Neither external
+    /// reaches quorum.
+    #[test]
+    fn cross_family_attribution_does_not_leak() {
+        let h = ProofHarness::new();
+        let ext_v4 = sa("198.51.100.1:10000");
+        let ext_v6 = sa("[2001:db8::1]:10000");
+        h.pin(ext_v4);
+        h.pin(ext_v6);
+
+        let p_v4 = sa("203.0.113.10:0");
+        let p_v6 = sa("[2001:db8:cafe::10]:0");
+
+        h.inbound(p_v4);
+        h.observe(p_v4, ext_v4);
+        h.inbound(p_v6);
+        h.observe(p_v6, ext_v6);
+
+        assert_eq!(h.observer_count(ext_v4), 1);
+        assert_eq!(h.observer_count(ext_v6), 1);
+        assert!(!h.is_proven(ext_v4));
+        assert!(!h.is_proven(ext_v6));
+    }
+
+    /// Per-peer observation cap: reports beyond the cap are dropped.
+    /// The first `MAX_OBSERVATIONS_PER_PEER` distinct externals are
+    /// retained; further distinct externals from the same peer are
+    /// silently ignored.
+    #[test]
+    fn per_peer_observation_cap_enforced() {
+        let h = ProofHarness::new();
+
+        let p1 = sa("203.0.113.10:0");
+        h.inbound(p1);
+
+        let cap = MAX_OBSERVATIONS_PER_PEER;
+        for i in 0..cap {
+            let ext = format!("198.51.100.{}:10000", i + 1)
+                .parse::<SocketAddr>()
+                .expect("addr");
+            h.pin(ext);
+            h.observe(p1, ext);
+        }
+
+        let overflow = sa("198.51.100.250:10000");
+        h.pin(overflow);
+        h.observe(p1, overflow);
+
+        assert_eq!(
+            h.observer_count(overflow),
+            0,
+            "the cap+1 observation must be dropped, even with the address pinned"
+        );
+        // Within-cap observations are credited normally.
+        let first = sa("198.51.100.1:10000");
+        assert_eq!(h.observer_count(first), 1);
+    }
+
+    /// Threshold semantics: ≥ `MIN_DISTINCT_OBSERVERS_FOR_DIRECT`
+    /// distinct attributable peer IPs must promote to Direct.
+    #[test]
+    fn threshold_constant_is_respected() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let mut ips = Vec::new();
+        for i in 0..MIN_DISTINCT_OBSERVERS_FOR_DIRECT {
+            let p = format!("203.0.113.{}:0", 10 + i)
+                .parse::<SocketAddr>()
+                .expect("addr");
+            h.inbound(p);
+            h.observe(p, ext_a);
+            ips.push(p);
+        }
+
+        assert!(h.is_proven(ext_a));
+        // Sanity: ext_a got exactly MIN_DISTINCT_OBSERVERS_FOR_DIRECT
+        // observers, not more.
+        assert_eq!(h.observer_count(ext_a), MIN_DISTINCT_OBSERVERS_FOR_DIRECT);
+    }
+
+    #[test]
+    fn promotion_is_reported_once_on_threshold_crossing() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+        h.pin(ext_a);
+
+        let p1 = sa("203.0.113.10:0");
+        let p2 = sa("203.0.113.20:0");
+        let p3 = sa("203.0.113.30:0");
+
+        h.inbound(p1);
+        assert_eq!(h.observe_promoted(p1, ext_a), None);
+        h.inbound(p2);
+        assert_eq!(h.observe_promoted(p2, ext_a), Some(ext_a));
+        h.inbound(p3);
+        assert_eq!(h.observe_promoted(p3, ext_a), None);
+
+        assert!(h.is_proven(ext_a));
+        assert_eq!(h.observer_count(ext_a), 3);
+    }
+
+    #[test]
+    fn back_fill_reports_promotion_when_pin_completes_threshold() {
+        let h = ProofHarness::new();
+        let ext_a = sa("198.51.100.1:10000");
+
+        let p1 = sa("203.0.113.10:0");
+        let p2 = sa("203.0.113.20:0");
+
+        h.inbound(p1);
+        h.observe(p1, ext_a);
+        h.inbound(p2);
+        h.observe(p2, ext_a);
+
+        assert_eq!(h.observer_count(ext_a), 0);
+        assert_eq!(h.pin_with_back_fill(ext_a), vec![ext_a]);
+        assert!(h.is_proven(ext_a));
     }
 }

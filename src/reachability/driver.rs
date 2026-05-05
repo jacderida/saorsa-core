@@ -24,31 +24,34 @@
 //! The driver runs as a single tokio task and cycles through three states:
 //!
 //! 1. **Acquiring**: call [`run_relay_acquisition`]. On success, publish
-//!    the full typed self-record (direct addresses + relay-allocated
-//!    address tagged [`AddressType::Relay`]) to K-closest peers, store
-//!    the relayer peer ID, and enter the **Holding** state. Relay
-//!    serving stays permanently enabled. On failure, publish the
-//!    direct-only address set so the node remains as reachable as
-//!    possible, arm the exponential backoff timer, and enter the
-//!    **Backoff** state.
-//! 2. **Holding**: subscribe to `KClosestPeersChanged` events and poll
+//!    the full typed self-record (relay-allocated address tagged
+//!    [`AddressType::Relay`] first, then one best non-relay address per
+//!    IP family) to K-closest peers, store the relayer peer ID, and enter
+//!    the **Holding** state. Relay serving stays permanently enabled. On
+//!    failure, publish the direct-only address set so the node remains as
+//!    reachable as possible, arm the exponential backoff timer, and enter
+//!    the **Backoff** state.
+//! 2. **Holding**: subscribe to `KClosestPeersChanged` events, republish
+//!    when a pinned external address is promoted to
+//!    [`AddressType::Direct`], and poll
 //!    [`TransportHandle::is_relay_healthy`] every
-//!    [`HEALTH_POLL_INTERVAL`]. On relayer-evicted, unhealthy-tunnel,
-//!    or shutdown, transition to **Lost**.
+//!    [`HEALTH_POLL_INTERVAL`]. On relayer-evicted or unhealthy-tunnel,
+//!    transition to **Lost**; on shutdown, exit the driver.
 //! 3. **Lost**: run the `republish-direct-only → reacquire` sequence.
 //!    The republish MUST happen **before** the acquisition walk starts,
 //!    so the network stops dialing the dead relay address during the
 //!    1–10 s acquisition window. After republishing, loop back to
 //!    **Acquiring**.
 //! 4. **Backoff**: wait for the current backoff window or a
-//!    `KClosestPeersChanged` event (whichever comes first), then loop
-//!    back to **Acquiring**. Successful acquisition resets the backoff.
+//!    `KClosestPeersChanged` event (whichever comes first), republishing
+//!    if a pinned external is promoted to [`AddressType::Direct`] while
+//!    waiting, then loop back to **Acquiring**. Successful acquisition
+//!    resets the backoff.
 //!
 //! Clients ([`NodeMode::Client`](crate::network::NodeMode::Client)) do
 //! not spawn the driver at all — they are outbound-only and do not need
 //! a relay.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +64,7 @@ use tracing::{debug, info, trace, warn};
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
 use crate::reachability::session::{RelayAcquisitionOutcome, run_relay_acquisition};
+use crate::self_address::build_typed_self_address_set;
 use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
 
@@ -106,6 +110,7 @@ pub(crate) fn spawn_acquisition_driver(
             relay_address,
             shutdown,
             current_backoff: BACKOFF_INITIAL,
+            last_published_typed_set: None,
         };
         driver.run().await;
     });
@@ -121,6 +126,13 @@ struct AcquisitionDriver {
     relay_address: Arc<RwLock<Option<SocketAddr>>>,
     shutdown: CancellationToken,
     current_backoff: Duration,
+    last_published_typed_set: Option<PublishedTypedSet>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PublishedTypedSet {
+    typed_addresses: Vec<(MultiAddr, AddressType)>,
+    peers: Vec<PeerId>,
 }
 
 impl AcquisitionDriver {
@@ -140,7 +152,7 @@ impl AcquisitionDriver {
                     *self.relay_address.write().await = Some(relay.allocated_public_addr);
                     self.transport
                         .set_relay_address(relay.allocated_public_addr);
-                    self.publish_typed_set(Some(relay.allocated_public_addr))
+                    self.force_publish_typed_set(Some(relay.allocated_public_addr))
                         .await;
                     info!(
                         relayer = ?relay.relayer,
@@ -175,84 +187,51 @@ impl AcquisitionDriver {
 
     /// Publish this node's current typed address set to K-closest peers.
     ///
-    /// The direct tier's [`AddressType`] depends on the passive
-    /// reachability classifier (see
-    /// [`TransportHandle::direct_reachability_observed`]): when at least
-    /// one unsolicited inbound handshake has completed, observed external
-    /// addresses are tagged [`AddressType::Direct`]; otherwise they are
-    /// tagged [`AddressType::Unverified`] so dialers know they may time
-    /// out. When `relay` is `Some`, the relay-allocated socket is appended
-    /// tagged [`AddressType::Relay`].
+    /// Each address's [`AddressType`] is computed independently from the
+    /// passive per-address reachability proof (see
+    /// [`TransportHandle::is_external_proven`]): an address is tagged
+    /// [`AddressType::Direct`] only after at least
+    /// `MIN_DISTINCT_OBSERVERS_FOR_DIRECT` source-disjoint inbounds have
+    /// been attributed to it; otherwise it is tagged
+    /// [`AddressType::Unverified`] (so dialers know they may time out).
     ///
-    /// When a relay has been acquired, unverified-only addresses are
-    /// suppressed — the relay address is the authoritative contact and
-    /// publishing undialable direct entries alongside it just adds
-    /// timeout cost for dialers.
+    /// When `relay` is `Some`, the relay-allocated socket is emitted
+    /// first, tagged [`AddressType::Relay`].
+    ///
+    /// Per-address (not global) tagging matters for two cases the previous
+    /// global-flag approach got wrong:
+    ///
+    /// 1. A v4 inbound proves nothing about a v6 external; the classifier
+    ///    only credits same-family externals, and the tag is computed
+    ///    per address from that per-address proof.
+    /// 2. On a multi-NAT host, one external being proven Direct does not
+    ///    promote unrelated externals.
     ///
     /// Quietly drops the publish when there are no dialable addresses to
     /// advertise — a fully wildcard-bound node cannot meaningfully tell
     /// peers how to reach it.
-    async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
+    async fn publish_typed_set(&mut self, relay: Option<SocketAddr>) {
+        self.publish_typed_set_with_policy(relay, false).await;
+    }
+
+    async fn force_publish_typed_set(&mut self, relay: Option<SocketAddr>) {
+        self.publish_typed_set_with_policy(relay, true).await;
+    }
+
+    async fn publish_typed_set_with_policy(&mut self, relay: Option<SocketAddr>, force: bool) {
         let listen = self.transport.listen_addrs().await;
-        let observed = self.transport.direct_external_addresses();
-        let direct_verified = self.transport.direct_reachability_observed();
+        let observed = self.transport.non_relay_external_addresses();
 
-        // Choose the tag for observed/listen addresses:
-        //   - classifier has proven reachability → Direct
-        //   - no proof yet, no relay either      → Unverified (cold-start;
-        //                                          dialers eat the risk)
-        //   - no proof yet, but relay is held    → suppress (relay is
-        //                                          authoritative; don't
-        //                                          waste dialers on
-        //                                          unverified direct)
-        let direct_tag: Option<AddressType> = if direct_verified {
-            Some(AddressType::Direct)
-        } else if relay.is_none() {
-            Some(AddressType::Unverified)
-        } else {
-            None
-        };
+        debug!(
+            relay = ?relay,
+            observed = ?observed,
+            listen = ?listen,
+            "driver: preparing typed self address set"
+        );
 
-        let mut typed: Vec<(MultiAddr, AddressType)> = Vec::new();
-        // Normalize addresses before dedup so IPv4-mapped IPv6
-        // (::ffff:a.b.c.d) and plain IPv4 (a.b.c.d) are treated as
-        // equal, preventing the same address from appearing twice with
-        // different representations.
-        let mut seen: HashSet<SocketAddr> = HashSet::new();
-
-        if let Some(tag) = direct_tag {
-            // Prefer observed (post-NAT) addresses for the direct tier since
-            // those are what peers actually see from the outside. Fall back
-            // to locally-bound listen addresses when no observations exist.
-            if !observed.is_empty() {
-                for sa in observed {
-                    if sa.ip().is_unspecified() {
-                        continue;
-                    }
-                    let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                    if seen.insert(normalized) {
-                        typed.push((MultiAddr::quic(normalized), tag));
-                    }
-                }
-            }
-            for addr in listen {
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    continue;
-                };
-                if sa.ip().is_unspecified() {
-                    continue;
-                }
-                let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                if seen.insert(normalized) {
-                    typed.push((MultiAddr::quic(normalized), tag));
-                }
-            }
-        }
-
-        if let Some(relay_addr) = relay {
-            let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
-            typed.push((MultiAddr::quic(normalized), AddressType::Relay));
-        }
+        let typed = build_typed_self_address_set(observed, listen, relay, |sa| {
+            self.transport.is_external_proven(sa)
+        });
 
         if typed.is_empty() {
             debug!("driver: publish skipped, no dialable self addresses");
@@ -264,6 +243,27 @@ impl AcquisitionDriver {
             .dht
             .find_closest_nodes_local(&own_key, self.dht.k_value())
             .await;
+        let peers = all_peers.iter().map(|node| node.peer_id).collect();
+        let publish_snapshot = PublishedTypedSet {
+            typed_addresses: typed.clone(),
+            peers,
+        };
+        if !force && self.last_published_typed_set.as_ref() == Some(&publish_snapshot) {
+            debug!(
+                peers = all_peers.len(),
+                typed_addresses = ?typed,
+                relay = ?relay,
+                "driver: publish skipped, typed self address set unchanged"
+            );
+            return;
+        }
+
+        debug!(
+            peers = all_peers.len(),
+            typed_addresses = ?typed,
+            relay = ?relay,
+            "driver: publishing typed self address set"
+        );
         trace!(
             peers = all_peers.len(),
             addrs = typed.len(),
@@ -273,13 +273,14 @@ impl AcquisitionDriver {
         self.dht
             .publish_address_set_to_peers(typed, &all_peers)
             .await;
+        self.last_published_typed_set = Some(publish_snapshot);
     }
 
     /// Hold the acquired relay until an eviction or death event forces a
     /// rebind. Returns `true` on shutdown (caller should exit), `false`
     /// when the relay is considered lost and a republish+reacquire is
     /// needed.
-    async fn hold_until_lost(&self) -> bool {
+    async fn hold_until_lost(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
         health.tick().await; // drop the immediate first tick
@@ -310,6 +311,40 @@ impl AcquisitionDriver {
                         None => {
                             // Channel closed — transport is shutting
                             // down. Treat as shutdown.
+                            return true;
+                        }
+                    }
+                }
+                promoted = self.transport.recv_direct_address_promoted() => {
+                    match promoted {
+                        Some(addr) => {
+                            let relay = *self.relay_address.read().await;
+                            info!(
+                                address = %addr,
+                                relay = ?relay,
+                                "driver: direct address promoted, republishing typed self address set"
+                            );
+                            self.publish_typed_set(relay).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
+                            return true;
+                        }
+                    }
+                }
+                updated = self.transport.recv_self_address_updated() => {
+                    match updated {
+                        Some(addr) => {
+                            let relay = *self.relay_address.read().await;
+                            debug!(
+                                address = %addr,
+                                relay = ?relay,
+                                "driver: self address updated, refreshing typed self address set"
+                            );
+                            self.publish_typed_set(relay).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
                             return true;
                         }
                     }
@@ -357,17 +392,17 @@ impl AcquisitionDriver {
     /// pre-retry publish is critical — without it, other peers would
     /// continue dialing the dead relay address during the 1–10 s
     /// acquisition walk.
-    async fn lose_relay_and_republish(&self) {
+    async fn lose_relay_and_republish(&mut self) {
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
         self.transport.clear_relay_address();
-        self.publish_typed_set(None).await;
+        self.force_publish_typed_set(None).await;
     }
 
     /// Wait out the current backoff window, or short-circuit on a
     /// `KClosestPeersChanged` event (new peers may offer fresh candidates).
     /// Returns `true` on shutdown.
-    async fn wait_backoff_or_event(&self) -> bool {
+    async fn wait_backoff_or_event(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let sleep = tokio::time::sleep(self.current_backoff);
         tokio::pin!(sleep);
@@ -379,6 +414,36 @@ impl AcquisitionDriver {
                 _ = &mut sleep => {
                     trace!(window = ?self.current_backoff, "driver: backoff window expired");
                     return false;
+                }
+                promoted = self.transport.recv_direct_address_promoted() => {
+                    match promoted {
+                        Some(addr) => {
+                            info!(
+                                address = %addr,
+                                "driver: direct address promoted during relay backoff, republishing typed self address set"
+                            );
+                            self.publish_typed_set(None).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
+                            return true;
+                        }
+                    }
+                }
+                updated = self.transport.recv_self_address_updated() => {
+                    match updated {
+                        Some(addr) => {
+                            debug!(
+                                address = %addr,
+                                "driver: self address updated during relay backoff, refreshing typed self address set"
+                            );
+                            self.publish_typed_set(None).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
+                            return true;
+                        }
+                    }
                 }
                 event = events.recv() => {
                     match event {
