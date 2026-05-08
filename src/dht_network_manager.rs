@@ -883,6 +883,24 @@ type SubjectReports = HashMap<PeerId, DHTNode>;
 /// Used as the fallback tie-breaker in [`compute_winner`]: when no
 /// quorum exists and two responders are at the same XOR distance,
 /// the one whose best tag tier is stronger wins.
+/// Count `AddressType` occurrences in a typed address list.
+///
+/// Returns `[relay, direct, unverified, natted]`. Used by the
+/// `PublishAddressSet` send/receive log lines so operators can see the
+/// reachability mix being advertised, not just the total count.
+fn count_address_types(typed: &[(MultiAddr, AddressType)]) -> [u32; 4] {
+    let mut counts = [0u32; 4];
+    for (_, t) in typed {
+        match t {
+            AddressType::Relay => counts[0] += 1,
+            AddressType::Direct => counts[1] += 1,
+            AddressType::Unverified => counts[2] += 1,
+            AddressType::NATted => counts[3] += 1,
+        }
+    }
+    counts
+}
+
 fn best_tier_priority(node: &DHTNode) -> u8 {
     node.typed_addresses()
         .iter()
@@ -2965,11 +2983,16 @@ impl DhtNetworkManager {
                 Ok(DhtNetworkResult::LeaveSuccess)
             }
             DhtNetworkOperation::PublishAddressSet { seq, addresses } => {
+                let [relay, direct, unverified, natted] = count_address_types(addresses);
                 info!(
-                    "Handling PUBLISH_ADDRESS_SET from {}: seq={} addrs={}",
+                    "Handling PUBLISH_ADDRESS_SET from {}: seq={} addrs={} (relay={} direct={} unverified={} natted={})",
                     authenticated_sender,
                     seq,
-                    addresses.len()
+                    addresses.len(),
+                    relay,
+                    direct,
+                    unverified,
+                    natted,
                 );
                 let dht = self.dht.read().await;
                 dht.replace_node_addresses(authenticated_sender, addresses.clone(), *seq)
@@ -3866,9 +3889,14 @@ impl DhtNetworkManager {
                 .await
             {
                 Ok(_) => {
-                    debug!(
+                    let [relay, direct, unverified, natted] = count_address_types(&typed_addresses);
+                    info!(
                         peer = %peer.peer_id.to_hex(),
                         addrs = typed_addresses.len(),
+                        relay,
+                        direct,
+                        unverified,
+                        natted,
                         seq,
                         "published address set to peer",
                     );
