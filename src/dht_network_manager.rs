@@ -136,6 +136,13 @@ const STALE_REVALIDATION_BUDGET: Duration =
 /// lagging.
 const PENDING_DIAL_BROADCAST_CAPACITY: usize = 16;
 
+/// Broadcast buffer for active FIND_NODE peer-failure signals.
+///
+/// Only active lookup probes subscribe, and each message is a single
+/// [`PeerId`]. A larger buffer than the dial coordinator keeps a short burst
+/// of failing peers from lagging sibling lookups during upload/download storms.
+const LOOKUP_FAILURE_BROADCAST_CAPACITY: usize = 1024;
+
 /// Maximum concurrent stale revalidation passes across all buckets.
 const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 
@@ -532,6 +539,10 @@ pub struct DhtNetworkManager {
     /// handshake runs once — not once per caller racing through the
     /// window where `peer_to_channel` has not yet been populated.
     pending_peer_dials: Arc<DashMap<PeerId, broadcast::Sender<PendingDialOutcome>>>,
+    /// Active FIND_NODE failure broadcaster. When one lookup observes that a
+    /// peer failed while it was being queried, every other active lookup that
+    /// is waiting on the same peer can stop spending an alpha slot on it.
+    lookup_failures: Arc<LookupFailureCoordinator>,
 }
 
 /// Outcome of a shared dial+identity-exchange attempt, broadcast to
@@ -877,6 +888,73 @@ const QUORUM_THRESHOLD: usize = 2;
 /// arrive and feeds [`compute_winner`].
 type SubjectReports = HashMap<PeerId, DHTNode>;
 
+#[derive(Debug)]
+struct LookupFailureCoordinator {
+    tx: broadcast::Sender<PeerId>,
+}
+
+impl LookupFailureCoordinator {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(LOOKUP_FAILURE_BROADCAST_CAPACITY);
+        Self { tx }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<PeerId> {
+        self.tx.subscribe()
+    }
+
+    fn notify_failed(&self, peer_id: PeerId) {
+        // No active subscribers is the common case. `send` only fails when
+        // receiver_count == 0, so ignore the returned peer id.
+        let _ = self.tx.send(peer_id);
+    }
+}
+
+/// Per-lookup state for peers in an iterative FIND_NODE query.
+///
+/// Mirrors rust-libp2p's closest-peer iterator model: peers move from
+/// "not contacted" (absence from the map) to `Waiting`, then to a final
+/// outcome. Final states are not selected again by the same lookup, so a
+/// failed or abandoned alpha probe cannot be reintroduced by later gossip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupPeerState {
+    Waiting,
+    Succeeded,
+    Failed,
+    Unresponsive,
+}
+
+#[derive(Debug, Default)]
+struct LookupPeerStates {
+    states: HashMap<PeerId, LookupPeerState>,
+}
+
+impl LookupPeerStates {
+    fn mark_waiting(&mut self, peer_id: PeerId) {
+        self.states.insert(peer_id, LookupPeerState::Waiting);
+    }
+
+    fn mark_succeeded(&mut self, peer_id: PeerId) {
+        self.states.insert(peer_id, LookupPeerState::Succeeded);
+    }
+
+    fn mark_failed(&mut self, peer_id: PeerId) {
+        self.states.insert(peer_id, LookupPeerState::Failed);
+    }
+
+    fn mark_unresponsive(&mut self, peer_id: PeerId) {
+        self.states.insert(peer_id, LookupPeerState::Unresponsive);
+    }
+
+    fn is_contactable(&self, peer_id: &PeerId) -> bool {
+        !self.states.contains_key(peer_id)
+    }
+
+    fn state(&self, peer_id: &PeerId) -> Option<LookupPeerState> {
+        self.states.get(peer_id).copied()
+    }
+}
+
 /// Best (lowest-numeric) [`AddressType::priority`] across a node's
 /// address tags. `u8::MAX` when the address list is empty.
 ///
@@ -1027,6 +1105,7 @@ impl DhtNetworkManager {
             dial_failure_cache: Arc::new(DialFailureCache::new()),
             identity_failure_cache: Arc::new(IdentityFailureCache::new()),
             pending_peer_dials: Arc::new(DashMap::new()),
+            lookup_failures: Arc::new(LookupFailureCoordinator::new()),
         })
     }
 
@@ -1627,7 +1706,7 @@ impl DhtNetworkManager {
         );
 
         let target_key = DhtKey::from_bytes(*key);
-        let mut queried_nodes: HashSet<PeerId> = HashSet::new();
+        let mut peer_states = LookupPeerStates::default();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
 
         // Kademlia correctness: the local node must compete on distance in the
@@ -1635,7 +1714,7 @@ impl DhtNetworkManager {
         // Seed best_nodes with self and mark self as "queried" so the iterative
         // loop never tries to contact us.
         best_nodes.push(self.local_dht_node().await);
-        self.mark_self_queried(&mut queried_nodes);
+        self.mark_self_queried(&mut peer_states);
 
         // Candidates sorted by XOR distance to target (closest first).
         // Composite key (distance, peer_id) ensures uniqueness when two peers
@@ -1651,7 +1730,7 @@ impl DhtNetworkManager {
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
         for node in initial {
-            if !queried_nodes.contains(&node.peer_id) {
+            if peer_states.is_contactable(&node.peer_id) {
                 let dist = node.peer_id.distance(&target_key);
                 candidates.entry((dist, node.peer_id)).or_insert(node);
             }
@@ -1680,9 +1759,10 @@ impl DhtNetworkManager {
                     break;
                 };
                 let node = entry.remove();
-                if queried_nodes.contains(&node.peer_id) {
+                if !peer_states.is_contactable(&node.peer_id) {
                     continue;
                 }
+                peer_states.mark_waiting(node.peer_id);
                 batch.push(node);
             }
 
@@ -1720,41 +1800,34 @@ impl DhtNetworkManager {
                 .map(|node| {
                     let peer_id = node.peer_id;
                     let typed = node.typed_addresses();
-                    let op = DhtNetworkOperation::FindNode { key: *key };
+                    let lookup_key = *key;
+                    let failure_rx = self.lookup_failures.subscribe();
                     async move {
-                        // Pass the same typed candidate list to both
-                        // ensure_peer_channel and send_dht_request so
-                        // the request path doesn't pay a redundant
-                        // routing-table read. Trying every dialable
-                        // address — instead of stopping at the first
-                        // — protects against stale NAT bindings,
-                        // single-IP-family failures, and
-                        // recently-relayed peers whose direct address
-                        // is no longer reachable.
-                        //
-                        // Going through ensure_peer_channel (instead
-                        // of dial_addresses directly) registers the
-                        // in-flight dial in the peer-dial coordinator,
-                        // so a concurrent iterative lookup from a
-                        // different top-level operation that happens
-                        // to batch the same peer joins this dial
-                        // rather than racing it.
-                        let _ = self.ensure_peer_channel(&peer_id, &typed).await;
-                        (
-                            peer_id,
-                            self.send_dht_request(&peer_id, op, Some(&typed)).await,
-                        )
+                        self.send_find_node_lookup_request(peer_id, typed, lookup_key, failure_rx)
+                            .await
                     }
                 })
                 .collect();
 
             let results = Self::collect_iteration_results(query_stream).await;
+            let responded: HashSet<PeerId> = results.iter().map(|(peer_id, _)| *peer_id).collect();
+
+            // Queries still pending after the grace window are dropped. Treat
+            // them like libp2p's `Unresponsive`: they free alpha capacity and
+            // are skipped for the rest of this lookup, preventing later gossip
+            // from reintroducing the same abandoned probe.
+            for node in &batch {
+                if !responded.contains(&node.peer_id)
+                    && peer_states.state(&node.peer_id) == Some(LookupPeerState::Waiting)
+                {
+                    peer_states.mark_unresponsive(node.peer_id);
+                }
+            }
 
             for (peer_id, result) in results {
-                queried_nodes.insert(peer_id);
-
                 match result {
                     Ok(DhtNetworkResult::NodesFound { mut nodes, .. }) => {
+                        peer_states.mark_succeeded(peer_id);
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
@@ -1766,7 +1839,7 @@ impl DhtNetworkManager {
                         nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
                         nodes.truncate(self.k_value());
                         for node in nodes {
-                            if queried_nodes.contains(&node.peer_id)
+                            if !peer_states.is_contactable(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
                             {
                                 continue;
@@ -1832,6 +1905,7 @@ impl DhtNetworkManager {
                         }
                     }
                     Ok(DhtNetworkResult::PeerRejected) => {
+                        peer_states.mark_failed(peer_id);
                         // Remote peer rejected us (e.g. older node with blocking) —
                         // remove them from our routing table (no point retrying) but
                         // do NOT penalise their trust score; the rejection is an
@@ -1847,12 +1921,14 @@ impl DhtNetworkManager {
                         let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
+                        peer_states.mark_succeeded(peer_id);
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
                             best_nodes.push(queried_node.clone());
                         }
                     }
                     Err(e) => {
+                        peer_states.mark_failed(peer_id);
                         trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
                         // Trust failure is recorded inside send_dht_request —
                         // no additional recording needed here.
@@ -1913,6 +1989,85 @@ impl DhtNetworkManager {
         );
 
         Ok(best_nodes)
+    }
+
+    /// Send one iterative FIND_NODE probe, aborting early if another active
+    /// lookup reports the same peer as failed.
+    ///
+    /// This is the closest analogue to libp2p feeding a dial/connection
+    /// failure into every active query that is waiting on that peer. The
+    /// actual request owns the failure notification: externally-cancelled
+    /// probes return an error but do not rebroadcast, avoiding feedback loops.
+    async fn send_find_node_lookup_request(
+        &self,
+        peer_id: PeerId,
+        typed: Vec<(MultiAddr, AddressType)>,
+        key: Key,
+        failure_rx: broadcast::Receiver<PeerId>,
+    ) -> (PeerId, Result<DhtNetworkResult>) {
+        let request = async {
+            // Pass the same typed candidate list to both ensure_peer_channel
+            // and send_dht_request so the request path doesn't pay a redundant
+            // routing-table read. Trying every dialable address protects
+            // against stale NAT bindings, single-IP-family failures, and
+            // recently-relayed peers whose direct address is no longer reachable.
+            //
+            // Going through ensure_peer_channel registers the in-flight dial in
+            // the peer-dial coordinator, so concurrent iterative lookups that
+            // happen to batch the same peer join this dial rather than racing it.
+            self.ensure_peer_channel(&peer_id, &typed).await?;
+            self.send_dht_request(
+                &peer_id,
+                DhtNetworkOperation::FindNode { key },
+                Some(&typed),
+            )
+            .await
+        };
+        tokio::pin!(request);
+
+        let external_failure = Self::wait_for_lookup_failure_signal(peer_id, failure_rx);
+        tokio::pin!(external_failure);
+
+        let result = tokio::select! {
+            biased;
+
+            result = &mut request => {
+                if result.is_err() {
+                    self.notify_lookup_peer_failed(peer_id);
+                }
+                result
+            }
+            () = &mut external_failure => {
+                Err(Self::active_lookup_peer_failed_error(&peer_id))
+            }
+        };
+
+        (peer_id, result)
+    }
+
+    /// Wait until the active-lookup failure bus reports `peer_id`.
+    async fn wait_for_lookup_failure_signal(peer_id: PeerId, mut rx: broadcast::Receiver<PeerId>) {
+        loop {
+            match rx.recv().await {
+                Ok(failed_peer) if failed_peer == peer_id => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
+            }
+        }
+    }
+
+    fn notify_lookup_peer_failed(&self, peer_id: PeerId) {
+        self.lookup_failures.notify_failed(peer_id);
+    }
+
+    fn active_lookup_peer_failed_error(peer_id: &PeerId) -> P2PError {
+        P2PError::Network(NetworkError::PeerNotFound(
+            format!(
+                "peer {} failed in another active FIND_NODE lookup",
+                peer_id.to_hex()
+            )
+            .into(),
+        ))
     }
 
     /// Compare two nodes by their XOR distance to a target key.
@@ -2005,10 +2160,10 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Add the local app-level peer ID to `queried` so that iterative lookups
-    /// never send RPCs to the local node.
-    fn mark_self_queried(&self, queried: &mut HashSet<PeerId>) {
-        queried.insert(self.config.peer_id);
+    /// Add the local app-level peer ID to the per-lookup state map so that
+    /// iterative lookups never send RPCs to the local node.
+    fn mark_self_queried(&self, peer_states: &mut LookupPeerStates) {
+        peer_states.mark_succeeded(self.config.peer_id);
     }
 
     /// Return the first dialable `Direct`-tagged address from a [`DHTNode`].
@@ -3401,6 +3556,7 @@ impl DhtNetworkManager {
                                         "DHT peer fully disconnected: app_id={}",
                                         peer_id.to_hex()
                                     );
+                                    self_arc.notify_lookup_peer_failed(peer_id);
 
                                     if self_arc.event_tx.receiver_count() > 0
                                         && let Err(e) = self_arc
@@ -4038,6 +4194,78 @@ mod tests {
             STALE_REVALIDATION_BUDGET,
             IDENTITY_EXCHANGE_TIMEOUT + STALE_REVALIDATION_PING_RTT,
         );
+    }
+
+    #[test]
+    fn lookup_peer_states_only_absent_peers_are_contactable() {
+        let mut states = LookupPeerStates::default();
+        let waiting = pid(1);
+        let succeeded = pid(2);
+        let failed = pid(3);
+        let unresponsive = pid(4);
+        let fresh = pid(5);
+
+        states.mark_waiting(waiting);
+        states.mark_succeeded(succeeded);
+        states.mark_failed(failed);
+        states.mark_unresponsive(unresponsive);
+
+        assert!(!states.is_contactable(&waiting));
+        assert!(!states.is_contactable(&succeeded));
+        assert!(!states.is_contactable(&failed));
+        assert!(!states.is_contactable(&unresponsive));
+        assert!(states.is_contactable(&fresh));
+    }
+
+    #[test]
+    fn lookup_peer_states_failure_and_unresponsive_are_final_for_lookup() {
+        let mut states = LookupPeerStates::default();
+        let failed = pid(7);
+        let unresponsive = pid(8);
+
+        states.mark_waiting(failed);
+        states.mark_failed(failed);
+        states.mark_waiting(unresponsive);
+        states.mark_unresponsive(unresponsive);
+
+        assert_eq!(states.state(&failed), Some(LookupPeerState::Failed));
+        assert_eq!(
+            states.state(&unresponsive),
+            Some(LookupPeerState::Unresponsive)
+        );
+        assert!(!states.is_contactable(&failed));
+        assert!(!states.is_contactable(&unresponsive));
+    }
+
+    #[tokio::test]
+    async fn lookup_failure_coordinator_broadcasts_to_all_subscribers() {
+        let coordinator = LookupFailureCoordinator::new();
+        let peer = pid(9);
+        let mut first = coordinator.subscribe();
+        let mut second = coordinator.subscribe();
+
+        coordinator.notify_failed(peer);
+
+        assert_eq!(first.recv().await.unwrap(), peer);
+        assert_eq!(second.recv().await.unwrap(), peer);
+    }
+
+    #[tokio::test]
+    async fn lookup_failure_signal_waits_for_matching_peer() {
+        let coordinator = LookupFailureCoordinator::new();
+        let target = pid(10);
+        let other = pid(11);
+        let rx = coordinator.subscribe();
+
+        coordinator.notify_failed(other);
+        coordinator.notify_failed(target);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            DhtNetworkManager::wait_for_lookup_failure_signal(target, rx),
+        )
+        .await
+        .expect("matching peer failure should wake the waiter");
     }
 
     #[test]
