@@ -3172,7 +3172,7 @@ impl DhtNetworkManager {
     /// Peers whose user agent is not yet known (e.g. identity announce still
     /// in flight) are skipped — they will be handled by the normal
     /// `PeerConnected` event path once authentication completes.
-    async fn reconcile_connected_peers(&self) {
+    async fn reconcile_connected_peers(self: &Arc<Self>) {
         let connected = self.transport.connected_peers().await;
         if connected.is_empty() {
             return;
@@ -3207,7 +3207,7 @@ impl DhtNetworkManager {
     /// The `node_id` is the authenticated app-level [`PeerId`] — no
     /// `canonical_app_peer_id()` lookup is needed because `PeerConnected`
     /// only fires after identity verification.
-    async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
+    async fn handle_peer_connected(self: &Arc<Self>, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
 
         info!(
@@ -3285,30 +3285,13 @@ impl DhtNetworkManager {
                         app_peer_id_hex,
                         stale_peers.len()
                     );
-                    match self
-                        .revalidate_and_retry_admission(
-                            candidate,
-                            candidate_ips,
-                            candidate_bucket_idx,
-                            stale_peers,
-                            &trust_fn,
-                        )
-                        .await
-                    {
-                        Ok(rt_events) => {
-                            info!(
-                                "Added peer {} to DHT routing table after stale revalidation",
-                                app_peer_id_hex
-                            );
-                            self.broadcast_routing_events(&rt_events);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Stale revalidation for peer {} failed: {}",
-                                app_peer_id_hex, e
-                            );
-                        }
-                    }
+                    self.spawn_revalidate_and_retry_admission(
+                        candidate,
+                        candidate_ips,
+                        candidate_bucket_idx,
+                        stale_peers,
+                        app_peer_id_hex.clone(),
+                    );
                 }
                 Err(e) => {
                     debug!(
@@ -3325,6 +3308,68 @@ impl DhtNetworkManager {
                 dht_key,
             });
         }
+    }
+
+    /// Spawn stale-peer revalidation and retry routing-table admission.
+    ///
+    /// This path can spend seconds pinging stale peers, so it must not run
+    /// inline on the transport event processor.
+    fn spawn_revalidate_and_retry_admission(
+        self: &Arc<Self>,
+        candidate: NodeInfo,
+        candidate_ips: Vec<IpAddr>,
+        candidate_bucket_idx: usize,
+        stale_peers: Vec<(PeerId, usize)>,
+        app_peer_id_hex: String,
+    ) {
+        let this = Arc::clone(self);
+        let trust_engine = self.trust_engine.clone();
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                () = shutdown.cancelled() => {
+                    debug!(
+                        "Cancelled stale revalidation for peer {} during shutdown",
+                        app_peer_id_hex
+                    );
+                    return;
+                }
+                result = async {
+                    let trust_fn = |peer_id: &PeerId| -> f64 {
+                        trust_engine
+                            .as_ref()
+                            .map(|engine| engine.score(peer_id))
+                            .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+                    };
+
+                    this.revalidate_and_retry_admission(
+                        candidate,
+                        candidate_ips,
+                        candidate_bucket_idx,
+                        stale_peers,
+                        &trust_fn,
+                    )
+                    .await
+                } => result,
+            };
+
+            match result {
+                Ok(rt_events) => {
+                    info!(
+                        "Added peer {} to DHT routing table after stale revalidation",
+                        app_peer_id_hex
+                    );
+                    this.broadcast_routing_events(&rt_events);
+                }
+                Err(e) => {
+                    warn!(
+                        "Stale revalidation for peer {} failed: {}",
+                        app_peer_id_hex, e
+                    );
+                }
+            }
+        });
     }
 
     /// Start network event handler
