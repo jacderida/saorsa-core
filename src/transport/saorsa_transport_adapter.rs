@@ -157,8 +157,9 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 /// Per-attempt direct connect timeout used by the Happy Eyeballs race.
 ///
 /// Keep this short because DHT lookups expect to encounter unreachable
-/// candidates on live networks and should move on quickly.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// candidates on live networks and should move on quickly, but leave enough
+/// room for one QUIC initial-flight retransmission on slower relay paths.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1250);
 
 /// Per-attempt direct handshake timeout after connection progress is observed.
 const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
