@@ -2174,7 +2174,13 @@ impl DhtNetworkManager {
         loop {
             match rx.recv().await {
                 Ok(failed_peer) if failed_peer == peer_id => return,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // The skipped window may have contained this peer. Treat
+                    // lag as a conservative failure signal so lookup storms do
+                    // not leave waiters spending their full request timeout.
+                    return;
+                }
                 Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
             }
         }
@@ -4453,6 +4459,25 @@ mod tests {
         )
         .await
         .expect("matching peer failure should wake the waiter");
+    }
+
+    #[tokio::test]
+    async fn lookup_failure_signal_aborts_when_receiver_lagged() {
+        let coordinator = LookupFailureCoordinator::new();
+        let target = pid(12);
+        let other = pid(13);
+        let rx = coordinator.subscribe();
+
+        for _ in 0..=LOOKUP_FAILURE_BROADCAST_CAPACITY {
+            coordinator.notify_failed(other);
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            DhtNetworkManager::wait_for_lookup_failure_signal(target, rx),
+        )
+        .await
+        .expect("lagged receiver should conservatively wake the waiter");
     }
 
     #[test]
