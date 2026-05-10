@@ -4,7 +4,7 @@
 //! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
-use crate::address::MultiAddr;
+use crate::address::{MultiAddr, is_lan_ip};
 use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
@@ -110,9 +110,9 @@ const MAX_ADDRESSES_PER_NODE: usize = 8;
 
 /// Address classification for priority ordering and staleness eviction.
 ///
-/// Priority: Relay > Direct > Unverified > NATted. The `merge_typed_address`
+/// Priority: Relay > Direct > Unverified > Lan. The `merge_typed_address`
 /// method uses this for insertion ordering and the eviction of excess
-/// `NATted` / `Unverified` entries.
+/// `Lan` / `Unverified` entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressType {
     /// Address through a MASQUE relay server (always reachable)
@@ -122,17 +122,20 @@ pub enum AddressType {
     /// Self-published observed external address whose reachability has not
     /// been confirmed by the local classifier. Published by cold-start nodes
     /// that have not yet accepted an unsolicited inbound handshake and have
-    /// not yet acquired a relay. Dialers try these last (before `NATted`)
+    /// not yet acquired a relay. Dialers try these after Relay/Direct and
+    /// before LAN-only fallback
     /// and must accept the possibility of a timeout.
     Unverified,
-    /// NATted address (ephemeral, typically unreachable from outside)
-    NATted,
+    /// LAN or other local-scope address. This reuses the old `NATted`
+    /// variant slot for wire compatibility with older nodes.
+    #[serde(alias = "NATted")]
+    Lan,
 }
 
 impl AddressType {
     /// Priority index for ordering addresses by type. Lower is preferred.
     ///
-    /// Relay (0) → Direct (1) → Unverified (2) → NATted (3).
+    /// Relay (0) → Direct (1) → Unverified (2) → Lan (3).
     ///
     /// Used by [`NodeInfo::merge_typed_address`], [`KBucket::replace_node_addresses`],
     /// [`DHTNode::addresses_by_priority`], and [`DhtNetworkManager::dialable_addresses_typed`]
@@ -142,7 +145,20 @@ impl AddressType {
             Self::Relay => 0,
             Self::Direct => 1,
             Self::Unverified => 2,
-            Self::NATted => 3,
+            Self::Lan => 3,
+        }
+    }
+
+    /// Canonicalize an advertised type against the address itself.
+    ///
+    /// A local-scope IP address is never accepted as Relay, Direct, or
+    /// Unverified, even if that is what a peer advertised. It may still be
+    /// stored as [`AddressType::Lan`] so same-LAN/same-WAN peers can use it.
+    pub(crate) fn for_advertised_address(addr: &MultiAddr, advertised: Self) -> Self {
+        if addr.ip().is_some_and(is_lan_ip) {
+            Self::Lan
+        } else {
+            advertised
         }
     }
 }
@@ -170,7 +186,7 @@ pub struct NodeInfo {
     pub addresses: Vec<MultiAddr>,
     /// Type tag for each address, parallel to `addresses` by index.
     /// Defaults to empty on deserialization (legacy nodes); callers treat
-    /// untagged addresses as `Direct`.
+    /// untagged addresses as `Unverified`.
     #[serde(default)]
     pub address_types: Vec<AddressType>,
     /// Monotonic timestamp of last successful interaction.
@@ -217,11 +233,13 @@ impl NodeInfo {
     /// Merge a new address with an explicit type tag.
     ///
     /// Insertion position depends on type priority: Relay → Direct →
-    /// Unverified → NATted. Relay addresses always go to the front. After
+    /// Unverified → Lan. Relay addresses always go to the front. After
     /// insertion, [`Self::enforce_per_ip_family_cap`] prunes the list so
-    /// the "at most 1 Relay + 1 non-Relay per IP family, Direct dominates
-    /// Unverified dominates NATted" invariant holds.
+    /// the "at most 1 Relay + 1 WAN non-Relay + 1 LAN per IP family"
+    /// invariant holds.
     pub fn merge_typed_address(&mut self, addr: MultiAddr, addr_type: AddressType) {
+        let addr_type = AddressType::for_advertised_address(&addr, addr_type);
+
         // Ensure address_types is in sync with addresses (legacy compat).
         // Trailing untagged entries are padded with `Unverified` so we do not
         // claim direct-reachability for addresses whose publisher never
@@ -241,8 +259,8 @@ impl NodeInfo {
         // Insert based on type priority. Insertion order is what the cap
         // uses to break "newest wins" ties: Relay / Direct / Unverified
         // insert at the front of their tier so the newest sits at the
-        // lowest index among same-tier entries; NATted appends so the
-        // newest sits at the highest index.
+        // lowest index among same-tier entries; Lan appends so the newest
+        // sits at the highest index.
         match addr_type {
             AddressType::Relay => {
                 self.addresses.insert(0, addr);
@@ -266,9 +284,9 @@ impl NodeInfo {
                 self.addresses.insert(pos, addr);
                 self.address_types.insert(pos, AddressType::Unverified);
             }
-            AddressType::NATted => {
+            AddressType::Lan => {
                 self.addresses.push(addr);
-                self.address_types.push(AddressType::NATted);
+                self.address_types.push(AddressType::Lan);
             }
         }
 
@@ -276,18 +294,25 @@ impl NodeInfo {
 
         // Last-line guard for non-IP transports (outside the per-family cap).
         self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
-        self.address_types.truncate(MAX_ADDRESSES_PER_NODE);
+        self.address_types.truncate(self.addresses.len());
     }
 
-    /// Get the address type at the given index. Returns `Unverified` for
-    /// untagged addresses — legacy records that predate ADR-014 never
-    /// asserted reachability for their entries, so the conservative default
-    /// is "publisher did not claim this is directly dialable."
+    /// Get the address type at the given index.
+    ///
+    /// Local-scope IP addresses always return [`AddressType::Lan`], even if
+    /// the stored or legacy-advertised tag says otherwise. Other untagged
+    /// addresses return [`AddressType::Unverified`] because legacy records
+    /// that predate ADR-014 never asserted direct reachability.
     pub fn address_type_at(&self, index: usize) -> AddressType {
-        self.address_types
+        let advertised = self
+            .address_types
             .get(index)
             .copied()
-            .unwrap_or(AddressType::Unverified)
+            .unwrap_or(AddressType::Unverified);
+        self.addresses
+            .get(index)
+            .map(|addr| AddressType::for_advertised_address(addr, advertised))
+            .unwrap_or(advertised)
     }
 
     /// Enforce the per-IP-family address cap for an external peer.
@@ -296,16 +321,16 @@ impl NodeInfo {
     /// to IPv4 so it is counted against the IPv4 slot), keep at most:
     ///
     /// - 1 [`AddressType::Relay`] (newest wins)
-    /// - 1 of {[`AddressType::Direct`], [`AddressType::Unverified`],
-    ///   [`AddressType::NATted`]} — the entry with the highest priority
-    ///   tier present in that family wins, newer entries within a tier
-    ///   win over older ones
+    /// - 1 of {[`AddressType::Direct`], [`AddressType::Unverified`]} — the
+    ///   entry with the highest priority tier present in that family wins,
+    ///   newer entries within a tier win over older ones
+    /// - 1 [`AddressType::Lan`] address for same-LAN/same-WAN peers
     ///
-    /// That yields the invariant: at most 2 addresses per IP family, and
-    /// weaker tiers (Unverified, NATted) never coexist with a stronger
-    /// same-family tier (Direct) — they add no useful dial option once
+    /// That yields the invariant: at most 3 addresses per IP family, and
+    /// weaker WAN tiers (Unverified) never coexist with a stronger
+    /// same-family tier (Direct) — they add no useful WAN dial option once
     /// the stronger one is known. A dual-stack peer may therefore hold
-    /// up to 4 IP addresses (2 per family).
+    /// up to 6 IP addresses (3 per family).
     ///
     /// Non-IP transport addresses (Bluetooth, LoRa) are left alone — they
     /// have no IP family and are governed only by [`MAX_ADDRESSES_PER_NODE`].
@@ -313,7 +338,7 @@ impl NodeInfo {
     /// "Newest wins" is encoded by the insertion positions in
     /// [`Self::merge_typed_address`]: Relay, Direct, and Unverified insert
     /// at the front of their tier, so the newest entry has the lowest
-    /// index; NATted appends, so the newest has the highest index.
+    /// index; Lan appends, so the newest has the highest index.
     ///
     /// This enforces the invariant for *external peers*. The routing
     /// table never stores `NodeInfo` for self (admission rejects
@@ -323,6 +348,7 @@ impl NodeInfo {
         while self.address_types.len() < self.addresses.len() {
             self.address_types.push(AddressType::Unverified);
         }
+        self.address_types.truncate(self.addresses.len());
 
         // Non-IP addresses are exempt from the per-family cap.
         let mut keep: Vec<bool> = self.addresses.iter().map(|a| a.ip().is_none()).collect();
@@ -348,28 +374,30 @@ impl NodeInfo {
                 keep[i] = true;
             }
 
-            // Slot 2: the single highest-priority non-Relay entry for the
-            // family. Precedence is Direct > Unverified > NATted. Within
-            // Direct/Unverified, newer is at the lowest index; within
-            // NATted, newer is at the highest (append ordering).
-            let best_non_relay = [
-                AddressType::Direct,
-                AddressType::Unverified,
-                AddressType::NATted,
-            ]
-            .iter()
-            .find_map(|t| match t {
-                AddressType::NATted => family
-                    .iter()
-                    .rev()
-                    .find(|&&i| self.address_types[i] == AddressType::NATted)
-                    .copied(),
-                tier => family
-                    .iter()
-                    .find(|&&i| self.address_types[i] == *tier)
-                    .copied(),
-            });
-            if let Some(i) = best_non_relay {
+            // Slot 2: the single highest-priority WAN entry for the family.
+            // Precedence is Direct > Unverified. Within each tier, newer is
+            // at the lowest index.
+            let best_wan = [AddressType::Direct, AddressType::Unverified]
+                .iter()
+                .find_map(|tier| {
+                    family
+                        .iter()
+                        .find(|&&i| self.address_types[i] == *tier)
+                        .copied()
+                });
+            if let Some(i) = best_wan {
+                keep[i] = true;
+            }
+
+            // Slot 3: newest LAN address for peers that can use a
+            // local-scope route. LAN addresses are independent from WAN
+            // Direct/Unverified addresses; otherwise hybrid deployments
+            // would drop the local path that same-WAN peers need.
+            if let Some(&i) = family
+                .iter()
+                .rev()
+                .find(|&&i| self.address_types[i] == AddressType::Lan)
+            {
                 keep[i] = true;
             }
         }
@@ -402,6 +430,7 @@ impl NodeInfo {
         addr: MultiAddr,
         addr_type: AddressType,
     ) -> bool {
+        let addr_type = AddressType::for_advertised_address(&addr, addr_type);
         if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
             let existing = self.address_type_at(pos);
             if existing.priority() <= addr_type.priority() {
@@ -458,7 +487,20 @@ impl KBucket {
         // Cap addresses to prevent memory exhaustion from oversized lists
         // arriving via deserialization or direct construction.
         node.addresses.truncate(MAX_ADDRESSES_PER_NODE);
-        node.address_types.truncate(MAX_ADDRESSES_PER_NODE);
+        node.address_types.truncate(node.addresses.len());
+        for (i, addr) in node.addresses.iter().enumerate() {
+            let advertised = node
+                .address_types
+                .get(i)
+                .copied()
+                .unwrap_or(AddressType::Unverified);
+            if i < node.address_types.len() {
+                node.address_types[i] = AddressType::for_advertised_address(addr, advertised);
+            } else {
+                node.address_types
+                    .push(AddressType::for_advertised_address(addr, advertised));
+            }
+        }
 
         // If the node is already in this bucket, merge addresses using
         // type-aware merge so relay addresses stay at the front and
@@ -623,6 +665,7 @@ impl KBucket {
         let merge_is_noop = match address {
             None => true,
             Some(addr) => {
+                let addr_type = AddressType::for_advertised_address(addr, addr_type);
                 // Already in the list → merge would reinsert at the same
                 // position, which is a no-op only if the existing entry
                 // has the same type classification. If the type differs
@@ -668,7 +711,7 @@ impl KBucket {
     /// drops any state the sender omits (e.g., a stale relay address after
     /// the relay session closes).
     ///
-    /// The new list is sorted by [`type_priority`] (Relay → Direct → NATted)
+    /// The new list is sorted by [`type_priority`] (Relay → Direct → Lan)
     /// to preserve the same ordering invariant that [`NodeInfo::merge_typed_address`]
     /// maintains, then truncated to [`MAX_ADDRESSES_PER_NODE`].
     ///
@@ -710,7 +753,13 @@ impl KBucket {
             return false;
         };
 
-        let mut typed = typed_addresses;
+        let mut typed: Vec<(MultiAddr, AddressType)> = typed_addresses
+            .into_iter()
+            .map(|(addr, ty)| {
+                let ty = AddressType::for_advertised_address(&addr, ty);
+                (addr, ty)
+            })
+            .collect();
         typed.sort_by_key(|(_, t)| type_priority(*t));
         typed.truncate(MAX_ADDRESSES_PER_NODE);
 
@@ -721,9 +770,10 @@ impl KBucket {
             node.addresses = addresses;
             node.address_types = address_types;
             // Apply the per-IP-family cap on the incoming publish set: a
-            // peer is not expected to publish more than Relay+{one other}
-            // per family, but a misbehaving sender could try to exceed
-            // that. The cap enforces the invariant regardless.
+            // peer is not expected to publish more than Relay + one WAN
+            // address + one LAN address per family, but a misbehaving sender
+            // could try to exceed that. The cap enforces the invariant
+            // regardless.
             node.enforce_per_ip_family_cap();
         }
 
@@ -1431,14 +1481,7 @@ impl DhtCoreEngine {
                 n.addresses
                     .iter()
                     .enumerate()
-                    .map(|(i, addr)| {
-                        let addr_type = n
-                            .address_types
-                            .get(i)
-                            .copied()
-                            .unwrap_or(AddressType::Unverified);
-                        (addr.clone(), addr_type)
-                    })
+                    .map(|(i, addr)| (addr.clone(), n.address_type_at(i)))
                     .collect()
             })
             .unwrap_or_default()
@@ -1495,11 +1538,12 @@ impl DhtCoreEngine {
     /// Passing the current address ensures stale addresses are replaced when a
     /// peer reconnects from a different endpoint.
     ///
-    /// Any address passed here is classified [`AddressType::Unverified`]: a
-    /// successful RPC with us proves reachability from *us* to the peer
-    /// (possibly through a NAT mapping we opened), not public
-    /// cold-dialability. Callers with authoritative type information must use
-    /// [`Self::touch_node_typed`].
+    /// Non-local addresses passed here are classified
+    /// [`AddressType::Unverified`]: a successful RPC with us proves
+    /// reachability from *us* to the peer (possibly through a NAT mapping we
+    /// opened), not public cold-dialability. Local-scope addresses are
+    /// canonicalized to [`AddressType::Lan`] by the typed merge path. Callers
+    /// with authoritative type information must use [`Self::touch_node_typed`].
     pub async fn touch_node(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, AddressType::Unverified)
@@ -1678,6 +1722,10 @@ impl DhtCoreEngine {
                 !addr
                     .ip()
                     .is_some_and(|ip| canonicalize_ip(ip).is_loopback())
+            })
+            .map(|(addr, ty)| {
+                let ty = AddressType::for_advertised_address(&addr, ty);
+                (addr, ty)
             })
             .collect();
 
@@ -2652,6 +2700,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_addresses_canonicalizes_local_scope_direct_to_lan() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+            .unwrap();
+
+        let private: MultiAddr = "/ip4/192.168.1.10/udp/9001/quic".parse().unwrap();
+        let typed = vec![(private.clone(), AddressType::Direct)];
+        assert!(bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed));
+
+        let node = bucket.find_node(&PeerId::from_bytes([1u8; 32])).unwrap();
+        assert_eq!(node.addresses, vec![private]);
+        assert_eq!(node.address_types, vec![AddressType::Lan]);
+    }
+
+    #[test]
     fn replace_addresses_missing_peer_returns_false() {
         let k = 8;
         let mut bucket = KBucket::new(k);
@@ -2681,7 +2746,9 @@ mod tests {
         let typed: Vec<(MultiAddr, AddressType)> = (0..12)
             .map(|i| {
                 (
-                    format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap(),
+                    format!("/ip4/203.0.113.{}/udp/9000/quic", i + 1)
+                        .parse()
+                        .unwrap(),
                     AddressType::Direct,
                 )
             })
@@ -3193,7 +3260,11 @@ mod tests {
         // `merge_typed_address`, and the per-IP-family cap keeps exactly
         // one Direct per family.
         let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
-            .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
+            .map(|i| {
+                format!("/ip4/203.0.113.{}/udp/9000/quic", i)
+                    .parse()
+                    .unwrap()
+            })
             .collect();
         let address_types = vec![AddressType::Direct; addresses.len()];
         let replacement = NodeInfo {
@@ -4473,33 +4544,55 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn address_type_priority_is_relay_direct_unverified_natted() {
+    fn address_type_priority_is_relay_direct_unverified_lan() {
         assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
         assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
-        assert!(AddressType::Unverified.priority() < AddressType::NATted.priority());
+        assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
     }
 
     #[test]
-    fn merge_same_family_keeps_relay_and_best_non_relay() {
-        // Under the per-IP-family cap: at most 1 Relay + 1 of {Direct,
-        // Unverified, NATted} per family. Direct is the strongest
-        // non-Relay tier, so when all four tiers are fed into the same
-        // IPv4 family, only Relay+Direct survive.
-        let mut node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
-        let direct = node.addresses[0].clone();
-        let relay: MultiAddr = "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap();
-        let unverified: MultiAddr = "/ip4/10.0.0.3/udp/9000/quic".parse().unwrap();
-        let natted: MultiAddr = "/ip4/10.0.0.4/udp/9000/quic".parse().unwrap();
+    fn address_type_accepts_legacy_natted_name_as_lan() {
+        let decoded: AddressType = serde_json::from_str("\"NATted\"").unwrap();
+        assert_eq!(decoded, AddressType::Lan);
+    }
 
-        node.merge_typed_address(natted, AddressType::NATted);
+    #[test]
+    fn local_scope_address_type_is_canonicalized_to_lan() {
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            last_seen: AtomicInstant::now(),
+        };
+        let private: MultiAddr = "/ip4/192.168.1.10/udp/9000/quic".parse().unwrap();
+
+        node.merge_typed_address(private.clone(), AddressType::Direct);
+        assert_eq!(node.addresses, vec![private]);
+        assert_eq!(node.address_types, vec![AddressType::Lan]);
+        assert_eq!(node.address_type_at(0), AddressType::Lan);
+    }
+
+    #[test]
+    fn merge_same_family_keeps_relay_best_wan_and_lan() {
+        // Under the per-IP-family cap: at most 1 Relay + 1 WAN
+        // non-Relay (Direct/Unverified) + 1 Lan per family. Direct is the
+        // strongest WAN tier, but it must not evict the local path that
+        // same-WAN peers can use.
+        let mut node = make_node(1, "/ip4/203.0.113.1/udp/9000/quic");
+        let direct = node.addresses[0].clone();
+        let relay: MultiAddr = "/ip4/198.51.100.1/udp/9000/quic".parse().unwrap();
+        let unverified: MultiAddr = "/ip4/203.0.113.2/udp/9000/quic".parse().unwrap();
+        let lan: MultiAddr = "/ip4/192.168.1.4/udp/9000/quic".parse().unwrap();
+
+        node.merge_typed_address(lan.clone(), AddressType::Lan);
         node.merge_typed_address(unverified, AddressType::Unverified);
         node.merge_typed_address(relay.clone(), AddressType::Relay);
 
         assert_eq!(
             node.address_types,
-            vec![AddressType::Relay, AddressType::Direct]
+            vec![AddressType::Relay, AddressType::Direct, AddressType::Lan]
         );
-        assert_eq!(node.addresses, vec![relay, direct]);
+        assert_eq!(node.addresses, vec![relay, direct, lan]);
     }
 
     #[test]
@@ -4573,23 +4666,29 @@ mod tests {
     }
 
     #[test]
-    fn cap_direct_dominates_natted_same_family() {
+    fn cap_direct_preserves_lan_same_family() {
         let mut node = node_with(vec![
             ("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct),
-            ("/ip4/2.2.2.2/udp/9000/quic", AddressType::NATted),
+            ("/ip4/192.168.1.20/udp/9000/quic", AddressType::Lan),
         ]);
         node.enforce_per_ip_family_cap();
-        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Direct, AddressType::Lan]
+        );
     }
 
     #[test]
-    fn cap_unverified_dominates_natted_same_family() {
+    fn cap_unverified_preserves_lan_same_family() {
         let mut node = node_with(vec![
             ("/ip4/2.2.2.2/udp/9000/quic", AddressType::Unverified),
-            ("/ip4/3.3.3.3/udp/9000/quic", AddressType::NATted),
+            ("/ip4/192.168.1.30/udp/9000/quic", AddressType::Lan),
         ]);
         node.enforce_per_ip_family_cap();
-        assert_eq!(node.address_types, vec![AddressType::Unverified]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Unverified, AddressType::Lan]
+        );
     }
 
     #[test]
@@ -4619,39 +4718,51 @@ mod tests {
     }
 
     #[test]
-    fn cap_merge_direct_then_natted_drops_natted() {
+    fn cap_merge_direct_then_lan_keeps_both() {
         let mut node = node_with(vec![("/ip4/1.1.1.1/udp/9000/quic", AddressType::Direct)]);
         node.merge_typed_address(
-            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
-            AddressType::NATted,
+            "/ip4/192.168.1.20/udp/9000/quic".parse().unwrap(),
+            AddressType::Lan,
         );
-        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Direct, AddressType::Lan]
+        );
     }
 
     #[test]
-    fn cap_merge_natted_then_direct_drops_natted() {
-        let mut node = node_with(vec![("/ip4/2.2.2.2/udp/9000/quic", AddressType::NATted)]);
+    fn cap_merge_lan_then_direct_keeps_both() {
+        let mut node = node_with(vec![("/ip4/192.168.1.20/udp/9000/quic", AddressType::Lan)]);
         node.merge_typed_address(
             "/ip4/1.1.1.1/udp/9000/quic".parse().unwrap(),
             AddressType::Direct,
         );
-        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Direct, AddressType::Lan]
+        );
         assert_eq!(
             node.addresses,
-            vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()]
+            vec![
+                "/ip4/1.1.1.1/udp/9000/quic".parse().unwrap(),
+                "/ip4/192.168.1.20/udp/9000/quic".parse().unwrap()
+            ]
         );
     }
 
     #[test]
     fn cap_newest_relay_replaces_stale_same_family_relay() {
-        let mut node = node_with(vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let mut node = node_with(vec![(
+            "/ip4/198.51.100.1/udp/9000/quic",
+            AddressType::Relay,
+        )]);
         node.merge_typed_address(
-            "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+            "/ip4/198.51.100.2/udp/9000/quic".parse().unwrap(),
             AddressType::Relay,
         );
         assert_eq!(
             node.addresses,
-            vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()]
+            vec!["/ip4/198.51.100.2/udp/9000/quic".parse().unwrap()]
         );
         assert_eq!(node.address_types, vec![AddressType::Relay]);
     }
@@ -4660,7 +4771,7 @@ mod tests {
     fn cap_newest_relay_preserves_different_family_relay() {
         let mut node = node_with(vec![("/ip6/2001:db8::1/udp/9000/quic", AddressType::Relay)]);
         node.merge_typed_address(
-            "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
+            "/ip4/198.51.100.1/udp/9000/quic".parse().unwrap(),
             AddressType::Relay,
         );
         let mut relays: Vec<_> = node
@@ -4674,7 +4785,7 @@ mod tests {
         assert_eq!(
             relays,
             vec![
-                "/ip4/10.0.0.1/udp/9000/quic".to_string(),
+                "/ip4/198.51.100.1/udp/9000/quic".to_string(),
                 "/ip6/2001:db8::1/udp/9000/quic".to_string(),
             ]
         );
@@ -4698,8 +4809,8 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![
-                "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
-                "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
+                "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap(),
+                "/ip4/203.0.113.11/udp/9000/quic".parse().unwrap(),
             ],
             address_types: vec![], // legacy: no tags at all
             last_seen: AtomicInstant::now(),
@@ -4710,7 +4821,7 @@ mod tests {
 
     #[test]
     fn merge_typed_address_upgrade_only_promotes_unverified_to_direct() {
-        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let addr: MultiAddr = "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap();
         let mut node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![addr.clone()],
@@ -4726,7 +4837,7 @@ mod tests {
     fn merge_typed_address_upgrade_only_refuses_to_demote() {
         // Existing Relay must not be demoted by incoming Unverified/Direct
         // arriving out of order via FIND_NODE gossip.
-        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let addr: MultiAddr = "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap();
         for incoming in [AddressType::Unverified, AddressType::Direct] {
             let mut node = NodeInfo {
                 id: PeerId::from_bytes([1u8; 32]),
@@ -4746,7 +4857,7 @@ mod tests {
         // A new address is always added, regardless of tag — this is how a
         // peer XOR-far from every PublishAddressSet source learns about
         // its neighbours' Relay/Direct addresses via gossip.
-        let existing: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let existing: MultiAddr = "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap();
         let new_relay: MultiAddr = "/ip4/192.0.2.7/udp/44100/quic".parse().unwrap();
         let mut node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
@@ -4764,7 +4875,7 @@ mod tests {
 
     #[test]
     fn merge_typed_address_upgrade_only_idempotent_on_same_tag() {
-        let addr: MultiAddr = "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap();
+        let addr: MultiAddr = "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap();
         let mut node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![addr.clone()],

@@ -42,6 +42,26 @@ pub use saorsa_transport::transport::TransportAddr;
 
 use crate::identity::peer_id::PeerId;
 
+/// Return true for IP addresses that should only be advertised for local
+/// reachability.
+#[must_use]
+pub(crate) fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
 /// Composable, self-describing network address with an optional [`PeerId`]
 /// suffix.
 ///
@@ -179,17 +199,10 @@ impl MultiAddr {
         self.ip().is_some_and(|ip| ip.is_loopback())
     }
 
-    /// `true` if this is an IP-based private/link-local address, `false`
+    /// `true` if this is an IP-based local-scope address, `false`
     /// otherwise.
     pub fn is_private(&self) -> bool {
-        match self.ip() {
-            Some(IpAddr::V4(ip)) => ip.is_private(),
-            Some(IpAddr::V6(ip)) => {
-                let octets = ip.octets();
-                (octets[0] & 0xfe) == 0xfc
-            }
-            None => false,
-        }
+        self.ip().is_some_and(is_lan_ip)
     }
 }
 

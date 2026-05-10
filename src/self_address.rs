@@ -23,13 +23,17 @@
 //!
 //! 1. If a relay address exists, publish it first and tag it
 //!    [`AddressType::Relay`].
-//! 2. Publish at most one best non-relay address per IP family. A proven
-//!    externally reachable address is tagged [`AddressType::Direct`]; an
-//!    observed-but-unproven address is tagged [`AddressType::Unverified`].
-//!    Direct wins over Unverified within the same family.
-//! 3. If there is no relay, publish the same best non-relay set: Direct when
-//!    present, otherwise Unverified.
-//! 4. Drop non-dialable wildcard or zero-port addresses rather than
+//! 2. Publish at most one best WAN address per IP family. A proven externally
+//!    reachable address is tagged [`AddressType::Direct`]; an
+//!    observed-but-unproven WAN address is tagged
+//!    [`AddressType::Unverified`]. Direct wins over Unverified within the
+//!    same family.
+//! 3. Publish at most one LAN address per IP family, tagged
+//!    [`AddressType::Lan`]. LAN addresses are kept separate from WAN
+//!    Direct/Unverified addresses so same-WAN peers can prefer the local path
+//!    without advertising it as generally reachable.
+//! 4. If there is no relay, publish the same best WAN/LAN set.
+//! 5. Drop non-dialable wildcard or zero-port addresses rather than
 //!    advertising placeholders peers cannot connect to.
 //!
 //! The per-family cap mirrors the peer storage/dial policy. Publishing more
@@ -41,6 +45,7 @@ use std::net::SocketAddr;
 use tracing::{debug, trace};
 
 use crate::MultiAddr;
+use crate::address::is_lan_ip;
 use crate::dht::AddressType;
 
 pub(crate) fn build_self_address_set<F>(
@@ -66,8 +71,8 @@ where
 
     // Prefer observed (post-NAT) addresses when the reachability tier is the
     // same, since those are what peers actually see from the outside. Listen
-    // addresses still participate in tier selection, so a proven Direct
-    // listen socket can beat an Unverified observed socket in the same family.
+    // addresses still participate in tier selection, so a proven WAN listen
+    // socket can beat an Unverified observed socket in the same family.
     for sa in observed {
         record_non_relay_self_address(
             sa,
@@ -100,13 +105,19 @@ where
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SelfAddressSet {
     relay: Option<SocketAddr>,
-    v4: Option<FamilyAddressChoice>,
-    v6: Option<FamilyAddressChoice>,
+    wan_v4: Option<FamilyAddressChoice>,
+    wan_v6: Option<FamilyAddressChoice>,
+    lan_v4: Option<FamilyAddressChoice>,
+    lan_v6: Option<FamilyAddressChoice>,
 }
 
 impl SelfAddressSet {
     pub(crate) fn is_empty(&self) -> bool {
-        self.relay.is_none() && self.v4.is_none() && self.v6.is_none()
+        self.relay.is_none()
+            && self.wan_v4.is_none()
+            && self.wan_v6.is_none()
+            && self.lan_v4.is_none()
+            && self.lan_v6.is_none()
     }
 
     pub(crate) fn into_typed_vec(self) -> Vec<(MultiAddr, AddressType)> {
@@ -136,18 +147,28 @@ impl SelfAddressSet {
 
     fn len(&self) -> usize {
         usize::from(self.relay.is_some())
-            + usize::from(self.v4.is_some())
-            + usize::from(self.v6.is_some())
+            + usize::from(self.wan_v4.is_some())
+            + usize::from(self.wan_v6.is_some())
+            + usize::from(self.lan_v4.is_some())
+            + usize::from(self.lan_v6.is_some())
     }
 
     fn contains_selected(&self, socket_addr: SocketAddr) -> bool {
         self.relay == Some(socket_addr)
             || self
-                .v4
+                .wan_v4
                 .map(|choice| choice.socket_addr == socket_addr)
                 .unwrap_or(false)
             || self
-                .v6
+                .wan_v6
+                .map(|choice| choice.socket_addr == socket_addr)
+                .unwrap_or(false)
+            || self
+                .lan_v4
+                .map(|choice| choice.socket_addr == socket_addr)
+                .unwrap_or(false)
+            || self
+                .lan_v6
                 .map(|choice| choice.socket_addr == socket_addr)
                 .unwrap_or(false)
     }
@@ -159,10 +180,11 @@ impl SelfAddressSet {
         replace_same_tier: bool,
         candidate_index: usize,
     ) {
-        let slot = if socket_addr.ip().is_ipv4() {
-            &mut self.v4
-        } else {
-            &mut self.v6
+        let slot = match (tag, socket_addr.ip().is_ipv4()) {
+            (AddressType::Lan, true) => &mut self.lan_v4,
+            (AddressType::Lan, false) => &mut self.lan_v6,
+            (_, true) => &mut self.wan_v4,
+            (_, false) => &mut self.wan_v6,
         };
 
         let Some(existing) = slot else {
@@ -188,18 +210,14 @@ impl SelfAddressSet {
     }
 
     fn for_each_non_relay(self, mut visit: impl FnMut(FamilyAddressChoice)) {
-        match (self.v4, self.v6) {
-            (Some(v4), Some(v6)) if v4.first_seen_index <= v6.first_seen_index => {
-                visit(v4);
-                visit(v6);
-            }
-            (Some(v4), Some(v6)) => {
-                visit(v6);
-                visit(v4);
-            }
-            (Some(v4), None) => visit(v4),
-            (None, Some(v6)) => visit(v6),
-            (None, None) => {}
+        let mut choices: Vec<FamilyAddressChoice> =
+            [self.wan_v4, self.wan_v6, self.lan_v4, self.lan_v6]
+                .into_iter()
+                .flatten()
+                .collect();
+        choices.sort_by_key(|choice| (choice.tag.priority(), choice.first_seen_index));
+        for choice in choices {
+            visit(choice);
         }
     }
 }
@@ -257,7 +275,9 @@ fn record_non_relay_self_address<F>(
         return;
     }
 
-    let tag = if is_external_proven(normalized) {
+    let tag = if is_lan_ip(normalized.ip()) {
+        AddressType::Lan
+    } else if is_external_proven(normalized) {
         AddressType::Direct
     } else {
         AddressType::Unverified
@@ -462,6 +482,44 @@ mod tests {
                 addr("/ip4/203.0.113.11/udp/10004/quic"),
                 AddressType::Unverified,
             )]
+        );
+    }
+
+    #[test]
+    fn publish_set_tags_private_address_as_lan() {
+        let typed = typed_self_address_set(
+            [sock("192.168.1.10:10004")],
+            Vec::<MultiAddr>::new(),
+            None,
+            |_| true,
+        );
+
+        assert_eq!(
+            typed,
+            vec![(addr("/ip4/192.168.1.10/udp/10004/quic"), AddressType::Lan,)]
+        );
+    }
+
+    #[test]
+    fn publish_set_keeps_lan_alongside_same_family_direct() {
+        let proven = sock("203.0.113.10:10004");
+        let typed = typed_self_address_set(
+            [proven],
+            [addr("/ip4/192.168.1.10/udp/10004/quic")],
+            Some(sock("198.51.100.1:45000")),
+            |sa| sa == proven,
+        );
+
+        assert_eq!(
+            typed,
+            vec![
+                (addr("/ip4/198.51.100.1/udp/45000/quic"), AddressType::Relay),
+                (
+                    addr("/ip4/203.0.113.10/udp/10004/quic"),
+                    AddressType::Direct,
+                ),
+                (addr("/ip4/192.168.1.10/udp/10004/quic"), AddressType::Lan,),
+            ]
         );
     }
 

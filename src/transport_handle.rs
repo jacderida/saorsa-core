@@ -113,7 +113,7 @@ fn address_kind_label(kind: Option<AddressType>) -> &'static str {
         Some(AddressType::Relay) => "Relay",
         Some(AddressType::Direct) => "Direct",
         Some(AddressType::Unverified) => "Unverified",
-        Some(AddressType::NATted) => "NATted",
+        Some(AddressType::Lan) => "Lan",
         None => "unknown",
     }
 }
@@ -1194,7 +1194,7 @@ impl TransportHandle {
     /// return [`NetworkError::InvalidAddress`].
     ///
     /// Callers that already know how the address was classified (Direct,
-    /// Relay, Unverified, NATted) should prefer
+    /// Relay, Unverified, Lan) should prefer
     /// [`Self::connect_peer_typed`] so the success/failure logs include
     /// the address kind. This entry point is preserved for callers
     /// (tests, public API consumers) that don't have type metadata.
@@ -1207,7 +1207,7 @@ impl TransportHandle {
     /// Same as [`Self::connect_peer`] but additionally records the
     /// [`AddressType`] tag in the success/failure logs so an operator
     /// can tell, after the fact, whether a failed dial was against a
-    /// `Direct`, `Relay`, `Unverified`, or `NATted` address.
+    /// `Direct`, `Relay`, `Unverified`, or `Lan` address.
     pub async fn connect_peer_typed(
         &self,
         address: &MultiAddr,

@@ -1452,7 +1452,7 @@ impl P2PNode {
     /// Same as [`Self::connect_peer`] but threads the [`AddressType`]
     /// through to the transport-level dial log so an operator can tell,
     /// after the fact, whether a failed dial was against a `Direct`,
-    /// `Relay`, `Unverified`, or `NATted` address.
+    /// `Relay`, `Unverified`, or `Lan` address.
     pub async fn connect_peer_typed(
         &self,
         address: &MultiAddr,
