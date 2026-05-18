@@ -4060,12 +4060,13 @@ mod tests {
     async fn bucket_refresh_candidates_use_probe_debt() {
         let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
         let bucket_idx = 7;
-        let now = Instant::now();
+        let live_age = Duration::from_secs(2);
+        let probe_age = Duration::from_millis(50);
         {
             let mut routing = dht.routing_table_for_test().write().await;
             let bucket = &mut routing.buckets[bucket_idx];
-            bucket.last_refreshed_by_live_peer = now - Duration::from_secs(2 * 3600);
-            bucket.last_probe_finished = now - Duration::from_secs(60);
+            bucket.last_refreshed_by_live_peer = instant_ago(live_age);
+            bucket.last_probe_finished = instant_ago(probe_age);
         }
 
         let candidates = dht.bucket_refresh_candidates().await;
@@ -4074,10 +4075,10 @@ mod tests {
             .find(|candidate| candidate.index == bucket_idx)
             .expect("bucket should be returned");
 
-        assert!(candidate.live_peer_age >= Duration::from_secs(2 * 3600));
-        assert!(candidate.probe_age >= Duration::from_secs(60));
+        assert!(candidate.live_peer_age >= live_age);
+        assert!(candidate.probe_age >= probe_age);
         assert!(
-            candidate.refresh_debt <= Duration::from_secs(65),
+            candidate.refresh_debt < live_age,
             "recent probe should limit refresh debt: {:?}",
             candidate.refresh_debt
         );
@@ -4087,8 +4088,8 @@ mod tests {
     async fn marking_bucket_probe_finished_does_not_refresh_live_peer_timestamp() {
         let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
         let bucket_idx = 11;
-        let old_live = Instant::now() - Duration::from_secs(2 * 3600);
-        let old_probe = Instant::now() - Duration::from_secs(3600);
+        let old_live = instant_ago(Duration::from_secs(2));
+        let old_probe = instant_ago(Duration::from_millis(50));
         {
             let mut routing = dht.routing_table_for_test().write().await;
             let bucket = &mut routing.buckets[bucket_idx];
@@ -4122,6 +4123,19 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Return an `Instant` approximately `duration` in the past without
+    /// assuming the runner's monotonic clock has already existed that long.
+    fn instant_ago(duration: Duration) -> Instant {
+        if let Some(instant) = Instant::now().checked_sub(duration) {
+            return instant;
+        }
+
+        std::thread::sleep(duration.saturating_add(Duration::from_millis(1)));
+        Instant::now()
+            .checked_sub(duration)
+            .expect("runner Instant should be old enough after sleeping")
     }
 
     // =======================================================================
