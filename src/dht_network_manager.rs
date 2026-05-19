@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::{MultiAddr, is_lan_ip},
-    dht::core_engine::{AddressType, AtomicInstant, NodeInfo},
+    dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
@@ -34,6 +34,7 @@ use anyhow::Context as _;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -150,23 +151,43 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
 
-/// Duration after which a bucket without activity is considered stale.
-const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
-
 /// Minimum self-lookup interval (randomized between min and max).
 const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Maximum self-lookup interval.
 const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minutes
 
-/// Minimum periodic refresh cadence for stale k-buckets (randomized between
-/// min and max). Jittering this interval prevents 1000s of nodes that started
-/// in lockstep from all firing their bucket-refresh FIND_NODEs in the same
-/// second once their distant buckets cross [`STALE_BUCKET_THRESHOLD`].
+/// Minimum periodic refresh cadence for k-buckets (randomized between min and
+/// max). Jittering this interval prevents 1000s of nodes that started in
+/// lockstep from all firing their bucket-refresh FIND_NODEs in the same second.
 const BUCKET_REFRESH_INTERVAL_MIN: Duration = Duration::from_secs(450); // 7.5 minutes
 
-/// Maximum periodic refresh cadence for stale k-buckets.
+/// Maximum periodic refresh cadence for k-buckets.
 const BUCKET_REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(750); // 12.5 minutes
+
+/// Maximum k-buckets refreshed during a single bucket-refresh pass.
+///
+/// A large production routing table has 256 buckets to maintain. Without a
+/// per-pass budget, the refresh task can spend the whole interval running
+/// iterative network lookups back-to-back. With the current 7.5-12.5 minute
+/// interval, refreshing two buckets per pass gives an approximate once-per-day
+/// full-table maintenance cadence while keeping background lookup pressure low.
+const MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS: usize = 2;
+
+/// Maximum concurrent bucket-refresh lookups.
+///
+/// This is intentionally scoped to bucket refresh so periodic self-lookup and
+/// foreground/user lookup behaviour remain unchanged. Automatic re-bootstrap is
+/// intentionally exempt: it is gated separately by [`REBOOTSTRAP_COOLDOWN`] and
+/// only runs when the routing table has fallen below
+/// [`AUTO_REBOOTSTRAP_THRESHOLD`].
+const MAX_CONCURRENT_BUCKET_REFRESH_LOOKUPS: usize = 1;
+
+/// Random jitter applied to bucket-refresh debt ordering.
+///
+/// Kept small so the oldest/debtiest buckets still dominate, while same-age
+/// buckets do not refresh in lockstep across nodes.
+const BUCKET_REFRESH_SELECTION_JITTER: Duration = Duration::from_secs(60);
 
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
@@ -657,6 +678,11 @@ pub struct DhtNetworkManager {
     /// Uses `parking_lot::Mutex` (not tokio) because it is never held across
     /// `.await` and its `Drop`-based guard cleanup requires synchronous locking.
     bucket_revalidation_active: Arc<parking_lot::Mutex<HashSet<usize>>>,
+    /// Semaphore for limiting concurrent bucket-refresh lookups.
+    ///
+    /// Self-lookups and foreground/payment/user lookup calls do not use this
+    /// semaphore.
+    bucket_refresh_lookup_semaphore: Arc<Semaphore>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1321,6 +1347,9 @@ impl DhtNetworkManager {
             message_handler_semaphore,
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
             bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            bucket_refresh_lookup_semaphore: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_BUCKET_REFRESH_LOOKUPS,
+            )),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
             self_lookup_handle: Arc::new(RwLock::new(None)),
@@ -1466,10 +1495,10 @@ impl DhtNetworkManager {
     /// Spawn the periodic bucket refresh background task.
     ///
     /// At a randomised interval between [`BUCKET_REFRESH_INTERVAL_MIN`] and
-    /// [`BUCKET_REFRESH_INTERVAL_MAX`], finds stale buckets (not refreshed
-    /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
-    /// a random key in each stale bucket's range. This populates stale buckets
-    /// with fresh peers.
+    /// [`BUCKET_REFRESH_INTERVAL_MAX`], selects the highest-debt buckets and
+    /// performs a FIND_NODE lookup for a random key in each selected bucket's
+    /// range. This keeps bucket refresh continuous while the per-pass budget
+    /// limits background lookup volume.
     async fn spawn_bucket_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
@@ -1493,51 +1522,70 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
-                        let stale_indices = this
-                            .dht
-                            .read()
-                            .await
-                            .stale_bucket_indices(STALE_BUCKET_THRESHOLD)
-                            .await;
+                        match Arc::clone(&this.bucket_refresh_lookup_semaphore).try_acquire_owned()
+                        {
+                            Ok(_maintenance_lookup_permit) => {
+                                let refresh_candidates = this
+                                    .dht
+                                    .read()
+                                    .await
+                                    .bucket_refresh_candidates()
+                                    .await;
 
-                        if stale_indices.is_empty() {
-                            trace!("Bucket refresh: no stale buckets");
-                            return;
-                        }
+                                let candidate_count = refresh_candidates.len();
+                                let refresh_indices =
+                                    Self::select_bucket_refresh_indices(refresh_candidates);
+                                let refresh_count = refresh_indices.len();
+                                debug!(
+                                    "Bucket refresh: {candidate_count} candidate buckets, refreshing {refresh_count}"
+                                );
 
-                        debug!("Bucket refresh: {} stale buckets", stale_indices.len());
-                        let k = this.k_value();
+                                let k = this.k_value();
 
-                        for bucket_idx in stale_indices {
-                            if shutdown_ref.is_cancelled() {
-                                break;
-                            }
-                            let random_key = {
-                                let dht = this.dht.read().await;
-                                dht.generate_random_key_for_bucket(bucket_idx)
-                            };
-                            let Some(key) = random_key else {
-                                continue;
-                            };
+                                for bucket_idx in refresh_indices {
+                                    if shutdown_ref.is_cancelled() {
+                                        break;
+                                    }
+                                    let random_key = {
+                                        let dht = this.dht.read().await;
+                                        dht.generate_random_key_for_bucket(bucket_idx)
+                                    };
+                                    let Some(key) = random_key else {
+                                        this.mark_bucket_probe_finished(bucket_idx).await;
+                                        continue;
+                                    };
 
-                            let key_bytes: Key = *key.as_bytes();
-                            match this.find_closest_nodes_network(&key_bytes, k).await {
-                                Ok(nodes) => {
-                                    trace!(
-                                        "Bucket refresh[{bucket_idx}]: discovered {} peers",
-                                        nodes.len()
-                                    );
-                                    for dht_node in nodes {
-                                        if dht_node.peer_id == this.config.peer_id {
-                                            continue;
+                                    let key_bytes: Key = *key.as_bytes();
+                                    let lookup_result =
+                                        this.find_closest_nodes_network(&key_bytes, k).await;
+                                    this.mark_bucket_probe_finished(bucket_idx).await;
+                                    match lookup_result {
+                                        Ok(nodes) => {
+                                            trace!(
+                                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                                nodes.len()
+                                            );
+                                            for dht_node in nodes {
+                                                if dht_node.peer_id == this.config.peer_id {
+                                                    continue;
+                                                }
+                                                this.dial_addresses(
+                                                    &dht_node.peer_id,
+                                                    &dht_node.typed_addresses(),
+                                                )
+                                                .await;
+                                            }
                                         }
-                                        this.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
-                                            .await;
+                                        Err(e) => {
+                                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
-                                }
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "Bucket refresh skipped: bucket refresh lookup already running"
+                                );
                             }
                         }
 
@@ -1547,6 +1595,18 @@ impl DhtNetworkManager {
             }
         });
         *handle_slot.write().await = Some(handle);
+    }
+
+    async fn mark_bucket_probe_finished(&self, bucket_idx: usize) {
+        let marked = {
+            let dht = self.dht.read().await;
+            dht.mark_bucket_probe_finished(bucket_idx).await
+        };
+        if !marked {
+            warn!(
+                "Bucket refresh[{bucket_idx}]: probe-finished mark skipped for out-of-range bucket"
+            );
+        }
     }
 
     /// Trigger an immediate self-lookup to refresh the close neighborhood.
@@ -1584,7 +1644,10 @@ impl DhtNetworkManager {
     /// [`AUTO_REBOOTSTRAP_THRESHOLD`] and the cooldown has elapsed.
     ///
     /// Uses currently connected peers as bootstrap seeds. The cooldown prevents
-    /// hammering bootstrap nodes during transient network partitions.
+    /// hammering bootstrap nodes during transient network partitions. This is
+    /// deliberately not guarded by `bucket_refresh_lookup_semaphore`: once the
+    /// routing table is below the recovery threshold, bootstrap repair should
+    /// not be skipped just because a best-effort bucket refresh is running.
     async fn maybe_rebootstrap(&self) {
         let rt_size = self.get_routing_table_size().await;
         if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
@@ -1645,6 +1708,35 @@ impl DhtNetworkManager {
         ]);
         let jitter = Duration::from_secs(random_value % (range_secs + 1));
         min + jitter
+    }
+
+    fn select_bucket_refresh_indices(candidates: Vec<BucketRefreshCandidate>) -> Vec<usize> {
+        let jitter_bound_millis = BUCKET_REFRESH_SELECTION_JITTER.as_millis() as u64;
+        let mut rng = rand::thread_rng();
+        let mut scored: Vec<(u128, u128, u128, usize)> = candidates
+            .into_iter()
+            .map(|candidate| {
+                let jitter = if jitter_bound_millis == 0 {
+                    0
+                } else {
+                    rng.gen_range(0..=jitter_bound_millis) as u128
+                };
+                (
+                    candidate.refresh_debt.as_millis().saturating_add(jitter),
+                    candidate.live_peer_age.as_millis(),
+                    candidate.probe_age.as_millis(),
+                    candidate.index,
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        scored.truncate(MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
+        scored.into_iter().map(|(_, _, _, index)| index).collect()
     }
 
     /// Perform DHT peer discovery from already-connected bootstrap peers.
@@ -4769,6 +4861,56 @@ mod tests {
             STALE_REVALIDATION_BUDGET,
             IDENTITY_EXCHANGE_TIMEOUT + STALE_REVALIDATION_PING_RTT,
         );
+    }
+
+    fn bucket_refresh_candidate(index: usize, refresh_debt_secs: u64) -> BucketRefreshCandidate {
+        let refresh_debt = Duration::from_secs(refresh_debt_secs);
+        BucketRefreshCandidate {
+            index,
+            refresh_debt,
+            live_peer_age: refresh_debt,
+            probe_age: refresh_debt,
+        }
+    }
+
+    #[test]
+    fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
+        assert!(
+            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            "bucket refresh budget must allow at least one lookup"
+        );
+
+        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS)
+            .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
+            .collect();
+        let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
+        selected.sort_unstable();
+
+        assert_eq!(
+            selected,
+            (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
+        assert!(
+            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            "bucket refresh budget must allow at least one lookup"
+        );
+
+        let candidate_count = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3;
+        let candidates: Vec<_> = (0..candidate_count)
+            .map(|idx| bucket_refresh_candidate(idx, (idx as u64) * 3_600))
+            .collect();
+        let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
+        selected.sort_unstable();
+
+        let expected_start = candidate_count - MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
+        let expected: Vec<_> = (expected_start..candidate_count).collect();
+
+        assert_eq!(selected.len(), MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
+        assert_eq!(selected, expected);
     }
 
     #[test]
