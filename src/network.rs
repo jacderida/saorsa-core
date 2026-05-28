@@ -1733,21 +1733,6 @@ impl P2PNode {
 /// can pass it directly to `send_message()`. This eliminates a spoofing
 /// vector where a peer could claim an arbitrary identity via the payload.
 ///
-/// Maximum allowed clock skew for message timestamps.
-///
-/// A decentralized network cannot assume participants have accurate clocks.
-/// Consumer devices commonly have clocks that drift by minutes (no NTP, wrong
-/// timezone offset applied to UTC, suspended laptops, VMs without guest
-/// additions, etc.). Both past and future windows must be symmetric and
-/// generous enough that normal clock drift does not partition the network.
-///
-/// 5 minutes in both directions provides replay protection while tolerating
-/// the clock skew observed in real-world deployments (31-42 seconds was
-/// measured between a macOS client and NTP-synced VPS nodes).
-const MAX_MESSAGE_AGE_SECS: u64 = 300;
-/// Maximum allowed future timestamp — symmetric with the past window.
-const MAX_FUTURE_SECS: u64 = 300;
-
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
     P2PError::Network(NetworkError::ProtocolError(msg.to_string().into()))
@@ -1773,34 +1758,6 @@ pub(crate) struct ParsedMessage {
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
     let transport_source = source.parse::<SocketAddr>().ok().map(MultiAddr::quic);
-
-    // Validate timestamp to prevent replay attacks
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Reject messages that are too old (potential replay)
-    if message.timestamp < now.saturating_sub(MAX_MESSAGE_AGE_SECS) {
-        tracing::warn!(
-            "Rejecting stale message from {} (timestamp {} is {} seconds old)",
-            source,
-            message.timestamp,
-            now.saturating_sub(message.timestamp)
-        );
-        return None;
-    }
-
-    // Reject messages too far in the future (clock manipulation)
-    if message.timestamp > now + MAX_FUTURE_SECS {
-        tracing::warn!(
-            "Rejecting future-dated message from {} (timestamp {} is {} seconds ahead)",
-            source,
-            message.timestamp,
-            message.timestamp.saturating_sub(now)
-        );
-        return None;
-    }
 
     // Verify app-level signature if present
     let authenticated_node_id = if !message.signature.is_empty() {
@@ -3526,6 +3483,30 @@ mod tests {
         assert!(
             parse_protocol_message(&bytes, "transport-xyz").is_none(),
             "message with mismatched from field should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_protocol_message_accepts_arbitrary_timestamps() {
+        // Clock skew between peers must not drop messages.
+        // Regression: previously ±5 min tolerance silently rejected all
+        // traffic when client and node clocks differed.
+        let payload = vec![1, 2, 3];
+
+        // 10 hours in the past
+        let old_ts = current_timestamp().saturating_sub(36_000);
+        let old_bytes = make_wire_bytes("test/old", payload.clone(), "sender", old_ts);
+        assert!(
+            parse_protocol_message(&old_bytes, "peer-id").is_some(),
+            "should accept message with timestamp 10h in the past"
+        );
+
+        // 10 hours in the future
+        let future_ts = current_timestamp().saturating_add(36_000);
+        let future_bytes = make_wire_bytes("test/future", payload, "sender", future_ts);
+        assert!(
+            parse_protocol_message(&future_bytes, "peer-id").is_some(),
+            "should accept message with timestamp 10h in the future"
         );
     }
 }
