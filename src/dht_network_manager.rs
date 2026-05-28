@@ -5049,41 +5049,40 @@ mod tests {
 
     #[test]
     fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
+        let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
         assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            refresh_budget > 0,
             "bucket refresh budget must allow at least one lookup"
         );
 
-        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS)
+        let candidates: Vec<_> = (0..refresh_budget)
             .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
         selected.sort_unstable();
 
-        assert_eq!(
-            selected,
-            (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS).collect::<Vec<_>>()
-        );
+        assert_eq!(selected, (0..refresh_budget).collect::<Vec<_>>());
     }
 
     #[test]
     fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
+        let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
         assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            refresh_budget > 0,
             "bucket refresh budget must allow at least one lookup"
         );
 
-        let candidate_count = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3;
+        let candidate_count = refresh_budget * 3;
         let candidates: Vec<_> = (0..candidate_count)
             .map(|idx| bucket_refresh_candidate(idx, (idx as u64) * 3_600))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
         selected.sort_unstable();
 
-        let expected_start = candidate_count - MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
+        let expected_start = candidate_count - refresh_budget;
         let expected: Vec<_> = (expected_start..candidate_count).collect();
 
-        assert_eq!(selected.len(), MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
+        assert_eq!(selected.len(), refresh_budget);
         assert_eq!(selected, expected);
     }
 

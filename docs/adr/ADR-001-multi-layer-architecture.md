@@ -59,7 +59,7 @@ We adopt a **multi-layer architecture** with clearly defined boundaries and inte
 │  ┌─────────────────────────────┴─────────────────────────────┐  │
 │  │                    saorsa-transport (QUIC + PQC)                   │  │
 │  │  ┌────────────┐  ┌────────────────┐  ┌─────────────────┐   │  │
-│  │  │ Connection │  │ NAT Traversal  │  │ Bootstrap Cache │   │  │
+│  │  │ Connection │  │ NAT Traversal  │  │ Configured Peers│   │  │
 │  │  └────────────┘  └────────────────┘  └─────────────────┘   │  │
 │  └───────────────────────────────────────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
@@ -77,7 +77,7 @@ We adopt a **multi-layer architecture** with clearly defined boundaries and inte
 Handles all network I/O:
 - QUIC connection management with connection pooling
 - NAT traversal (STUN/TURN, hole punching)
-- Bootstrap cache for peer discovery
+- Configured peer dialing for initial network entry
 - Post-quantum TLS via ML-KEM key exchange
 
 **Interface to upper layers**: `Connection`, `Endpoint`, stream abstractions
