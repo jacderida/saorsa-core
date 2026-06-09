@@ -21,10 +21,10 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | ADR | Title | Description |
 |-----|-------|-------------|
 | [ADR-001](docs/adr/ADR-001-multi-layer-architecture.md) | Multi-Layer P2P Architecture | Layered design separating transport, DHT, identity, and application concerns |
-| [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using saorsa-transport for QUIC transport, NAT traversal, and bootstrap cache |
+| [ADR-002](docs/adr/ADR-002-delegated-transport.md) | Delegated Transport | Using saorsa-transport for QUIC transport and NAT traversal |
 | [ADR-003](docs/adr/ADR-003-pure-post-quantum-crypto.md) | Pure Post-Quantum Cryptography | ML-DSA-65 and ML-KEM-768 without classical fallbacks |
 | [ADR-006](docs/adr/ADR-006-eigentrust-reputation.md) | Trust System | Response-rate scoring for Sybil resistance |
-| [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Delegating bootstrap to saorsa-transport with Sybil protection |
+| [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Delegation | Historical bootstrap design |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
 
