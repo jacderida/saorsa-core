@@ -340,44 +340,21 @@ if enforcer.check_diversity(ip_addr) {
 
 ## Bootstrap & Discovery
 
-### Bootstrap Manager
-
-Manage peer discovery cache.
-
-```rust
-use saorsa_core::{BootstrapManager, CacheConfig};
-use std::path::PathBuf;
-
-// Create with default config
-let manager = BootstrapManager::new(PathBuf::from("~/.cache/saorsa")).await?;
-
-// Add contact (with Sybil protection)
-manager.add_contact("192.168.1.100:9000".parse()?).await?;
-
-// Get bootstrap contacts
-let contacts = manager.get_contacts(10).await;
-
-// Record connection result
-manager.record_connection_result(addr, true, Some(Duration::from_millis(50))).await;
-```
-
-### Bootstrap Configuration
-
-Configure cache behavior.
+Bootstrap is driven by configured peers plus DHT discovery. The DHT remains a
+peer phonebook; user data storage lives above core.
 
 ```rust
-use saorsa_core::bootstrap::CacheConfig;
+use saorsa_core::{MultiAddr, NodeConfig};
 
-let config = CacheConfig {
-    cache_dir: PathBuf::from("~/.cache/saorsa"),
-    max_contacts: 30_000,
-    merge_interval: Duration::from_secs(60),
-    cleanup_interval: Duration::from_secs(300),
-    quality_update_interval: Duration::from_secs(60),
-    stale_threshold: Duration::from_secs(86400),
-    ..Default::default()
-};
+let config = NodeConfig::builder()
+    .bootstrap_peer(MultiAddr::quic("203.0.113.10:9000".parse()?))
+    .close_group_cache_dir("./state")
+    .build()?;
 ```
+
+The optional close-group cache stores trusted close-group peers in
+`close_group_cache.json` and is separate from the removed persistent bootstrap
+peer store.
 
 ---
 
@@ -417,31 +394,6 @@ server.start("0.0.0.0:8080").await?;
 let exporter = PrometheusExporter::new(health);
 let metrics = exporter.export()?;
 ```
-
-### Rate Limiting
-
-Configure join rate limits.
-
-```rust
-use saorsa_core::{JoinRateLimiter, JoinRateLimiterConfig};
-
-let config = JoinRateLimiterConfig {
-    per_ip_per_minute: 5,
-    per_subnet24_per_minute: 20,
-    per_subnet16_per_hour: 100,
-    ..Default::default()
-};
-
-let limiter = JoinRateLimiter::new(config);
-
-// Check rate limit
-match limiter.check_rate(ip_addr) {
-    Ok(()) => println!("Rate OK"),
-    Err(e) => println!("Rate limited: {}", e),
-}
-```
-
----
 
 ## Error Handling
 

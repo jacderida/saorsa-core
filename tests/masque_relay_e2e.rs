@@ -100,14 +100,14 @@ async fn start_relay_node() -> (P2PNode, MultiAddr) {
 /// Needed because the acquisition driver is spawned as a background task
 /// by `node.start()` and runs after a 0–2 s jitter; callers that need the
 /// relay address must wait for the driver to complete one cycle.
-async fn await_relay_address(node: &P2PNode) -> std::net::SocketAddr {
+async fn await_relay_address(node: &P2PNode) -> Option<std::net::SocketAddr> {
     let deadline = tokio::time::Instant::now() + RELAY_ACQUIRE_TIMEOUT;
     loop {
         if let Some(sock) = node.relay_address().await {
-            return sock;
+            return Some(sock);
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("relay address was not acquired within {RELAY_ACQUIRE_TIMEOUT:?}");
+            return None;
         }
         sleep(RELAY_POLL_INTERVAL).await;
     }
@@ -130,7 +130,9 @@ async fn start_private_node(relay_node_addr: &MultiAddr) -> (P2PNode, MultiAddr)
     let node = P2PNode::new(config).await.unwrap();
     node.start().await.unwrap();
 
-    let relay_sock = await_relay_address(&node).await;
+    let relay_sock = await_relay_address(&node)
+        .await
+        .expect("relay address should be acquired before timeout");
     let relay_multi = MultiAddr::quic(relay_sock);
     (node, relay_multi)
 }

@@ -20,7 +20,6 @@ use crate::PeerId;
 use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
-use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::dht::core_engine::AddressType;
 use crate::dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT,
@@ -137,9 +136,6 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 /// the historical API default.
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
 
-/// Number of cached bootstrap peers to retrieve.
-const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
-
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
 /// Tighter than the post-bootstrap budget (`IDENTITY_EXCHANGE_TIMEOUT`,
@@ -147,9 +143,8 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 /// must not be allowed to head-of-line block convergence. 3 s covers
 /// loopback (<100 ms) and direct WAN paths (~1–2 s with one handshake
 /// retry); a relay-tunnelled path with congested ML-DSA verification
-/// can exceed this and will fail identity exchange, but the bootstrap
-/// manager simply moves on to other candidates rather than retrying the
-/// same one.
+/// can exceed this and will fail identity exchange, but bootstrap simply
+/// moves on to other candidates rather than retrying the same one.
 ///
 /// `wait_for_peer_identity` short-circuits on channel close, so most dead
 /// channels surface in microseconds regardless of this budget.
@@ -157,8 +152,8 @@ const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 3;
 
 /// Maximum number of bootstrap peers dialed concurrently in Phase B.
 ///
-/// Bounds the fan-out of CLI + cached bootstrap dials so simultaneous
-/// QUIC+PQC handshakes don't spike CPU or saturate the UDP socket. Chosen
+/// Bounds the fan-out of configured bootstrap dials so simultaneous QUIC+PQC
+/// handshakes don't spike CPU or saturate the UDP socket. Chosen
 /// low on purpose: each dial runs a full ML-KEM key exchange and ML-DSA
 /// verification, and a cold-start node has no spare compute budget.
 const MAX_CONCURRENT_BOOTSTRAP_DIALS: usize = 4;
@@ -213,13 +208,10 @@ pub struct NodeConfig {
     /// DHT configuration
     pub dht_config: DHTConfig,
 
-    /// Bootstrap cache configuration
-    pub bootstrap_cache_config: Option<BootstrapConfig>,
-
     /// Optional IP diversity configuration for Sybil protection tuning.
     ///
-    /// When set, this configuration is used by bootstrap peer discovery and
-    /// other diversity-enforcing subsystems. If `None`, defaults are used.
+    /// When set, this configuration is used by diversity-enforcing subsystems.
+    /// If `None`, defaults are used.
     pub diversity_config: Option<crate::security::IPDiversityConfig>,
 
     /// Optional override for the maximum application-layer message size.
@@ -570,7 +562,6 @@ impl NodeConfigBuilder {
                 .unwrap_or(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS)),
             max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             dht_config: self.dht_config.unwrap_or_default(),
-            bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: self.max_message_size,
             node_identity: None,
@@ -593,7 +584,6 @@ impl Default for NodeConfig {
             connection_timeout: Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             dht_config: DHTConfig::default(),
-            bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
             node_identity: None,
@@ -800,9 +790,6 @@ pub struct P2PNode {
     /// All DHT operations and trust signals go through this component.
     adaptive_dht: AdaptiveDHT,
 
-    /// Bootstrap cache manager for peer discovery
-    bootstrap_manager: Option<Arc<RwLock<BootstrapManager>>>,
-
     /// Bootstrap state tracking - indicates whether peer discovery has completed
     is_bootstrapped: Arc<AtomicBool>,
 
@@ -885,17 +872,6 @@ impl P2PNode {
                 .map_err(|e| P2PError::Validation(format!("IP diversity config: {e}").into()))?;
         }
 
-        // Initialize bootstrap cache manager
-        let bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let bootstrap_manager =
-            match BootstrapManager::with_node_config(bootstrap_config, &config).await {
-                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-                Err(e) => {
-                    warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
-                    None
-                }
-            };
-
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig::from_node_config(
             &config,
@@ -928,7 +904,6 @@ impl P2PNode {
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
             adaptive_dht,
-            bootstrap_manager,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
             reconnect_locks: ParkingMutex::new(HashMap::new()),
@@ -1111,15 +1086,6 @@ impl P2PNode {
     /// Start the P2P node
     pub async fn start(&self) -> Result<()> {
         info!("Starting P2P node...");
-
-        // Start bootstrap manager background tasks
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let mut manager = bootstrap_manager.write().await;
-            manager
-                .start_maintenance()
-                .map_err(|e| protocol_error(format!("Failed to start bootstrap manager: {e}")))?;
-            info!("Bootstrap cache manager started");
-        }
 
         // Start transport listeners and message receiving
         self.transport.start_network_listeners().await?;
@@ -1905,91 +1871,22 @@ impl P2PNode {
         self.dht_manager()
     }
 
-    /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(
-        &self,
-        _peer_id: PeerId,
-        addresses: Vec<MultiAddr>,
-    ) -> Result<()> {
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.read().await;
-            let socket_addresses: Vec<std::net::SocketAddr> = addresses
-                .iter()
-                .filter_map(|addr| addr.socket_addr())
-                .collect();
-            if let Some(&primary) = socket_addresses.first() {
-                manager
-                    .add_peer(&primary, socket_addresses)
-                    .await
-                    .map_err(|e| {
-                        protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
-                    })?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Update connection metrics for a peer in the bootstrap cache
-    pub async fn update_peer_metrics(
-        &self,
-        addr: &MultiAddr,
-        success: bool,
-        latency_ms: Option<u64>,
-        _error: Option<String>,
-    ) -> Result<()> {
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager
-            && let Some(sa) = addr.socket_addr()
-        {
-            let manager = bootstrap_manager.read().await;
-            if success {
-                let rtt_ms = latency_ms.unwrap_or(0) as u32;
-                manager.record_success(&sa, rtt_ms).await;
-            } else {
-                manager.record_failure(&sa).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Get bootstrap cache statistics
-    pub async fn get_bootstrap_cache_stats(
-        &self,
-    ) -> Result<Option<crate::bootstrap::BootstrapStats>> {
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.read().await;
-            Ok(Some(manager.stats().await))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Get the number of cached bootstrap peers
-    pub async fn cached_peer_count(&self) -> usize {
-        if let Some(ref _bootstrap_manager) = self.bootstrap_manager
-            && let Ok(Some(stats)) = self.get_bootstrap_cache_stats().await
-        {
-            return stats.total_peers;
-        }
-        0
-    }
-
     /// Connect to bootstrap peers and perform initial peer discovery.
     ///
     /// If a `close_group_cache` was loaded on startup, its peers are injected
-    /// as the highest-priority addresses (before configured and cached bootstrap
-    /// peers). Their trust scores were already imported into the `TrustEngine`
-    /// before this method is called.
+    /// as the highest-priority addresses before configured bootstrap peers.
+    /// Their trust scores were already imported into the `TrustEngine` before
+    /// this method is called.
     async fn connect_bootstrap_peers(
         &self,
         close_group_cache: Option<&CloseGroupCache>,
     ) -> Result<()> {
         // Each entry is a list of addresses for a single peer. Close-group
-        // peers are dialed serially to preserve trust-priority ordering; CLI
-        // and cached bootstrap peers are dialed concurrently to cut cold-start
+        // peers are dialed serially to preserve trust-priority ordering;
+        // configured bootstrap peers are dialed concurrently to cut cold-start
         // latency when some peers are slow or dead.
         let mut serial_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut parallel_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
-        let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
         // Priority 0: Cached close group peers (pre-trusted, highest priority).
@@ -2066,44 +1963,8 @@ impl P2PNode {
             }
         }
 
-        // Supplement with cached bootstrap peers (after CLI peers)
-        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.read().await;
-            let cached_peers = manager.select_peers(BOOTSTRAP_PEER_BATCH_SIZE).await;
-            if !cached_peers.is_empty() {
-                let mut added_from_cache = 0;
-                for cached in cached_peers {
-                    let mut addrs = vec![cached.primary_address];
-                    addrs.extend(cached.addresses);
-                    // Only add addresses we haven't seen from CLI peers
-                    let new_addresses: Vec<MultiAddr> = addrs
-                        .into_iter()
-                        .filter(|a| !seen_addresses.contains(a))
-                        .map(MultiAddr::quic)
-                        .collect();
-
-                    if !new_addresses.is_empty() {
-                        for addr in &new_addresses {
-                            if let Some(sa) = addr.socket_addr() {
-                                seen_addresses.insert(sa);
-                            }
-                        }
-                        parallel_addr_sets.push(new_addresses);
-                        added_from_cache += 1;
-                    }
-                }
-                if added_from_cache > 0 {
-                    info!(
-                        "Added {} cached bootstrap peers (supplementing CLI peers)",
-                        added_from_cache
-                    );
-                    used_cache = true;
-                }
-            }
-        }
-
         if serial_addr_sets.is_empty() && parallel_addr_sets.is_empty() {
-            info!("No bootstrap peers configured and no cached peers available");
+            info!("No bootstrap peers configured");
             return Ok(());
         }
 
@@ -2116,10 +1977,7 @@ impl P2PNode {
         // Phase A: serial close-group dials to preserve trust-priority ordering.
         let client_mode = matches!(self.config.mode, NodeMode::Client);
         for addrs in &serial_addr_sets {
-            if let Some(peer_id) = self
-                .dial_bootstrap_addr_set(addrs, used_cache, identity_timeout)
-                .await
-            {
+            if let Some(peer_id) = self.dial_bootstrap_addr_set(addrs, identity_timeout).await {
                 successful_connections += 1;
                 connected_peer_ids.push(peer_id);
                 if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
@@ -2131,15 +1989,14 @@ impl P2PNode {
             }
         }
 
-        // Phase B: concurrent dials of CLI + cached bootstrap peers, bounded
-        // by `MAX_CONCURRENT_BOOTSTRAP_DIALS` to cap simultaneous QUIC+PQC
+        // Phase B: concurrent dials of configured bootstrap peers, bounded by
+        // `MAX_CONCURRENT_BOOTSTRAP_DIALS` to cap simultaneous QUIC+PQC
         // handshakes. Skipped entirely when a client has already hit its
         // target during Phase A.
         if !client_mode || successful_connections < CLIENT_BOOTSTRAP_TARGET {
             let mut parallel_stream =
                 futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
-                    self.dial_bootstrap_addr_set(&addrs, used_cache, identity_timeout)
-                        .await
+                    self.dial_bootstrap_addr_set(&addrs, identity_timeout).await
                 }))
                 .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
             while let Some(result) = parallel_stream.next().await {
@@ -2173,9 +2030,7 @@ impl P2PNode {
                 connected_peer_ids = transport_peers;
                 successful_connections = connected_peer_ids.len();
             } else {
-                if !used_cache {
-                    warn!("Failed to connect to any bootstrap peers");
-                }
+                warn!("Failed to connect to any bootstrap peers");
                 // Starting a node should not be gated on immediate bootstrap connectivity.
                 // Keep running and allow background discovery / retries to populate peers later.
                 return Ok(());
@@ -2240,20 +2095,19 @@ impl P2PNode {
     }
 
     /// Dial a single bootstrap peer's address set, stopping at the first
-    /// address that completes the identity handshake. Records success/failure
-    /// in the bootstrap cache and returns the remote peer's cryptographic
-    /// PeerId on success. Safe to call concurrently for different peers.
+    /// address that completes the identity handshake. Returns the remote peer's
+    /// cryptographic PeerId on success. Safe to call concurrently for different
+    /// peers.
     async fn dial_bootstrap_addr_set(
         &self,
         addrs: &[MultiAddr],
-        used_cache: bool,
         identity_timeout: Duration,
     ) -> Option<PeerId> {
         for addr in addrs {
             // Bootstrap addresses come from operator-supplied seeds (CLI
-            // flags, config file, bootstrap cache). The local reachability
-            // classifier hasn't proven them yet, so log them as
-            // `Unverified` rather than `unknown`.
+            // flags or config file). The local reachability classifier hasn't
+            // proven them yet, so log them as `Unverified` rather than
+            // `unknown`.
             match self
                 .transport
                 .connect_peer_typed(addr, AddressType::Unverified)
@@ -2264,15 +2118,7 @@ impl P2PNode {
                     .wait_for_peer_identity(&channel_id, identity_timeout)
                     .await
                 {
-                    Ok(real_peer_id) => {
-                        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.read().await;
-                            if let Some(sa) = addr.socket_addr() {
-                                manager.record_success(&sa, 100).await;
-                            }
-                        }
-                        return Some(real_peer_id);
-                    }
+                    Ok(real_peer_id) => return Some(real_peer_id),
                     Err(e) => {
                         warn!(
                             "Timeout waiting for identity from bootstrap peer {}: {}, \
@@ -2284,12 +2130,6 @@ impl P2PNode {
                 },
                 Err(e) => {
                     warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
-                    if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                        let manager = bootstrap_manager.read().await;
-                        if let Some(sa) = addr.socket_addr() {
-                            manager.record_failure(&sa).await;
-                        }
-                    }
                 }
             }
         }
@@ -2368,37 +2208,6 @@ pub trait NetworkSender: Send + Sync {
 // P2PNetworkSender removed — NetworkSender is now implemented directly on TransportHandle.
 // NodeBuilder removed — use NodeConfigBuilder + P2PNode::new() instead.
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod diversity_tests {
-    use super::*;
-    use crate::security::IPDiversityConfig;
-
-    async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
-        // Use a temp dir to avoid conflicts with cached files from old format
-        let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let mut bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        bootstrap_config.cache_dir = temp_dir.path().to_path_buf();
-
-        BootstrapManager::with_node_config(bootstrap_config, config)
-            .await
-            .expect("bootstrap manager")
-    }
-
-    #[tokio::test]
-    async fn test_nodeconfig_diversity_config_used_for_bootstrap() {
-        let config = NodeConfig {
-            diversity_config: Some(IPDiversityConfig::testnet()),
-            ..Default::default()
-        };
-
-        let manager = build_bootstrap_manager_like_prod(&config).await;
-        // Verify testnet config has permissive IP limits
-        assert_eq!(manager.diversity_config().max_per_ip, Some(usize::MAX));
-        assert_eq!(manager.diversity_config().max_per_subnet, Some(usize::MAX));
-    }
-}
-
 /// Helper function to register a new channel.
 ///
 /// Sync because the underlying map is a sharded `DashMap` — no `.await` is
@@ -2446,7 +2255,6 @@ mod tests {
             connection_timeout: Duration::from_secs(2),
             max_connections: 100,
             dht_config: DHTConfig::default(),
-            bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
             node_identity: None,

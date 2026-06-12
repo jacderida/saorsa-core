@@ -11,7 +11,7 @@ The **Sybil attack** is the fundamental threat to decentralized systems. An adve
 - **Control routing**: Dominate key regions in the DHT
 - **Eclipse honest nodes**: Surround targets with malicious peers
 - **Manipulate consensus**: Outvote honest participants
-- **Poison caches**: Fill bootstrap caches with attacker nodes
+- **Poison discovery**: Feed malicious routing or contact information
 - **Corrupt reputation**: Collude to boost malicious scores
 
 Without identity binding (like proof-of-work or real-world identity), any node can create unlimited identities. We need defense-in-depth:
@@ -94,39 +94,10 @@ pub struct SignedOperation {
 
 ### Layer 2: Rate Limiting
 
-```rust
-// src/rate_limit.rs
-
-pub struct JoinRateLimiter {
-    /// Sliding window counters
-    per_ip: SlidingWindowCounter,
-    per_subnet24: SlidingWindowCounter,
-    per_subnet16: SlidingWindowCounter,
-}
-
-impl JoinRateLimiter {
-    pub fn check_rate(&self, ip: IpAddr) -> Result<(), JoinRateLimitError> {
-        // Limit: 5 joins per IP per minute
-        if self.per_ip.count(ip) >= 5 {
-            return Err(JoinRateLimitError::IpRateExceeded);
-        }
-
-        // Limit: 20 joins per /24 subnet per minute
-        let subnet24 = extract_ipv4_subnet_24(ip);
-        if self.per_subnet24.count(subnet24) >= 20 {
-            return Err(JoinRateLimitError::SubnetRateExceeded);
-        }
-
-        // Limit: 100 joins per /16 subnet per hour
-        let subnet16 = extract_ipv4_subnet_16(ip);
-        if self.per_subnet16.count_hourly(subnet16) >= 100 {
-            return Err(JoinRateLimitError::SubnetRateExceeded);
-        }
-
-        Ok(())
-    }
-}
-```
+Rate limits are applied at node admission and operational boundaries where a
+caller has enough context to decide whether a request should count against an
+IP, subnet, account, or deployment-specific budget. saorsa-core no longer keeps
+a dedicated join limiter tied to peer-ranking persistence.
 
 **Cost to attacker**: Must control IPs across many subnets; cloud providers typically allocate from limited /16 ranges.
 

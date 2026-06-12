@@ -210,6 +210,24 @@ const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 /// Unverified/Direct entries published by NATed peers.
 const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Number of *distinct* failed relay-session `SocketAddr`s at a single
+/// relay-server IP (with no intervening success at that IP, within the
+/// [`DIAL_FAILURE_CACHE_TTL`] window) that trips IP-level suppression in
+/// [`DialFailureCache`].
+///
+/// When a relay server goes down it orphans every MASQUE session address
+/// it ever allocated; those records keep circulating in FIND_NODE
+/// responses, each a distinct `ip:port` the per-`SocketAddr` tier can only
+/// suppress after it fails its own dial. Once this many distinct sessions
+/// at one IP have failed, every *remaining* session at that IP is
+/// suppressed without an individual dial. A success at the IP clears the
+/// suppression immediately, so a recovered relay is re-admitted promptly.
+///
+/// Conservative on purpose: a threshold (not a single failure) plus
+/// success-clears-immediately guards against suppressing a live IP because
+/// one peer behind a shared NAT IP churned.
+const DIAL_FAILURE_IP_SUPPRESS_THRESHOLD: usize = 4;
+
 /// Worst-case number of addresses
 /// [`DhtNetworkManager::select_dial_candidates_with_context`] returns for a
 /// single peer: one Relay plus at most one best WAN and one best LAN address
@@ -792,9 +810,34 @@ impl PendingDialOutcome {
 /// rather than by a background sweeper. A 30-minute TTL keeps the
 /// hot-set small enough that lazy eviction is sufficient, even on
 /// long-lived nodes.
+///
+/// # IP-level tier
+///
+/// Alongside the per-`SocketAddr` tier above, a second index keyed by
+/// relay-server [`IpAddr`] collapses the dead-orphaned-session pattern: a
+/// downed relay server orphans *every* MASQUE session address it ever
+/// allocated, and each is a distinct `ip:port` that the per-`SocketAddr`
+/// tier can only suppress after it fails its own dial. The IP tier records
+/// the set of *distinct* failed relay sessions per IP and, once that set
+/// reaches [`DIAL_FAILURE_IP_SUPPRESS_THRESHOLD`] within the TTL,
+/// suppresses *all* remaining sessions at that IP without dialing them.
+///
+/// The IP tier is fed only by `AddressType::Relay` failures and only
+/// suppresses relay-kind dials, so a genuinely-distinct Direct peer behind
+/// a shared NAT IP is never suppressed by relay churn at that IP. Any
+/// successful dial at an IP clears its IP-level suppression immediately
+/// (see [`Self::clear`]) — the primary guard against a transient
+/// false-positive on a shared or recovered IP.
 #[derive(Debug, Default)]
 struct DialFailureCache {
+    /// Per-`SocketAddr` failure timestamps (the original tier).
     entries: DashMap<SocketAddr, Instant>,
+    /// Per relay-server `IpAddr`: the distinct relay-session `SocketAddr`s
+    /// that have failed, each with its own record time for lazy TTL
+    /// expiry. Keyed on `SocketAddr` so re-dialing the *same* dead session
+    /// cannot inflate the distinct count. Only `AddressType::Relay`
+    /// failures populate this map.
+    ip_failures: DashMap<IpAddr, HashMap<SocketAddr, Instant>>,
 }
 
 impl DialFailureCache {
@@ -802,17 +845,30 @@ impl DialFailureCache {
         Self::default()
     }
 
-    /// Returns true if `addr` failed a dial within the last
-    /// [`DIAL_FAILURE_CACHE_TTL`]. Expired entries are removed as a
-    /// side effect of the lookup so the cache stays bounded without a
-    /// dedicated sweeper.
+    /// Canonicalize a cache key so an IPv4-mapped IPv6 socket
+    /// (`[::ffff:a.b.c.d]:p`) and its bare IPv4 form (`a.b.c.d:p`) resolve to
+    /// the **same** entry — matching how the rest of the dial path
+    /// canonicalizes endpoint identity (see [`canonicalize_ip`]). Without
+    /// this, a failure recorded under one form would neither suppress nor be
+    /// cleared by the other for the same physical endpoint.
+    fn canon_key(addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
+    }
+
+    /// Returns true if `addr` should be skipped because it failed a dial
+    /// within the last [`DIAL_FAILURE_CACHE_TTL`] (per-`SocketAddr` tier),
+    /// or — for `AddressType::Relay` dials only — because its relay-server
+    /// IP is currently suppressed by the IP tier. Expired entries in both
+    /// tiers are removed as a side effect of the lookup so the cache stays
+    /// bounded without a dedicated sweeper.
     ///
     /// The `DashMap::entry` API holds a single shard write lock across
     /// the elapsed-check and the `remove`, so a concurrent
     /// [`Self::record_failure`] cannot slip a fresh entry in between
     /// the check and the eviction.
-    fn is_failed(&self, addr: &SocketAddr) -> bool {
-        match self.entries.entry(*addr) {
+    fn is_failed(&self, addr: &SocketAddr, ty: AddressType) -> bool {
+        let addr = Self::canon_key(*addr);
+        let per_addr_failed = match self.entries.entry(addr) {
             DashEntry::Occupied(entry) => {
                 if entry.get().elapsed() < DIAL_FAILURE_CACHE_TTL {
                     true
@@ -822,18 +878,82 @@ impl DialFailureCache {
                 }
             }
             DashEntry::Vacant(_) => false,
+        };
+        if per_addr_failed {
+            return true;
+        }
+        ty == AddressType::Relay && self.ip_is_suppressed(&addr.ip())
+    }
+
+    /// Returns true if `ip` has at least
+    /// [`DIAL_FAILURE_IP_SUPPRESS_THRESHOLD`] distinct relay sessions that
+    /// failed within the TTL. Expired sessions are pruned on access, and
+    /// an IP whose set empties is removed entirely, so the IP tier stays
+    /// bounded by the same lazy-expiry discipline as the per-addr tier.
+    ///
+    /// Holds the shard write lock across the prune and the count, so a
+    /// concurrent [`Self::record_failure`] or [`Self::clear`] cannot race
+    /// the threshold decision.
+    fn ip_is_suppressed(&self, ip: &IpAddr) -> bool {
+        match self.ip_failures.entry(*ip) {
+            DashEntry::Occupied(mut entry) => {
+                let sessions = entry.get_mut();
+                sessions.retain(|_, recorded| recorded.elapsed() < DIAL_FAILURE_CACHE_TTL);
+                if sessions.is_empty() {
+                    entry.remove();
+                    false
+                } else {
+                    sessions.len() >= DIAL_FAILURE_IP_SUPPRESS_THRESHOLD
+                }
+            }
+            DashEntry::Vacant(_) => false,
         }
     }
 
-    fn record_failure(&self, addr: SocketAddr) {
-        self.entries.insert(addr, Instant::now());
+    /// Record a failed dial of `addr`. Always updates the per-`SocketAddr`
+    /// tier; additionally registers the session against its relay-server IP
+    /// when `ty` is [`AddressType::Relay`], so enough distinct dead
+    /// sessions at one IP trip IP-level suppression.
+    fn record_failure(&self, addr: SocketAddr, ty: AddressType) {
+        let addr = Self::canon_key(addr);
+        let now = Instant::now();
+        self.entries.insert(addr, now);
+        if ty == AddressType::Relay {
+            let mut sessions = self.ip_failures.entry(addr.ip()).or_default();
+            let newly_distinct = sessions.insert(addr, now).is_none();
+            let count = sessions.len();
+            drop(sessions);
+            // Log once — when a newly-distinct failed session first brings the
+            // IP to the suppression threshold — so traces can tell a single
+            // skipped address apart from a fully suppressed relay IP. (The
+            // count may include not-yet-expired entries; `ip_is_suppressed`
+            // prunes on read, so this is best-effort observability.)
+            if newly_distinct && count == DIAL_FAILURE_IP_SUPPRESS_THRESHOLD {
+                debug!(
+                    "DialFailureCache: relay IP {} reached the suppression threshold \
+                     ({} distinct failed sessions, no intervening success); suppressing \
+                     all further relay dials to this IP for up to {:?}",
+                    addr.ip(),
+                    DIAL_FAILURE_IP_SUPPRESS_THRESHOLD,
+                    DIAL_FAILURE_CACHE_TTL
+                );
+            }
+        }
     }
 
     /// Clear the cached failure for `addr` after a successful dial so
     /// the next retry is not suppressed by a stale entry. Cheap when
     /// the address is absent (typical success path).
+    ///
+    /// Also drops the entire IP-level failure set for `addr.ip()`: a
+    /// success at an IP proves the relay server (or a live peer behind a
+    /// shared IP) is reachable, so any IP-level suppression must lift
+    /// immediately. Type-agnostic on purpose — a Direct success behind a
+    /// shared NAT IP re-admits relay sessions there too.
     fn clear(&self, addr: &SocketAddr) {
-        self.entries.remove(addr);
+        let addr = Self::canon_key(*addr);
+        self.entries.remove(&addr);
+        self.ip_failures.remove(&addr.ip());
     }
 }
 
@@ -1301,7 +1421,14 @@ fn apply_lookup_report_winners(
     }
 
     let mut refreshed: Vec<DHTNode> = by_peer.into_values().collect();
-    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, key));
+    // Fix E: final re-rank of the converged candidate pool by
+    // (reachability_tier, xor_distance) so directly-reachable peers lead the
+    // result. This is the sole final-ordering chokepoint for the network path
+    // (the Merkle candidate pool and the client's find_closest_peers), so the
+    // re-rank applies to the returned order without touching the iterative
+    // convergence or the dial-failure skip. Re-rank only — truncation is
+    // unchanged, so the result can never drop below `count`.
+    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, key));
     refreshed.truncate(count);
     refreshed
 }
@@ -1961,24 +2088,124 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
+        // Over-fetch so the reachability re-rank below has material to demote
+        // with: an XOR-closer relay-only peer can be displaced by a slightly
+        // farther directly-reachable one only if the latter is in the fetched
+        // set. The routing table is scanned per bucket regardless, so a 2x
+        // over-fetch is cheap.
+        let overfetch = count.saturating_mul(2);
+
+        let dht_guard = self.dht.read().await;
+        match dht_guard
+            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), overfetch)
+            .await
+        {
+            Ok(nodes) => {
+                let mut nodes: Vec<DHTNode> = nodes
+                    .into_iter()
+                    .filter(|(node, _)| !self.is_local_peer_id(&node.id))
+                    .map(|(node, publish_seq)| {
+                        // Fix E: stamp the real trust score instead of a
+                        // hardcoded constant so downstream consumers (ant-node
+                        // replication/payment) see a meaningful reliability.
+                        // Never-failed peers sit at DEFAULT_NEUTRAL_TRUST, so
+                        // reachability tier (below) is the primary signal and
+                        // trust is only a future tiebreaker.
+                        let reliability = self
+                            .trust_engine
+                            .as_ref()
+                            .map(|engine| engine.score(&node.id))
+                            .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                        DHTNode {
+                            peer_id: node.id,
+                            address_types: node.address_types,
+                            addresses: node.addresses,
+                            distance: encode_publish_seq_distance(publish_seq),
+                            reliability,
+                        }
+                    })
+                    .collect();
+
+                // Re-rank by (reachability_tier, xor_distance) and truncate
+                // back to `count`. Re-rank only, never filter: this can never
+                // return fewer than `count` reachable-or-not peers, keeping the
+                // close-group selection sparse-network-safe.
+                nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
+                nodes.truncate(count);
+                nodes
+            }
+            Err(e) => {
+                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Find closest nodes to a key using the local routing table, ordered by
+    /// **XOR distance only** (no reachability re-rank).
+    ///
+    /// This is the distance-pure counterpart to [`find_closest_nodes_local`].
+    /// The two exist because the routing table serves two consumers with
+    /// opposite ordering needs:
+    ///
+    /// - **Close-group / candidate *selection* for storage** (the majority of
+    ///   callers) benefits from the `(reachability_tier, xor_distance)`
+    ///   re-rank in [`find_closest_nodes_local`]: a directly-reachable peer is
+    ///   a better place to put data than an XOR-equal relay-only one.
+    /// - **Closeness *verification*** (ant-node's Merkle pay-yourself defence)
+    ///   must instead mirror the *uploader's* view, which is built from a
+    ///   pure XOR-distance network lookup. If the verifier re-ranked by
+    ///   reachability it could demote an XOR-close relay-only peer out of the
+    ///   compared window and falsely reject an honest candidate pool that
+    ///   legitimately contains that peer. Verification therefore needs the raw
+    ///   XOR ordering this method provides.
+    ///
+    /// Like [`find_closest_nodes_local`] this is a pure in-memory routing-table
+    /// read (no network I/O) and excludes the local peer. Reliability is still
+    /// stamped with the real trust score so consumers see a meaningful value;
+    /// only the *ordering* differs.
+    pub async fn find_closest_nodes_local_by_distance(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        debug!(
+            "[LOCAL] Finding {} closest nodes (XOR-only) to key: {}",
+            count,
+            hex::encode(key)
+        );
+
         let dht_guard = self.dht.read().await;
         match dht_guard
             .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), count)
             .await
         {
+            // `find_nodes_with_publish_seq` already returns peers in ascending
+            // XOR-distance order; we keep that order intact — no re-rank, no
+            // truncation beyond what the routing table returned.
             Ok(nodes) => nodes
                 .into_iter()
                 .filter(|(node, _)| !self.is_local_peer_id(&node.id))
-                .map(|(node, publish_seq)| DHTNode {
-                    peer_id: node.id,
-                    address_types: node.address_types,
-                    addresses: node.addresses,
-                    distance: encode_publish_seq_distance(publish_seq),
-                    reliability: SELF_RELIABILITY_SCORE,
+                .map(|(node, publish_seq)| {
+                    let reliability = self
+                        .trust_engine
+                        .as_ref()
+                        .map(|engine| engine.score(&node.id))
+                        .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                    DHTNode {
+                        peer_id: node.id,
+                        address_types: node.address_types,
+                        addresses: node.addresses,
+                        distance: encode_publish_seq_distance(publish_seq),
+                        reliability,
+                    }
                 })
                 .collect(),
             Err(e) => {
-                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+                warn!(
+                    "find_nodes (XOR-only) failed for key {}: {e}",
+                    hex::encode(key)
+                );
                 Vec::new()
             }
         }
@@ -1993,7 +2220,8 @@ impl DhtNetworkManager {
     /// `IsResponsible(self, K)` by checking whether self appears in the
     /// top-N results.
     ///
-    /// Results are sorted by XOR distance to the key and truncated to `count`.
+    /// Results are sorted by `(reachability_tier, XOR distance)` to the key —
+    /// directly-reachable peers first — and truncated to `count`.
     pub async fn find_closest_nodes_local_with_self(
         &self,
         key: &Key,
@@ -2005,12 +2233,50 @@ impl DhtNetworkManager {
 
         nodes.push(self.local_dht_node().await);
 
-        let key_peer = PeerId::from_bytes(*key);
-        nodes.sort_by(|a, b| {
-            let da = a.peer_id.xor_distance(&key_peer);
-            let db = b.peer_id.xor_distance(&key_peer);
-            da.cmp(&db)
-        });
+        // Same reachability-aware ordering as find_closest_nodes_local: prefer
+        // directly-reachable peers, XOR distance as tiebreaker. Self competes
+        // on the same terms and may displace the farthest peer.
+        nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
+        nodes.truncate(count);
+        nodes
+    }
+
+    /// XOR-only, self-inclusive variant of
+    /// [`find_closest_nodes_local_by_distance`].
+    ///
+    /// Mirrors [`find_closest_nodes_local_with_self`] — it includes the local
+    /// node in the candidate set so a caller can compute `IsResponsible(self,
+    /// K)` — but orders purely by XOR distance and does **not** prefer
+    /// directly-reachable peers.
+    ///
+    /// Use this for closeness *verification* (the single-node payment
+    /// close-group check, the Merkle candidate-pool check), which must mirror
+    /// the uploader's pure XOR-distance peer selection rather than the
+    /// reachability re-rank used for storage *selection*. The reachability
+    /// re-rank in [`find_closest_nodes_local_with_self`] can demote an
+    /// XOR-close relay-only peer out of the compared window and falsely reject
+    /// an honest payment that legitimately quoted that peer — see
+    /// saorsa-labs/saorsa-core#121, which added the XOR-only
+    /// [`find_closest_nodes_local_by_distance`] for exactly this purpose.
+    ///
+    /// Like the other `_local` lookups this is a pure in-memory routing-table
+    /// read (no network I/O). Self competes on XOR distance and may displace
+    /// the farthest peer.
+    pub async fn find_closest_nodes_local_by_distance_with_self(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        // Fetch the XOR-closest `count` peers (self is excluded by the
+        // underlying lookup), append self, re-sort by pure XOR distance, and
+        // truncate back to `count`. Any peer beyond the closest `count` is
+        // farther than all of them, so adding only self cannot pull it into
+        // the top-`count` — fetching `count` is sufficient.
+        let mut nodes = self.find_closest_nodes_local_by_distance(key, count).await;
+
+        nodes.push(self.local_dht_node().await);
+
+        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
         nodes.truncate(count);
         nodes
     }
@@ -2065,7 +2331,10 @@ impl DhtNetworkManager {
         for node in initial {
             if peer_states.is_contactable(&node.peer_id) {
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    peer_states.mark_failed(node.peer_id);
+                    // Cache exhaustion is a transient, address-view-local
+                    // decision — not a terminal peer failure. Skip this view
+                    // but leave the peer contactable so a later responder can
+                    // still revive it with a usable (e.g. Direct) address.
                     continue;
                 }
                 let dist = node.peer_id.distance(&target_key);
@@ -2100,9 +2369,12 @@ impl DhtNetworkManager {
                     continue;
                 }
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    peer_states.mark_failed(node.peer_id);
+                    // Transient skip, not a terminal failure: keep the peer
+                    // contactable so a better address from a later responder
+                    // can re-admit it (it may have become exhausted only
+                    // because of a coarse relay-IP suppression).
                     trace!(
-                        "[NETWORK] Skipping {}: all FIND_NODE dial candidates are in the failure cache",
+                        "[NETWORK] Skipping {} this round: all dial candidates currently in the failure cache (peer left contactable)",
                         node.peer_id.to_hex()
                     );
                     continue;
@@ -2200,9 +2472,14 @@ impl DhtNetworkManager {
                                 continue;
                             }
                             if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                                peer_states.mark_failed(node.peer_id);
+                                // Transient skip, not a terminal failure: a
+                                // single responder's stale/suppressed (e.g.
+                                // relay-only) view of this peer must not poison
+                                // it for the rest of the lookup. Leave it
+                                // contactable so another responder's usable
+                                // (e.g. Direct) address can still win.
                                 trace!(
-                                    "[NETWORK] Skipping gossiped {}: all FIND_NODE dial candidates are in the failure cache",
+                                    "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
                                     node.peer_id.to_hex()
                                 );
                                 continue;
@@ -2448,6 +2725,33 @@ impl DhtNetworkManager {
             .cmp(&b.peer_id.distance(&target_key))
     }
 
+    /// Reachability tier for selection ranking: `0` when the node exposes a
+    /// directly-dialable address, `1` when it is relay-only / NAT-stuck (no
+    /// `Direct` address). Used as the primary sort key so a directly-reachable
+    /// peer is preferred over an XOR-equal unreachable one (Fix E).
+    ///
+    /// Keyed on the *absence* of a `Direct` address, not on the presence of a
+    /// `Relay` address — a peer that advertises both stays tier `0`. This is a
+    /// re-ranking signal only; it is never used to filter peers out, so it can
+    /// never shrink a close group below the requested `count`.
+    fn reachability_tier(node: &DHTNode) -> u8 {
+        u8::from(Self::first_direct_dialable(node).is_none())
+    }
+
+    /// Order nodes by `(reachability_tier, xor_distance)`: directly-reachable
+    /// peers first, then by XOR distance to `key` within each tier. The XOR
+    /// tiebreaker reuses [`Self::compare_node_distance`], keeping ordering
+    /// deterministic for equal tiers (stable, no churn).
+    fn compare_node_reachability_then_distance(
+        a: &DHTNode,
+        b: &DHTNode,
+        key: &Key,
+    ) -> std::cmp::Ordering {
+        Self::reachability_tier(a)
+            .cmp(&Self::reachability_tier(b))
+            .then_with(|| Self::compare_node_distance(a, b, key))
+    }
+
     /// Drain an iteration's α queries with a bounded wait after first response.
     ///
     /// Waits for the first query to complete, then grants the remaining
@@ -2683,7 +2987,7 @@ impl DhtNetworkManager {
             let Some(socket_addr) = addr.dialable_socket_addr() else {
                 continue;
             };
-            if self.dial_failure_cache.is_failed(&socket_addr) {
+            if self.dial_failure_cache.is_failed(&socket_addr, *ty) {
                 skipped_cached += 1;
                 trace!(
                     "dial_addresses: skipping recently failed address {} ({:?}) for {}",
@@ -2699,7 +3003,7 @@ impl DhtNetworkManager {
                     return Some(channel_id);
                 }
                 None => {
-                    self.dial_failure_cache.record_failure(socket_addr);
+                    self.dial_failure_cache.record_failure(socket_addr, *ty);
                 }
             }
         }
@@ -2735,9 +3039,9 @@ impl DhtNetworkManager {
     ) -> bool {
         let plan = Self::select_dial_candidates(typed_addresses);
         !plan.is_empty()
-            && plan.iter().all(|(addr, _)| {
+            && plan.iter().all(|(addr, ty)| {
                 addr.dialable_socket_addr()
-                    .is_some_and(|socket_addr| cache.is_failed(&socket_addr))
+                    .is_some_and(|socket_addr| cache.is_failed(&socket_addr, *ty))
             })
     }
 
@@ -2800,9 +3104,9 @@ impl DhtNetworkManager {
     ) -> bool {
         let plan = self.contextual_dial_plan(typed_addresses).await;
         !plan.is_empty()
-            && plan.iter().all(|(addr, _)| {
+            && plan.iter().all(|(addr, ty)| {
                 addr.dialable_socket_addr()
-                    .is_some_and(|socket_addr| self.dial_failure_cache.is_failed(&socket_addr))
+                    .is_some_and(|socket_addr| self.dial_failure_cache.is_failed(&socket_addr, *ty))
             })
     }
 
@@ -3320,34 +3624,18 @@ impl DhtNetworkManager {
             return None;
         }
 
-        let dial_timeout = self
-            .transport
-            .connection_timeout()
-            .min(self.config.request_timeout);
-        match tokio::time::timeout(
-            dial_timeout,
-            self.transport.connect_peer_typed(address, kind),
-        )
-        .await
-        {
-            Ok(Ok(channel_id)) => {
+        match self.transport.connect_peer_typed(address, kind).await {
+            Ok(channel_id) => {
                 debug!(
                     "dial_candidate: connected to {} at {} ({:?}) (channel {})",
                     peer_hex, address, kind, channel_id
                 );
                 Some(channel_id)
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {} ({:?}): {}",
                     peer_hex, address, kind, e
-                );
-                None
-            }
-            Err(_) => {
-                debug!(
-                    "dial_candidate: timeout connecting to {} at {} ({:?}) (>{:?})",
-                    peer_hex, address, kind, dial_timeout
                 );
                 None
             }
@@ -4801,10 +5089,8 @@ impl DhtNetworkManager {
 
 /// Default request timeout for outbound DHT operations (seconds).
 ///
-/// Governs `wait_for_response` and the upper bound of `dial_candidate`'s
-/// dial timeout (`min(connection_timeout, request_timeout)`). Must stay
-/// above the relay stage (~10s) so it never truncates the NAT traversal
-/// cascade.
+/// Governs `wait_for_response`. Peer dials are bounded by the transport
+/// strategy's direct connect and handshake timeouts.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Maximum additional wait for outstanding α queries after the first
@@ -4876,41 +5162,40 @@ mod tests {
 
     #[test]
     fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
+        let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
         assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            refresh_budget > 0,
             "bucket refresh budget must allow at least one lookup"
         );
 
-        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS)
+        let candidates: Vec<_> = (0..refresh_budget)
             .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
         selected.sort_unstable();
 
-        assert_eq!(
-            selected,
-            (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS).collect::<Vec<_>>()
-        );
+        assert_eq!(selected, (0..refresh_budget).collect::<Vec<_>>());
     }
 
     #[test]
     fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
+        let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
         assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            refresh_budget > 0,
             "bucket refresh budget must allow at least one lookup"
         );
 
-        let candidate_count = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3;
+        let candidate_count = refresh_budget * 3;
         let candidates: Vec<_> = (0..candidate_count)
             .map(|idx| bucket_refresh_candidate(idx, (idx as u64) * 3_600))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
         selected.sort_unstable();
 
-        let expected_start = candidate_count - MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
+        let expected_start = candidate_count - refresh_budget;
         let expected: Vec<_> = (expected_start..candidate_count).collect();
 
-        assert_eq!(selected.len(), MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
+        assert_eq!(selected.len(), refresh_budget);
         assert_eq!(selected, expected);
     }
 
@@ -5536,6 +5821,124 @@ mod tests {
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
     }
 
+    // ---- Fix E: reachability-aware selection re-rank ----
+
+    #[test]
+    fn reachability_tier_is_zero_for_direct_one_for_relay_only() {
+        let direct = dht_node(
+            1,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+        let relay_only = dht_node(2, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let empty = DHTNode {
+            peer_id: PeerId::from_bytes([3u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            distance: None,
+            reliability: 1.0,
+        };
+
+        assert_eq!(DhtNetworkManager::reachability_tier(&direct), 0);
+        assert_eq!(DhtNetworkManager::reachability_tier(&relay_only), 1);
+        assert_eq!(DhtNetworkManager::reachability_tier(&empty), 1);
+    }
+
+    #[test]
+    fn reachability_tier_zero_when_node_has_both_relay_and_direct() {
+        // A peer advertising both a relay and a direct address is still
+        // directly reachable — tier keyed on absence of Direct, not presence
+        // of Relay.
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        assert_eq!(DhtNetworkManager::reachability_tier(&node), 0);
+    }
+
+    #[test]
+    fn reachability_rerank_prefers_direct_over_xor_closer_relay_only() {
+        // With key = [0; 32], xor_distance == peer_id, so the lower seed is the
+        // XOR-closer peer. The relay-only peer (seed 1) is XOR-closer; the
+        // direct peer (seed 2) is farther. Reachability tier must win: the
+        // direct peer is ranked first despite the larger XOR distance.
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+
+        let mut nodes = [relay_closer, direct_farther];
+        nodes
+            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
+
+        assert_eq!(nodes.len(), 2, "re-rank must never drop peers");
+        assert_eq!(
+            nodes[0].peer_id,
+            PeerId::from_bytes([2u8; 32]),
+            "directly-reachable peer must rank first even though it is XOR-farther"
+        );
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([1u8; 32]));
+    }
+
+    #[test]
+    fn by_distance_comparator_keeps_xor_closer_relay_only_ahead_of_direct() {
+        // Complement of `reachability_rerank_prefers_direct_over_xor_closer_relay_only`,
+        // and the property the closeness-verification path relies on: the XOR-only
+        // `compare_node_distance` (used by `find_closest_nodes_local_by_distance`
+        // and `find_closest_nodes_local_by_distance_with_self`) must NOT apply the
+        // reachability re-rank. With key = [0; 32], xor_distance == peer_id, so the
+        // lower seed is XOR-closer. The relay-only peer (seed 1) is XOR-closer and
+        // must therefore rank first even though it is relay-only — mirroring the
+        // uploader's pure-XOR view so an honest payment quoting that peer is not
+        // falsely rejected. (The reranked comparator would put the direct peer first.)
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+
+        // Start in the opposite order so a passing assertion proves the sort
+        // actually reordered (rather than leaving an already-correct input).
+        let mut nodes = [direct_farther, relay_closer];
+        nodes.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, &key));
+
+        assert_eq!(nodes.len(), 2, "distance sort must never drop peers");
+        assert_eq!(
+            nodes[0].peer_id,
+            PeerId::from_bytes([1u8; 32]),
+            "XOR-only ordering must keep the XOR-closer relay-only peer first, \
+             unlike compare_node_reachability_then_distance"
+        );
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
+    }
+
+    #[test]
+    fn reachability_rerank_sparse_all_relay_only_keeps_count_in_xor_order() {
+        // Sparse-network safety: when every candidate is relay-only they all
+        // share tier 1, so ordering falls back to XOR distance and truncation
+        // still yields `count` members — selection never shrinks below `count`.
+        let key: Key = [0u8; 32];
+        let mut nodes = vec![
+            dht_node(3, vec![("/ip4/10.0.0.3/udp/9000/quic", AddressType::Relay)]),
+            dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]),
+            dht_node(2, vec![("/ip4/10.0.0.2/udp/9000/quic", AddressType::Relay)]),
+        ];
+        nodes
+            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
+
+        let count = 2;
+        nodes.truncate(count);
+
+        assert_eq!(nodes.len(), count, "sparse selection must still fill count");
+        assert_eq!(nodes[0].peer_id, PeerId::from_bytes([1u8; 32]));
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
+    }
+
     #[test]
     fn first_direct_dialable_skips_wildcard_direct() {
         let node = dht_node(
@@ -6026,13 +6429,13 @@ mod tests {
             &cache, &addrs
         ));
 
-        cache.record_failure(plan[0].0.dialable_socket_addr().unwrap());
+        cache.record_failure(plan[0].0.dialable_socket_addr().unwrap(), plan[0].1);
         assert!(
             !DhtNetworkManager::dial_plan_fully_failed_in_cache(&cache, &addrs),
             "one available planned address should keep the candidate queryable"
         );
 
-        cache.record_failure(plan[1].0.dialable_socket_addr().unwrap());
+        cache.record_failure(plan[1].0.dialable_socket_addr().unwrap(), plan[1].1);
         assert!(
             DhtNetworkManager::dial_plan_fully_failed_in_cache(&cache, &addrs),
             "all planned dial addresses in the failure cache should suppress the candidate"
@@ -6057,10 +6460,13 @@ mod tests {
     fn dial_failure_cache_records_and_checks() {
         let cache = DialFailureCache::new();
         let addr = sock("203.0.113.7:9001");
-        assert!(!cache.is_failed(&addr), "empty cache never reports failed");
-        cache.record_failure(addr);
         assert!(
-            cache.is_failed(&addr),
+            !cache.is_failed(&addr, AddressType::Direct),
+            "empty cache never reports failed"
+        );
+        cache.record_failure(addr, AddressType::Direct);
+        assert!(
+            cache.is_failed(&addr, AddressType::Direct),
             "recorded address must be treated as failed within the TTL"
         );
     }
@@ -6069,10 +6475,10 @@ mod tests {
     fn dial_failure_cache_clear_removes_entry() {
         let cache = DialFailureCache::new();
         let addr = sock("203.0.113.7:9001");
-        cache.record_failure(addr);
+        cache.record_failure(addr, AddressType::Direct);
         cache.clear(&addr);
         assert!(
-            !cache.is_failed(&addr),
+            !cache.is_failed(&addr, AddressType::Direct),
             "clear() must drop the entry so a subsequent dial is allowed"
         );
     }
@@ -6096,7 +6502,7 @@ mod tests {
         };
         cache.entries.insert(addr, stale);
         assert!(
-            !cache.is_failed(&addr),
+            !cache.is_failed(&addr, AddressType::Direct),
             "stale entry must not suppress a fresh dial"
         );
         assert!(
@@ -6110,9 +6516,204 @@ mod tests {
         let cache = DialFailureCache::new();
         let a = sock("203.0.113.7:9001");
         let b = sock("203.0.113.8:9001");
-        cache.record_failure(a);
-        assert!(cache.is_failed(&a));
-        assert!(!cache.is_failed(&b), "different SocketAddr must not hit");
+        cache.record_failure(a, AddressType::Direct);
+        assert!(cache.is_failed(&a, AddressType::Direct));
+        assert!(
+            !cache.is_failed(&b, AddressType::Direct),
+            "different SocketAddr must not hit"
+        );
+    }
+
+    /// Helper: a distinct relay-session [`SocketAddr`] at relay-server IP
+    /// `203.0.113.50`, varying only the port. Models the many orphaned
+    /// MASQUE session addresses a single downed relay leaves circulating.
+    fn relay_session(port: u16) -> SocketAddr {
+        SocketAddr::new("203.0.113.50".parse().unwrap(), port)
+    }
+
+    const TEST_RELAY_IP: &str = "203.0.113.50";
+
+    #[test]
+    fn dial_failure_ip_tier_suppresses_unseen_session_after_threshold() {
+        let cache = DialFailureCache::new();
+
+        // One short of the threshold: no IP-level suppression yet, so a
+        // never-seen session at that IP is still dialable.
+        for port in 0..(DIAL_FAILURE_IP_SUPPRESS_THRESHOLD - 1) as u16 {
+            cache.record_failure(relay_session(9001 + port), AddressType::Relay);
+        }
+        let unseen = relay_session(9500);
+        assert!(
+            !cache.is_failed(&unseen, AddressType::Relay),
+            "below the threshold the IP tier must not suppress a fresh session"
+        );
+
+        // Cross the threshold with one more distinct dead session.
+        cache.record_failure(
+            relay_session(9001 + (DIAL_FAILURE_IP_SUPPRESS_THRESHOLD - 1) as u16),
+            AddressType::Relay,
+        );
+        assert!(
+            cache.is_failed(&unseen, AddressType::Relay),
+            "at the threshold every remaining session at the dead relay IP is suppressed"
+        );
+        assert!(
+            cache.entries.get(&unseen).is_none(),
+            "IP-level suppression must not require dialing or recording the unseen session"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_redialing_same_session_does_not_inflate_count() {
+        let cache = DialFailureCache::new();
+        // The same dead session failing repeatedly is one *distinct* address
+        // and must not on its own reach the distinct-session threshold.
+        for _ in 0..(DIAL_FAILURE_IP_SUPPRESS_THRESHOLD + 2) {
+            cache.record_failure(relay_session(9001), AddressType::Relay);
+        }
+        let unseen = relay_session(9500);
+        assert!(
+            !cache.is_failed(&unseen, AddressType::Relay),
+            "re-dialing a single dead session must not trip IP-level suppression"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_success_clears_suppression() {
+        let cache = DialFailureCache::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            cache.record_failure(relay_session(9001 + port), AddressType::Relay);
+        }
+        let unseen = relay_session(9500);
+        assert!(cache.is_failed(&unseen, AddressType::Relay));
+
+        // A success at any address at that IP proves the relay recovered.
+        cache.clear(&relay_session(9001));
+        assert!(
+            !cache.is_failed(&unseen, AddressType::Relay),
+            "a success at the IP must lift IP-level suppression immediately"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_shared_ip_success_keeps_live_peer() {
+        // A shared NAT IP hosts several churning relay sessions plus one
+        // genuinely-live peer. Once the dead sessions trip suppression, a
+        // success from the live peer at the same IP must re-admit it.
+        let cache = DialFailureCache::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            cache.record_failure(relay_session(9001 + port), AddressType::Relay);
+        }
+        let live_peer = relay_session(7000);
+        assert!(
+            cache.is_failed(&live_peer, AddressType::Relay),
+            "precondition: the live peer's session is initially caught by IP suppression"
+        );
+
+        // The live peer answers — record the success.
+        cache.clear(&live_peer);
+        assert!(
+            !cache.is_failed(&live_peer, AddressType::Relay),
+            "a live peer that succeeds at a shared IP must not stay suppressed"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_ignores_non_relay_failures() {
+        // Many distinct Direct failures at one IP must never build IP-level
+        // suppression: distinct Direct peers legitimately share a NAT IP.
+        let cache = DialFailureCache::new();
+        for port in 0..(DIAL_FAILURE_IP_SUPPRESS_THRESHOLD + 2) as u16 {
+            cache.record_failure(relay_session(9001 + port), AddressType::Direct);
+        }
+        let unseen_relay = relay_session(9500);
+        assert!(
+            !cache.is_failed(&unseen_relay, AddressType::Relay),
+            "non-relay failures must not populate the relay-IP suppression tier"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_relay_failures_do_not_suppress_direct_dials() {
+        // Even at a suppressed relay IP, a Direct dial to the same IP is a
+        // distinct peer kind and must not be skipped by the relay tier.
+        let cache = DialFailureCache::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            cache.record_failure(relay_session(9001 + port), AddressType::Relay);
+        }
+        let direct = relay_session(9500);
+        assert!(
+            !cache.is_failed(&direct, AddressType::Direct),
+            "IP-level suppression is scoped to relay-kind dials only"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_expires_stale_sessions_on_read() {
+        let cache = DialFailureCache::new();
+        let ip: IpAddr = TEST_RELAY_IP.parse().unwrap();
+        let Some(stale) =
+            Instant::now().checked_sub(DIAL_FAILURE_CACHE_TTL + Duration::from_secs(1))
+        else {
+            eprintln!(
+                "skipping: runner Instant is fresher than DIAL_FAILURE_CACHE_TTL ({DIAL_FAILURE_CACHE_TTL:?})"
+            );
+            return;
+        };
+        let mut sessions = HashMap::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            sessions.insert(relay_session(9001 + port), stale);
+        }
+        cache.ip_failures.insert(ip, sessions);
+
+        assert!(
+            !cache.ip_is_suppressed(&ip),
+            "all sessions stale: the IP must not suppress a fresh dial"
+        );
+        assert!(
+            cache.ip_failures.get(&ip).is_none(),
+            "an IP whose session set empties on expiry must be evicted"
+        );
+    }
+
+    #[test]
+    fn dial_failure_cache_canonicalizes_v4_mapped_v6_key() {
+        // A failure recorded under the IPv4-mapped IPv6 form must suppress —
+        // and be cleared by — the bare IPv4 form of the same endpoint, so the
+        // cache matches the transport's canonicalized endpoint identity.
+        let cache = DialFailureCache::new();
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:9001".parse().unwrap();
+        let bare: SocketAddr = "203.0.113.7:9001".parse().unwrap();
+
+        cache.record_failure(mapped, AddressType::Direct);
+        assert!(
+            cache.is_failed(&bare, AddressType::Direct),
+            "failure recorded under v4-mapped-v6 must suppress the bare IPv4 form"
+        );
+        cache.clear(&mapped);
+        assert!(
+            !cache.is_failed(&bare, AddressType::Direct),
+            "clear under v4-mapped-v6 must clear the bare IPv4 form"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_canonicalizes_v4_mapped_v6() {
+        // IP-tier suppression must collapse v4-mapped-v6 and bare IPv4 to the
+        // same relay-server IP: threshold sessions recorded under the mapped
+        // form must suppress an unseen bare-IPv4 session at the same endpoint.
+        let cache = DialFailureCache::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            let mapped: SocketAddr = format!("[::ffff:203.0.113.50]:{}", 9001 + port)
+                .parse()
+                .unwrap();
+            cache.record_failure(mapped, AddressType::Relay);
+        }
+        let bare_unseen: SocketAddr = "203.0.113.50:9500".parse().unwrap();
+        assert!(
+            cache.is_failed(&bare_unseen, AddressType::Relay),
+            "IP-tier suppression must apply across v4-mapped-v6 / bare IPv4 forms of one IP"
+        );
     }
 
     /// Helper: deterministic [`PeerId`] from a single byte. Mirrors
