@@ -1239,6 +1239,27 @@ const QUORUM_THRESHOLD: usize = 2;
 /// arrive and feeds [`compute_winner`].
 type SubjectReports = HashMap<PeerId, DHTNode>;
 
+#[derive(Debug, Default)]
+struct FindNodeLookupTranscript {
+    responder_views: HashMap<PeerId, Vec<DHTNode>>,
+}
+
+impl FindNodeLookupTranscript {
+    fn record_responder_view(&mut self, responder: PeerId, closest: Vec<DHTNode>) {
+        self.responder_views.insert(responder, closest);
+    }
+
+    fn take_responder_view(&mut self, responder: &PeerId) -> Option<Vec<DHTNode>> {
+        self.responder_views.remove(responder)
+    }
+}
+
+#[derive(Debug)]
+struct FindNodeLookupOutcome {
+    closest_nodes: Vec<DHTNode>,
+    transcript: FindNodeLookupTranscript,
+}
+
 #[derive(Debug)]
 struct LookupFailureCoordinator {
     tx: broadcast::Sender<PeerId>,
@@ -1599,6 +1620,23 @@ fn build_witnessed_close_group(
         vote_counts,
         consensus,
     }
+}
+
+fn split_witnessed_transcript_views(
+    initial_closest: &[DHTNode],
+    transcript: &mut FindNodeLookupTranscript,
+) -> (Vec<(PeerId, Vec<DHTNode>)>, Vec<DHTNode>) {
+    let mut responder_node_views = Vec::with_capacity(initial_closest.len());
+    let mut missing_responders = Vec::new();
+
+    for node in initial_closest {
+        match transcript.take_responder_view(&node.peer_id) {
+            Some(view) => responder_node_views.push((node.peer_id, view)),
+            None => missing_responders.push(node.clone()),
+        }
+    }
+
+    (responder_node_views, missing_responders)
 }
 
 impl DhtNetworkManager {
@@ -2180,8 +2218,9 @@ impl DhtNetworkManager {
     ///
     /// 1. Perform the normal iterative pure-XOR lookup and keep the closest K
     ///    remote responders.
-    /// 2. Ask each initial responder for its own closest-K view of the same
-    ///    target.
+    /// 2. Reuse each initial responder's closest-K view from the iterative
+    ///    lookup transcript when available; query only responders whose view
+    ///    was not captured during convergence.
     /// 3. Make each responder view self-inclusive, so a responder that belongs
     ///    in its own local close group recognises itself even though standard
     ///    FIND_NODE responses omit the responder.
@@ -2210,11 +2249,14 @@ impl DhtNetworkManager {
         }
 
         let initial_lookup_count = count.saturating_add(1);
-        let initial_lookup = self
-            .find_closest_nodes_network(key, initial_lookup_count)
+        let FindNodeLookupOutcome {
+            closest_nodes,
+            mut transcript,
+        } = self
+            .find_closest_nodes_network_with_transcript(key, initial_lookup_count, Some(count))
             .await?;
         let initial_closest: Vec<DHTNode> = sort_dedup_witnessed_nodes(
-            initial_lookup
+            closest_nodes
                 .into_iter()
                 .filter(|node| !self.is_local_peer_id(&node.peer_id))
                 .collect(),
@@ -2233,7 +2275,22 @@ impl DhtNetworkManager {
             )));
         }
 
-        let mut query_stream: FuturesUnordered<_> = initial_closest
+        let (mut responder_node_views, missing_responders) =
+            split_witnessed_transcript_views(&initial_closest, &mut transcript);
+        for (_, nodes) in &responder_node_views {
+            for node in nodes {
+                self.merge_trusted_gossiped_typed_addresses(node).await;
+            }
+        }
+        if !missing_responders.is_empty() {
+            debug!(
+                "Witnessed close group re-querying {} responder(s) without transcript views for key {}",
+                missing_responders.len(),
+                hex::encode(key)
+            );
+        }
+
+        let mut query_stream: FuturesUnordered<_> = missing_responders
             .iter()
             .map(|node| {
                 let peer_id = node.peer_id;
@@ -2247,27 +2304,24 @@ impl DhtNetworkManager {
             })
             .collect();
 
-        let mut responder_node_views = Vec::with_capacity(initial_closest.len());
         while let Some((responder, result)) = query_stream.next().await {
             match result {
                 Ok(DhtResponseEnvelope {
-                    result: DhtNetworkResult::NodesFound { mut nodes, .. },
+                    result: DhtNetworkResult::NodesFound { nodes, .. },
                     transport_source,
                     ..
                 }) => {
-                    nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-                    nodes.truncate(count);
-
-                    let mut trusted_nodes = Vec::with_capacity(nodes.len());
-                    for node in nodes {
-                        let node = self
-                            .gossiped_node_with_trusted_addresses(node, transport_source.as_ref())
-                            .await;
-                        if self.is_local_peer_id(&node.peer_id) {
-                            continue;
-                        }
-                        self.merge_trusted_gossiped_typed_addresses(&node).await;
-                        trusted_nodes.push(node);
+                    let (_, trusted_nodes) = self
+                        .trusted_find_node_response_nodes(
+                            nodes,
+                            transport_source.as_ref(),
+                            key,
+                            0,
+                            count,
+                        )
+                        .await;
+                    for node in &trusted_nodes {
+                        self.merge_trusted_gossiped_typed_addresses(node).await;
                     }
 
                     responder_node_views.push((responder, trusted_nodes));
@@ -2479,6 +2533,18 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<Vec<DHTNode>> {
+        Ok(self
+            .find_closest_nodes_network_with_transcript(key, count, None)
+            .await?
+            .closest_nodes)
+    }
+
+    async fn find_closest_nodes_network_with_transcript(
+        &self,
+        key: &Key,
+        count: usize,
+        transcript_view_count: Option<usize>,
+    ) -> Result<FindNodeLookupOutcome> {
         const MAX_ITERATIONS: usize = 20;
         const ALPHA: usize = 3; // Parallel queries per iteration
 
@@ -2509,6 +2575,7 @@ impl DhtNetworkManager {
         // third close-XOR responder has replied can supersede a
         // previously-stored single-source pick.
         let mut subject_reports: HashMap<PeerId, SubjectReports> = HashMap::new();
+        let mut transcript = FindNodeLookupTranscript::default();
 
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
@@ -2628,7 +2695,7 @@ impl DhtNetworkManager {
             for (peer_id, result) in results {
                 match result {
                     Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::NodesFound { mut nodes, .. },
+                        result: DhtNetworkResult::NodesFound { nodes, .. },
                         transport_source,
                         ..
                     }) => {
@@ -2638,21 +2705,21 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
 
-                        // Truncate response to K closest to the lookup key to
-                        // limit amplification from a single response and bound
-                        // per-iteration memory growth.
-                        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-                        nodes.truncate(self.k_value());
-                        for node in nodes {
-                            let node = self
-                                .gossiped_node_with_trusted_addresses(
-                                    node,
-                                    transport_source.as_ref(),
-                                )
-                                .await;
-                            if !peer_states.is_contactable(&node.peer_id)
-                                || self.is_local_peer_id(&node.peer_id)
-                            {
+                        let (candidate_nodes, responder_view) = self
+                            .trusted_find_node_response_nodes(
+                                nodes,
+                                transport_source.as_ref(),
+                                key,
+                                self.k_value(),
+                                transcript_view_count.unwrap_or(0),
+                            )
+                            .await;
+                        if transcript_view_count.is_some() {
+                            transcript.record_responder_view(peer_id, responder_view);
+                        }
+
+                        for node in candidate_nodes {
+                            if !peer_states.is_contactable(&node.peer_id) {
                                 continue;
                             }
                             if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
@@ -2813,7 +2880,10 @@ impl DhtNetworkManager {
                 .collect::<Vec<_>>()
         );
 
-        Ok(best_nodes)
+        Ok(FindNodeLookupOutcome {
+            closest_nodes: best_nodes,
+            transcript,
+        })
     }
 
     /// Send one iterative FIND_NODE probe, aborting early if another active
@@ -2907,6 +2977,45 @@ impl DhtNetworkManager {
         a.peer_id
             .distance(&target_key)
             .cmp(&b.peer_id.distance(&target_key))
+    }
+
+    async fn trusted_find_node_response_nodes(
+        &self,
+        mut nodes: Vec<SerializableDHTNode>,
+        transport_source: Option<&MultiAddr>,
+        key: &Key,
+        candidate_limit: usize,
+        transcript_limit: usize,
+    ) -> (Vec<DHTNode>, Vec<DHTNode>) {
+        let processing_limit = candidate_limit.max(transcript_limit);
+        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        nodes.truncate(processing_limit);
+
+        let mut candidate_nodes = Vec::with_capacity(candidate_limit.min(nodes.len()));
+        let mut transcript_nodes = Vec::with_capacity(transcript_limit.min(nodes.len()));
+
+        for (index, node) in nodes.into_iter().enumerate() {
+            let node = self
+                .gossiped_node_with_trusted_addresses(node, transport_source)
+                .await;
+            if self.is_local_peer_id(&node.peer_id) {
+                continue;
+            }
+
+            let is_candidate_node = index < candidate_limit;
+            let is_transcript_node = index < transcript_limit;
+            match (is_candidate_node, is_transcript_node) {
+                (true, true) => {
+                    candidate_nodes.push(node.clone());
+                    transcript_nodes.push(node);
+                }
+                (true, false) => candidate_nodes.push(node),
+                (false, true) => transcript_nodes.push(node),
+                (false, false) => {}
+            }
+        }
+
+        (candidate_nodes, transcript_nodes)
     }
 
     /// Drain an iteration's α queries with a bounded wait after first response.
@@ -5751,6 +5860,41 @@ mod tests {
             .find(|(candidate, _)| *candidate == peer)
             .map(|(_, votes)| *votes)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn witnessed_lookup_reuses_transcript_views_and_only_requeries_missing_responders() {
+        let mut transcript = FindNodeLookupTranscript::default();
+        transcript.record_responder_view(PeerId::from_bytes([1; 32]), witness_nodes(&[2, 3]));
+        transcript.record_responder_view(PeerId::from_bytes([3; 32]), Vec::new());
+
+        let initial = witness_nodes(&[1, 2, 3]);
+        let (views, missing) = split_witnessed_transcript_views(&initial, &mut transcript);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].0, PeerId::from_bytes([1; 32]));
+        assert_eq!(
+            views[0]
+                .1
+                .iter()
+                .map(|node| node.peer_id.to_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(views[1].0, PeerId::from_bytes([3; 32]));
+        assert!(views[1].1.is_empty());
+        assert_eq!(
+            missing
+                .iter()
+                .map(|node| node.peer_id.to_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            transcript
+                .take_responder_view(&PeerId::from_bytes([1; 32]))
+                .is_none()
+        );
     }
 
     #[test]
