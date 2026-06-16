@@ -1529,6 +1529,7 @@ fn self_inclusive_responder_view(
 fn build_witnessed_close_group(
     key: &Key,
     count: usize,
+    view_count: usize,
     initial_closest: Vec<DHTNode>,
     responder_node_views: Vec<(PeerId, Vec<DHTNode>)>,
 ) -> WitnessedCloseGroup {
@@ -1547,7 +1548,8 @@ fn build_witnessed_close_group(
     let mut responder_views = Vec::with_capacity(responder_node_views.len());
 
     for (responder, closest) in responder_node_views {
-        let closest = self_inclusive_responder_view(responder, closest, &known_nodes, key, count);
+        let closest =
+            self_inclusive_responder_view(responder, closest, &known_nodes, key, view_count);
         responder_views.push(ResponderView { responder, closest });
     }
 
@@ -2176,9 +2178,30 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<WitnessedCloseGroup> {
+        self.find_witnessed_close_group_with_view_count(key, count, count)
+            .await
+    }
+
+    /// Find a witnessed close-group transcript with independently sized
+    /// responder views.
+    ///
+    /// `count` controls the initial pure-XOR responder set. `view_count`
+    /// controls how many closest nodes each responder view may contribute to
+    /// the transcript.
+    pub async fn find_witnessed_close_group_with_view_count(
+        &self,
+        key: &Key,
+        count: usize,
+        view_count: usize,
+    ) -> Result<WitnessedCloseGroup> {
         if count == 0 {
             return Err(P2PError::InvalidInput(
                 "witnessed close group count must be greater than zero".to_string(),
+            ));
+        }
+        if view_count == 0 {
+            return Err(P2PError::InvalidInput(
+                "witnessed close group view count must be greater than zero".to_string(),
             ));
         }
 
@@ -2187,7 +2210,7 @@ impl DhtNetworkManager {
             closest_nodes,
             mut transcript,
         } = self
-            .find_closest_nodes_network_with_transcript(key, initial_lookup_count, Some(count))
+            .find_closest_nodes_network_with_transcript(key, initial_lookup_count, Some(view_count))
             .await?;
         let initial_closest: Vec<DHTNode> = sort_dedup_witnessed_nodes(
             closest_nodes
@@ -2251,7 +2274,7 @@ impl DhtNetworkManager {
                             transport_source.as_ref(),
                             key,
                             0,
-                            count,
+                            view_count,
                         )
                         .await;
                     for node in &trusted_nodes {
@@ -2278,8 +2301,13 @@ impl DhtNetworkManager {
             }
         }
 
-        let witnessed =
-            build_witnessed_close_group(key, count, initial_closest, responder_node_views);
+        let witnessed = build_witnessed_close_group(
+            key,
+            count,
+            view_count,
+            initial_closest,
+            responder_node_views,
+        );
 
         if witnessed.responder_views.len() < witnessed.initial_closest.len() {
             warn!(
@@ -5824,7 +5852,8 @@ mod tests {
         let initial = witness_nodes(&[1, 2]);
         let views = vec![witness_view(1, &[4, 5]), witness_view(2, &[3, 6])];
 
-        let group = build_witnessed_close_group(&key, FALLBACK_TEST_K, initial, views);
+        let group =
+            build_witnessed_close_group(&key, FALLBACK_TEST_K, FALLBACK_TEST_K, initial, views);
 
         assert!(
             group
@@ -5838,12 +5867,42 @@ mod tests {
     }
 
     #[test]
+    fn witnessed_group_allows_wider_responder_views_than_initial_group() {
+        const INITIAL_K: usize = 2;
+        const VIEW_K: usize = 3;
+
+        let key: Key = [0u8; 32];
+        let initial = witness_nodes(&[1, 2]);
+        let views = vec![witness_view(1, &[4, 5]), witness_view(2, &[3, 6])];
+
+        let group = build_witnessed_close_group(&key, INITIAL_K, VIEW_K, initial, views);
+
+        assert_eq!(group.k, INITIAL_K);
+        assert!(
+            group
+                .responder_views
+                .iter()
+                .all(|view| view.closest.len() <= VIEW_K),
+            "responder views should use the independent view cap"
+        );
+        assert_eq!(
+            responder_view_seeds(&group.responder_views[0]),
+            vec![1, 4, 5]
+        );
+        assert_eq!(
+            responder_view_seeds(&group.responder_views[1]),
+            vec![2, 3, 6]
+        );
+    }
+
+    #[test]
     fn witnessed_group_self_includes_responder_when_response_omits_self() {
         let key: Key = [0u8; 32];
         let initial = witness_nodes(&[1, 2, 3, 4, 5, 6, 7]);
         let views = vec![witness_view(3, &[1, 2, 4, 5, 6, 7, 8])];
 
-        let group = build_witnessed_close_group(&key, TEST_WITNESS_K, initial, views);
+        let group =
+            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_K, initial, views);
         let view = group
             .responder_views
             .iter()
@@ -5891,7 +5950,8 @@ mod tests {
             .map(|seed| (PeerId::from_bytes([seed; 32]), view_nodes.clone()))
             .collect();
 
-        let group = build_witnessed_close_group(&key, TEST_WITNESS_K, initial, views);
+        let group =
+            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_K, initial, views);
 
         let closest = &group.responder_views[0].closest;
         assert_eq!(
