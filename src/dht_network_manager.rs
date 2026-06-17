@@ -1485,6 +1485,20 @@ fn merge_witnessed_node(nodes: &mut HashMap<PeerId, DHTNode>, node: DHTNode) {
     }
 }
 
+/// True if `node` advertises a directly-dialable (`Direct`) or relayed
+/// (`Relay`) address.
+///
+/// A node we know only by `Unverified`/`Lan` tags has no address a fresh peer
+/// can reach: the observed `Unverified` socket fails under port-restricted NAT,
+/// and `Lan` is local-scope. Such a peer needs relay resolution before a lookup
+/// can contact it. See the relay-resolution step in
+/// `find_closest_nodes_network_with_transcript`.
+fn node_has_reachable_address(node: &DHTNode) -> bool {
+    node.typed_addresses()
+        .iter()
+        .any(|(_, ty)| matches!(ty, AddressType::Relay | AddressType::Direct))
+}
+
 fn compare_peer_distance(a: &PeerId, b: &PeerId, key: &Key) -> std::cmp::Ordering {
     let target_key = DhtKey::from_bytes(*key);
     a.distance(&target_key)
@@ -2210,7 +2224,12 @@ impl DhtNetworkManager {
             closest_nodes,
             mut transcript,
         } = self
-            .find_closest_nodes_network_with_transcript(key, initial_lookup_count, Some(view_count))
+            .find_closest_nodes_network_with_transcript(
+                key,
+                initial_lookup_count,
+                Some(view_count),
+                true,
+            )
             .await?;
         let initial_closest: Vec<DHTNode> = sort_dedup_witnessed_nodes(
             closest_nodes
@@ -2493,9 +2512,38 @@ impl DhtNetworkManager {
         count: usize,
     ) -> Result<Vec<DHTNode>> {
         Ok(self
-            .find_closest_nodes_network_with_transcript(key, count, None)
+            .find_closest_nodes_network_with_transcript(key, count, None, true)
             .await?
             .closest_nodes)
+    }
+
+    /// Resolve a (likely NAT'd / relay-only) peer's relay address by running a
+    /// bounded secondary lookup keyed on the peer's OWN id.
+    ///
+    /// The lookup converges on the peer's K-closest neighbours — exactly the
+    /// nodes that received the peer's authoritative `PublishAddressSet` (which
+    /// carries its `Relay`-tagged address). The lookup's normal response
+    /// ingestion (`merge_trusted_gossiped_typed_addresses`) stores that address
+    /// in our routing table as a side effect, so a subsequent
+    /// `peer_addresses_for_dial_typed` read returns a dialable relay address.
+    ///
+    /// Runs with `allow_relay_resolution = false` so it can never recurse into
+    /// further relay-resolution lookups.
+    async fn resolve_relay_for_peer(&self, peer_id: &PeerId) {
+        let key: Key = *peer_id.to_bytes();
+        // `Box::pin` breaks the static async recursion cycle
+        // (`find_closest_nodes_network_with_transcript` → here → it again).
+        // The cycle is runtime-bounded by `allow_relay_resolution = false`, but
+        // the compiler still needs the indirection for a finite future size.
+        let lookup =
+            self.find_closest_nodes_network_with_transcript(&key, self.k_value(), None, false);
+        if let Err(e) = Box::pin(lookup).await {
+            debug!(
+                "relay resolution lookup for {} did not complete: {}",
+                peer_id.to_hex(),
+                e
+            );
+        }
     }
 
     async fn find_closest_nodes_network_with_transcript(
@@ -2503,9 +2551,15 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
         transcript_view_count: Option<usize>,
+        allow_relay_resolution: bool,
     ) -> Result<FindNodeLookupOutcome> {
         const MAX_ITERATIONS: usize = 20;
         const ALPHA: usize = 3; // Parallel queries per iteration
+        // Cap the bounded secondary lookups spent resolving relay-only
+        // candidates' addresses within a single top-level lookup, so a
+        // neighbourhood thick with NAT'd peers cannot turn one lookup into an
+        // unbounded fan-out of nested lookups.
+        const MAX_RELAY_RESOLUTIONS_PER_LOOKUP: usize = 8;
 
         debug!(
             "[NETWORK] Finding {} closest nodes to key: {}",
@@ -2557,6 +2611,11 @@ impl DhtNetworkManager {
         // candidate is closer than the current worst member of top-K.
         let mut previous_top_k: Vec<PeerId> = Vec::new();
 
+        // Peers whose relay address we have already attempted to resolve via a
+        // secondary lookup this run — resolve each at most once, and cap the
+        // total (see `MAX_RELAY_RESOLUTIONS_PER_LOOKUP`).
+        let mut relay_resolved: HashSet<PeerId> = HashSet::new();
+
         for iteration in 0..MAX_ITERATIONS {
             if candidates.is_empty() {
                 debug!(
@@ -2607,6 +2666,34 @@ impl DhtNetworkManager {
                 batch.len()
             );
 
+            // Reactive relay resolution. A close candidate we know only by an
+            // `Unverified`/observed address (no `Direct`, no `Relay`) is almost
+            // always a NAT'd / relay-only peer whose own `PublishAddressSet`
+            // relay address never reached us: that set fans out only to the
+            // publisher's K-closest, not to the neighbourhood of an arbitrary
+            // key it is responsible for. Dialing its observed address fails
+            // under port-restricted NAT, the peer drops out of the lookup, and
+            // the caller's responder set diverges from the XOR close group the
+            // storers compute — which is exactly what breaks single-node
+            // uploads on NAT-simulated networks. Before querying, resolve such
+            // a peer's relay address with a bounded secondary lookup on its OWN
+            // id; that lookup's normal `merge_trusted_gossiped_typed_addresses`
+            // ingestion stores the `Relay` tag its K-closest publish, so the
+            // dial below can use it. Never recursive: the nested lookup runs
+            // with `allow_relay_resolution = false`.
+            if allow_relay_resolution {
+                for node in &batch {
+                    if relay_resolved.len() >= MAX_RELAY_RESOLUTIONS_PER_LOOKUP {
+                        break;
+                    }
+                    if node_has_reachable_address(node) || relay_resolved.contains(&node.peer_id) {
+                        continue;
+                    }
+                    relay_resolved.insert(node.peer_id);
+                    self.resolve_relay_for_peer(&node.peer_id).await;
+                }
+            }
+
             // Query nodes in parallel.
             //
             // saorsa-transport connection multiplexing lets us keep a single
@@ -2626,10 +2713,20 @@ impl DhtNetworkManager {
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
-                    let typed = node.typed_addresses();
+                    // Fallback to the candidate's gossiped view; for a peer we
+                    // just resolved, re-read the routing table so the dial
+                    // picks up the freshly-merged `Relay` address (sorted
+                    // first by `peer_addresses_for_dial_typed`).
+                    let fallback_typed = node.typed_addresses();
+                    let refresh = relay_resolved.contains(&peer_id);
                     let lookup_key = *key;
                     let failure_rx = self.lookup_failures.subscribe();
                     async move {
+                        let typed = if refresh {
+                            self.peer_addresses_for_dial_typed(&peer_id).await
+                        } else {
+                            fallback_typed
+                        };
                         self.send_find_node_lookup_request(peer_id, typed, lookup_key, failure_rx)
                             .await
                     }
@@ -5567,6 +5664,39 @@ mod tests {
         let typed = node.typed_addresses();
         assert_eq!(typed.len(), 1);
         assert_eq!(typed[0].1, AddressType::Lan);
+    }
+
+    #[test]
+    fn node_has_reachable_address_gates_on_direct_or_relay() {
+        // WAN addresses so typed_addresses() does not downgrade Direct -> Lan.
+        const WAN_A: &str = "/ip4/203.0.113.7/udp/9000/quic";
+        const WAN_B: &str = "/ip4/203.0.113.8/udp/9000/quic";
+
+        // Unverified-only (the NAT'd / observed-address case) is the one the
+        // relay-resolution step must act on: not reachable.
+        let unverified = dht_node(1, vec![(WAN_A, AddressType::Unverified)]);
+        assert!(!node_has_reachable_address(&unverified));
+
+        // A peer with no addresses at all is not reachable.
+        let empty = dht_node(2, vec![]);
+        assert!(!node_has_reachable_address(&empty));
+
+        // A Direct or Relay tag means the dial path already has something
+        // routable — skip resolution.
+        let direct = dht_node(3, vec![(WAN_A, AddressType::Direct)]);
+        assert!(node_has_reachable_address(&direct));
+        let relay = dht_node(4, vec![(WAN_A, AddressType::Relay)]);
+        assert!(node_has_reachable_address(&relay));
+
+        // Any reachable tag among several suffices.
+        let mixed = dht_node(
+            5,
+            vec![
+                (WAN_A, AddressType::Unverified),
+                (WAN_B, AddressType::Relay),
+            ],
+        );
+        assert!(node_has_reachable_address(&mixed));
     }
 
     fn typed_addresses(entries: Vec<(&str, AddressType)>) -> Vec<(MultiAddr, AddressType)> {
