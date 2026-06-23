@@ -3470,7 +3470,36 @@ impl DhtNetworkManager {
         // `actual` in the outcome) is learned via the normal
         // connection-event path that registers it against the
         // channel it actually authenticated on.
-        if matches!(outcome, PendingDialOutcome::IdentityMismatch { .. }) {
+        //
+        // [evict-experiment] Additionally evict a peer that was unreachable at
+        // *every* candidate address. On a network whose FIND_NODE responses are
+        // heavy with stale relay-session addresses (each relay reconnect mints a
+        // new OS-assigned port, permanently orphaning the previously advertised
+        // address), a peer whose only/last address is a dead relay session is
+        // otherwise kept and re-served by this routing table indefinitely — the
+        // dial-failure path applies only a trust penalty (`record_peer_failure`)
+        // and never evicts. Drop it now so it stops being re-dialed and
+        // re-gossiped; if it is still around it is re-learned with a fresh
+        // address via the normal FIND_NODE path. The distinct log line lets an
+        // upload run be post-processed for how many unreachable peers were
+        // evicted (the within-run "avoided re-dials" signal).
+        // IdentityMismatch always evicts (the peer genuinely isn't at any of
+        // the candidate addresses, regardless of role). DialFailed eviction is
+        // gated to NodeMode::Client: a Client cleans only its own ephemeral
+        // routing view with no downstream effect, whereas a Node serves
+        // FIND_NODE and one-strike eviction of a transiently-unreachable (but
+        // live) peer would thin the shared routing table the rest of the
+        // network queries — so Node-mode keeps the existing trust-penalty-only
+        // behaviour.
+        let evict_dial_failed = matches!(outcome, PendingDialOutcome::DialFailed { .. })
+            && matches!(self.config.node_config.mode, NodeMode::Client);
+        if evict_dial_failed {
+            warn!(
+                "[evict-experiment] {} -> {}: evicting unreachable peer from routing table (all candidate dials failed, client mode)",
+                local_hex, peer_hex
+            );
+        }
+        if matches!(outcome, PendingDialOutcome::IdentityMismatch { .. }) || evict_dial_failed {
             let rt_events = {
                 let mut dht = self.dht.write().await;
                 dht.remove_node_by_id(peer_id).await
