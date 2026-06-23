@@ -80,3 +80,6 @@ wyz = "=0.5.1"
 [dev-dependencies]
 tempfile = "3.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+saorsa-transport = { git = "https://github.com/jacderida/saorsa-transport.git", rev = "18fda355e76fb9f145b42b644187601440ab4073" }  # branch: experiment/relay-drop-instrumentation
