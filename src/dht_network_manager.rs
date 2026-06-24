@@ -993,6 +993,31 @@ impl DialFailureCache {
     }
 }
 
+/// ADR-011 self-heal: when a newer authoritative `PublishAddressSet` is applied
+/// for a peer, clear any stale dial-failure suppression for its freshly
+/// published socket addresses. A recovered address — for example a relay that
+/// now hands a reconnecting peer back its previous stable port — is otherwise
+/// kept suppressed for up to [`DIAL_FAILURE_CACHE_TTL`] even though the owner
+/// has just re-attested it. Returns the number of addresses cleared; a no-op
+/// when the publish was not applied (stale or duplicate sequence).
+fn clear_dial_failures_for_published(
+    cache: &DialFailureCache,
+    applied: bool,
+    addresses: &[(crate::MultiAddr, AddressType)],
+) -> usize {
+    if !applied {
+        return 0;
+    }
+    let mut cleared = 0;
+    for (addr, _ty) in addresses {
+        if let Some(socket_addr) = addr.dialable_socket_addr() {
+            cache.clear(&socket_addr);
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
 /// TTL-indexed cache of [`PeerId`]s whose identity exchange recently
 /// failed (timeout) or mismatched (authenticated as a different peer).
 ///
@@ -4231,8 +4256,27 @@ impl DhtNetworkManager {
                     );
                 }
                 let dht = self.dht.read().await;
-                dht.replace_node_addresses(authenticated_sender, filtered_addresses, *seq)
+                let applied = dht
+                    .replace_node_addresses(authenticated_sender, filtered_addresses.clone(), *seq)
                     .await;
+                drop(dht);
+                // ADR-011: a newer authoritative address set just landed — lift
+                // stale dial-failure suppression for its addresses so a
+                // self-healed (e.g. reclaimed stable relay) address is retried
+                // immediately instead of staying suppressed for the cache TTL.
+                let cleared = clear_dial_failures_for_published(
+                    self.dial_failure_cache.as_ref(),
+                    applied,
+                    &filtered_addresses,
+                );
+                if cleared > 0 {
+                    debug!(
+                        peer = %authenticated_sender.to_hex(),
+                        seq,
+                        cleared,
+                        "ADR-011: cleared dial-failure suppression for freshly-published addresses"
+                    );
+                }
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
         }
@@ -6808,6 +6852,35 @@ mod tests {
             !cache.is_failed(&addr, AddressType::Direct),
             "clear() must drop the entry so a subsequent dial is allowed"
         );
+    }
+
+    #[test]
+    fn publish_self_heal_clears_dial_failures_only_when_applied() {
+        let cache = DialFailureCache::new();
+        let relay = crate::MultiAddr::quic(sock("203.0.113.7:9000"));
+        let direct = crate::MultiAddr::quic(sock("203.0.113.8:9000"));
+        let relay_sa = relay.dialable_socket_addr().expect("dialable");
+        let direct_sa = direct.dialable_socket_addr().expect("dialable");
+
+        cache.record_failure(relay_sa, AddressType::Relay);
+        cache.record_failure(direct_sa, AddressType::Direct);
+        assert!(cache.is_failed(&relay_sa, AddressType::Relay));
+        assert!(cache.is_failed(&direct_sa, AddressType::Direct));
+
+        let addrs = vec![
+            (relay.clone(), AddressType::Relay),
+            (direct.clone(), AddressType::Direct),
+        ];
+
+        // A stale/duplicate publish (not applied) must NOT lift suppression.
+        assert_eq!(clear_dial_failures_for_published(&cache, false, &addrs), 0);
+        assert!(cache.is_failed(&relay_sa, AddressType::Relay));
+        assert!(cache.is_failed(&direct_sa, AddressType::Direct));
+
+        // A newer applied publish lifts suppression for every published address.
+        assert_eq!(clear_dial_failures_for_published(&cache, true, &addrs), 2);
+        assert!(!cache.is_failed(&relay_sa, AddressType::Relay));
+        assert!(!cache.is_failed(&direct_sa, AddressType::Direct));
     }
 
     #[test]
