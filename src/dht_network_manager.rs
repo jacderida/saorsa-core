@@ -991,6 +991,19 @@ impl DialFailureCache {
         self.entries.remove(&addr);
         self.ip_failures.remove(&addr.ip());
     }
+
+    /// Clear only the per-address failure for `addr`, used when its owner
+    /// re-attests it via an applied `PublishAddressSet`.
+    ///
+    /// Unlike [`Self::clear`], this deliberately does NOT lift IP-level
+    /// suppression: a re-publish proves the owner re-attested this address, not
+    /// that *this* node can now reach the relay IP. Unrelated failed relay
+    /// sessions on the same IP therefore stay suppressed, and the re-attested
+    /// address itself remains IP-suppressed if the IP is over threshold.
+    fn clear_address(&self, addr: &SocketAddr) {
+        let addr = Self::canon_key(*addr);
+        self.entries.remove(&addr);
+    }
 }
 
 /// ADR-011 self-heal: when a newer authoritative `PublishAddressSet` is applied
@@ -1011,7 +1024,9 @@ fn clear_dial_failures_for_published(
     let mut cleared = 0;
     for (addr, _ty) in addresses {
         if let Some(socket_addr) = addr.dialable_socket_addr() {
-            cache.clear(&socket_addr);
+            // Per-address only: re-attestation must not lift IP-level relay
+            // suppression (that requires a real dial success, not a republish).
+            cache.clear_address(&socket_addr);
             cleared += 1;
         }
     }
@@ -6881,6 +6896,43 @@ mod tests {
         assert_eq!(clear_dial_failures_for_published(&cache, true, &addrs), 2);
         assert!(!cache.is_failed(&relay_sa, AddressType::Relay));
         assert!(!cache.is_failed(&direct_sa, AddressType::Direct));
+    }
+
+    #[test]
+    fn publish_self_heal_keeps_ip_tier_suppression_for_others() {
+        let cache = DialFailureCache::new();
+        // Push one relay IP to the suppression threshold with distinct sessions.
+        let mut socks = Vec::new();
+        for port in 9001..9001 + DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            let sa = sock(&format!("198.51.100.7:{port}"));
+            cache.record_failure(sa, AddressType::Relay);
+            socks.push(sa);
+        }
+        let ip = socks[0].ip();
+        assert!(
+            cache.ip_is_suppressed(&ip),
+            "relay IP should be suppressed once at threshold"
+        );
+
+        // The owner re-attests one of those addresses via an applied publish.
+        let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
+        assert_eq!(clear_dial_failures_for_published(&cache, true, &addrs), 1);
+
+        // Its own per-address entry is cleared, but a republish (weaker evidence
+        // than a real dial success) must NOT lift IP-level suppression for the
+        // unrelated failed relay sessions sharing that IP.
+        assert!(
+            cache.entries.get(&socks[0]).is_none(),
+            "the re-attested address's per-address entry is cleared"
+        );
+        assert!(
+            cache.ip_is_suppressed(&ip),
+            "IP-tier suppression for other relay sessions on the same IP is retained"
+        );
+        assert!(
+            cache.is_failed(&socks[1], AddressType::Relay),
+            "another failed relay session on the same IP stays suppressed"
+        );
     }
 
     #[test]
