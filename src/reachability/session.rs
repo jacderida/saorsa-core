@@ -32,6 +32,7 @@ use std::time::Duration;
 use rand::Rng;
 use tracing::{debug, info, warn};
 
+use crate::PeerId;
 use crate::dht_network_manager::DhtNetworkManager;
 use crate::reachability::acquisition::{AcquiredRelay, RelayAcquisition, RelayCandidate};
 use crate::transport_handle::TransportHandle;
@@ -88,6 +89,7 @@ pub(crate) enum RelayAcquisitionOutcome {
 pub(crate) async fn run_relay_acquisition(
     dht: &DhtNetworkManager,
     transport: &Arc<TransportHandle>,
+    previous_relayer: Option<PeerId>,
 ) -> RelayAcquisitionOutcome {
     let jitter_ms = rand::thread_rng().gen_range(0..STARTUP_JITTER_UPPER_MS);
     if jitter_ms > 0 {
@@ -132,7 +134,7 @@ pub(crate) async fn run_relay_acquisition(
     );
 
     let coordinator = RelayAcquisition::new(Arc::clone(transport));
-    match coordinator.acquire(candidates).await {
+    match coordinator.acquire(candidates, previous_relayer).await {
         Ok(relay) => {
             info!(
                 relayer = ?relay.relayer,

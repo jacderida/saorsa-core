@@ -111,6 +111,7 @@ pub(crate) fn spawn_acquisition_driver(
             shutdown,
             current_backoff: BACKOFF_INITIAL,
             last_published_typed_set: None,
+            previous_relayer: None,
         };
         driver.run().await;
     });
@@ -127,6 +128,12 @@ struct AcquisitionDriver {
     shutdown: CancellationToken,
     current_backoff: Duration,
     last_published_typed_set: Option<PublishedTypedSet>,
+    /// The last successfully-acquired relayer, carried across acquisition
+    /// rounds so the next round can report whether relay affinity (V2-551)
+    /// would have kept us on the same relay. Survives the `relayer_peer_id`
+    /// clear that `lose_relay_and_republish` performs; updated only on a
+    /// successful acquire.
+    previous_relayer: Option<PeerId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,10 +151,13 @@ impl AcquisitionDriver {
                 return;
             }
 
-            let outcome = run_relay_acquisition(self.dht.as_ref(), &self.transport).await;
+            let previous_relayer = self.previous_relayer;
+            let outcome =
+                run_relay_acquisition(self.dht.as_ref(), &self.transport, previous_relayer).await;
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
                     self.current_backoff = BACKOFF_INITIAL;
+                    self.previous_relayer = Some(relay.relayer);
                     *self.relayer_peer_id.write().await = Some(relay.relayer);
                     *self.relay_address.write().await = Some(relay.allocated_public_addr);
                     self.transport

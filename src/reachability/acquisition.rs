@@ -181,6 +181,7 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
     pub async fn acquire(
         &self,
         candidates: Vec<RelayCandidate>,
+        previous_relayer: Option<PeerId>,
     ) -> Result<AcquiredRelay, RelayAcquisitionError> {
         if candidates.is_empty() {
             debug!("relay acquisition called with empty candidate list");
@@ -188,6 +189,14 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
         }
 
         let candidate_count = candidates.len();
+        // V2-568 affinity instrumentation: where the previously-used relayer
+        // sits in this round's fresh candidate list. `present_in_candidates`
+        // with a different `chosen` is an affinity miss that V2-551 would
+        // convert to a hit; absent means eviction / routing-table not yet
+        // repopulated.
+        let previous_index =
+            previous_relayer.and_then(|prev| candidates.iter().position(|c| c.peer_id == prev));
+        let present_in_candidates = previous_index.is_some();
         debug!(
             candidates = candidate_count,
             "starting proactive relay acquisition walk"
@@ -210,6 +219,16 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
                         allocated = %allocated,
                         index = index,
                         "acquired proactive relay session"
+                    );
+                    // V2-568: relay-affinity reacquire decision — was the
+                    // previously-used relayer available this round, and did we
+                    // land back on it? Feeds Query 4 (V2-551 reach).
+                    debug!(
+                        previous_relayer = ?previous_relayer,
+                        present_in_candidates = present_in_candidates,
+                        previous_index = ?previous_index,
+                        chosen = ?candidate.peer_id,
+                        "relay acquisition: reacquire decision"
                     );
                     return Ok(AcquiredRelay {
                         relayer: candidate.peer_id,
@@ -303,7 +322,7 @@ mod tests {
     async fn empty_candidate_list_returns_no_candidates_error() {
         let establisher = ScriptedEstablisher::new(Vec::new());
         let coordinator = RelayAcquisition::new(establisher);
-        let result = coordinator.acquire(Vec::new()).await;
+        let result = coordinator.acquire(Vec::new(), None).await;
         assert_eq!(result.unwrap_err(), RelayAcquisitionError::NoCandidates);
     }
 
@@ -314,7 +333,7 @@ mod tests {
         let coordinator = RelayAcquisition::new(establisher);
         let candidates = vec![candidate(1, 10000), candidate(2, 10001)];
         let result = coordinator
-            .acquire(candidates)
+            .acquire(candidates, None)
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(1));
@@ -336,7 +355,7 @@ mod tests {
         let coordinator = RelayAcquisition::new(establisher);
         let candidates = vec![candidate(1, 10000), candidate(2, 10001)];
         let result = coordinator
-            .acquire(candidates)
+            .acquire(candidates, None)
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(2));
@@ -356,7 +375,7 @@ mod tests {
         let coordinator = RelayAcquisition::new(establisher);
         let candidates = vec![candidate(1, 10000), candidate(2, 10001)];
         let result = coordinator
-            .acquire(candidates)
+            .acquire(candidates, None)
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(2));
@@ -377,7 +396,7 @@ mod tests {
             candidate(2, 10001),
             candidate(3, 10002),
         ];
-        let result = coordinator.acquire(candidates).await;
+        let result = coordinator.acquire(candidates, None).await;
         assert_eq!(
             result.unwrap_err(),
             RelayAcquisitionError::AllCandidatesExhausted
@@ -397,7 +416,7 @@ mod tests {
         ]);
         let coordinator = RelayAcquisition::new(establisher);
         let candidates = vec![candidate(1, 10000), candidate(2, 10001)];
-        let result = coordinator.acquire(candidates).await;
+        let result = coordinator.acquire(candidates, None).await;
         assert_eq!(
             result.unwrap_err(),
             RelayAcquisitionError::AllCandidatesExhausted
@@ -419,7 +438,7 @@ mod tests {
             candidate(3, 10002),
         ];
         let result = coordinator
-            .acquire(candidates)
+            .acquire(candidates, None)
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(3));
@@ -441,7 +460,7 @@ mod tests {
         let calls = establisher.calls.clone();
         let coordinator = RelayAcquisition::new(establisher);
         let result = coordinator
-            .acquire(vec![skipped, ok])
+            .acquire(vec![skipped, ok], None)
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(2));
@@ -463,7 +482,7 @@ mod tests {
         let establisher = ScriptedEstablisher::new(Vec::new());
         let calls = establisher.calls.clone();
         let coordinator = RelayAcquisition::new(establisher);
-        let result = coordinator.acquire(vec![c1, c2]).await;
+        let result = coordinator.acquire(vec![c1, c2], None).await;
         assert_eq!(
             result.unwrap_err(),
             RelayAcquisitionError::AllCandidatesExhausted
